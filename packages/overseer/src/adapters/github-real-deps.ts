@@ -43,6 +43,7 @@ import type {
 } from './required-contexts.ts';
 import { createDurableAttemptCounterStore } from './required-contexts-store';
 import { classifyRateLimitError } from '../github-rate-limit';
+import { mergeHoldReason } from '../merge-holds';
 import {
   attachWorkflowAttempts,
   blockingFindingsAreCheckScoped,
@@ -204,6 +205,7 @@ export interface RealGitHubOctokitLike {
         base?: { sha: string; ref?: string };
         mergeable_state?: string;
         labels?: { name?: string | null }[];
+        draft?: boolean;
       };
     }>;
     listFiles?(input: Record<string, unknown>): Promise<{
@@ -256,7 +258,13 @@ export interface RealGitHubOctokitLike {
        */
       page?: number;
     }): Promise<{
-      data: { user: { login?: string | null } | null; state: string; commit_id: string }[];
+      data: {
+        user: { login?: string | null } | null;
+        state: string;
+        commit_id: string;
+        /** ISO time the review was submitted (WO-HARNESS-MERGE-GATES-01 Amendment 1). */
+        submitted_at?: string | null;
+      }[];
     }>;
   };
   /**
@@ -273,6 +281,18 @@ export interface RealGitHubOctokitLike {
     }>;
   };
   issues?: {
+    /**
+     * Optional: the issue timeline, paginated (WO-HARNESS-MERGE-GATES-01 Amendment 1). The merge
+     * function reads convert_to_draft and ready_for_review from it; a client without it cannot prove an
+     * approval was not given while the PR was a draft, so the merge is refused (fail closed).
+     */
+    listEventsForTimeline?(input: {
+      owner: string;
+      repo: string;
+      issue_number: number;
+      per_page: number;
+      page: number;
+    }): Promise<{ data: { event?: string | null; created_at?: string | null }[] }>;
     createComment(input: {
       owner: string;
       repo: string;
@@ -1403,6 +1423,7 @@ export function createRealFindPullRequest(
         mergeableState: pr.data.mergeable_state,
         changedFilePaths,
         labels: pullRequestLabelNames(pr.data.labels),
+        ...(typeof pr.data.draft === 'boolean' ? { draft: pr.data.draft } : {}),
       };
       if (!preserveRateLimitBackoff) {
         rateLimitBackoffUntil = 0;
@@ -1439,6 +1460,117 @@ export function createRealFindPullRequest(
   };
 }
 
+/** Pages read per list before the read is declared incomplete (10 x 100 = 1000 items). */
+const DRAFT_EVIDENCE_MAX_PAGES = 10;
+const DRAFT_EVIDENCE_PAGE_SIZE = 100;
+
+/**
+ * WO-HARNESS-MERGE-GATES-01 Amendment 1: is the Overseer's latest APPROVED review at `headSha` one that
+ * was submitted while the PR was a draft? Returns 'approval_given_while_draft' when it was,
+ * 'pr_approval_state_unknown' when the timeline or the reviews could not be read COMPLETELY, else null.
+ *
+ * Both lists are read through EVERY page: the key event or the latest approval can sit on page 2 or
+ * later, the bug class recorded for the reviews read above (fetchAllPullRequestReviews). A thrown page,
+ * a missing method, a page ceiling reached with full pages, or an event or approval without a timestamp
+ * is incomplete, and incomplete refuses.
+ *
+ * Draft state at a moment comes from the convert_to_draft and ready_for_review events in time order.
+ * Before the first event the PR was in the OPPOSITE state of that event; with no events it was never a
+ * draft. Tie rule: an approval whose submitted_at EQUALS an event's time counts as given while a draft.
+ */
+export async function approvalGivenWhileDraft(
+  octokit: RealGitHubOctokitLike,
+  input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    reviewGateLogin?: string;
+  }
+): Promise<'approval_given_while_draft' | 'pr_approval_state_unknown' | null> {
+  // Called through their objects (never detached) so a real client method keeps its receiver.
+  const issues = octokit.issues;
+  if (!issues?.listEventsForTimeline || !octokit.pulls.listReviews) {
+    return 'pr_approval_state_unknown';
+  }
+
+  const transitions: { atMs: number; toDraft: boolean }[] = [];
+  let eventsComplete = false;
+  for (let page = 1; page <= DRAFT_EVIDENCE_MAX_PAGES; page += 1) {
+    let data: { event?: string | null; created_at?: string | null }[];
+    try {
+      const batch = await issues.listEventsForTimeline?.({
+        owner: input.owner,
+        repo: input.repo,
+        issue_number: input.prNumber,
+        per_page: DRAFT_EVIDENCE_PAGE_SIZE,
+        page,
+      });
+      if (!batch) return 'pr_approval_state_unknown';
+      data = batch.data ?? [];
+    } catch {
+      return 'pr_approval_state_unknown';
+    }
+    for (const event of data) {
+      if (event.event !== 'convert_to_draft' && event.event !== 'ready_for_review') continue;
+      const atMs = Date.parse(event.created_at ?? '');
+      if (!Number.isFinite(atMs)) return 'pr_approval_state_unknown';
+      transitions.push({ atMs, toDraft: event.event === 'convert_to_draft' });
+    }
+    if (data.length < DRAFT_EVIDENCE_PAGE_SIZE) {
+      eventsComplete = true;
+      break;
+    }
+  }
+  if (!eventsComplete) return 'pr_approval_state_unknown';
+
+  const gateLogin = (input.reviewGateLogin ?? resolveReviewGateLogin()).toLowerCase();
+  let latestApprovalMs: number | null = null;
+  let reviewsComplete = false;
+  for (let page = 1; page <= DRAFT_EVIDENCE_MAX_PAGES; page += 1) {
+    let data: Awaited<
+      ReturnType<NonNullable<RealGitHubOctokitLike['pulls']['listReviews']>>
+    >['data'];
+    try {
+      const batch = await octokit.pulls.listReviews?.({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+        per_page: DRAFT_EVIDENCE_PAGE_SIZE,
+        page,
+      });
+      if (!batch) return 'pr_approval_state_unknown';
+      data = batch.data ?? [];
+    } catch {
+      return 'pr_approval_state_unknown';
+    }
+    for (const review of data) {
+      if (review.state !== 'APPROVED' || review.commit_id !== input.headSha) continue;
+      if ((review.user?.login ?? '').toLowerCase() !== gateLogin) continue;
+      const atMs = Date.parse(review.submitted_at ?? '');
+      if (!Number.isFinite(atMs)) return 'pr_approval_state_unknown';
+      if (latestApprovalMs === null || atMs > latestApprovalMs) latestApprovalMs = atMs;
+    }
+    if (data.length < DRAFT_EVIDENCE_PAGE_SIZE) {
+      reviewsComplete = true;
+      break;
+    }
+  }
+  if (!reviewsComplete) return 'pr_approval_state_unknown';
+  // No Overseer approval at this head: nothing to void (the approval requirement is checked elsewhere).
+  if (latestApprovalMs === null) return null;
+
+  transitions.sort((a, b) => a.atMs - b.atMs);
+  // Tie rule: an event at exactly the approval time makes it a draft-era approval.
+  if (transitions.some(t => t.atMs === latestApprovalMs)) return 'approval_given_while_draft';
+  let draft = transitions.length > 0 ? !transitions[0].toDraft : false;
+  for (const t of transitions) {
+    if (t.atMs >= latestApprovalMs) break;
+    draft = t.toDraft;
+  }
+  return draft ? 'approval_given_while_draft' : null;
+}
+
 /**
  * Real mergePullRequest for the GitHubClientDeps / merge-manager composition.
  *
@@ -1473,6 +1605,30 @@ export function createRealMergePullRequest(
     if (seenHead !== input.expectedHeadSha) {
       return { merged: false, message: `head_moved:${seenHead}` };
     }
+    // The last check before GitHub's merge API, for EVERY caller (merge manager, merge coordinator, any
+    // future path), on the fresh pulls.get response: a hold label added after the evidence was assembled
+    // still stops the merge, and a response without labels or without the draft field is refused, never
+    // assumed clean (WO-HARNESS-MERGE-GATES-01).
+    const holdReason = mergeHoldReason(
+      {
+        labels: pr.data.labels === undefined ? undefined : pullRequestLabelNames(pr.data.labels),
+        draft: pr.data.draft,
+        title: pr.data.title,
+      },
+      { failClosed: true }
+    );
+    if (holdReason) return { merged: false, message: holdReason };
+    // An Overseer approval given while the PR was a draft is VOID (Amendment 1): a review queued before a
+    // PR was drafted could still land on the draft (comicstoreos-provisioner PR 112, 2026-11-13), and that
+    // approval would otherwise merge the PR the moment it is marked ready. Every page is read; a failed
+    // or partial read refuses (pr_approval_state_unknown), never assumed clean.
+    const voidReason = await approvalGivenWhileDraft(octokit, {
+      owner: input.owner,
+      repo: input.repo,
+      prNumber: input.number,
+      headSha: input.expectedHeadSha,
+    });
+    if (voidReason) return { merged: false, message: voidReason };
     try {
       const mergeInput = {
         owner: input.owner,

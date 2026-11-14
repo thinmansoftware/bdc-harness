@@ -162,6 +162,8 @@ describe('originating run evidence gate', () => {
 
   test('Test 2: passing evidence gate follows the existing merge path', async () => {
     const f = fixture({ readRunEvents: async () => [event('node_completed')] });
+    // WO-HARNESS-MERGE-GATES-01: a run recorded failed at ANY node is held; a passed run merges.
+    f.record.status = 'completed';
     expect((await f.manager(f.record)).status).toBe('executed');
     expect(f.mergePullRequest).toHaveBeenCalledTimes(1);
     expect(f.mergePullRequest).toHaveBeenCalledWith(

@@ -103,10 +103,16 @@ export interface PullRequestEvidence {
   otherOpenPrsForWoLookupFailed?: boolean;
   /**
    * GitHub label names on this pull request. Absent on older evidence
-   * fixtures. An exact, case-sensitive `merge-hold` name holds the merge, and so does an
-   * exact `owner:reworking` (set and cleared only by the owner; it is not HOLD).
+   * fixtures. `merge-hold`, `run:blocked` and `owner:reworking` (matched case-insensitively) hold the
+   * merge on EVERY merge path through mergeHoldReason in merge-holds.ts; owner:reworking is set and
+   * cleared only by the owner and is not HOLD.
    */
   labels?: readonly string[];
+  /**
+   * True when the pull request is a draft. Absent on older evidence fixtures. A draft is never merged
+   * and never approved by the merge paths (WO-HARNESS-MERGE-GATES-01).
+   */
+  draft?: boolean;
   /**
    * Latest check run per name and app, when the evidence source loaded them.
    * Absent on older fixtures. An empty array means the lookup returned no runs.
@@ -154,6 +160,7 @@ export interface GrokDispositionReceipt {
     | 'judge_exit_nonzero'
     | 'judge_error'
     | 'originating_run_failed_evidence_gate'
+    | 'originating_run_failed'
     | 'originating_run_unreadable'
     | 'originating_run_in_progress';
   woId: string;

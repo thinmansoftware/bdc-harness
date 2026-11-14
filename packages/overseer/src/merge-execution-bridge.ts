@@ -21,11 +21,8 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
-import {
-  OWNER_REWORKING_LABEL,
-  PR_DISCOVERY_RUN_ID_PREFIX,
-  RUN_BLOCKED_LABEL,
-} from './merge-candidate-discovery';
+import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
+import { MERGE_HOLD_REASONS, mergeHoldReason } from './merge-holds';
 import {
   getRepoBasePolicy,
   hasRepoPolicyEntry,
@@ -51,6 +48,7 @@ import {
   postEvidenceHold,
   runlessOriginatingEvidenceHold,
   ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON,
+  ORIGINATING_RUN_FAILED_HOLD_REASON,
   ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON,
   ORIGINATING_RUN_UNREADABLE_HOLD_REASON,
 } from './merge-manager';
@@ -925,15 +923,19 @@ async function mergeClaimedVerdict(
   ): Promise<void> => {
     if (
       reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON ||
+      reason === ORIGINATING_RUN_FAILED_HOLD_REASON ||
       reason === ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON ||
-      reason === ORIGINATING_RUN_UNREADABLE_HOLD_REASON
+      reason === ORIGINATING_RUN_UNREADABLE_HOLD_REASON ||
+      MERGE_HOLD_REASONS.has(reason)
     ) {
       // Evidence holds must remain eligible for repair/adjudication on the next tick.
       // recordOutcome finalizes a verdict; transient retries consume a bounded budget.
       await options.store.releaseVerdictClaim(verdict.id, reason);
       log.info(
         { verdictId: verdict.id, runId: verdict.run_id, woId: verdict.wo_id, reason, prUrl },
-        'merge-coordinator.originating_evidence_held'
+        MERGE_HOLD_REASONS.has(reason)
+          ? `merge-coordinator.${reason}`
+          : 'merge-coordinator.originating_evidence_held'
       );
       return;
     }
@@ -1176,8 +1178,16 @@ async function mergeClaimedVerdict(
   // Holds release the claim and return. They are not skip() or deferVerdictClaim:
   // an extended hold must not set actioned_at, increment attempts, or exhaust
   // the transient retry cap. The next tick re-evaluates after the claim is free.
-  if (pr.labels?.includes('merge-hold')) {
-    await options.store.releaseVerdictClaim(verdict.id, 'merge_hold_label');
+  //
+  // ONE rule shared with the merge manager and the merge function (WO-HARNESS-MERGE-GATES-01,
+  // merge-holds.ts): merge-hold, run:blocked (a PR opened from a non-PROCEED run is not lane-verified;
+  // removing the label is a human decision), owner:reworking (set and cleared only by the owner; it is
+  // NOT HOLD, John's), a DRAFT and a FALLBACK: title. A draft is released here BEFORE any approve or
+  // merge call: a merge tried while the PR was a draft got GitHub's 405 and was recorded as a FINAL
+  // outcome, so marking the PR ready later did nothing (bdc-xo #6036, 2026-11-13).
+  const holdReason = mergeHoldReason({ labels: pr.labels, draft: pr.draft, title: pr.prTitle });
+  if (holdReason) {
+    await options.store.releaseVerdictClaim(verdict.id, holdReason);
     log.info(
       {
         verdictId: verdict.id,
@@ -1185,45 +1195,7 @@ async function mergeClaimedVerdict(
         woId: verdict.wo_id,
         prUrl: pr.htmlUrl,
       },
-      'merge-coordinator.merge_hold_label'
-    );
-    return undefined;
-  }
-
-  // A PR opened from a non-PROCEED run is labelled run:blocked by the lane's patch-pr-body
-  // node and is not lane-verified. This is the SHARED execution guard: the originating-run
-  // path (watch.ts emits merge_ready for a green PR regardless of run status) and the
-  // discovery path both reach it, so the label is enforced here as well as at discovery.
-  // Like a hold it releases the claim without skip(), attempts or an outcome row; removing
-  // the label (a human decision) frees the PR on the next tick.
-  if (pr.labels?.includes(RUN_BLOCKED_LABEL)) {
-    await options.store.releaseVerdictClaim(verdict.id, 'run_blocked_label');
-    log.info(
-      {
-        verdictId: verdict.id,
-        runId: verdict.run_id,
-        woId: verdict.wo_id,
-        prUrl: pr.htmlUrl,
-      },
-      'merge-coordinator.run_blocked_label'
-    );
-    return undefined;
-  }
-
-  // The owner marks a PR owner:reworking while the design is being redone. Like a hold it
-  // releases the claim without skip(), attempts or an outcome row, so the next tick
-  // re-evaluates after the owner clears the label. It is NOT HOLD (John's); nothing here sets
-  // or clears it.
-  if (pr.labels?.includes(OWNER_REWORKING_LABEL)) {
-    await options.store.releaseVerdictClaim(verdict.id, 'owner_reworking_label');
-    log.info(
-      {
-        verdictId: verdict.id,
-        runId: verdict.run_id,
-        woId: verdict.wo_id,
-        prUrl: pr.htmlUrl,
-      },
-      'merge-coordinator.owner_reworking_label'
+      `merge-coordinator.${holdReason}`
     );
     return undefined;
   }
@@ -1328,7 +1300,8 @@ async function mergeClaimedVerdict(
     if (
       traced &&
       !(
-        traced.failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+        (traced.failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON ||
+          traced.failure.reason === ORIGINATING_RUN_FAILED_HOLD_REASON) &&
         (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
       )
     ) {
@@ -1352,7 +1325,8 @@ async function mergeClaimedVerdict(
     if (
       failure &&
       !(
-        failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+        (failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON ||
+          failure.reason === ORIGINATING_RUN_FAILED_HOLD_REASON) &&
         (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
       )
     ) {
@@ -1560,12 +1534,7 @@ async function noteQueuedVerdict(
   if (!pr.exists || !pr.pr || pr.state !== 'open' || pr.headSha !== verdict.head_sha) {
     return notEligible();
   }
-  const labels = pr.labels ?? [];
-  if (
-    labels.includes('merge-hold') ||
-    labels.includes(RUN_BLOCKED_LABEL) ||
-    labels.includes(OWNER_REWORKING_LABEL)
-  ) {
+  if (mergeHoldReason({ labels: pr.labels, draft: pr.draft, title: pr.prTitle })) {
     return notEligible();
   }
   if (reportedChecksAreBlocking(pr.checks) || pr.mergeableState === 'dirty') return notEligible();

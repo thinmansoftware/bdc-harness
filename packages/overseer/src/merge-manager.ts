@@ -10,7 +10,7 @@ import {
   verifyMergeProvenance,
   type MergeProvenanceResult,
 } from './merge-provenance';
-import { OWNER_REWORKING_LABEL } from './merge-candidate-discovery';
+import { mergeHoldReason } from './merge-holds';
 import { eventMessage } from './watch';
 import { isRunTerminal } from './originating-run-lookup';
 import type { OriginatingRun, OriginatingRunLookupInput } from './originating-run-lookup';
@@ -42,6 +42,12 @@ export const BASE_BRANCH_MISMATCH_HOLD_REASON = 'base_branch_mismatch' as const;
 export const ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON =
   'originating_run_failed_evidence_gate' as const;
 export const ORIGINATING_RUN_UNREADABLE_HOLD_REASON = 'originating_run_unreadable' as const;
+/**
+ * WO-HARNESS-MERGE-GATES-01: the originating run is recorded failed at ANY node (not only
+ * manifest-evidence-check). A failed run is not proof of a good PR; it is released by an
+ * Evidence-Adjudication comment exactly like the evidence-gate hold.
+ */
+export const ORIGINATING_RUN_FAILED_HOLD_REASON = 'originating_run_failed' as const;
 /** A run-opened PR is held while its run has not finished: the evidence gate has not run yet. */
 export const ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON = 'originating_run_in_progress' as const;
 export const MERGE_MANAGER_EVIDENCE_ADJUDICATORS_ENV =
@@ -613,6 +619,7 @@ function trimmedBranch(value: string | null | undefined): string | null {
 
 export type EvidenceHoldReason =
   | typeof ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON
+  | typeof ORIGINATING_RUN_FAILED_HOLD_REASON
   | typeof ORIGINATING_RUN_UNREADABLE_HOLD_REASON
   | typeof ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON;
 
@@ -667,6 +674,15 @@ export async function originatingEvidenceFailure(
           error: failure ? eventMessage(failure) : (record.reason ?? ''),
         };
       }
+    }
+    // Any OTHER failed node (WO-HARNESS-MERGE-GATES-01): a run recorded failed is held, whatever node
+    // failed. run-less PRs (no traceable run) are not affected: they never reach this function.
+    if (record.status === 'failed') {
+      const failedNode = events.find(event => event.event_type === 'node_failed');
+      return {
+        reason: ORIGINATING_RUN_FAILED_HOLD_REASON,
+        error: failedNode ? eventMessage(failedNode) : (record.reason ?? 'originating run failed'),
+      };
     }
     return null;
   } catch (error) {
@@ -805,9 +821,11 @@ export async function postEvidenceHold(
           marker,
           failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON
             ? `Merge held: originating run ${runId} failed manifest-evidence-check`
-            : inProgress
-              ? `Merge held: originating run ${runId} has not finished`
-              : `Merge held: originating run ${runId} unreadable`,
+            : failure.reason === ORIGINATING_RUN_FAILED_HOLD_REASON
+              ? `Merge held: originating run ${runId} failed`
+              : inProgress
+                ? `Merge held: originating run ${runId} has not finished`
+                : `Merge held: originating run ${runId} unreadable`,
           `headSha=${target.headSha}`,
           `reason=${failure.reason}`,
           failure.error.slice(0, 300),
@@ -844,11 +862,15 @@ async function mergePreconditionMiss(
 ): Promise<string | null> {
   const headSha = evidence.head_sha;
   const checks = evidence.required_checks;
-  // The owner marks a PR owner:reworking while redoing the design; it must not merge.
-  // This is NOT HOLD (John's): nothing here sets or clears the label.
-  if (evidence.record.prEvidence.labels?.includes(OWNER_REWORKING_LABEL)) {
-    return 'owner_reworking_label';
-  }
+  // One rule for every merge path (WO-HARNESS-MERGE-GATES-01): merge-hold, run:blocked, owner:reworking,
+  // a draft and a FALLBACK: title all refuse the merge. Before this the manager checked owner:reworking
+  // alone, so a run-backed PR carrying merge-hold was merged (shopops-storefront PR 239, 2026-11-13).
+  const holdReason = mergeHoldReason({
+    labels: evidence.record.prEvidence.labels,
+    draft: evidence.record.prEvidence.draft,
+    title: evidence.record.prEvidence.prTitle,
+  });
+  if (holdReason) return holdReason;
   if (
     checks.length === 0 ||
     checks.some(check => check.conclusion !== 'success' || check.head_sha !== headSha)
@@ -1065,7 +1087,8 @@ export function createMergeManager(
       if (
         failure &&
         !(
-          failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+          (failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON ||
+            failure.reason === ORIGINATING_RUN_FAILED_HOLD_REASON) &&
           (await evidenceAdjudicated(deps, target, [
             reviewGateLogin,
             deps.operator?.identity,

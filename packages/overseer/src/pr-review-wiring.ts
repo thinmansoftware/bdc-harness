@@ -1439,6 +1439,18 @@ export function createRealSubmitDeps(
       });
       return pr.data.head.sha;
     },
+    // WO-HARNESS-MERGE-GATES-01 Amendment 1: no review on a draft. A response without a boolean draft
+    // field throws, which the submit path turns into a non-terminal deferral (fail closed).
+    async isDraft(input): Promise<boolean> {
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+      });
+      const draft = (pr.data as { draft?: unknown }).draft;
+      if (typeof draft !== 'boolean') throw new Error('pr_draft_unknown');
+      return draft;
+    },
     async hasCustody(context): Promise<boolean> {
       const message = await dispatch.renewMessageLease({
         id: context.requestId,

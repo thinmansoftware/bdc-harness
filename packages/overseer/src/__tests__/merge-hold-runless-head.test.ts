@@ -413,7 +413,12 @@ describe('merge manager: run-less candidate traced to its originating run', () =
     expect(human.mergePullRequest).toHaveBeenCalledTimes(1);
     expect(human.comments).toHaveLength(0);
 
-    const passing = managerFixture({ readRunEvents: mock(async () => [passedEvent()]) });
+    // WO-HARNESS-MERGE-GATES-01: a traced run recorded failed is held at any node; a passing gate on a
+    // COMPLETED run proceeds as before.
+    const passing = managerFixture({
+      findOriginatingRun: mock(async () => ({ runId: RUN_ID, status: 'completed' })),
+      readRunEvents: mock(async () => [passedEvent()]),
+    });
     expect((await passing.manager(passing.record)).status).toBe('executed');
     expect(passing.mergePullRequest).toHaveBeenCalledTimes(1);
   });

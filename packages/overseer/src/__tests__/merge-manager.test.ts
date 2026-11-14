@@ -15,10 +15,11 @@ const record: WatchedRunRecord = {
   woId: 'WO-MERGE-MANAGER-01',
   owner: 'thinmansoftware',
   repo: 'bdc-harness',
-  status: 'failed',
+  // WO-HARNESS-MERGE-GATES-01: a run recorded failed (the old tail-node false-fail shape) is now held at
+  // ANY node until an Evidence-Adjudication; the shared fixture is a passed run. See merge-manager-holds.test.ts.
+  status: 'completed',
   action: 'merge_ready',
   reason: 'green PR',
-  errorClass: 'tail_node_false_fail',
   // Engine-written worktree path -- required for merge provenance.
   workingPath: '/archon/worktrees/run-merge-manager-1',
   prEvidence: {
