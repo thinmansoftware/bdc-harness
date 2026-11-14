@@ -57,17 +57,9 @@ const {
   buildSupersedeReason,
   ingestPullRequestEvent,
 } = await import('../pr-review-ingest.ts');
-// LEGACY_PATTERN_CLASSES: the shipped AUTO_FIXABLE_CLASSES is empty (disarmed
-// pending a structured eligibility signal), so these FENCE tests inject the
-// former pattern table to get an eligible candidate. The fence, cap and
-// idempotency are what they exercise -- not the classification decision.
-const {
-  REMEDIATION_RECIPIENT,
-  REMEDIATION_SENDER,
-  MAX_REMEDIATION_ATTEMPTS,
-  decideRemediation,
-  LEGACY_PATTERN_CLASSES,
-} = await import('../remediation-candidate.ts');
+// Fence tests use the production structured eligibility path.
+const { REMEDIATION_RECIPIENT, REMEDIATION_SENDER, MAX_REMEDIATION_ATTEMPTS, decideRemediation } =
+  await import('../remediation-candidate.ts');
 const { createRealOctokitClient } = await import('../adapters/github-real-deps.ts');
 const { createHmac } = await import('crypto');
 // Imported after the test wrapper so runtime getDatabase() calls see this
@@ -1279,6 +1271,7 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
       {
         scope: 'migrations/041.sql',
         severity: 'blocker' as const,
+        remediation: 'mechanical' as const,
         summary:
           'The migration updates the parent before the child rows; the composite foreign key rejects that ordering.',
       },
@@ -1287,17 +1280,14 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
     // One delivery of the verdict, exactly as production does it.
     const deliver = async () => {
       const priorAttempts = await count(pr);
-      const decision = decideRemediation(
-        {
-          ...pr,
-          headSha,
-          verdict: 'CHANGES_REQUESTED',
-          findings,
-          verdictBody: 'byte-identical verdict body',
-          priorAttempts,
-        },
-        LEGACY_PATTERN_CLASSES
-      );
+      const decision = decideRemediation({
+        ...pr,
+        headSha,
+        verdict: 'CHANGES_REQUESTED',
+        findings,
+        verdictBody: 'byte-identical verdict body',
+        priorAttempts,
+      });
       if (!decision.emit) return { emitted: false as const, reason: decision.reason };
       const result = await emit(decision.body);
       return { emitted: true as const, claimed: result.claimed, attempt: decision.body.attempt };
@@ -1511,6 +1501,7 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
       {
         scope: 'migrations/041.sql',
         severity: 'blocker' as const,
+        remediation: 'mechanical' as const,
         summary:
           'The migration updates the parent before the child rows; the composite foreign key rejects that ordering.',
       },
@@ -1522,17 +1513,14 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
 
     const heads = ['1'.repeat(40), '2'.repeat(40), '3'.repeat(40), '4'.repeat(40)];
     const bodies = heads.map(headSha => {
-      const decision = decideRemediation(
-        {
-          ...pr,
-          headSha,
-          verdict: 'CHANGES_REQUESTED',
-          findings,
-          verdictBody: `verdict at ${headSha}`,
-          priorAttempts,
-        },
-        LEGACY_PATTERN_CLASSES
-      );
+      const decision = decideRemediation({
+        ...pr,
+        headSha,
+        verdict: 'CHANGES_REQUESTED',
+        findings,
+        verdictBody: `verdict at ${headSha}`,
+        priorAttempts,
+      });
       if (!decision.emit) throw new Error('expected every racer to build a candidate');
       return decision.body;
     });
@@ -1561,6 +1549,7 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
       {
         scope: 'migrations/041.sql',
         severity: 'blocker' as const,
+        remediation: 'mechanical' as const,
         summary:
           'The migration updates the parent before the child rows; the composite foreign key rejects that ordering.',
       },
@@ -1569,17 +1558,14 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
     // Each call is a full delivery for a NEW head, through the real path.
     const deliverHead = async (headSha: string) => {
       const priorAttempts = await count(pr);
-      const decision = decideRemediation(
-        {
-          ...pr,
-          headSha,
-          verdict: 'CHANGES_REQUESTED',
-          findings,
-          verdictBody: `verdict at ${headSha}`,
-          priorAttempts,
-        },
-        LEGACY_PATTERN_CLASSES
-      );
+      const decision = decideRemediation({
+        ...pr,
+        headSha,
+        verdict: 'CHANGES_REQUESTED',
+        findings,
+        verdictBody: `verdict at ${headSha}`,
+        priorAttempts,
+      });
       if (!decision.emit) return { emitted: false as const, reason: decision.reason };
       const result = await emit(decision.body);
       return { emitted: true as const, claimed: result.claimed };

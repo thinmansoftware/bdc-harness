@@ -66,6 +66,57 @@ function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
 }
 
 describe('governed PR-code reviewer', () => {
+  test('preserves recognized per-finding remediation signals', async () => {
+    for (const remediation of ['mechanical', 'judgment'] as const) {
+      const finding = {
+        scope: 'src/x.ts',
+        severity: 'major',
+        summary: 'Build fails.',
+        remediation,
+      };
+      const result = await evaluatePullRequest(
+        input,
+        deps({
+          invokeModel: async () => ({
+            exitCode: 0,
+            timedOut: false,
+            stdout: output('REQUEST_CHANGES', [finding]),
+          }),
+        })
+      );
+      expect(result.findings).toEqual([finding]);
+    }
+  });
+
+  test('absent or invalid remediation signals are omitted without losing the finding', () => {
+    const finding = { scope: 'src/x.ts', severity: 'major', summary: 'Build fails.' };
+    for (const remediation of [
+      undefined,
+      null,
+      'auto',
+      'Mechanical',
+      'mechanical ',
+      true,
+      {},
+      [],
+    ]) {
+      const parsed = parseReviewVerdict(output('REQUEST_CHANGES', [{ ...finding, remediation }]));
+      expect(parsed?.findings).toEqual([finding]);
+      expect(parsed?.findings[0]).not.toHaveProperty('remediation');
+    }
+  });
+
+  test('prompt requires a structured signal and reserves security judgments for humans', () => {
+    const prompt = buildReviewPrompt({
+      request: input,
+      diff: '',
+      checkPartition: { gating: [], nonRequired: [] },
+      acceptanceCriteria: null,
+    });
+    expect(prompt).toContain('"remediation":"mechanical|judgment"');
+    expect(prompt).toContain('security judgment is never mechanical');
+  });
+
   test('1 clean diff yields APPROVE with exact head and reviewer identity', async () => {
     const result = await evaluatePullRequest(input, deps());
     expect(result.verdict).toBe('APPROVE');

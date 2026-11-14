@@ -337,6 +337,14 @@ export interface SubmitDeps {
     prNumber: number;
   }): Promise<number>;
 
+  /** WO declared by the exact-head PR, when available; never a GitHub login or lane. */
+  resolveWoId?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+  }): Promise<string | null>;
+
   /**
    * Writes the remediation candidate onto the existing dispatch seam. Never
    * fires a builder: Taskmaster's budget, backoff, pause state, and
@@ -943,6 +951,19 @@ async function handBackToTaskmaster(
     return { emitted: false, reason: 'emit_failed' };
   }
 
+  let woId: string | null = null;
+  try {
+    woId =
+      (await deps.resolveWoId?.({
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+        headSha: work.headSha,
+      })) ?? null;
+  } catch {
+    // Optional metadata lookup must not invalidate the submitted review.
+  }
+
   const decision = decideRemediation({
     owner: work.owner,
     repo: work.repo,
@@ -952,7 +973,7 @@ async function handBackToTaskmaster(
     findings: verdict.findings ?? [],
     verdictBody: buildReviewBody(work, verdict),
     priorAttempts,
-    owningLane: work.author || null,
+    woId,
   });
 
   if (!decision.emit) return { emitted: false, reason: decision.reason };

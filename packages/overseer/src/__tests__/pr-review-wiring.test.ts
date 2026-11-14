@@ -81,6 +81,38 @@ const work = {
   author: 'contributor',
 };
 
+describe('remediation WO metadata', () => {
+  test('uses the unique WO manifest declaration on the reviewed head', async () => {
+    const octokit = submitOctokit();
+    octokit.pulls.get = async () =>
+      ({
+        data: {
+          title: 'Related WO-OTHER-01',
+          body: 'Related WO-OTHER-01\r\nWO: WO-HARNESS-TEST-01\r\n',
+          head: { sha: HEAD },
+        },
+      }) as Awaited<ReturnType<typeof octokit.pulls.get>>;
+    const deps = createRealSubmitDeps('review-app[bot]', { octokit });
+    expect(await deps.resolveWoId?.(work)).toBe('WO-HARNESS-TEST-01');
+  });
+
+  test('missing, ambiguous, or superseded declarations leave the WO unknown', async () => {
+    for (const [body, headSha] of [
+      ['Related WO-OTHER-01 without a manifest.', HEAD],
+      ['WO: WO-ONE-01\nWO: WO-TWO-01', HEAD],
+      ['WO: WO-ONE-01', 'b'.repeat(40)],
+    ]) {
+      const octokit = submitOctokit();
+      octokit.pulls.get = async () =>
+        ({ data: { body, head: { sha: headSha } } }) as Awaited<
+          ReturnType<typeof octokit.pulls.get>
+        >;
+      const deps = createRealSubmitDeps('review-app[bot]', { octokit });
+      expect(await deps.resolveWoId?.(work)).toBeNull();
+    }
+  });
+});
+
 describe('PR review approval verdict recording', () => {
   test('records one merge-ready runless verdict with the reviewed head and PR URL', async () => {
     const claims: unknown[] = [];

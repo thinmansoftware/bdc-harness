@@ -235,6 +235,9 @@ export function parseReviewVerdict(stdout: string): ParsedReviewVerdict | null {
         scope: finding.scope.trim(),
         severity: finding.severity as IndependentReviewFinding['severity'],
         summary: finding.summary.trim(),
+        ...(finding.remediation === 'mechanical' || finding.remediation === 'judgment'
+          ? { remediation: finding.remediation }
+          : {}),
       });
     }
     if (
@@ -264,7 +267,9 @@ export function buildReviewPrompt(input: {
     'Evaluate the exact-head code diff, check/test results, security implications, authorized scope, and stated acceptance criteria.',
     'Report blocking issues as severity blocker or major. Advisory issues use minor or note.',
     'Return only one JSON object with this exact shape:',
-    '{"verdict":"APPROVE|REQUEST_CHANGES","findings":[{"scope":"non-empty","severity":"blocker|major|minor|note","summary":"non-empty"}],"reviewed_head_sha":"exact input SHA"}',
+    '{"verdict":"APPROVE|REQUEST_CHANGES","findings":[{"scope":"non-empty","severity":"blocker|major|minor|note","summary":"non-empty","remediation":"mechanical|judgment"}],"reviewed_head_sha":"exact input SHA"}',
+    'The optional per-finding remediation field controls eligibility for an automated fix proposal. Use mechanical only for a deterministic correction that requires no human decision about security, behavior, design, scope, or policy. A failing test alone does not establish mechanical eligibility.',
+    'A security judgment is never mechanical, however it is phrased. Use judgment for security implications, access or data impact, design decisions, missing coverage, or uncertainty. Omit the field if eligibility cannot be established; absence or an invalid value means no automated remediation.',
     'Use REQUEST_CHANGES only with at least one blocker or major finding. Never approve when a required check fails or a stated acceptance criterion is unmet.',
     '',
     `Repository: ${input.request.owner}/${input.request.repo}`,

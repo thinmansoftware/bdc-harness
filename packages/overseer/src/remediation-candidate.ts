@@ -70,149 +70,23 @@ export type RemediationRefusalReason =
   | 'remediation_attempts_exhausted';
 
 /**
- * Finding classes the machine is permitted to hand back for an automated fix.
- *
- * DATA-DRIVEN AND FAIL-CLOSED BY CONSTRUCTION. Adding a class is an edit to
- * this table and nothing else; a finding that matches no entry here is NON-AUTO
- * and goes to a human. There is deliberately no wildcard, no default-auto
- * branch, and no "unknown -> probably fine" path. See classifyFinding.
+ * Prose classification stays disabled. Eligibility comes only from the
+ * reviewer's validated per-finding remediation signal, after both vetoes.
+ * Do not repopulate this table with regexes (PR #740; bdc-xo#2974).
  */
-export interface AutoFixableClass {
-  /** Stable id, recorded on the candidate so the fix target is auditable. */
-  readonly id: string;
-  /** Human-readable description for the wiki article and operator cards. */
-  readonly description: string;
-  /** Matched against the finding's scope + summary, case-insensitively. */
-  readonly pattern: RegExp;
-}
-
-/**
- * DISARMED PENDING A STRUCTURED ELIGIBILITY SIGNAL. Deliberately EMPTY.
- *
- * The hand-back mechanism in this module -- the fence, the attempt cap, the
- * idempotency, the dispatch contract -- is complete and tested. What is NOT
- * safe is deciding WHICH findings are mechanically fixable by pattern-matching
- * the reviewer's prose, so that decision is switched off rather than shipped
- * wrong. With no classes, every finding falls through classifyFinding's
- * fail-closed default and reaches a human. Remediation never fires.
- *
- * WHY, IN ONE EXAMPLE. The Overseer gate found this class of defect on PR #740
- * ten times. The decisive pair:
- *
- *   "The permission test fails: expected 403 but received 200."
- *       -> mechanical. A builder can fix this.
- *   "The permission test fails: a read-only member can delete projects."
- *       -> a privilege-escalation report. A human must decide.
- *
- * Same topic word, same evidence word, same grammatical shape. Any pattern that
- * admits the first admits the second. Narrowing was also starting to produce
- * FALSE NEGATIVES ("The auth test fails after the column rename." was being
- * refused), so continued tightening degraded the feature in both directions at
- * once. Rounds 3-9 of that PR were all this one defect class; round 9 closed
- * seven bypasses in a single audited pass and round 10 arrived anyway.
- *
- * The gate's own words: "Observed test failure does not establish that
- * remediation is mechanical. Require explicit, validated remediation
- * eligibility rather than treating a regex match plus absence of listed risk
- * phrases as authorization." That is correct, and it cannot be satisfied from
- * `IndependentReviewFinding`, which carries only {scope, severity, summary}.
- *
- * HOW TO RE-ARM. Do NOT repopulate this table with regexes -- that is the
- * mistake this emptiness records. The reviewer must emit a machine-readable
- * eligibility class, with ABSENCE meaning NON-AUTO, and this table must key off
- * that signal instead of prose. That requires changing the evaluator's model
- * contract, which WO-...-REMEDIATION-01 placed out of scope ("Changing what the
- * reviewer reviews or how it judges"), so it is tracked as its own WO.
- *
- * Everything else here stays live and covered by tests so the follow-up only
- * has to supply the signal.
- */
-export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [];
-
-/**
- * The pattern-based class table as it stood before AUTO_FIXABLE_CLASSES was
- * disarmed, kept HERE so the hand-back mechanism stays exercised end to end.
- *
- * These patterns are NOT safe to ship as an eligibility decision -- that is why
- * the production table is empty. They are retained as a TEST FIXTURE because
- * the fence, the attempt cap, the idempotency and the dispatch contract all
- * need a non-empty table to be exercised at all, and those parts ARE correct.
- *
- * Do not import this into production code. When the reviewer gains a structured
- * eligibility signal, the real table keys off that signal and this fixture can
- * go away.
- */
-export const LEGACY_PATTERN_CLASSES: readonly AutoFixableClass[] = [
-  {
-    id: 'build_failure',
-    description:
-      'Compilation or build errors the toolchain already reported. Excludes "should be typed better" style judgments.',
-    pattern:
-      /\b(?:build|compil\w*|type[-\s]?check|tsc|tsserver)\b[\s\S]{0,80}?\b(?:fails?|failing|failed|failure|errors?|erroring|broken|breaks)\b/i,
-  },
-  {
-    id: 'test_failure',
-    description:
-      'Tests that are OBSERVED FAILING. Deliberately excludes missing/absent coverage, which is a judgment call for a human.',
-    pattern:
-      /\b(?:test|tests|spec|specs|suite|assertion)\b[\s\S]{0,80}?\b(?:fails?|failing|failed|failure|red|erroring)\b|\b(?:fails?|failing|failed)\b[\s\S]{0,40}?\b(?:test|tests|spec|specs|suite|assertion)\b/i,
-  },
-  {
-    id: 'lint_or_format',
-    description:
-      'Lint/formatter violations a NAMED TOOL reported. A bare tool name, or a bare "format"/"style", is excluded.',
-    // THREE things this pattern deliberately refuses, each a real false
-    // positive the review gate caught on this PR:
-    //  - bare "format"/"style" (round 3): "The API response format exposes
-    //    internal identifiers" is a security judgment; "The date format shown
-    //    to customers is wrong" is a behavioral bug.
-    //  - a bare TOOL NAME (round 6): 'black' and 'ruff' are ordinary English
-    //    words and real filenames, so a mention alone is not evidence. A tool
-    //    name must appear WITH an observed failure.
-    // Combined with classifyFinding matching the SUMMARY only, a path like
-    // src/black.ts or ci/eslint-failures/ can no longer authorize automation.
-    pattern:
-      /\b(?:es-?lint|prettier|stylelint|rustfmt|gofmt|ruff|black|clippy|biome|tsfmt|lint(?:er|ing)?)\b[\s\S]{0,60}?\b(?:fails?|failing|failed|failure|errors?|erroring|violations?|reports?|reported|complains?|flags?|flagged)\b|\b(?:fails?|failing|failed|reports?|reported|violations?|errors?)\b[\s\S]{0,60}?\b(?:es-?lint|prettier|stylelint|rustfmt|gofmt|ruff|black|clippy|biome|tsfmt|lint(?:er|ing)?)\b|\b(?:style|lint|formatting)\s+(?:violation|error|failure)s?\b|\bformat(?:ting)?\s+check\s+(?:fail\w*|error\w*)\b/i,
-  },
-  {
-    id: 'migration_ordering',
-    description:
-      'Migration ordering defects the schema itself rejects (FK/constraint violations). Excludes "this migration should be redesigned" judgments.',
-    // Requires a CONSTRAINT the database enforces to be violated by the
-    // statement order. A migration plus a sequencing word is not enough:
-    // "this migration should run after the tenant backfill is redesigned" is a
-    // design call, and under the looser pattern it classified as auto-fixable.
-    pattern:
-      /\bmigrat\w+\b[\s\S]{0,160}?\b(?:foreign[-\s]?key|composite\s+key|unique\s+(?:index|constraint)|not\s+null|check\s+constraint|constraint)\b[\s\S]{0,160}?\b(?:violat\w*|reject\w*|fail\w*|error\w*|block\w*)\b/i,
-  },
-  {
-    id: 'ascii_violation',
-    description:
-      'Non-ASCII where the ENCODING RULE is the defect. Excludes rendering bugs that merely involve Unicode.',
-    // A bare "unicode" mention is excluded: "Unicode names render incorrectly
-    // for customers" is a display bug needing human judgment, and it used to
-    // classify as auto-fixable.
-    pattern:
-      /\b(?:ascii[-\s]?only|non[-\s]?ascii\s+(?:rule|gate|check|policy)|ascii\s+(?:rule|gate|check|policy)|encoding\s+(?:rule|gate|check))\b[\s\S]{0,80}?\b(?:fails\s+the\s+(?:gate|check|lint|build)|violat\w*|rejected\s+by|refuses\s+to\s+pars\w*|pars\w*\s+(?:error|failure)|breaks\s+(?:parsing|the\s+parser|powershell|the\s+build)|corrupts\s+the\s+file)\b|\b(?:fails\s+the\s+(?:gate|check|lint|build)|violat\w*|rejected\s+by|refuses\s+to\s+pars\w*|pars\w*\s+(?:error|failure)|breaks\s+(?:parsing|the\s+parser|powershell|the\s+build)|corrupts\s+the\s+file)\b[\s\S]{0,80}?\b(?:ascii[-\s]?only|non[-\s]?ascii\s+(?:rule|gate|check|policy)|ascii\s+(?:rule|gate|check|policy)|encoding\s+(?:rule|gate|check))\b|\b(?:em[-\s]?dash|en[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode\s+minus|ellipsis\s+character)\b[\s\S]{0,80}?\b(?:fails\s+the\s+(?:gate|check|lint|build)|violat\w*|rejected\s+by|refuses\s+to\s+pars\w*|pars\w*\s+(?:error|failure)|breaks\s+(?:parsing|the\s+parser|powershell|the\s+build)|corrupts\s+the\s+file)\b|\b(?:fails\s+the\s+(?:gate|check|lint|build)|violat\w*|rejected\s+by|refuses\s+to\s+pars\w*|pars\w*\s+(?:error|failure)|breaks\s+(?:parsing|the\s+parser|powershell|the\s+build)|corrupts\s+the\s+file)\b[\s\S]{0,80}?\b(?:em[-\s]?dash|en[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode\s+minus|ellipsis\s+character)\b/i,
-  },
-];
+export const AUTO_FIXABLE_CLASSES: readonly never[] = [];
 
 /**
  * Findings that must NEVER be auto-remediated, regardless of whether their text
- * happens to also match an auto-fixable pattern.
+ * carries a mechanical remediation signal.
  *
  * DEFENSE IN DEPTH, NOT THE BOUNDARY. This is an OVERRIDE checked FIRST in
  * classifyFinding, so "the migration ordering here is a security concern" is
- * non-auto even though it matches migration_ordering.
+ * non-auto even if the reviewer marked it mechanical.
  *
- * It is deliberately NOT the security boundary, because a blocklist cannot
- * enumerate every way a reviewer might phrase a security defect. The Overseer
- * gate proved that on this WO's own PR #740 (2026-09-04): a blocking finding
- * reading "Test missing for unescaped user content rendered into the page" is
- * XSS-shaped, trips none of these words, and was auto-routed for unattended
- * remediation. The real boundary is that each AUTO_FIXABLE_CLASSES pattern must
- * demand MECHANICAL EVIDENCE (a named failure, a tool's verdict) rather than
- * merely mentioning a mechanical noun -- see the note on that table.
+ * A blocklist cannot enumerate every security judgment. The primary gate is
+ * the reviewer's explicit mechanical signal; these vetoes can only refuse.
+ * Missing or invalid eligibility always routes to a human.
  *
  * NOTE ON PRECISION: a bare `sql` token is deliberately NOT listed. It matched
  * the `.sql` extension of the migration filename in the live shopops#650
@@ -291,31 +165,13 @@ export interface FindingClassification {
  *
  * Order is load-bearing and fails closed at every branch:
  *   1. A non-auto signal anywhere in the finding wins outright.
- *   2. Otherwise, the finding must match a known auto-fixable class.
- *   3. Matching nothing means NON-AUTO -- never auto.
+ *   2. Otherwise, the reviewer must explicitly mark the finding mechanical.
+ *   3. A missing, judgment, or invalid signal means NON-AUTO -- never auto.
  */
-export function classifyFinding(
-  finding: IndependentReviewFinding,
-  // Injectable so the mechanism stays exercised by tests while the SHIPPED
-  // table is empty. Production always takes the default, so passing a table is
-  // a test-only affordance and cannot re-arm remediation by accident.
-  classes: readonly AutoFixableClass[] = AUTO_FIXABLE_CLASSES
-): FindingClassification {
-  // THE SCOPE IS A FILE PATH, NOT A DESCRIPTION OF THE DEFECT.
-  //
-  // Classes are matched against the SUMMARY ALONE. Matching the concatenation
-  // let a path contaminate the decision: PR #740 round 6 (2026-10-05) showed
-  // scope 'src/black.ts' with summary "Endpoint returns every customer's
-  // invoices to any caller" matching lint_or_format through the FILENAME -- a
-  // data-disclosure finding routed for unattended remediation. It also meant
-  // failure words living in a path (ci/eslint-failures/...) could supply the
-  // "mechanical evidence" for a judgment call described in the summary.
-  //
-  // The non-auto override still reads BOTH, because a judgment-call signal
-  // anywhere in the finding must be able to veto. Widening what can REFUSE is
-  // safe; widening what can APPROVE is not.
+export function classifyFinding(finding: IndependentReviewFinding): FindingClassification {
+  // Scope is a path and cannot authorize remediation. Both scope and summary
+  // may veto the reviewer's signal, because either can identify human judgment.
   const vetoText = `${finding.scope} ${finding.summary}`;
-  const classifyText = finding.summary;
 
   // 1a. Judgment-call VOCABULARY overrides any mechanical-looking match.
   if (NON_AUTO_PATTERN.test(vetoText)) return { autoFixable: false, classId: null };
@@ -326,9 +182,9 @@ export function classifyFinding(
   // phrasings five rounds of keyword narrowing kept missing.
   if (NON_AUTO_IMPACT_PATTERN.test(vetoText)) return { autoFixable: false, classId: null };
 
-  // 2. Known mechanical class, judged on the reviewer's description only.
-  for (const candidate of classes) {
-    if (candidate.pattern.test(classifyText)) return { autoFixable: true, classId: candidate.id };
+  // 2. Only the explicit structured signal authorizes a mechanical hand-back.
+  if (finding.remediation === 'mechanical') {
+    return { autoFixable: true, classId: 'reviewer_mechanical' };
   }
 
   // 3. Unrecognized -> non-auto. This is the fail-closed default.
@@ -356,8 +212,7 @@ export interface FindingsClassification {
  * one the spec singles out, and it resolves toward the human.
  */
 export function classifyFindings(
-  findings: readonly IndependentReviewFinding[],
-  classes: readonly AutoFixableClass[] = AUTO_FIXABLE_CLASSES
+  findings: readonly IndependentReviewFinding[]
 ): FindingsClassification {
   const blocking = findings.filter(finding => BLOCKING_SEVERITIES.has(finding.severity));
   if (blocking.length === 0) {
@@ -367,7 +222,7 @@ export function classifyFindings(
   const classIds: string[] = [];
   const nonAutoSummaries: string[] = [];
   for (const finding of blocking) {
-    const classification = classifyFinding(finding, classes);
+    const classification = classifyFinding(finding);
     if (classification.autoFixable && classification.classId) {
       classIds.push(classification.classId);
     } else {
@@ -462,15 +317,12 @@ export type RemediationDecision =
  * `priorAttempts` rather than read here, which keeps the counting concern with
  * the durable store that owns it (see countPriorRemediationAttempts).
  */
-export function decideRemediation(
-  input: RemediationCandidateInput,
-  classes: readonly AutoFixableClass[] = AUTO_FIXABLE_CLASSES
-): RemediationDecision {
+export function decideRemediation(input: RemediationCandidateInput): RemediationDecision {
   if (input.verdict !== 'CHANGES_REQUESTED') {
     return { emit: false, reason: 'verdict_not_changes_requested', nonAutoSummaries: [] };
   }
 
-  const classification = classifyFindings(input.findings, classes);
+  const classification = classifyFindings(input.findings);
 
   if (classification.classIds.length === 0 && classification.nonAutoSummaries.length === 0) {
     // A CHANGES_REQUESTED verdict with no blocking finding is not something a
