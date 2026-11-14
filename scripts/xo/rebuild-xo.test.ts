@@ -10,7 +10,16 @@
  */
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
@@ -43,10 +52,15 @@ case "$1 $2" in
   "inspect --format")
     case "$3" in
       *Health*)
-        if [ "\${STUB_ROLLBACK_UNHEALTHY:-0}" = 1 ] && [ -e "$STUB_LOG.rolled" ]; then echo unhealthy; else echo healthy; fi ;;
+        if [ -n "\${STUB_HEALTH_SEQ:-}" ] && [ ! -e "$STUB_LOG.rolled" ]; then
+          n=$(( $(cat "$STUB_LOG.hc" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STUB_LOG.hc"
+          set -- $STUB_HEALTH_SEQ; [ "$n" -gt "$#" ] && n=$#; shift $((n - 1)); echo "$1"
+        elif [ "\${STUB_ROLLBACK_UNHEALTHY:-0}" = 1 ] && [ -e "$STUB_LOG.rolled" ]; then echo unhealthy; else echo healthy; fi ;;
       *RestartCount*) echo 0 ;;
     esac ;;
   "inspect -f") echo created ;;
+  "logs --timestamps") echo "boot output"; exit "\${STUB_LOGS_RC:-0}" ;;
+  "top archon-app-1") echo "PID ELAPSED STAT ARGS" ;;
 esac
 [ "$1" = tag ] && exit "\${STUB_TAG_RC:-0}"
 exit 0
@@ -93,6 +107,14 @@ esac
 exit 0
 `,
   sudo: `#!/bin/bash
+echo "sudo $*" >> "$STUB_LOG"
+# STUB_SUDO_HIDE=1: paths under ARCHON_DIR are visible ONLY through sudo (they live in ARCHON_DIR.hidden),
+# like the mode-750 DB folder on the host that the ssh user cannot read.
+if [ "\${STUB_SUDO_HIDE:-0}" = 1 ]; then
+  a=(); for x in "$@"; do a+=("\${x//$ARCHON_DIR/$ARCHON_DIR.hidden}"); done
+  set -- "\${a[@]}"
+fi
+if [ "$1" = timeout ] && [ -n "\${STUB_WARM_RC:-}" ]; then exit "$STUB_WARM_RC"; fi
 exec "$@"
 `,
   df: `#!/bin/bash
@@ -108,12 +130,15 @@ interface RunResult {
   status: number | null;
   out: string;
   calls: string[];
+  /** Names left in ARCHON_DIR.hidden (STUB_SUDO_HIDE=1) when the script finished, sorted. */
+  hidden: string[];
 }
 
 function runScript(
   extraEnv: Record<string, string> = {},
   target: string = script,
-  args: string[] = ['1']
+  args: string[] = ['1'],
+  setup?: (root: string) => void
 ): RunResult {
   const dir = mkdtempSync(join(tmpdir(), 'rebuild-xo-'));
   try {
@@ -132,6 +157,8 @@ function runScript(
     );
     const log = `${root}/calls.log`;
     writeFileSync(log, '');
+    if (extraEnv.STUB_SUDO_HIDE === '1') mkdirSync(`${root}.hidden`, { recursive: true });
+    setup?.(root);
     const res = spawnSync('bash', [target.replace(/\\/g, '/'), ...args], {
       encoding: 'utf8',
       env: {
@@ -141,16 +168,26 @@ function runScript(
         DB: `${root}/archon.db`,
         SCRIPTS_DIR: root,
         STUB_LOG: log,
+        // Failure evidence goes to the temp folder, never the real home folder.
+        REBUILD_FAIL_DIR: root,
         ...extraEnv,
       },
     });
+    let hidden: string[] = [];
+    try {
+      hidden = readdirSync(`${root}.hidden`).sort();
+    } catch {
+      hidden = [];
+    }
     return {
       status: res.status,
       out: `${res.stdout}\n${res.stderr}`,
       calls: readFileSync(log, 'utf8').split('\n').filter(Boolean),
+      hidden,
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}.hidden`, { recursive: true, force: true });
   }
 }
 
@@ -287,6 +324,112 @@ describe('rebuild-xo.sh', () => {
     expect(r.status).toBe(7);
     expect(r.out).toContain('DRAIN_STUCK');
     expect(r.out).not.toContain('=== DONE');
+  }, 60_000);
+  // WO-HARNESS-BOOT-CHOWN-WALK-AND-REBUILD-EVIDENCE-01, Test 4 (bdc-xo #6097): P4 reads the backup through sudo.
+  it('p4_sees_a_backup_only_sudo_can_read', () => {
+    const r = runScript({ STUB_SUDO_HIDE: '1' });
+    expect(r.out).not.toContain('ABORT_BACKUP');
+    expect(r.calls.some(c => /^sudo test -s \S+\/archon\.db\.pre-rebuild-\S+$/.test(c))).toBe(true);
+    expect(has(r, 'docker compose build')).toBe(true);
+    const missing = runScript({ STUB_SUDO_HIDE: '1', STUB_BACKUP_RC: '1' });
+    expect(missing.status).toBe(3);
+    expect(missing.out).toContain('ABORT_BACKUP');
+  }, 60_000);
+
+  // Test 5: the prune sees the backups only through sudo, keeps the newest two and removes the rest.
+  it('prune_keeps_the_newest_two_backups_through_sudo', () => {
+    const r = runScript({ STUB_SUDO_HIDE: '1' }, script, ['1'], root => {
+      ['A', 'B', 'C', 'D'].forEach((n, k) => {
+        const f = `${root}.hidden/archon.db.pre-rebuild-0${n}`;
+        writeFileSync(f, 'b');
+        const t = new Date(Date.UTC(2026, 9, 1 + k));
+        utimesSync(f, t, t);
+      });
+    });
+    expect(r.status).toBe(0);
+    const prune = r.calls.find(c => c.startsWith('sudo sh -c '));
+    expect(prune).toBeDefined();
+    // DBDIR is passed as an argument after "_", never inside the quoted script.
+    expect(prune).toMatch(/ _ \S+$/);
+    // Kept: tonight's new backup (newest) plus the newest older one (D); A, B and C are removed.
+    const kept = r.hidden.filter(n => n.startsWith('archon.db.pre-rebuild-'));
+    expect(kept.length).toBe(2);
+    expect(kept).toContain('archon.db.pre-rebuild-0D');
+    expect(kept).not.toContain('archon.db.pre-rebuild-0A');
+  }, 60_000);
+
+  // Test 6: the cache is warmed before up, and a warm-up timeout never aborts the rebuild.
+  it('cache_is_warmed_before_up_and_never_aborts', () => {
+    const r = runScript();
+    const warm = r.calls.findIndex(c =>
+      c.startsWith('sudo timeout 600 find /opt/bdc/archon-data /opt/bdc/archon-user-home')
+    );
+    const up = r.calls.findIndex(c => c.startsWith('docker compose up'));
+    expect(warm).toBeGreaterThanOrEqual(0);
+    expect(up).toBeGreaterThan(warm);
+    const slow = runScript({ STUB_WARM_RC: '124' });
+    expect(slow.out).toContain('warm: timed out after 600 s (continuing)');
+    expect(slow.status).toBe(0);
+    expect(slow.out).toContain('=== DONE');
+  }, 60_000);
+
+  // Test 7: an early "unhealthy" is not final; the bound is 360 s (72 polls of 5 s).
+  it('health_wait_survives_an_early_unhealthy', () => {
+    const ok = runScript({ STUB_HEALTH_SEQ: 'starting unhealthy unhealthy unhealthy healthy' });
+    expect(ok.out).toContain('=== V: health (up to 360 s) ===');
+    expect(ok.out).not.toContain('=== ROLLBACK');
+    expect(ok.status).toBe(0);
+    const fd = mkdtempSync(join(tmpdir(), 'rebuild-fail-'));
+    try {
+      const bad = runScript({
+        STUB_HEALTH_SEQ: 'unhealthy',
+        REBUILD_FAIL_DIR: fd.replace(/\\/g, '/'),
+      });
+      const vPolls = bad.calls.filter(
+        c => c.startsWith('docker inspect --format') && c.includes('Health')
+      ).length;
+      // 72 polls in the V phase, then one rollback poll (the rollback container reports healthy at once).
+      expect(vPolls).toBe(73);
+      expect(bad.out).toContain('=== ROLLBACK');
+      expect(bad.status).toBe(4);
+    } finally {
+      rmSync(fd, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  // Test 8: the failed start's logs, health and top are saved BEFORE any rollback command.
+  it('failed_start_evidence_is_saved_before_rollback', () => {
+    const fd = mkdtempSync(join(tmpdir(), 'rebuild-fail-'));
+    try {
+      const r = runScript({ STUB_UP_RC: '1', REBUILD_FAIL_DIR: fd.replace(/\\/g, '/') });
+      const logs = r.calls.findIndex(c => c.startsWith('docker logs --timestamps archon-app-1'));
+      const health = r.calls.findIndex(c =>
+        c.startsWith('docker inspect -f {{json .State.Health}}')
+      );
+      const top = r.calls.findIndex(c => c.startsWith('docker top archon-app-1'));
+      const firstRollback = r.calls.findIndex(c => c.startsWith('docker tag archon:rollback-'));
+      expect(firstRollback).toBeGreaterThanOrEqual(0);
+      for (const k of [logs, health, top]) {
+        expect(k).toBeGreaterThanOrEqual(0);
+        expect(k).toBeLessThan(firstRollback);
+      }
+      expect(r.out).toMatch(/saved: \S+rebuild-fail-\S+\.log \S+\.health\.json \S+\.top\.txt/);
+      const saved = readdirSync(fd);
+      expect(saved.some(f => f.endsWith('.log'))).toBe(true);
+      expect(saved.some(f => f.endsWith('.health.json'))).toBe(true);
+      expect(saved.some(f => f.endsWith('.top.txt'))).toBe(true);
+      // A failing docker logs never stops the rollback.
+      const broken = runScript({
+        STUB_UP_RC: '1',
+        STUB_LOGS_RC: '1',
+        REBUILD_FAIL_DIR: fd.replace(/\\/g, '/'),
+      });
+      expect(broken.out).toContain('WARN: could not save docker logs');
+      expect(broken.calls.some(c => c.startsWith('docker tag archon:rollback-'))).toBe(true);
+      expect(broken.status).toBe(4);
+    } finally {
+      rmSync(fd, { recursive: true, force: true });
+    }
   }, 60_000);
 });
 

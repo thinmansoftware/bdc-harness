@@ -35,7 +35,7 @@ i=0; while :; do
 done; echo "drained at $(date -u +%T)"
 echo "=== P0b: disk ==="; A=$(df -BG --output=avail / | tail -1 | tr -dc 0-9); echo "avail=${A}G"; [ "$A" -ge 15 ] || { echo ABORT_DISK; undrain; exit 3; }
 echo "=== P1: tree clean ==="; [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "ABORT dirty"; git status --short --untracked-files=no | head; undrain; exit 3; }
-echo "=== P4: DB backup ==="; sudo sqlite3 "$DB" ".backup $DBDIR/archon.db.pre-rebuild-$STAMP" && [ -s "$DBDIR/archon.db.pre-rebuild-$STAMP" ] || { echo "ABORT_BACKUP (no backup, nothing rebuilt)"; undrain; exit 3; }
+echo "=== P4: DB backup ==="; sudo sqlite3 "$DB" ".backup $DBDIR/archon.db.pre-rebuild-$STAMP" && sudo test -s "$DBDIR/archon.db.pre-rebuild-$STAMP" || { echo "ABORT_BACKUP (no backup, nothing rebuilt)"; undrain; exit 3; }
 echo "=== P5: pin image ==="; docker tag archon:latest "archon:rollback-$STAMP" || { echo "ABORT_PIN (no rollback image, nothing rebuilt)"; undrain; exit 3; }
 echo "=== P6: fetch ==="; PREV=$(git rev-parse HEAD); git fetch -q origin dev || { echo "ABORT_FETCH (git fetch failed; not building a stale commit)"; undrain; exit 3; }; TARGET=$(git rev-parse origin/dev); echo "target=$(git rev-parse --short $TARGET) from=$(git rev-parse --short HEAD)"
 git checkout -q "$TARGET" || { echo ABORT_CHECKOUT; undrain; exit 3; }
@@ -45,13 +45,28 @@ if [ "$BRC" -ne 0 ]; then
   git checkout -q "$PREV" || echo "WARN: could not restore the checkout to $PREV"
   undrain; exit 5
 fi
+# W (WO-HARNESS-BOOT-CHOWN-WALK-AND-REBUILD-EVIDENCE-01): warm the directory cache the entrypoint's ownership
+# walk reads. The image build pushes it out, and a cold walk hung two boots on 2026-11-13 (bdc-xo #5970).
+# Best effort: a timeout or error is printed and never aborts the rebuild.
+echo "=== W: warm directory cache ==="; WS=$(date +%s); sudo timeout 600 find /opt/bdc/archon-data /opt/bdc/archon-user-home -xdev > /dev/null 2>&1; WRC=$?
+if [ "$WRC" -eq 124 ]; then echo "warm: timed out after 600 s (continuing)"; elif [ "$WRC" -ne 0 ]; then echo "warm: find rc=$WRC (continuing)"; fi
+echo "warm: $(( $(date +%s) - WS ))s"
 echo "=== E4: up ==="; ULOG=$(mktemp); docker compose up -d "$SVC" > "$ULOG" 2>&1; URC=$?; tail -2 "$ULOG"; rm -f "$ULOG"
-echo "=== V: health (up to 150 s) ==="; i=0; S=unknown
-while [ $i -lt 30 ]; do S=$(docker inspect --format '{{.State.Health.Status}}' archon-app-1 2>/dev/null || echo missing); R=$(docker inspect --format '{{.RestartCount}}' archon-app-1 2>/dev/null || echo 0); [ "$S" = healthy ] && break; { [ "$S" = unhealthy ] || [ "${R:-0}" -gt 1 ]; } && break; sleep 5; i=$((i+1)); done
+# Up to 360 s (72 polls of 5 s). Docker's "unhealthy" is NOT final (it keeps checking and can report healthy
+# later), so the loop ends only on healthy, on a restart count above 1, or at the bound.
+echo "=== V: health (up to 360 s) ==="; i=0; S=unknown
+while [ $i -lt 72 ]; do S=$(docker inspect --format '{{.State.Health.Status}}' archon-app-1 2>/dev/null || echo missing); R=$(docker inspect --format '{{.RestartCount}}' archon-app-1 2>/dev/null || echo 0); [ "$S" = healthy ] && break; [ "${R:-0}" -gt 1 ] && break; sleep 5; i=$((i+1)); done
 TOKEN=$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN 2>/dev/null)
 API=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:3090/api/workflows -H "x-archon-operator-token: $TOKEN" || echo 000)
 echo "health=$S api=$API"
 if [ "$URC" -ne 0 ] || [ "$S" != healthy ] || [ "$API" != 200 ]; then
+  # Save the failed start's evidence BEFORE anything is rolled back: the rollback removes the container and,
+  # with the json-file log driver, its output (bdc-xo #6097). A failed save never stops the rollback.
+  FD="${REBUILD_FAIL_DIR:-$HOME}"
+  docker logs --timestamps archon-app-1 > "$FD/rebuild-fail-$STAMP.log" 2>&1 || echo "WARN: could not save docker logs"
+  docker inspect -f '{{json .State.Health}}' archon-app-1 > "$FD/rebuild-fail-$STAMP.health.json" 2>&1 || echo "WARN: could not save the health log"
+  docker top archon-app-1 -eo pid,etime,stat,args > "$FD/rebuild-fail-$STAMP.top.txt" 2>&1 || echo "WARN: could not save docker top"
+  echo "saved: $FD/rebuild-fail-$STAMP.log $FD/rebuild-fail-$STAMP.health.json $FD/rebuild-fail-$STAMP.top.txt"
   echo "=== ROLLBACK to archon:rollback-$STAMP (up rc=$URC health=$S api=$API) ==="
   # Every rollback step is checked. If any step fails, or the restored container is not healthy,
   # drain is left ON (no work starts on a broken container) and the script exits 8.
@@ -84,7 +99,9 @@ fi
 echo "=== D3: drain off (must read back mode normal) ==="
 if ! undrain; then echo "ALERT DRAIN_STUCK (drain mode is not normal after the rebuild; every fire is refused; clear it now)"; exit 7; fi
 echo "=== prune: keep newest 2 DB backups and newest 1 rollback image ==="
-for f in $(ls -1t "$DBDIR"/archon.db.pre-rebuild* 2>/dev/null | tail -n +3); do sudo rm -f "$f"; done
+# The DB folder is mode 750 owned by the app user, so the glob, the listing and the removal all run under
+# sudo, with the folder passed as an argument, never interpolated into the quoted script (bdc-xo #6097).
+sudo sh -c 'cd "$1" 2>/dev/null || exit 0; ls -1t archon.db.pre-rebuild* 2>/dev/null | tail -n +3 | while IFS= read -r f; do rm -f -- "$f"; done' _ "$DBDIR"
 for t in $(docker images archon --format '{{.Tag}}' | grep '^rollback-' | sort -r | tail -n +2); do docker rmi "archon:$t" >/dev/null 2>&1; done
 echo "HEAD=$(git rev-parse --short HEAD) created=$(docker inspect -f '{{.Created}}' archon-app-1) $(df -h / | tail -1 | awk '{print $4" free"}')"
 echo "=== DONE $STAMP ==="

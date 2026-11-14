@@ -35,7 +35,9 @@ interface RunResult {
   tree: string;
 }
 
-function runBlock(opts: { failMatch?: string; unwritable?: string } = {}): RunResult {
+function runBlock(
+  opts: { failMatch?: string; unwritable?: string; extra?: (dir: string) => void } = {}
+): RunResult {
   const dir = mkdtempSync(join(tmpdir(), 'archon-owner-'));
   // Forward slashes so Git Bash's find on Windows accepts the path as-is.
   const tree = dir.replace(/\\/g, '/');
@@ -50,6 +52,7 @@ function runBlock(opts: { failMatch?: string; unwritable?: string } = {}): RunRe
   }
   writeFileSync(join(dir, 'archon', 'ws-2', 'nested', 'wrong-a.txt'), 'x');
   writeFileSync(join(dir, 'home', 'ws-4', 'wrong-b.txt'), 'x');
+  opts.extra?.(dir);
   writeFileSync(log, '');
 
   const overrides = `
@@ -60,11 +63,25 @@ UNWRITABLE='${opts.unwritable ?? ''}'
 find() {
   echo "find $*" >> "$LOG"
   case "$1" in
-    /.archon) _m="$TREE/archon" ;;
-    /home/appuser) _m="$TREE/home" ;;
+    /.archon|/home/appuser) ;;
     *) return 1 ;;
   esac
-  command find "$_m" -name 'wrong-*' -print0
+  # Run the REAL find with the REAL expression (so -prune and the comma operator are exercised),
+  # mapping /.archon and /home/appuser onto the temp tree (also inside -path patterns) and the
+  # "! -user appuser" predicate onto a name match (wrong-* stands for "not owned by appuser").
+  _fa=()
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = '!' ] && [ "\${2:-}" = '-user' ] && [ "\${3:-}" = 'appuser' ]; then
+      _fa+=(-name 'wrong-*'); shift 3; continue
+    fi
+    case "$1" in
+      /.archon*) _fa+=("$TREE/archon\${1#/.archon}") ;;
+      /home/appuser*) _fa+=("$TREE/home\${1#/home/appuser}") ;;
+      *) _fa+=("$1") ;;
+    esac
+    shift
+  done
+  command find "\${_fa[@]}"
 }
 chown() {
   echo "chown $*" >> "$LOG"
@@ -104,8 +121,10 @@ describe('entrypoint ownership-fix block', () => {
     for (const c of chowns) expect(c).not.toMatch(/(^| )-[a-zA-Z]*R/);
     // find is asked only for entries not owned by appuser, on both roots.
     const finds = r.calls.filter(c => c.startsWith('find '));
+    // WO-HARNESS-BOOT-CHOWN-WALK-AND-REBUILD-EVIDENCE-01: /.archon prunes the run workspaces below
+    // their top two levels with find's comma operator; /home/appuser is unchanged.
     expect(finds).toEqual([
-      'find /.archon ! -user appuser -print0',
+      'find /.archon ( ! -user appuser -print0 ) , ( -path /.archon/workspaces/*/* -prune )',
       'find /home/appuser ! -user appuser -print0',
     ]);
     expect(r.calls).toContain('gosu appuser test -w /.archon');
@@ -131,5 +150,60 @@ describe('entrypoint ownership-fix block', () => {
       'ERROR: Failed to fix ownership of /.archon -- volume may be read-only or mounted with incompatible options'
     );
     expect(r.stdout).not.toContain('AFTER_BLOCK');
+  });
+  // WO-HARNESS-BOOT-CHOWN-WALK-AND-REBUILD-EVIDENCE-01, Test 1.
+  it('ownership_walk_prunes_workspace_contents', () => {
+    const r = runBlock({
+      extra: dir => {
+        mkdirSync(join(dir, 'archon', 'workspaces', 'run-a', 'repo', 'deep'), { recursive: true });
+        writeFileSync(
+          join(dir, 'archon', 'workspaces', 'run-a', 'repo', 'deep', 'wrong-deep.txt'),
+          'x'
+        );
+        writeFileSync(join(dir, 'archon', 'workspaces', 'wrong-top'), 'x');
+        writeFileSync(join(dir, 'archon', 'workspaces', 'run-a', 'wrong-mid'), 'x');
+        writeFileSync(join(dir, 'archon', 'wrong-root.txt'), 'x');
+      },
+    });
+    expect(r.status).toBe(0);
+    const chowned = r.calls.filter(c => c.startsWith('chown ')).map(c => c.split(' ').pop());
+    expect(chowned).toContain(`${r.tree}/archon/workspaces/wrong-top`);
+    expect(chowned).toContain(`${r.tree}/archon/workspaces/run-a/wrong-mid`);
+    expect(chowned).toContain(`${r.tree}/archon/wrong-root.txt`);
+    expect(chowned).not.toContain(`${r.tree}/archon/workspaces/run-a/repo/deep/wrong-deep.txt`);
+    const archonFind = r.calls.find(c => c.startsWith('find /.archon'));
+    expect(archonFind).toContain('-path /.archon/workspaces/*/* -prune');
+  });
+
+  // Test 2: the other walks are unchanged (no prune on /home/appuser).
+  it('other_walks_are_unchanged', () => {
+    const r = runBlock({
+      extra: dir => {
+        mkdirSync(join(dir, 'home', 'a', 'b', 'c'), { recursive: true });
+        writeFileSync(join(dir, 'home', 'a', 'b', 'c', 'wrong-deep-home.txt'), 'x');
+      },
+    });
+    expect(r.status).toBe(0);
+    expect(r.calls).toContain(`chown -h appuser:appuser ${r.tree}/home/a/b/c/wrong-deep-home.txt`);
+    const homeFind = r.calls.find(c => c.startsWith('find /home/appuser'));
+    expect(homeFind).toBe('find /home/appuser ! -user appuser -print0');
+  });
+
+  // Test 3: each walk is announced BEFORE it runs and timed after.
+  it('ownership_walk_is_announced_before_it_runs', () => {
+    const r = runBlock();
+    expect(r.status).toBe(0);
+    for (const root of ['/.archon', '/home/appuser']) {
+      const start = r.stderr.indexOf(`[archon] ownership check: ${root} ...`);
+      const done = r.stderr.indexOf(`[archon] ownership check: ${root} done in `);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(done).toBeGreaterThan(start);
+    }
+    // The announcement precedes the walk: the block prints before calling find (stderr is
+    // written before the find call is logged, so check the order of lines in stderr instead of
+    // interleaving two streams): the /.archon "done" line comes before the /home/appuser start.
+    expect(r.stderr.indexOf('ownership check: /.archon done in ')).toBeLessThan(
+      r.stderr.indexOf('ownership check: /home/appuser ...')
+    );
   });
 });
