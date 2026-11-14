@@ -12,6 +12,15 @@ ROOT = Path(__file__).resolve().parents[5]
 YAML = ROOT / '.archon/workflows/defaults/bdc-feature-development.yaml'
 WO = 'WO-ENV-FIXTURE'
 REPO = 'fixture/repo'
+# Windows' bare bash may be the WSL launcher, not Git Bash. Match the
+# existing reset-script Windows fixture and keep nested shebangs on that shell.
+BASH = (str(Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'Git/bin/bash.exe')
+        if os.name == 'nt' else 'bash')
+
+
+def write_lf(path, text):
+    # Shell scripts and lane node outputs must not acquire Windows CRLF.
+    path.write_bytes(text.replace('\r\n', '\n').encode('utf-8'))
 
 
 def cmd(args, cwd, env=None, check=True):
@@ -108,15 +117,16 @@ def fixture(t):
     cmd(['git', 'push', '-q', 'origin', 'HEAD:' + unique], wt)
     artifacts = t / 'artifacts'; artifacts.mkdir()
     out = artifacts / 'node-out'; out.mkdir()
-    (out / 'read-spec.out').write_text('WO_ID=' + WO + '\n')
-    (out / 'decide-push-target.out').write_text('pr_required: true\nrepo: fixture/repo\nstaging_gate_required: false\n')
-    (out / 'commit-and-push.out').write_text('unique_branch=' + unique + '\n')
+    write_lf(out / 'read-spec.out', 'WO_ID=' + WO + '\n')
+    write_lf(out / 'decide-push-target.out', 'pr_required: true\nrepo: fixture/repo\nstaging_gate_required: false\n')
+    write_lf(out / 'commit-and-push.out', 'unique_branch=' + unique + '\n')
     bindir = t / 'bin'; bindir.mkdir()
-    (bindir / 'gh').write_text('#!/usr/bin/env bash\nexec python3 "' + (t / 'gh.py').as_posix() + '" "$@"\n')
+    write_lf(bindir / 'gh', '#!/usr/bin/env bash\nexec python3 "' + (t / 'gh.py').as_posix() + '" "$@"\n')
     (t / 'gh.py').write_text(STUB)
     (bindir / 'gh').chmod(0o755)
     state = t / 'state.json'
-    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'], ARTIFACTS_DIR=str(artifacts), ARCHON_NODE_OUT=str(out), WORKFLOW_ID='fixture-run', WO_ID=WO, USER_MESSAGE=WO, RECORDED_BASE_BRANCH='dev', BASE_BRANCH='dev', PR_FIXTURE_STATE=str(state), CAULDRON_INTERACTIVE='false', TMPDIR=str(t), TEMP=str(t), TMP=str(t))
+    shell_path = str(Path(BASH).parent) + os.pathsep if os.name == 'nt' else ''
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + shell_path + os.environ['PATH'], ARTIFACTS_DIR=str(artifacts), ARCHON_NODE_OUT=str(out), WORKFLOW_ID='fixture-run', WO_ID=WO, USER_MESSAGE=WO, RECORDED_BASE_BRANCH='dev', BASE_BRANCH='dev', PR_FIXTURE_STATE=str(state), CAULDRON_INTERACTIVE='false', TMPDIR=str(t), TEMP=str(t), TMP=str(t))
     return wt, bare, artifacts, state, env, branch, unique, ancestor, head, base
 
 
@@ -125,8 +135,8 @@ def primary(branch, sha, **updates):
 
 
 def drive(t, wt, env, name, expected=0):
-    script = t / (name + '.sh'); script.write_text(node(name))
-    result = cmd(['bash', str(script)], wt, env, check=False)
+    script = t / (name + '.sh'); write_lf(script, node(name))
+    result = cmd([BASH, str(script)], wt, env, check=False)
     assert (result.returncode == 0) == (expected == 0), result.stdout + result.stderr
     return result.stdout
 
@@ -332,17 +342,17 @@ def run_concurrent():
                     marker = 'echo "run_pr_guard_waiting: another node holds the run PR lock" >&2'
                     assert marker in text
                     text = text.replace(marker, marker + '\n          touch "$PR_FIXTURE_WAITING"')
-                path = t / (name + '.sh'); path.write_text(text); scripts.append(path)
+                path = t / (name + '.sh'); write_lf(path, text); scripts.append(path)
             processes = []
             try:
-                first = subprocess.Popen(['bash', str(scripts[0])], cwd=wt, env=first_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                first = subprocess.Popen([BASH, str(scripts[0])], cwd=wt, env=first_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 processes.append(first)
                 wait_for(gate.with_suffix('.entered'), first)
                 # When salvage wins it has already changed HEAD. Publish its new HEAD to
                 # the run's unique branch as commit-and-push would, to satisfy the primary
                 # node's independent origin precondition before it reaches the lock.
                 if winner == 'salvage': cmd(['git', 'push', '-q', 'origin', 'HEAD:' + unique], wt)
-                second = subprocess.Popen(['bash', str(scripts[1])], cwd=wt, env=dict(env, PR_FIXTURE_WAITING=str(waiting)), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                second = subprocess.Popen([BASH, str(scripts[1])], cwd=wt, env=dict(env, PR_FIXTURE_WAITING=str(waiting)), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 processes.append(second)
                 wait_for(waiting, second)
                 gate.touch()
@@ -390,7 +400,7 @@ def run_stale_lock():
         lock = artifacts / 'run-pr.lock'
         ready = t / 'holder-ready'; release = t / 'holder-release'
         hold = t / 'hold.sh'
-        hold.write_text('''#!/usr/bin/env bash
+        write_lf(hold, '''#!/usr/bin/env bash
 set -e
 mkdir "$ARTIFACTS_DIR/run-pr.lock"
 mkdir "$ARTIFACTS_DIR/run-pr.lock/holder-$BASHPID"
@@ -398,22 +408,22 @@ trap 'rmdir "$ARTIFACTS_DIR/run-pr.lock/holder-$BASHPID"; rmdir "$ARTIFACTS_DIR/
 touch "$HOLDER_READY"
 while [ ! -f "$HOLDER_RELEASE" ]; do sleep 0.1; done
 ''')
-        holder = subprocess.Popen(['bash', str(hold)], cwd=wt, env=dict(env, HOLDER_READY=str(ready), HOLDER_RELEASE=str(release)), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        holder = subprocess.Popen([BASH, str(hold)], cwd=wt, env=dict(env, HOLDER_READY=str(ready), HOLDER_RELEASE=str(release)), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             wait_for(ready, holder)
             os.utime(lock, (time.time()-181, time.time()-181))
             script=t/'timeout.sh'
             # Test only: keep the production timeout at 180 seconds, exercise its
             # exact branch with a shorter extracted-script deadline.
-            script.write_text(node('open-pr-if-needed').replace('RPR_LOCK_TIMEOUT=180', 'RPR_LOCK_TIMEOUT=2'))
-            result=cmd(['bash', str(script)], wt, env, check=False)
+            write_lf(script, node('open-pr-if-needed').replace('RPR_LOCK_TIMEOUT=180', 'RPR_LOCK_TIMEOUT=2'))
+            result=cmd([BASH, str(script)], wt, env, check=False)
             assert result.returncode != 0 and 'run_pr_lock_timeout' in result.stderr, result.stdout+result.stderr
             assert holder.poll() is None and lock.exists()
             assert not Path(str(state)+'.attempts').exists()
             print('PASS: old live-holder lock is retained and contender reports bounded timeout', flush=True)
             (wt / 'file').write_text('preserved despite lock timeout\n')
-            script.write_text(node('noninteractive-salvage').replace('RPR_LOCK_TIMEOUT=180', 'RPR_LOCK_TIMEOUT=2'))
-            result=cmd(['bash', str(script)], wt, env, check=False)
+            write_lf(script, node('noninteractive-salvage').replace('RPR_LOCK_TIMEOUT=180', 'RPR_LOCK_TIMEOUT=2'))
+            result=cmd([BASH, str(script)], wt, env, check=False)
             assert result.returncode == 0, result.stdout+result.stderr
             assert 'SALVAGE=preserved_uncommitted:1' in result.stdout
             assert 'SALVAGE=preserved_local_only reason=github_or_lock_unavailable' in result.stdout
