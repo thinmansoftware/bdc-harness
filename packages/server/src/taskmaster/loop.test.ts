@@ -6573,6 +6573,46 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
     expect(attemptHours).toEqual([0, 6, 30]);
   });
 
+  test('escalate_p0 retry backoff: a pending row reconciled to sent starts the sent window at the real send', async () => {
+    // Board desk read of PR 1598 at 1bbda058a: restart reconciliation marked a
+    // pending in-place retry 'sent' with no proposal_json, so it kept the
+    // last_attempt_at of its last FAILURE (8 h ago) and the next escalation
+    // went out at hour 16. The found dispatch row (sent at hour 0) is the send.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const row = seedRow(world, 'pending', 20);
+    row.proposal_json = JSON.stringify({
+      type: 'escalate_p0',
+      reason: 'unclaimed_p0',
+      failure: 'test_delivery_down',
+      last_attempt_at: new Date(world.nowMs - 8 * HOUR).toISOString(),
+    });
+    world.sentMessages.push({
+      idempotency_key: row.idempotency_key!,
+      recipient: 'operator',
+      body: 'escalation sent just before the restart',
+      createdAt: new Date(world.nowMs).toISOString(),
+    });
+    const deps = depsFor(world, () => [p0()]);
+    const state = createTaskmasterState(60_000);
+    const sendHours: number[] = [];
+    let seen = sendsFor(world).length;
+    for (let hour = 0; hour <= 24; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+      const now = sendsFor(world).length;
+      if (now > seen) sendHours.push(hour);
+      seen = now;
+    }
+
+    // No further escalation before hour 24 (24 h after the real send); hour 24 may go.
+    expect(sendHours).toEqual([24]);
+    expect(row.outcome).toBe('sent');
+    expect(JSON.parse(row.proposal_json)).toMatchObject({
+      last_attempt_at: new Date(T0).toISOString(),
+    });
+  });
+
   test('escalate_p0 dedupe: a 36 h sent window holds across a 24 h bucket boundary', async () => {
     process.env[SENT_WINDOW_ENV] = '36';
     const world = makeWorld();

@@ -1462,6 +1462,33 @@ async function reconcilePendingFire(
 }
 
 /**
+ * proposal_json for an escalate_p0 row that restart reconciliation marks
+ * 'sent', with last_attempt_at set to the real send: the found dispatch row's
+ * createdAt, or the reconciliation time when that is not a valid time. An
+ * in-place retry would otherwise keep the last_attempt_at of its last FAILURE
+ * and start the sent window there (escalation-dedupe.ts latestAttemptIso;
+ * Board desk read of PR 1598 at 1bbda058a). Undefined (the row's JSON is left
+ * as it is) when its JSON cannot be read; the window then counts from
+ * created_at, since latestAttemptIso cannot read it either.
+ */
+function reconciledEscalationSentJson(
+  proposalJson: string,
+  effectCreatedAt: string,
+  nowMs: number
+): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(proposalJson);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const sentMs = Date.parse(effectCreatedAt);
+  const sentAt = new Date(Number.isFinite(sentMs) ? sentMs : nowMs).toISOString();
+  return JSON.stringify({ ...(parsed as Record<string, unknown>), last_attempt_at: sentAt });
+}
+
+/**
  * Restart reconciliation (Section 11 test 4): a journal row left 'pending'
  * (in-flight marker) is resolved against the external SOR. If the dispatch
  * row exists, the effect happened -- mark 'sent' WITHOUT a second
@@ -1485,7 +1512,13 @@ async function reconcilePendingActions(
       continue;
     const effect = await findEffect(action.idempotency_key);
     if (effect) {
-      await dal.updateActionOutcome(action.id, 'sent');
+      await dal.updateActionOutcome(
+        action.id,
+        'sent',
+        action.action_type === 'escalate_p0'
+          ? reconciledEscalationSentJson(action.proposal_json, effect.createdAt, nowMs)
+          : undefined
+      );
       log.info(
         { journalId: action.id, idempotencyKey: action.idempotency_key },
         'taskmaster.reconcile_pending_marked_sent'
