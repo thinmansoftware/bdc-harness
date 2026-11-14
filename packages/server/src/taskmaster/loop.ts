@@ -2986,6 +2986,13 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
     let dispatchSendRejected = false;
     let dispatchSubjectKey: string | null = null;
+    // An escalate_p0 send records WHEN it was attempted, as a failure does: an
+    // in-place retry keeps the row's created_at, and the sent window must
+    // start at the real send (escalation-dedupe.ts latestAttemptIso).
+    const escalationSentJson =
+      proposal.type === 'escalate_p0'
+        ? JSON.stringify({ ...proposal, last_attempt_at: new Date(nowMs).toISOString() })
+        : undefined;
     try {
       const escalationIssue =
         proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
@@ -3057,7 +3064,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           );
           continue;
         }
-        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.updateActionOutcome(journalRow.id, 'sent', escalationSentJson);
         await dal.gradeAction(journalRow.id, 'delivered_to_issue');
       } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
         if (!fireBudget || !fireHistoryReady) {
@@ -3269,9 +3276,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
                 : 'redispatch',
           max_retries: proposal.type === 'blocker_report' ? 0 : 2,
         });
-        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.updateActionOutcome(journalRow.id, 'sent', escalationSentJson);
       }
       journalRow.outcome = 'sent';
+      if (escalationSentJson !== undefined) journalRow.proposal_json = escalationSentJson;
       if (proposal.type === 'escalate_p0') escalateP0Rows.push(journalRow);
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
@@ -3307,7 +3315,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       // taskmaster_github_token_missing rows used.
       // An escalate_p0 failure records WHEN it was attempted: an in-place retry
       // keeps the row's created_at, and the failed backoff must restart from
-      // the latest attempt (escalation-dedupe.ts failedAttemptIso).
+      // the latest attempt (escalation-dedupe.ts latestAttemptIso).
       const attemptStamp =
         proposal.type === 'escalate_p0' ? { last_attempt_at: new Date(nowMs).toISOString() } : {};
       const failedProposalJson = dispatchSendRejected

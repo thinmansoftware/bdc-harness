@@ -6531,6 +6531,48 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
     ]);
   });
 
+  test('escalate_p0 retry backoff: a send on an in-place retry starts the sent window at the send', async () => {
+    // Board desk read of PR 1598 at 38ac23a29: the row is created at 05:00Z,
+    // delivery fails at 12:00Z (hour 0) and succeeds at the 18:00Z retry
+    // (hour 6). The 24 h sent window must count from 18:00Z, not from 05:00Z
+    // (which let the next escalation out at 05:00Z the next day, hour 17).
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedRow(world, 'failed', 7);
+    const base = depsFor(world, () => [p0()]);
+    const attemptHours: number[] = [];
+    let hour = 0;
+    const deps: TaskmasterDeps = {
+      ...base,
+      pageOperator: async () => {},
+      createTask: (async (
+        context: unknown,
+        data: { idempotency_key: string },
+        ...rest: unknown[]
+      ) => {
+        if (data.idempotency_key.startsWith(`tm:escalate_p0:${REF}:`)) {
+          attemptHours.push(hour);
+          if (hour === 0) throw new Error('test_delivery_down');
+        }
+        return (base.createTask as (...args: unknown[]) => unknown)(context, data, ...rest);
+      }) as unknown as TaskmasterDeps['createTask'],
+    };
+    const state = createTaskmasterState(60_000);
+    for (hour = 0; hour < 30; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+    }
+
+    expect(attemptHours).toEqual([0, 6]);
+    expect(sendsFor(world)).toHaveLength(1);
+
+    // Hour 30 (18:00Z the next day) is 24 h after the real send: it may go.
+    world.nowMs += HOUR;
+    hour = 30;
+    await tick(state, deps);
+    expect(attemptHours).toEqual([0, 6, 30]);
+  });
+
   test('escalate_p0 dedupe: a 36 h sent window holds across a 24 h bucket boundary', async () => {
     process.env[SENT_WINDOW_ENV] = '36';
     const world = makeWorld();

@@ -335,10 +335,13 @@ An existing compatible unique index makes the repair a no-op. This allows
 `/api/taskmaster/status` headroom to reflect recorded spawn evidence after
 the separately governed runtime rollout.
 
-Accepted residual (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01, Board desk read of PR 1598):
-a failed `escalate_p0` retried in place keeps its original `created_at`, so the 24 h sent
-window counts from the failure rather than the actual send, and a repeat escalation can come
-at most 6 h early (never sooner than 18 h after the real send).
+Attempt time (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01, Overseer and Board desk reads of
+PR 1598): an `escalate_p0` retried in place keeps its original `created_at`, so every send
+and every failure writes `proposal_json.last_attempt_at`. Both the 24 h sent window and the
+6 h failed backoff count from a row's latest attempt (the later of `created_at` and
+`last_attempt_at`). A repeat escalation therefore never comes sooner than the sent window
+after the real send, and a failing delivery is retried once per backoff, never every tick.
+Rows written before this rule have no `last_attempt_at` and count from `created_at`.
 
 ## Kill / rollback
 

@@ -5,15 +5,19 @@
  * The cooldown rules, in one place:
  *   - The SENT window (default 24 h, settable 24 to 168 h) starts ONLY from the
  *     last escalate_p0 journal row for the same thread and reason whose outcome
- *     is 'sent'. No other row starts or renews it (parked, pending, expired,
+ *     is 'sent', at that row's latest attempt (latestAttemptIso), which is the
+ *     real send. No other row starts or renews it (parked, pending, expired,
  *     rejected, deferred, and the recent_escalation skip rows never do).
  *   - The FAILED-delivery retry backoff (default 6 h, settable 1 to 168 h)
  *     applies when the last attempt (the newest 'sent' or 'failed' row) is a
- *     'failed' row. A failed row's attempt time is its LATEST attempt: the
- *     later of created_at and proposal_json.last_attempt_at, which every
- *     escalate_p0 failure writes. An in-place retry keeps the row's
- *     created_at, so without it a retry that failed again would find the
- *     backoff already over and retry every tick (Overseer review of PR 1598).
+ *     'failed' row.
+ *   - A row's time, for both windows, is its LATEST attempt: the later of
+ *     created_at and proposal_json.last_attempt_at, which every escalate_p0
+ *     send and failure writes. An in-place retry keeps the row's created_at,
+ *     so without it a retry that failed again would find the backoff already
+ *     over and retry every tick (Overseer review of PR 1598), and a retry that
+ *     succeeded would start the sent window before the real send (Board desk
+ *     read of PR 1598 at 38ac23a29).
  *   - The GitHub marker cooldown of escalation-delivery.ts (default 72 h,
  *     settable 1 to 168 h) is read here too, so all three windows share one
  *     reader and one fallback rule.
@@ -172,11 +176,11 @@ export interface EscalationJournalRow {
 }
 
 /**
- * The time of a failed row's latest delivery attempt, as an ISO string: the
- * later of created_at and a valid proposal_json.last_attempt_at. A row without
+ * The time of a row's latest delivery attempt, as an ISO string: the later of
+ * created_at and a valid proposal_json.last_attempt_at. A row without
  * last_attempt_at (written before this rule) falls back to created_at.
  */
-export function failedAttemptIso(row: EscalationJournalRow): string {
+export function latestAttemptIso(row: EscalationJournalRow): string {
   const createdMs = Date.parse(row.created_at);
   try {
     const parsed = JSON.parse(row.proposal_json) as { last_attempt_at?: unknown } | null;
@@ -220,14 +224,13 @@ export function decideEscalation(input: {
     if (row.outcome !== 'sent' && row.outcome !== 'failed') continue;
     if (canonicalize(row.thread_ref) !== input.threadRef) continue;
     if (reasonOfRow(row) !== input.reason) continue;
-    const createdMs = Date.parse(row.created_at);
-    if (row.outcome === 'sent' && Number.isFinite(createdMs) && createdMs > lastSentMs) {
-      lastSentMs = createdMs;
-      lastSentIso = row.created_at;
-    }
-    const attemptIso = row.outcome === 'failed' ? failedAttemptIso(row) : row.created_at;
+    const attemptIso = latestAttemptIso(row);
     const attemptMs = Date.parse(attemptIso);
     if (!Number.isFinite(attemptMs)) continue;
+    if (row.outcome === 'sent' && attemptMs > lastSentMs) {
+      lastSentMs = attemptMs;
+      lastSentIso = attemptIso;
+    }
     if (attemptMs > lastAttemptMs) {
       lastAttemptMs = attemptMs;
       lastAttemptIso = attemptIso;
