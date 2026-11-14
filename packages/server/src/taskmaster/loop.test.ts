@@ -6485,7 +6485,7 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
     expect(skipRows(late)).toHaveLength(0);
   });
 
-  test('escalate_p0 dedupe: consecutive failed retries each restart the 6 h backoff', async () => {
+  test('escalate_p0 retry backoff: consecutive failed retries each restart the 6 h backoff', async () => {
     // Overseer review of PR 1598: an in-place retry keeps the row's created_at.
     // Under the old rule a retry that failed again found the backoff already
     // over and retried EVERY tick; now each failure restarts it.
