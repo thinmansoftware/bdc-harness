@@ -2283,7 +2283,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // 'sent' row, and a 'failed' row starts the retry backoff instead. This
   // replaces the 24h any-outcome thread set of WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01,
   // which silently skipped and let a parked or expired row silence a real P0.
-  // The 7-day lookback covers the longest settable window (168 h).
+  // A window starts at the latest attempt, which may follow row creation.
   const configWarn = deps.onConfigWarning ?? defaultConfigWarn;
   const escalationCooldowns = resolveEscalationCooldowns(process.env, configWarn);
   const maxEffectsPerTick = resolveMaxEffectsPerTick(
@@ -2293,7 +2293,19 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // escalate_p0 rows the dedupe reads. A row written earlier in THIS tick is
   // appended once its outcome is known, so a same-tick duplicate is journaled
   // once like any other, never dropped silently.
-  const escalateP0Rows = lookback.filter(action => action.action_type === 'escalate_p0');
+  // Retries keep created_at. They run within the 24 h proof deadline, while
+  // restart reconciliation can stamp a pending row up to JOURNAL_LOOKBACK_MS
+  // after creation (including its conservative invalid-timestamp fallback).
+  // Retain that entire lifetime PLUS the current maximum cooldown. This is
+  // bounded at 14 days and leaves every other action's 7-day history unchanged.
+  const escalationHistory = await dal.getActionsSince(
+    new Date(
+      nowMs -
+        JOURNAL_LOOKBACK_MS -
+        Math.max(escalationCooldowns.sentWindowMs, escalationCooldowns.failedBackoffMs)
+    ).toISOString()
+  );
+  const escalateP0Rows = escalationHistory.filter(action => action.action_type === 'escalate_p0');
   try {
     if (deps.refreshLaneHealth) await deps.refreshLaneHealth();
     else if (!deps.db) await refreshLaneHealth();

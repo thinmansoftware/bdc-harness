@@ -1,7 +1,8 @@
 /**
  * Taskmaster loop tests -- Section 11 scenarios 1, 3, 4, 5 plus the
- * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
- * fake dispatch); no mock.module.
+ * auto-circuit. Dependency-injected clocks and effects; most DALs are fake,
+ * while cooldown-history regressions use the production DAL on isolated
+ * SQLite. No mock.module.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
@@ -73,6 +74,7 @@ import type {
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import * as taskmasterConnection from '@archon/core/db/connection';
 import * as fireBudgetDb from '@archon/core/db/taskmaster';
 
 describe('Taskmaster reset visibility and canary', () => {
@@ -6610,6 +6612,112 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
     expect(row.outcome).toBe('sent');
     expect(JSON.parse(row.proposal_json)).toMatchObject({
       last_attempt_at: new Date(T0).toISOString(),
+    });
+  });
+
+  async function withSqliteJournalHistory(
+    world: FakeWorld,
+    deps: TaskmasterDeps,
+    check: () => Promise<void>
+  ): Promise<void> {
+    const native = new SqliteAdapter(':memory:');
+    const connection = spyOn(taskmasterConnection, 'getDatabase').mockReturnValue(native);
+    deps.db = {
+      ...deps.db!,
+      getActionsSince: async sinceIso => {
+        // Writes remain in the existing fake world, but every history read
+        // executes the production DAL and its created_at SQL on real SQLite.
+        for (const row of world.journal) {
+          await native.query(
+            `INSERT INTO tm_journal
+             (id,created_at,thread_ref,action_type,proposal_json,idempotency_key,
+              before_hash,proof_predicate,proof_deadline_at,outcome,graded_at,grade)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             ON CONFLICT(id) DO UPDATE SET proposal_json=$5,outcome=$10,graded_at=$11,grade=$12`,
+            [
+              row.id,
+              row.created_at,
+              row.thread_ref,
+              row.action_type,
+              row.proposal_json,
+              row.idempotency_key,
+              row.before_hash,
+              row.proof_predicate,
+              row.proof_deadline_at,
+              row.outcome,
+              row.graded_at,
+              row.grade,
+            ]
+          );
+        }
+        return fireBudgetDb.getActionsSince(sinceIso);
+      },
+    };
+    try {
+      await check();
+    } finally {
+      connection.mockRestore();
+      await native.close();
+    }
+  }
+
+  for (const outcome of ['sent', 'failed'] as const) {
+    test(`escalate_p0 cooldown history: an old ${outcome} row keeps its 168 h latest-attempt window`, async () => {
+      process.env[SENT_WINDOW_ENV] = '168';
+      const priorBackoff = process.env.TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS;
+      process.env.TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS = '168';
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        // The row was created 169 h ago and retried 6 h after creation. Its
+        // 168 h window still has 5 h left, despite leaving the 7-day history.
+        const row = seedRow(world, outcome, 169);
+        row.idempotency_key = bucketKey(REF, world.nowMs - 169 * HOUR);
+        row.proposal_json = JSON.stringify({
+          type: 'escalate_p0',
+          reason: 'unclaimed_p0',
+          last_attempt_at: new Date(world.nowMs - 163 * HOUR).toISOString(),
+        });
+        const deps = depsFor(world, () => [p0()]);
+        await withSqliteJournalHistory(world, deps, async () => {
+          expect(await sendHoursOver(world, deps, 6)).toEqual([5]);
+        });
+      } finally {
+        if (priorBackoff === undefined)
+          delete process.env.TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS;
+        else process.env.TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS = priorBackoff;
+      }
+    });
+  }
+
+  test('escalate_p0 cooldown history: late reconciliation fallback keeps the full sent window', async () => {
+    process.env[SENT_WINDOW_ENV] = '168';
+    const world = makeWorld();
+    seedDigestSent(world);
+    // Pending reconciliation can find a row almost 7 days after creation.
+    // An invalid effect timestamp conservatively stamps reconciliation time.
+    const row = seedRow(world, 'pending', 167);
+    row.idempotency_key = bucketKey(REF, world.nowMs - 167 * HOUR);
+    world.sentMessages.push({
+      idempotency_key: row.idempotency_key!,
+      recipient: 'operator',
+      body: 'existing escalation before restart',
+      createdAt: 'invalid-time',
+    });
+    const start = world.nowMs;
+    const deps = depsFor(world, () => [p0()]);
+    const state = createTaskmasterState(60_000);
+    await withSqliteJournalHistory(world, deps, async () => {
+      await tick(state, deps);
+      expect(row.outcome).toBe('sent');
+      expect(JSON.parse(row.proposal_json).last_attempt_at).toBe(new Date(start).toISOString());
+      expect(sendsFor(world)).toHaveLength(1);
+      world.nowMs = start + 167 * HOUR;
+      await tick(state, deps);
+      expect(sendsFor(world)).toHaveLength(1);
+      world.nowMs = start + 168 * HOUR;
+      await tick(state, deps);
+      expect(sendsFor(world)).toHaveLength(2);
     });
   });
 
