@@ -2697,15 +2697,15 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     // escalate_p0 dedupe per (thread, reason), BEFORE the same-key skip below so
     // a duplicate inside the window is journaled once instead of dropped
     // silently (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01). A remediation
-    // candidate whose own row is failed/deferred keeps its in-place retry under
-    // its stable key and proof deadline, as before (Amendment 5, C2).
+    // candidate whose OWN row already exists (any outcome) keeps its existing
+    // lifecycle under its stable per-attempt key: an in-place retry of a
+    // failed/deferred row under its proof deadline (Amendment 5, C2), or, for a
+    // 'sent' row, the reconcile-and-dispose step of the same-key skip below
+    // (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01). The dedupe window only
+    // gates a candidate proposal that has no row yet.
     if (proposal.type === 'escalate_p0') {
-      const retryInPlace = Boolean(
-        proposal.remediationCandidateId &&
-        existingAction &&
-        ['failed', 'deferred'].includes(existingAction.outcome)
-      );
-      if (!retryInPlace) {
+      const candidateOwnRow = Boolean(proposal.remediationCandidateId && existingAction);
+      if (!candidateOwnRow) {
         const reason = proposal.reason ?? reasonForThreadRef(canonicalProposalRef);
         if (reason) {
           const decision = decideEscalation({
