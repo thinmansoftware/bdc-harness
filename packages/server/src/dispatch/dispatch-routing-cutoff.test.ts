@@ -470,6 +470,18 @@ describe('WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01', () => {
       return rows.filter(row => row.action_type === 'escalate_p0');
     }
 
+    // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01 Amendment 7b: a suppressed
+    // re-proposal is journaled ONCE as a recent_escalation skip row, separate from
+    // the delivery attempts these tests count.
+    const isSkip = (row: taskmasterDb.TmJournalEntry): boolean =>
+      JSON.parse(row.proposal_json).suppressed === 'recent_escalation';
+    async function attemptRows(): Promise<taskmasterDb.TmJournalEntry[]> {
+      return (await escalateRows()).filter(row => !isSkip(row));
+    }
+    async function skipRows(): Promise<taskmasterDb.TmJournalEntry[]> {
+      return (await escalateRows()).filter(isSkip);
+    }
+
     test('Test 5: one escalate_p0 per stall, even when delivery fails', async () => {
       setSystemTime(new Date(START));
       const attempts: string[] = [];
@@ -480,7 +492,8 @@ describe('WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01', () => {
         setSystemTime(new Date(START + offsetMin * 60_000));
         await tick(state, deps);
       }
-      const rows = await escalateRows();
+      // Still one delivery attempt per stall: exactly one row that is not a skip.
+      const rows = await attemptRows();
       expect(rows).toHaveLength(1);
       expect(rows[0]?.outcome).toBe('failed');
       expect(JSON.parse(rows[0]?.proposal_json ?? '{}')).toMatchObject({
@@ -488,6 +501,17 @@ describe('WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01', () => {
         failure: 'dispatch_send_failed_for_test',
       });
       expect(attempts).toEqual([T3_DESKTOP_RECIPIENT]);
+      // The re-proposals inside the 6 h failed backoff are journaled ONCE (the old
+      // rule dropped them with no row, so a regression fails here).
+      const skips = await skipRows();
+      expect(skips).toHaveLength(1);
+      expect(skips[0]?.outcome).toBe('expired');
+      expect(JSON.parse(skips[0]?.proposal_json ?? '{}')).toMatchObject({
+        suppressed: 'recent_escalation',
+        reason: 'unclaimed_p0',
+        window_basis: 'failed_backoff',
+        window_start: rows[0]?.created_at,
+      });
     });
 
     test('Test 6: a stall unmoved after 24 hours escalates once more', async () => {
@@ -496,16 +520,33 @@ describe('WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01', () => {
       const deps = failingDeps(attempts);
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
-      expect(await escalateRows()).toHaveLength(1);
+      expect(await attemptRows()).toHaveLength(1);
+      expect(await skipRows()).toHaveLength(0);
 
+      // After 24 hours the stall escalates once more (one more delivery attempt).
       setSystemTime(new Date(START + 25 * 3_600_000));
       await tick(state, deps);
-      expect(await escalateRows()).toHaveLength(2);
+      const afterDay = await attemptRows();
+      expect(afterDay).toHaveLength(2);
+      expect(await skipRows()).toHaveLength(0);
 
+      // 30 min later: no third attempt; the duplicate is journaled ONCE. Every
+      // delivery in this test fails, so the last attempt is a failed row and the
+      // window that applies is the 6 h failed backoff (no sent row ever exists).
       setSystemTime(new Date(START + 25 * 3_600_000 + 30 * 60_000));
       await tick(state, deps);
-      expect(await escalateRows()).toHaveLength(2);
+      expect(await attemptRows()).toHaveLength(2);
       expect(attempts).toEqual([T3_DESKTOP_RECIPIENT, T3_DESKTOP_RECIPIENT]);
+      const skips = await skipRows();
+      expect(skips).toHaveLength(1);
+      expect(skips[0]?.outcome).toBe('expired');
+      const newest = afterDay.reduce((a, b) => (a.created_at > b.created_at ? a : b));
+      expect(JSON.parse(skips[0]?.proposal_json ?? '{}')).toMatchObject({
+        suppressed: 'recent_escalation',
+        reason: 'unclaimed_p0',
+        window_basis: 'failed_backoff',
+        window_start: newest.created_at,
+      });
       expect(ESCALATE_P0_CLOCK_MS).toBe(24 * 60 * 60 * 1000);
     });
   });

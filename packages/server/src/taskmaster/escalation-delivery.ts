@@ -33,6 +33,11 @@
  * escalation.
  */
 import { createLogger } from '@archon/paths';
+import {
+  DEFAULT_MARKER_WINDOW_HOURS,
+  MARKER_WINDOW_ENV,
+  resolveEscalationCooldowns,
+} from './escalation-dedupe';
 import type { IDatabase } from '@archon/core/db/adapters/types';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -53,8 +58,27 @@ const log = createLogger('taskmaster/escalation-delivery');
 /** Hidden marker that identifies a Taskmaster escalation comment on an issue. */
 export const TASKMASTER_ESCALATION_MARKER = '<!-- taskmaster-escalation -->';
 
-/** Re-escalate only after this long since the last marker comment. */
-export const TASKMASTER_ESCALATION_COOLDOWN_MS = 72 * 60 * 60 * 1000;
+/**
+ * Re-escalate only after this long since the last marker comment. This is the
+ * DEFAULT; TASKMASTER_ESCALATION_MARKER_WINDOW_HOURS (1 to 168) overrides it at
+ * run time (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01, escalation-dedupe.ts).
+ */
+export const TASKMASTER_ESCALATION_COOLDOWN_MS = DEFAULT_MARKER_WINDOW_HOURS * 60 * 60 * 1000;
+
+/** One log line per distinct invalid marker-window value. */
+const warnedMarkerValues = new Set<string>();
+
+/** The marker cooldown in force now: the environment value, else the 72 h default. */
+export function escalationMarkerWindowMs(
+  env: Record<string, string | undefined> = process.env
+): number {
+  return resolveEscalationCooldowns(env, (variable, raw, fallback) => {
+    if (variable !== MARKER_WINDOW_ENV) return;
+    if (warnedMarkerValues.has(raw)) return;
+    warnedMarkerValues.add(raw);
+    log.warn({ variable, fallback }, 'taskmaster.config_value_invalid_using_default');
+  }).markerWindowMs;
+}
 
 /**
  * Matches a canonical GitHub thread ref `gh:owner/repo#N`, splitting owner and
@@ -268,8 +292,9 @@ export async function deliverEscalationToIssue(
   }
 
   let posted = false;
+  const markerWindowMs = escalationMarkerWindowMs();
   try {
-    const windowStartIso = new Date(nowMs - TASKMASTER_ESCALATION_COOLDOWN_MS).toISOString();
+    const windowStartIso = new Date(nowMs - markerWindowMs).toISOString();
     const comments = await deps.listIssueComments(params.issue, windowStartIso);
     // The marker text is public, so anyone who can comment can copy it. Only a
     // marker comment AUTHORED BY the identity Taskmaster posts as counts toward
@@ -289,10 +314,7 @@ export async function deliverEscalationToIssue(
         if (Number.isFinite(createdMs) && createdMs > latestMarkerMs) latestMarkerMs = createdMs;
       }
     }
-    if (
-      latestMarkerMs > Number.NEGATIVE_INFINITY &&
-      nowMs - latestMarkerMs < TASKMASTER_ESCALATION_COOLDOWN_MS
-    ) {
+    if (latestMarkerMs > Number.NEGATIVE_INFINITY && nowMs - latestMarkerMs < markerWindowMs) {
       return { posted: false, suppressedBy: 'cooldown_marker' };
     }
     await deps.postIssueComment(params.issue, params.body);
@@ -353,7 +375,7 @@ export function createDbEscalationDeliveryClaim(
           issue_key: issueKey,
           now_iso: new Date(nowMs).toISOString(),
           lease_expires_at: new Date(nowMs + escalationClaimLeaseMs()).toISOString(),
-          hold_cutoff_iso: new Date(nowMs - TASKMASTER_ESCALATION_COOLDOWN_MS).toISOString(),
+          hold_cutoff_iso: new Date(nowMs - escalationMarkerWindowMs()).toISOString(),
         },
         database
       ),

@@ -29,6 +29,7 @@ import type { RemediationCandidateBody } from '@archon/overseer/remediation-cand
 import type { FireEligibilityEvidence } from './fire-eligibility';
 import { WO_ID_RE } from './guard';
 import type { FireLane } from './lane-budget';
+import type { EscalationReason } from './escalation-dedupe';
 import { canonicalizeThreadRef } from './thread-ref';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
@@ -99,6 +100,11 @@ export interface ActionProposal {
    * thread is never proof. remediation_nudge only.
    */
   remediationEvidence?: RemediationEvidence;
+  /**
+   * Why an escalate_p0 was built (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01):
+   * the dedupe key is (thread, reason). escalate_p0 only.
+   */
+  reason?: EscalationReason;
 }
 
 export interface RemediationEvidence {
@@ -446,6 +452,7 @@ export function computeNextAction(
         (adoption ? ` ${adoptionIssueUrl(adoption)}` : ''),
       idempotencyKey: `tm:escalate_p0:${thread.ref}:${bucket}`,
       actsImmediately: true,
+      reason: 'unclaimed_p0',
     };
   }
 
@@ -704,6 +711,7 @@ export function computeRemediationNudge(
         'no automated assignment is made (Slice 1 has no assignment authority).',
       idempotencyKey,
       actsImmediately: true,
+      reason: 'unroutable_remediation',
     };
   }
 

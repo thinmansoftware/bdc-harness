@@ -82,6 +82,15 @@ import {
   type CascadeEvidenceDeps,
 } from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
+import {
+  decideEscalation,
+  DEFAULT_MAX_EFFECTS_PER_TICK,
+  escalationSkipKey,
+  reasonForThreadRef,
+  resolveEscalationCooldowns,
+  resolveMaxEffectsPerTick,
+  type CooldownConfigWarn,
+} from './escalation-dedupe';
 import { pageOnce } from '../dispatch/worker-heartbeat-alarm';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
 import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
@@ -108,8 +117,21 @@ function defaultEscalationDelivery(): EscalationDeliveryDeps {
   return realEscalationDelivery;
 }
 
-/** Ratified Q1 budgets. */
-export const MAX_EFFECTS_PER_TICK = 10;
+/**
+ * Ratified Q1 budgets. MAX_EFFECTS_PER_TICK is the default AND the ceiling:
+ * TASKMASTER_MAX_EFFECTS_PER_TICK (read each tick by resolveMaxEffectsPerTick in
+ * escalation-dedupe.ts) can only lower it (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01).
+ */
+export const MAX_EFFECTS_PER_TICK = DEFAULT_MAX_EFFECTS_PER_TICK;
+
+/** One log line per distinct invalid setting value, not one per tick. */
+const warnedConfigValues = new Set<string>();
+function defaultConfigWarn(variable: string, raw: string, fallback: number): void {
+  const key = `${variable}=${raw}`;
+  if (warnedConfigValues.has(key)) return;
+  warnedConfigValues.add(key);
+  log.warn({ variable, fallback }, 'taskmaster.config_value_invalid_using_default');
+}
 /** Conservative faucet bound for newly eligible work, within the shared cap. */
 export const MAX_FIRES_PER_TICK = 3;
 
@@ -294,6 +316,12 @@ export interface TaskmasterDeps {
    */
   assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
   getDispatchReceiptCutoverAt?: () => Promise<string | null>;
+  /**
+   * Test seam: receives each invalid cooldown or effect-cap setting read this
+   * tick (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01). Default: one log line per
+   * distinct invalid value.
+   */
+  onConfigWarning?: CooldownConfigWarn;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
@@ -1434,6 +1462,33 @@ async function reconcilePendingFire(
 }
 
 /**
+ * proposal_json for an escalate_p0 row that restart reconciliation marks
+ * 'sent', with last_attempt_at set to the real send: the found dispatch row's
+ * createdAt, or the reconciliation time when that is not a valid time. An
+ * in-place retry would otherwise keep the last_attempt_at of its last FAILURE
+ * and start the sent window there (escalation-dedupe.ts latestAttemptIso;
+ * Board desk read of PR 1598 at 1bbda058a). Undefined (the row's JSON is left
+ * as it is) when its JSON cannot be read; the window then counts from
+ * created_at, since latestAttemptIso cannot read it either.
+ */
+function reconciledEscalationSentJson(
+  proposalJson: string,
+  effectCreatedAt: string,
+  nowMs: number
+): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(proposalJson);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const sentMs = Date.parse(effectCreatedAt);
+  const sentAt = new Date(Number.isFinite(sentMs) ? sentMs : nowMs).toISOString();
+  return JSON.stringify({ ...(parsed as Record<string, unknown>), last_attempt_at: sentAt });
+}
+
+/**
  * Restart reconciliation (Section 11 test 4): a journal row left 'pending'
  * (in-flight marker) is resolved against the external SOR. If the dispatch
  * row exists, the effect happened -- mark 'sent' WITHOUT a second
@@ -1457,7 +1512,13 @@ async function reconcilePendingActions(
       continue;
     const effect = await findEffect(action.idempotency_key);
     if (effect) {
-      await dal.updateActionOutcome(action.id, 'sent');
+      await dal.updateActionOutcome(
+        action.id,
+        'sent',
+        action.action_type === 'escalate_p0'
+          ? reconciledEscalationSentJson(action.proposal_json, effect.createdAt, nowMs)
+          : undefined
+      );
       log.info(
         { journalId: action.id, idempotencyKey: action.idempotency_key },
         'taskmaster.reconcile_pending_marked_sent'
@@ -2217,16 +2278,34 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
-  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: ANY escalate_p0 journal action in
-  // the trailing 24h (sent, failed, rejected, expired...) counts, so a failed
-  // delivery is not re-proposed on every tick. Before this, only 'sent' and
-  // suppressed expiries were remembered and failed rows re-proposed on each
-  // 30-minute bucket (5,319 failed rows over 30 issues in 7 days, board evidence 2026-11-01).
-  const recentEscalateP0ByThread = new Set(
-    actions24h
-      .filter(action => action.action_type === 'escalate_p0')
-      .map(action => canonicalizeThreadRef(action.thread_ref))
+  // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01: escalate_p0 is deduped per
+  // (thread, reason) by escalation-dedupe.ts. Its sent window starts only from a
+  // 'sent' row, and a 'failed' row starts the retry backoff instead. This
+  // replaces the 24h any-outcome thread set of WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01,
+  // which silently skipped and let a parked or expired row silence a real P0.
+  // A window starts at the latest attempt, which may follow row creation.
+  const configWarn = deps.onConfigWarning ?? defaultConfigWarn;
+  const escalationCooldowns = resolveEscalationCooldowns(process.env, configWarn);
+  const maxEffectsPerTick = resolveMaxEffectsPerTick(
+    process.env.TASKMASTER_MAX_EFFECTS_PER_TICK,
+    configWarn
   );
+  // escalate_p0 rows the dedupe reads. A row written earlier in THIS tick is
+  // appended once its outcome is known, so a same-tick duplicate is journaled
+  // once like any other, never dropped silently.
+  // Retries keep created_at. They run within the 24 h proof deadline, while
+  // restart reconciliation can stamp a pending row up to JOURNAL_LOOKBACK_MS
+  // after creation (including its conservative invalid-timestamp fallback).
+  // Retain that entire lifetime PLUS the current maximum cooldown. This is
+  // bounded at 14 days and leaves every other action's 7-day history unchanged.
+  const escalationHistory = await dal.getActionsSince(
+    new Date(
+      nowMs -
+        JOURNAL_LOOKBACK_MS -
+        Math.max(escalationCooldowns.sentWindowMs, escalationCooldowns.failedBackoffMs)
+    ).toISOString()
+  );
+  const escalateP0Rows = escalationHistory.filter(action => action.action_type === 'escalate_p0');
   try {
     if (deps.refreshLaneHealth) await deps.refreshLaneHealth();
     else if (!deps.db) await refreshLaneHealth();
@@ -2660,6 +2739,60 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       continue;
     }
 
+    // escalate_p0 dedupe per (thread, reason), BEFORE the same-key skip below so
+    // a duplicate inside the window is journaled once instead of dropped
+    // silently (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01). A remediation
+    // candidate whose OWN row already exists (any outcome) keeps its existing
+    // lifecycle under its stable per-attempt key: an in-place retry of a
+    // failed/deferred row under its proof deadline (Amendment 5, C2), or, for a
+    // 'sent' row, the reconcile-and-dispose step of the same-key skip below
+    // (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01). The dedupe window only
+    // gates a candidate proposal that has no row yet.
+    if (proposal.type === 'escalate_p0') {
+      const candidateOwnRow = Boolean(proposal.remediationCandidateId && existingAction);
+      if (!candidateOwnRow) {
+        const reason = proposal.reason ?? reasonForThreadRef(canonicalProposalRef);
+        if (reason) {
+          const decision = decideEscalation({
+            threadRef: canonicalProposalRef,
+            reason,
+            nowMs,
+            rows: escalateP0Rows,
+            settings: escalationCooldowns,
+            canonicalize: canonicalizeThreadRef,
+          });
+          if (decision.action === 'skip') {
+            const skipKey = escalationSkipKey(
+              canonicalProposalRef,
+              reason,
+              decision.windowStartIso
+            );
+            const existingSkip =
+              actionsByKey.get(skipKey) ?? (await dal.getActionByIdempotencyKey(skipKey));
+            if (!existingSkip) {
+              const skipRow = await dal.recordAction({
+                thread_ref: proposal.threadRef,
+                action_type: proposal.type,
+                proposal_json: JSON.stringify({
+                  ...proposal,
+                  reason,
+                  suppressed: 'recent_escalation',
+                  window_basis: decision.basis,
+                  window_start: decision.windowStartIso,
+                }),
+                idempotency_key: skipKey,
+                before_hash: sha256(proposal.body),
+                outcome: 'expired',
+              });
+              actionsByKey.set(skipKey, skipRow);
+              result.expired += 1;
+            }
+            continue;
+          }
+        }
+      }
+    }
+
     if (
       existingAction &&
       ['sent', 'pending', 'rejected', 'expired', 'parked'].includes(existingAction.outcome)
@@ -2683,20 +2816,6 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           );
         }
       }
-      continue;
-    }
-    // Backoff withholds new sends, not cleanup of already-confirmed delivery.
-    // A candidate deferred by pause/epoch fencing has not been sent. Retry its
-    // stable journal key under the original deadline instead of blocking resume.
-    if (
-      proposal.type === 'escalate_p0' &&
-      recentEscalateP0ByThread.has(canonicalProposalRef) &&
-      !(
-        proposal.remediationCandidateId &&
-        existingAction &&
-        ['failed', 'deferred'].includes(existingAction.outcome)
-      )
-    ) {
       continue;
     }
     if (existingAction && ['failed', 'deferred'].includes(existingAction.outcome)) {
@@ -2801,7 +2920,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     // Budgets: max 10 effects/tick, 1 effect/item/tick. Overflow is
     // journaled as deferred, not dropped.
     if (
-      result.effects + unconfirmedFireReservations >= MAX_EFFECTS_PER_TICK ||
+      result.effects + unconfirmedFireReservations >= maxEffectsPerTick ||
       (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
       (proposal.type === 'blocker_report' &&
         blockerReportsThisTick >= MAX_BLOCKER_REPORTS_PER_TICK) ||
@@ -2912,6 +3031,13 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
     let dispatchSendRejected = false;
     let dispatchSubjectKey: string | null = null;
+    // An escalate_p0 send records WHEN it was attempted, as a failure does: an
+    // in-place retry keeps the row's created_at, and the sent window must
+    // start at the real send (escalation-dedupe.ts latestAttemptIso).
+    const escalationSentJson =
+      proposal.type === 'escalate_p0'
+        ? JSON.stringify({ ...proposal, last_attempt_at: new Date(nowMs).toISOString() })
+        : undefined;
     try {
       const escalationIssue =
         proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
@@ -2970,7 +3096,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             JSON.stringify({ ...proposal, suppressed })
           );
           journalRow.outcome = 'expired';
-          recentEscalateP0ByThread.add(canonicalProposalRef);
+          escalateP0Rows.push(journalRow);
           result.expired += 1;
           log.info(
             {
@@ -2983,7 +3109,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           );
           continue;
         }
-        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.updateActionOutcome(journalRow.id, 'sent', escalationSentJson);
         await dal.gradeAction(journalRow.id, 'delivered_to_issue');
       } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
         if (!fireBudget || !fireHistoryReady) {
@@ -3195,12 +3321,11 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
                 : 'redispatch',
           max_retries: proposal.type === 'blocker_report' ? 0 : 2,
         });
-        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.updateActionOutcome(journalRow.id, 'sent', escalationSentJson);
       }
       journalRow.outcome = 'sent';
-      if (proposal.type === 'escalate_p0') {
-        recentEscalateP0ByThread.add(canonicalProposalRef);
-      }
+      if (escalationSentJson !== undefined) journalRow.proposal_json = escalationSentJson;
+      if (proposal.type === 'escalate_p0') escalateP0Rows.push(journalRow);
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
@@ -3233,22 +3358,28 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       // A rejected Dispatch send records its reason for EVERY verb (fence 281:
       // never silent), in the same proposal_json.failure field the 2026-11-01
       // taskmaster_github_token_missing rows used.
-      await dal.updateActionOutcome(
-        journalRow.id,
-        'failed',
-        dispatchSendRejected
-          ? JSON.stringify({
-              ...proposal,
-              failure: failureReason,
-              failure_stage: 'dispatch_send',
-              subject_key: dispatchSubjectKey,
-            })
-          : proposal.type === 'escalate_p0'
-            ? JSON.stringify({ ...proposal, failure: failureReason })
-            : undefined
-      );
+      // An escalate_p0 failure records WHEN it was attempted: an in-place retry
+      // keeps the row's created_at, and the failed backoff must restart from
+      // the latest attempt (escalation-dedupe.ts latestAttemptIso).
+      const attemptStamp =
+        proposal.type === 'escalate_p0' ? { last_attempt_at: new Date(nowMs).toISOString() } : {};
+      const failedProposalJson = dispatchSendRejected
+        ? JSON.stringify({
+            ...proposal,
+            failure: failureReason,
+            failure_stage: 'dispatch_send',
+            subject_key: dispatchSubjectKey,
+            ...attemptStamp,
+          })
+        : proposal.type === 'escalate_p0'
+          ? JSON.stringify({ ...proposal, failure: failureReason, ...attemptStamp })
+          : undefined;
+      await dal.updateActionOutcome(journalRow.id, 'failed', failedProposalJson);
       journalRow.outcome = 'failed';
-      if (proposal.type === 'escalate_p0') recentEscalateP0ByThread.add(canonicalProposalRef);
+      if (proposal.type === 'escalate_p0' && failedProposalJson !== undefined) {
+        journalRow.proposal_json = failedProposalJson;
+      }
+      if (proposal.type === 'escalate_p0') escalateP0Rows.push(journalRow);
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
       if (dispatchSendRejected) {
