@@ -3305,21 +3305,27 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       // A rejected Dispatch send records its reason for EVERY verb (fence 281:
       // never silent), in the same proposal_json.failure field the 2026-11-01
       // taskmaster_github_token_missing rows used.
-      await dal.updateActionOutcome(
-        journalRow.id,
-        'failed',
-        dispatchSendRejected
-          ? JSON.stringify({
-              ...proposal,
-              failure: failureReason,
-              failure_stage: 'dispatch_send',
-              subject_key: dispatchSubjectKey,
-            })
-          : proposal.type === 'escalate_p0'
-            ? JSON.stringify({ ...proposal, failure: failureReason })
-            : undefined
-      );
+      // An escalate_p0 failure records WHEN it was attempted: an in-place retry
+      // keeps the row's created_at, and the failed backoff must restart from
+      // the latest attempt (escalation-dedupe.ts failedAttemptIso).
+      const attemptStamp =
+        proposal.type === 'escalate_p0' ? { last_attempt_at: new Date(nowMs).toISOString() } : {};
+      const failedProposalJson = dispatchSendRejected
+        ? JSON.stringify({
+            ...proposal,
+            failure: failureReason,
+            failure_stage: 'dispatch_send',
+            subject_key: dispatchSubjectKey,
+            ...attemptStamp,
+          })
+        : proposal.type === 'escalate_p0'
+          ? JSON.stringify({ ...proposal, failure: failureReason, ...attemptStamp })
+          : undefined;
+      await dal.updateActionOutcome(journalRow.id, 'failed', failedProposalJson);
       journalRow.outcome = 'failed';
+      if (proposal.type === 'escalate_p0' && failedProposalJson !== undefined) {
+        journalRow.proposal_json = failedProposalJson;
+      }
       if (proposal.type === 'escalate_p0') escalateP0Rows.push(journalRow);
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');

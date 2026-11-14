@@ -6485,6 +6485,52 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
     expect(skipRows(late)).toHaveLength(0);
   });
 
+  test('escalate_p0 dedupe: consecutive failed retries each restart the 6 h backoff', async () => {
+    // Overseer review of PR 1598: an in-place retry keeps the row's created_at.
+    // Under the old rule a retry that failed again found the backoff already
+    // over and retried EVERY tick; now each failure restarts it.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const failed = seedRow(world, 'failed', 7);
+    const base = depsFor(world, () => [p0()]);
+    const attemptHours: number[] = [];
+    let hour = 0;
+    const deps: TaskmasterDeps = {
+      ...base,
+      pageOperator: async () => {},
+      createTask: (async (
+        context: unknown,
+        data: { idempotency_key: string },
+        ...rest: unknown[]
+      ) => {
+        if (data.idempotency_key.startsWith(`tm:escalate_p0:${REF}:`)) {
+          attemptHours.push(hour);
+          throw new Error('test_delivery_down');
+        }
+        return (base.createTask as (...args: unknown[]) => unknown)(context, data, ...rest);
+      }) as unknown as TaskmasterDeps['createTask'],
+    };
+    const state = createTaskmasterState(60_000);
+    // T0 is 12:00Z: twelve hourly ticks stay inside one 24 h bucket (one key).
+    for (hour = 0; hour < 12; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+    }
+
+    expect(attemptHours).toEqual([0, 6]);
+    expect(sendsFor(world)).toHaveLength(0);
+    expect(failed.outcome).toBe('failed');
+    expect(JSON.parse(failed.proposal_json)).toMatchObject({
+      last_attempt_at: new Date(T0 + 6 * HOUR).toISOString(),
+    });
+    // One skip row per backoff window: the one from hour 0 and the one from hour 6.
+    expect(skipRows(world)).toHaveLength(2);
+    expect(skipRows(world).map(r => JSON.parse(r.proposal_json).window_basis)).toEqual([
+      'failed_backoff',
+      'failed_backoff',
+    ]);
+  });
+
   test('escalate_p0 dedupe: a 36 h sent window holds across a 24 h bucket boundary', async () => {
     process.env[SENT_WINDOW_ENV] = '36';
     const world = makeWorld();

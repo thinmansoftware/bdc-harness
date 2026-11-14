@@ -1,7 +1,8 @@
 /**
  * escalation-dedupe unit tests (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01):
  * Test 4 (reason guard), Test 5 (settable windows and fallback) and Test 12
- * (reason from thread_ref, heartbeat rows excluded). Nine named cases.
+ * (reason from thread_ref, heartbeat rows excluded), and the failed backoff
+ * from the latest attempt (Overseer review of PR 1598). Eleven named cases.
  */
 import { describe, expect, test } from 'bun:test';
 import {
@@ -125,6 +126,51 @@ describe('escalation-dedupe: Test 5, the windows are settable and fall back', ()
       );
       expect(seen).toEqual([{ variable: MARKER_WINDOW_ENV, raw, fallback: 72 }]);
     }
+  });
+});
+
+describe('escalation-dedupe: the failed backoff starts at the latest attempt', () => {
+  const H = 3_600_000;
+  const T = Date.parse('2026-11-14T00:00:00.000Z');
+  const settings = { sentWindowMs: 24 * H, failedBackoffMs: 6 * H, markerWindowMs: 72 * H };
+  const failedRow = (lastAttemptAt?: string): EscalationJournalRow => ({
+    thread_ref: 'gh:o/r#1',
+    action_type: 'escalate_p0',
+    proposal_json: JSON.stringify({
+      reason: 'unclaimed_p0',
+      ...(lastAttemptAt ? { last_attempt_at: lastAttemptAt } : {}),
+    }),
+    outcome: 'failed',
+    created_at: new Date(T).toISOString(),
+  });
+  const decide = (row: EscalationJournalRow, nowMs: number) =>
+    decideEscalation({
+      threadRef: 'gh:o/r#1',
+      reason: 'unclaimed_p0',
+      nowMs,
+      rows: [row],
+      settings,
+    });
+
+  test('escalation-dedupe: a failed retry at +7 h holds the backoff from +7 h, not from created_at', () => {
+    const retriedAt = new Date(T + 7 * H).toISOString();
+    expect(decide(failedRow(retriedAt), T + 8 * H)).toEqual({
+      action: 'skip',
+      basis: 'failed_backoff',
+      windowStartIso: retriedAt,
+    });
+    expect(decide(failedRow(retriedAt), T + 13 * H - 1)).toMatchObject({ action: 'skip' });
+    expect(decide(failedRow(retriedAt), T + 13 * H)).toEqual({ action: 'send' });
+  });
+
+  test('escalation-dedupe: a row without last_attempt_at, or with an older or invalid one, uses created_at', () => {
+    expect(decide(failedRow(), T + 7 * H)).toEqual({ action: 'send' });
+    expect(decide(failedRow(new Date(T - H).toISOString()), T + 7 * H)).toEqual({ action: 'send' });
+    expect(decide(failedRow('not-a-date'), T + 7 * H)).toEqual({ action: 'send' });
+    expect(decide(failedRow(), T + 5 * H)).toMatchObject({
+      action: 'skip',
+      basis: 'failed_backoff',
+    });
   });
 });
 

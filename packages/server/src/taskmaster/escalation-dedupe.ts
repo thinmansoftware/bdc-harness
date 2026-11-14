@@ -9,7 +9,11 @@
  *     rejected, deferred, and the recent_escalation skip rows never do).
  *   - The FAILED-delivery retry backoff (default 6 h, settable 1 to 168 h)
  *     applies when the last attempt (the newest 'sent' or 'failed' row) is a
- *     'failed' row.
+ *     'failed' row. A failed row's attempt time is its LATEST attempt: the
+ *     later of created_at and proposal_json.last_attempt_at, which every
+ *     escalate_p0 failure writes. An in-place retry keeps the row's
+ *     created_at, so without it a retry that failed again would find the
+ *     backoff already over and retry every tick (Overseer review of PR 1598).
  *   - The GitHub marker cooldown of escalation-delivery.ts (default 72 h,
  *     settable 1 to 168 h) is read here too, so all three windows share one
  *     reader and one fallback rule.
@@ -167,6 +171,28 @@ export interface EscalationJournalRow {
   created_at: string;
 }
 
+/**
+ * The time of a failed row's latest delivery attempt, as an ISO string: the
+ * later of created_at and a valid proposal_json.last_attempt_at. A row without
+ * last_attempt_at (written before this rule) falls back to created_at.
+ */
+export function failedAttemptIso(row: EscalationJournalRow): string {
+  const createdMs = Date.parse(row.created_at);
+  try {
+    const parsed = JSON.parse(row.proposal_json) as { last_attempt_at?: unknown } | null;
+    const last = parsed?.last_attempt_at;
+    if (typeof last === 'string') {
+      const lastMs = Date.parse(last);
+      if (Number.isFinite(lastMs) && (!Number.isFinite(createdMs) || lastMs > createdMs)) {
+        return last;
+      }
+    }
+  } catch {
+    // A malformed proposal_json still has a created_at; fall through.
+  }
+  return row.created_at;
+}
+
 export type EscalationDecision =
   | { action: 'send' }
   | { action: 'skip'; basis: 'sent_window' | 'failed_backoff'; windowStartIso: string };
@@ -194,15 +220,17 @@ export function decideEscalation(input: {
     if (row.outcome !== 'sent' && row.outcome !== 'failed') continue;
     if (canonicalize(row.thread_ref) !== input.threadRef) continue;
     if (reasonOfRow(row) !== input.reason) continue;
-    const atMs = Date.parse(row.created_at);
-    if (!Number.isFinite(atMs)) continue;
-    if (row.outcome === 'sent' && atMs > lastSentMs) {
-      lastSentMs = atMs;
+    const createdMs = Date.parse(row.created_at);
+    if (row.outcome === 'sent' && Number.isFinite(createdMs) && createdMs > lastSentMs) {
+      lastSentMs = createdMs;
       lastSentIso = row.created_at;
     }
-    if (atMs > lastAttemptMs) {
-      lastAttemptMs = atMs;
-      lastAttemptIso = row.created_at;
+    const attemptIso = row.outcome === 'failed' ? failedAttemptIso(row) : row.created_at;
+    const attemptMs = Date.parse(attemptIso);
+    if (!Number.isFinite(attemptMs)) continue;
+    if (attemptMs > lastAttemptMs) {
+      lastAttemptMs = attemptMs;
+      lastAttemptIso = attemptIso;
       lastAttemptFailed = row.outcome === 'failed';
     }
   }
