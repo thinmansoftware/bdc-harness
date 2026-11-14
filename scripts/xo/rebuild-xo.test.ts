@@ -381,7 +381,10 @@ describe('rebuild-xo.sh', () => {
     expect(ok.status).toBe(0);
     const fd = mkdtempSync(join(tmpdir(), 'rebuild-fail-'));
     try {
-      const bad = runScript({ STUB_HEALTH_SEQ: 'unhealthy', REBUILD_FAIL_DIR: fd.replace(/\\/g, '/') });
+      const bad = runScript({
+        STUB_HEALTH_SEQ: 'unhealthy',
+        REBUILD_FAIL_DIR: fd.replace(/\\/g, '/'),
+      });
       const vPolls = bad.calls.filter(
         c => c.startsWith('docker inspect --format') && c.includes('Health')
       ).length;
@@ -400,7 +403,9 @@ describe('rebuild-xo.sh', () => {
     try {
       const r = runScript({ STUB_UP_RC: '1', REBUILD_FAIL_DIR: fd.replace(/\\/g, '/') });
       const logs = r.calls.findIndex(c => c.startsWith('docker logs --timestamps archon-app-1'));
-      const health = r.calls.findIndex(c => c.startsWith('docker inspect -f {{json .State.Health}}'));
+      const health = r.calls.findIndex(c =>
+        c.startsWith('docker inspect -f {{json .State.Health}}')
+      );
       const top = r.calls.findIndex(c => c.startsWith('docker top archon-app-1'));
       const firstRollback = r.calls.findIndex(c => c.startsWith('docker tag archon:rollback-'));
       expect(firstRollback).toBeGreaterThanOrEqual(0);

@@ -156,7 +156,10 @@ describe('entrypoint ownership-fix block', () => {
     const r = runBlock({
       extra: dir => {
         mkdirSync(join(dir, 'archon', 'workspaces', 'run-a', 'repo', 'deep'), { recursive: true });
-        writeFileSync(join(dir, 'archon', 'workspaces', 'run-a', 'repo', 'deep', 'wrong-deep.txt'), 'x');
+        writeFileSync(
+          join(dir, 'archon', 'workspaces', 'run-a', 'repo', 'deep', 'wrong-deep.txt'),
+          'x'
+        );
         writeFileSync(join(dir, 'archon', 'workspaces', 'wrong-top'), 'x');
         writeFileSync(join(dir, 'archon', 'workspaces', 'run-a', 'wrong-mid'), 'x');
         writeFileSync(join(dir, 'archon', 'wrong-root.txt'), 'x');
