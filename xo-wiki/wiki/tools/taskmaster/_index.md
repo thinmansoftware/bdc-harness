@@ -89,15 +89,19 @@ This preserves the existing governance-delivery behavior.
 
 ## Environment
 
-| Variable                       | Meaning                                                                                                                                                                                             |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TASKMASTER_INTERVAL_MS`       | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch.                                                                                 |
-| `TASKMASTER_GH_REPOS`          | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                                                                                                         |
-| `TASKMASTER_USAGE_ARTIFACT`    | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                                                                                                           |
-| `TASKMASTER_CLI_ANCHOR_CMD`    | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                                                                                                  |
-| `TASKMASTER_FIRE_VERB_ENABLED` | Enables mechanically-qualified unclaimed-P0 Cauldron fires. Default `false`; leave off through deploy.                                                                                              |
-| `TASKMASTER_FIRE_MAX_PER_DAY`  | Maximum successful automatic fires per UTC day. Default `2`.                                                                                                                                        |
-| `TASKMASTER_ESCALATE_TO_ISSUE` | Route `escalate_p0` for `gh:owner/repo#N` threads to a GitHub issue comment instead of the operator mailbox. Default `true`; only the literal `false` (any case) restores the pre-WO dispatch path. |
+| Variable                                      | Meaning                                                                                                                                                                                                                |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKMASTER_INTERVAL_MS`                      | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch.                                                                                                    |
+| `TASKMASTER_GH_REPOS`                         | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                                                                                                                            |
+| `TASKMASTER_USAGE_ARTIFACT`                   | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                                                                                                                              |
+| `TASKMASTER_CLI_ANCHOR_CMD`                   | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                                                                                                                     |
+| `TASKMASTER_FIRE_VERB_ENABLED`                | Enables mechanically-qualified unclaimed-P0 Cauldron fires. Default `false`; leave off through deploy.                                                                                                                 |
+| `TASKMASTER_FIRE_MAX_PER_DAY`                 | Maximum successful automatic fires per UTC day. Default `2`.                                                                                                                                                           |
+| `TASKMASTER_ESCALATE_TO_ISSUE`                | Route `escalate_p0` for `gh:owner/repo#N` threads to a GitHub issue comment instead of the operator mailbox. Default `true`; only the literal `false` (any case) restores the pre-WO dispatch path.                    |
+| `TASKMASTER_ESCALATE_P0_SENT_WINDOW_HOURS`    | escalate_p0 dedupe window per (thread, reason), counted from the last `sent` row (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01). Integer hours 24 to 168, default `24`; anything else falls back to 24 with one warning. |
+| `TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS` | Retry backoff after a `failed` escalate_p0 delivery. Integer hours 1 to 168, default `6`.                                                                                                                              |
+| `TASKMASTER_ESCALATION_MARKER_WINDOW_HOURS`   | GitHub issue-marker cooldown of the escalate-to-issue path. Integer hours 1 to 168, default `72`.                                                                                                                      |
+| `TASKMASTER_MAX_EFFECTS_PER_TICK`             | Per-tick effect cap. Integers 1 to 10, default `10`; it can only LOWER the cap, never raise it or turn it off.                                                                                                         |
 
 ### Escalate a stuck P0 to its GitHub issue (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)
 
@@ -292,6 +296,33 @@ expectation and later requests return that stored expectation without consuming
 daily-cap headroom. See
 `docs/doctrine/taskmaster-expectation-registration.md` for the API contract and
 evidence forms.
+
+## Bulk-address a mailbox flood (`scripts/dispatch/address-batch.ts`)
+
+An operator command (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01, Amendments 1 E and 4) that marks stale rows in ONE Dispatch mailbox as addressed, in bulk and with an audit trail. Run it on the host inside `archon-app-1`, which has the harness database. It is SQLite only. It never acknowledges, cancels or deletes a row; it sets only `addressed_at` and `addressed_by = 'bulk-address:<actor>'`. The builder never runs `--confirm` on a live mailbox: that is an operator act, on a recorded dry run, on the acting XO's or John's written word naming the filter.
+
+1. **Dry run (the default; it changes nothing).** All four filters are required:
+
+   ```
+   bun scripts/dispatch/address-batch.ts --recipient xo --status queued \
+     --kind duty_officer_escalation --min-age-hours 72
+   ```
+
+   It prints the filter expression, the kind expression (`json_extract(body, '$.kind')`), each matching id, the count and a `dry_run_id`, and appends one `dry_run` line to the audit file. Record the output on the work order's issue.
+
+2. **Confirm** (same filters, plus the dry run's id, an actor and a reason). For `--recipient xo`, add `--xo-bind-file <path>`, a JSON lease bind made by the XO lease procedure; the script never prints it:
+
+   ```
+   bun scripts/dispatch/address-batch.ts --recipient xo --status queued \
+     --kind duty_officer_escalation --min-age-hours 72 \
+     --confirm --dry-run-id <id> --actor <who> --reason "<why>" --xo-bind-file <path>
+   ```
+
+   It re-reads the matching ids inside ONE transaction and refuses if they differ from the dry run (`dry_run_mismatch`). It checks the XO lease fence, updates the rows, and rolls back if the updated count differs (`count_mismatch_rolled_back`). It writes a `confirm_pending` audit line inside the transaction and a `confirm` line after the COMMIT.
+
+- Exit codes: `0` done; `2` refused (a missing filter or argument, `confirm_requires_status_queued`, `dry_run_mismatch`, `xo_bind_required`, `lease_fence_stale`, `sqlite_only`), with nothing changed; `3` the count differed, so the transaction rolled back.
+- Audit file: `--audit-file <path>`, else `BULK_ADDRESS_AUDIT_FILE`, else `/.archon/inbox-reader/bulk-address-audit.jsonl`. One JSON line per dry run, per pending confirm and per confirm.
+- Deliberate departure from `addressMessage` (packages/core/src/db/dispatch.ts): it does not require the same principal to have acknowledged the row first, because most flood rows were never acknowledged. Every other guard that fits one statement is kept (still queued, not yet addressed, same recipient and kind), and so is the XO lease fence.
 
 ## Known issues
 
