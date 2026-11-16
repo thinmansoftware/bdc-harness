@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile, rm, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { invokeConfiguredReviewModel, evaluatePullRequest } from '../pr-review-evaluator.ts';
 import { terminationDiagnostic, submitReviewerBrokerJob } from '../reviewer-broker-client.ts';
@@ -1630,16 +1630,39 @@ describe('Phase A production diagnostic return wiring', () => {
   });
 
   test('A8 real native-client evaluator submit wiring keeps exact safe body and proof gates', async () => {
-    const head = 'd'.repeat(40);
     const root = await mkdtemp(join(tmpdir(), 'diagnostic-return-'));
     await writeFile(join(root, 'ready'), 'synthetic');
     try {
+      const checkout = join(root, 'checkout');
+      await mkdir(checkout);
+      await writeFile(join(checkout, 'fixture.txt'), 'synthetic repository\n');
+      const git = (args: string[]): string => {
+        const result = Bun.spawnSync(['git', '-C', checkout, ...args], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        expect(result.exitCode).toBe(0);
+        return result.stdout.toString().trim();
+      };
+      git(['init', '-q']);
+      git(['add', 'fixture.txt']);
+      git([
+        '-c',
+        'user.name=Synthetic Reviewer',
+        '-c',
+        'user.email=fixture@example.invalid',
+        'commit',
+        '-qm',
+        'synthetic fixture',
+      ]);
+      const head = git(['rev-parse', 'HEAD']);
+      const tree = git(['rev-parse', 'HEAD^{tree}']);
       const native = await invokeConfiguredReviewModel(
         'codex',
         'PRIVATE_PROMPT_CANARY',
         {
           kind: 'pr-review',
-          cwd: '/synthetic',
+          cwd: checkout,
           expectedHeadSha: head,
           nativePolicy: 'codex_bubblewrap',
         },
@@ -1659,7 +1682,7 @@ describe('Phase A production diagnostic return wiring', () => {
           return submitReviewerBrokerJob(job, { ...options, env: { OVERSEER_REVIEW_SPOOL: root } });
         }
       );
-      expect(await readdir(root)).toEqual(['ready']);
+      expect((await readdir(root)).sort()).toEqual(['checkout', 'ready']);
       const context = {
         requestId: 'synthetic-request',
         workerId: 'synthetic-worker',
@@ -1668,7 +1691,7 @@ describe('Phase A production diagnostic return wiring', () => {
         repo: 'fixture',
         prNumber: 1,
         headSha: head,
-        checkoutPath: '/synthetic',
+        checkoutPath: checkout,
         reviewerIdentity: 'thinman-overseer[bot]',
         rung: 'codex',
         checkPlanStatus: 'absent' as const,
@@ -1677,8 +1700,8 @@ describe('Phase A production diagnostic return wiring', () => {
       const proof: ReviewExecutionProof = {
         requestId: context.requestId,
         headSha: head,
-        treeSha: 'e'.repeat(40),
-        cwd: '/synthetic',
+        treeSha: tree,
+        cwd: checkout,
         nativePolicy: 'codex_bubblewrap',
         nativeVersion: 'synthetic-version',
         runtimeUid: 1002,
