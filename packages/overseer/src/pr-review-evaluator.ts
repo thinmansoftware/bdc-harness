@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
@@ -17,7 +18,13 @@ import {
   type JudgeTransport,
   type PrReviewTransportContext,
 } from './judge-transport';
-import { submitReviewerBrokerJob } from './reviewer-broker-client';
+import {
+  submitReviewerBrokerJob,
+  diagnosticForError,
+  terminationDiagnostic,
+  isTrustedTermination,
+  type SanitizedTermination,
+} from './reviewer-broker-client';
 
 /**
  * Observability gap found 2026-09-17: this ladder loop classifies a per-rung
@@ -109,6 +116,7 @@ export interface PrReviewCheckPartition {
 }
 
 export interface PrReviewResult {
+  diagnostics?: readonly SanitizedTermination[];
   verdict: PrReviewVerdict;
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
@@ -136,6 +144,7 @@ export interface PrReviewResult {
 }
 
 export interface PrReviewModelResult {
+  diagnostic?: SanitizedTermination;
   exitCode: number;
   stdout: string;
   timedOut: boolean;
@@ -656,6 +665,7 @@ export async function evaluatePullRequest(
     acceptanceCriteria,
   });
   const ladder = deps.ladder ?? defaultReviewLadder();
+  const diagnostics: SanitizedTermination[] = [];
   let lastError = 'model_unavailable';
   // TRANSPORT vs JUDGMENT across the whole ladder.
   //
@@ -685,6 +695,7 @@ export async function evaluatePullRequest(
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
     const rungStartedAt = Date.now();
+    const invocationId = randomUUID();
     getLog().info(
       { binary, promptBytes: prompt.length, prNumber: input.pr_number, headSha: input.head_sha },
       'judge_rung_started'
@@ -692,7 +703,15 @@ export async function evaluatePullRequest(
     try {
       const result = await deps.invokeModel(binary, prompt, deps.executionContext);
       const rungMs = Date.now() - rungStartedAt;
+      const diagnostic = (
+        kind: SanitizedTermination['terminationClass'],
+        exit: number | null
+      ): SanitizedTermination =>
+        isTrustedTermination(result.diagnostic)
+          ? result.diagnostic
+          : terminationDiagnostic(kind, exit, invocationId);
       if (result.timedOut) {
+        diagnostics.push(diagnostic('timeout', null));
         // A timeout is transport, not judgment: the process started but never
         // delivered anything to judge, so this rung was not reached.
         lastError = `model_timeout:${binary}`;
@@ -703,6 +722,13 @@ export async function evaluatePullRequest(
       // The process ran and returned. Whatever happens below is judgment.
       reachedAnyRung = true;
       if (result.exitCode !== 0) {
+        diagnostics.push(
+          diagnostic(
+            classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`)?.kind ??
+              'unknown_nonzero',
+            Number.isSafeInteger(result.exitCode) ? result.exitCode : null
+          )
+        );
         // QUOTA / CREDIT / AUTH REFUSALS ARE NAMED, NOT HIDDEN (#847). The
         // process ran, so this is still a JUDGMENT failure and still terminal
         // exactly as before -- but `model_exit_nonzero` told nobody that codex
@@ -729,6 +755,7 @@ export async function evaluatePullRequest(
       getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_clean_exit');
       const parsed = parseReviewVerdict(result.stdout);
       if (!parsed) {
+        diagnostics.push(diagnostic('invalid_model_output', 0));
         lastError = `model_output_invalid:${binary}`;
         getLog().warn({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_output_invalid');
         continue;
@@ -749,6 +776,14 @@ export async function evaluatePullRequest(
       };
     } catch (error) {
       const rungMs = Date.now() - rungStartedAt;
+      const known = diagnosticForError(error);
+      const message = error instanceof Error ? error.message : '';
+      const kind =
+        message === 'pr_review_native_sandbox_unsupported_binary'
+          ? 'unsupported_binary'
+          : (classifyJudgeOutage(message)?.kind ??
+            (isTransportError(error) ? 'transport_error' : 'unknown_error'));
+      diagnostics.push(known ?? terminationDiagnostic(kind, null, invocationId));
       // A rate limit raised by the model seam (the judge CLIs read GitHub too)
       // is the same deferral, and must abandon the ladder immediately: walking
       // to the next binary would spend more of a budget that is already
@@ -808,7 +843,7 @@ export async function evaluatePullRequest(
   if (transportFailure && !reachedAnyRung && !nonTransportFailure) {
     return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
   }
-  return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
+  return { ...indeterminate(input, deps, acceptanceCriteriaAvailable, lastError), diagnostics };
 }
 
 /** The configured judge ladder, cheapest first. Exported for the breaker (#847). */
@@ -859,23 +894,29 @@ export async function invokeConfiguredReviewModel(
   binary: string,
   prompt: string,
   context?: PrReviewTransportContext,
-  timeoutMs = resolveReviewModelTimeoutMs()
+  timeoutMs = resolveReviewModelTimeoutMs(),
+  brokerSubmit: typeof submitReviewerBrokerJob = submitReviewerBrokerJob
 ): Promise<PrReviewModelResult> {
+  const correlationId = randomUUID();
   const transport = await buildReviewModelTransport(binary, prompt, context);
   try {
     if (context) {
       if (!transport.brokerJob) throw new Error('reviewer_broker_unavailable');
-      const result = await submitReviewerBrokerJob({
-        ...transport.brokerJob,
-        // The broker accepts 1 ms to 30 min; it starts from env -i, so the
-        // parent supplies its configured model wall clock per job.
-        timeoutMs: Math.max(1, Math.min(Math.floor(timeoutMs), 30 * 60_000)),
-      });
+      const result = await brokerSubmit(
+        {
+          ...transport.brokerJob,
+          // The broker accepts 1 ms to 30 min; it starts from env -i, so the
+          // parent supplies its configured model wall clock per job.
+          timeoutMs: Math.max(1, Math.min(Math.floor(timeoutMs), 30 * 60_000)),
+        },
+        { id: correlationId }
+      );
       const payload = result.stdout.trim().length > 0 ? result.stdout : result.stderr;
       return {
         exitCode: result.exitCode,
         stdout: codexExecJsonlVerdictText(payload),
         timedOut: result.timedOut === true,
+        diagnostic: result.diagnostic,
       };
     }
     return await runReviewModelProcess(transport, binary, timeoutMs);

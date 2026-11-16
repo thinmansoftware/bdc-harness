@@ -1,3 +1,13 @@
+import { mkdtemp, writeFile, rm, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { invokeConfiguredReviewModel, evaluatePullRequest } from '../pr-review-evaluator.ts';
+import { terminationDiagnostic, submitReviewerBrokerJob } from '../reviewer-broker-client.ts';
+import { buildIndeterminateSummary } from '../pr-review-wiring.ts';
+import {
+  runAndSubmitReview,
+  type ReviewWorkItem,
+  type ReviewExecutionProof,
+} from '../pr-review-submit.ts';
 /**
  * WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 -- integration test against a REAL
  * database, not a fake IngestDeps.
@@ -1603,5 +1613,195 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
       [REMEDIATION_RECIPIENT]
     );
     expect(Number(rows.rows[0]?.n ?? 0)).toBe(MAX_REMEDIATION_ATTEMPTS);
+  });
+});
+
+describe('Phase A production diagnostic return wiring', () => {
+  beforeEach(() => {
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-diagnostic-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+  afterEach(async () => {
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  test('A8 real native-client evaluator submit wiring keeps exact safe body and proof gates', async () => {
+    const head = 'd'.repeat(40);
+    const root = await mkdtemp(join(tmpdir(), 'diagnostic-return-'));
+    await writeFile(join(root, 'ready'), 'synthetic');
+    try {
+      const native = await invokeConfiguredReviewModel(
+        'codex',
+        'PRIVATE_PROMPT_CANARY',
+        {
+          kind: 'pr-review',
+          cwd: '/synthetic',
+          expectedHeadSha: head,
+          nativePolicy: 'codex_bubblewrap',
+        },
+        1000,
+        async (job, options) => {
+          await writeFile(
+            join(root, `${options?.id}.result.json`),
+            JSON.stringify({
+              id: options?.id,
+              ok: false,
+              exitCode: 1,
+              stdout: 'PRIVATE_STDOUT_CANARY',
+              stderr: 'PRIVATE_CREDENTIAL_CANARY authentication required',
+              uid: 1002,
+            })
+          );
+          return submitReviewerBrokerJob(job, { ...options, env: { OVERSEER_REVIEW_SPOOL: root } });
+        }
+      );
+      expect(await readdir(root)).toEqual(['ready']);
+      const context = {
+        requestId: 'synthetic-request',
+        workerId: 'synthetic-worker',
+        fencingToken: 1,
+        owner: 'thinmansoftware',
+        repo: 'fixture',
+        prNumber: 1,
+        headSha: head,
+        checkoutPath: '/synthetic',
+        reviewerIdentity: 'thinman-overseer[bot]',
+        rung: 'codex',
+        checkPlanStatus: 'absent' as const,
+        checkPlan: [],
+      };
+      const proof: ReviewExecutionProof = {
+        requestId: context.requestId,
+        headSha: head,
+        treeSha: 'e'.repeat(40),
+        cwd: '/synthetic',
+        nativePolicy: 'codex_bubblewrap',
+        nativeVersion: 'synthetic-version',
+        runtimeUid: 1002,
+        inspectionObserved: true,
+        check_plan: 'absent',
+        checks: [],
+        startedAt: '2026-01-01T00:00:00Z',
+        endedAt: '2026-01-01T00:00:01Z',
+      };
+      const work: ReviewWorkItem = {
+        correlationId: 'synthetic-review',
+        messageId: 'synthetic-message',
+        owner: context.owner,
+        repo: context.repo,
+        prNumber: 1,
+        headSha: head,
+        author: 'fixture-author',
+        executionContext: context,
+      };
+      const evaluator = async () =>
+        evaluatePullRequest(
+          { owner: work.owner, repo: work.repo, pr_number: 1, head_sha: head },
+          {
+            reviewer: { provider: 'synthetic', model: 'synthetic' },
+            fetchEvidence: async () => ({ diff: '+synthetic', checks: [], requiredContexts: [] }),
+            fetchAcceptanceCriteria: async () => null,
+            ladder: ['codex'],
+            invokeModel: async () => native,
+          }
+        );
+      const production = createRealSubmitDeps('thinman-overseer[bot]', {
+        octokit: stubOctokit(),
+        patOctokit: null,
+        evaluate: evaluator,
+        observeExecution: async () => proof,
+      });
+      const bodies: { body: string; commitId?: string; event: string }[] = [];
+      const isolated = {
+        ...production,
+        currentHeadSha: async () => head,
+        isDraft: async () => false,
+        hasCustody: async () => true,
+        recordReceipt: async () => {},
+        submitReview: async (request: Parameters<typeof production.submitReview>[0]) => {
+          bodies.push(request);
+          return {
+            submitted: true,
+            review: {
+              id: 1,
+              url: 'https://example.invalid/review',
+              commitSha: head,
+              state: 'CHANGES_REQUESTED',
+            },
+          };
+        },
+      };
+      const outcome = await runAndSubmitReview(work, isolated);
+      expect(outcome.disposition).toBe('changes_requested');
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0].event).toBe('REQUEST_CHANGES');
+      expect(bodies[0].commitId).toBe(head);
+      const body = bodies[0].body;
+      expect(body).toContain('Reviewer diagnostic (sanitized):');
+      expect(body).toContain(JSON.stringify(native.diagnostic));
+      expect(body).toContain('End reviewer diagnostic.');
+      expect(body).toContain(head);
+      expect(body.length).toBeLessThanOrEqual(60_000);
+      for (const canary of [
+        'PRIVATE_PROMPT_CANARY',
+        'PRIVATE_STDOUT_CANARY',
+        'PRIVATE_CREDENTIAL_CANARY',
+      ])
+        expect(body).not.toContain(canary);
+      // Actual production proof-refusal branch must remain a COMMENT, with no forced section.
+      const incomplete = createRealSubmitDeps('thinman-overseer[bot]', {
+        octokit: stubOctokit(),
+        patOctokit: null,
+        evaluate: evaluator,
+        observeExecution: async () => undefined,
+      });
+      const refused = await runAndSubmitReview(work, {
+        ...isolated,
+        runReviewer: incomplete.runReviewer,
+      });
+      expect(refused.disposition).toBe('review_incomplete');
+      expect(bodies.at(-1)?.event).toBe('COMMENT');
+      expect(bodies.at(-1)?.body).not.toContain('Reviewer diagnostic (sanitized):');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('A9 renderer refuses caller/model metadata without invoking malicious getters', async () => {
+    let reads = 0;
+    const foreign = {
+      terminationClass: 'auth_expired',
+      exitCode: 1,
+      correlationId: '11111111-1111-4111-8111-111111111111',
+      secret: 'PRIVATE_FOREIGN_CANARY',
+    };
+    const getter = Object.defineProperty({}, 'terminationClass', {
+      get() {
+        reads++;
+        throw new Error('PRIVATE_GETTER_CANARY');
+      },
+    });
+    const safe = terminationDiagnostic('unknown_error', null);
+    const summary = buildIndeterminateSummary('model_error:PRIVATE_EXCEPTION_CANARY', [
+      foreign,
+      getter,
+      safe,
+    ] as never);
+    expect(reads).toBe(0);
+    expect(summary).toContain(JSON.stringify(safe));
+    expect(summary).not.toContain(foreign.correlationId);
+    for (const canary of [
+      'PRIVATE_FOREIGN_CANARY',
+      'PRIVATE_GETTER_CANARY',
+      'PRIVATE_EXCEPTION_CANARY',
+    ])
+      expect(summary).not.toContain(canary);
+    expect(buildIndeterminateSummary('model_error', [foreign] as never)).not.toContain(
+      'Reviewer diagnostic (sanitized):'
+    );
   });
 });

@@ -1,3 +1,11 @@
+import { mkdtemp, writeFile, rm, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  submitReviewerBrokerJob,
+  diagnosticForError,
+  type ReviewerBrokerResult,
+} from '../reviewer-broker-client.ts';
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
   createRealFetchExactHeadPullRequestEvidence,
@@ -14,6 +22,7 @@ import {
   checksAreTerminal,
   codexExecJsonlVerdictText,
   evaluatePullRequest,
+  invokeConfiguredReviewModel,
   parseReviewVerdict,
   partitionChecksByRequired,
   runReviewModelProcess,
@@ -870,5 +879,183 @@ describe('WO-HARNESS-OVERSEER-REVIEW-JSONL-VERDICT-01 -- broker JSONL verdict te
     expect(parseReviewVerdict(codexExecJsonlVerdictText(eventsOnly))).toBeNull();
     expect(parseReviewVerdict(codexExecJsonlVerdictText('not json at all'))).toBeNull();
     expect(parseReviewVerdict(codexExecJsonlVerdictText(verdictOnlyInToolOutput))).toBeNull();
+  });
+});
+
+/** Phase A fixtures never start a model, broker, socket or use a real profile. */
+async function diagnosticFixture(
+  fields: Partial<ReviewerBrokerResult>,
+  action?: (id: string) => Partial<ReviewerBrokerResult>
+) {
+  const root = await mkdtemp(join(tmpdir(), 'review-diagnostic-'));
+  await writeFile(join(root, 'ready'), 'synthetic');
+  const canary = 'PRIVATE_DIAGNOSTIC_CANARY';
+  let requestId = '';
+  try {
+    const result = await invokeConfiguredReviewModel(
+      'codex',
+      canary,
+      {
+        kind: 'pr-review',
+        cwd: '/synthetic',
+        expectedHeadSha: HEAD_A,
+        nativePolicy: 'codex_bubblewrap',
+      },
+      1000,
+      async (job, options) => {
+        requestId = options?.id ?? '';
+        await writeFile(
+          join(root, `${requestId}.result.json`),
+          JSON.stringify({
+            id: requestId,
+            ok: false,
+            exitCode: 1,
+            stdout: canary,
+            stderr: canary,
+            uid: 1002,
+            ...fields,
+            ...action?.(requestId),
+          })
+        );
+        return submitReviewerBrokerJob(job, { ...options, env: { OVERSEER_REVIEW_SPOOL: root } });
+      }
+    );
+    expect(await readdir(root)).toEqual(['ready']);
+    return { result, requestId };
+  } finally {
+    expect(await readdir(root)).toEqual(['ready']);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+describe('Phase A sanitized termination production seams', () => {
+  test('A1 classified native result preserves only safe fields and actual broker id', async () => {
+    const { result, requestId } = await diagnosticFixture({
+      stderr: 'PRIVATE_DIAGNOSTIC_CANARY authentication required',
+    });
+    expect(result.diagnostic).toEqual({
+      terminationClass: 'auth_expired',
+      exitCode: 1,
+      correlationId: requestId,
+    });
+    expect(Object.keys(result.diagnostic!).sort()).toEqual([
+      'correlationId',
+      'exitCode',
+      'terminationClass',
+    ]);
+    // Native stderr still does NOT become business classifier input.
+    expect(result.stderr).toBeUndefined();
+  });
+  test('A2 unknown native exit is not guessed and remains nonapproving', async () => {
+    const { result } = await diagnosticFixture({});
+    const evaluated = await evaluatePullRequest(input, deps({ invokeModel: async () => result }));
+    expect(evaluated.verdict).toBe('INDETERMINATE');
+    expect(evaluated.diagnostics?.[0].terminationClass).toBe('unknown_nonzero');
+    expect(evaluated.diagnostics?.[0].exitCode).toBe(1);
+  });
+  test('A3 wrong result identity and malformed types refuse and clean private spool', async () => {
+    for (const bad of [
+      { id: 'FOREIGN_DIAGNOSTIC_CANARY' },
+      { id: '11111111-1111-4111-8111-111111111111' },
+      { stdout: 42 },
+      { uid: 'wrong' },
+    ]) {
+      try {
+        await diagnosticFixture({}, () => bad as Partial<ReviewerBrokerResult>);
+        throw new Error('fixture must refuse');
+      } catch (error) {
+        expect(diagnosticForError(error)?.terminationClass).toBe('invalid_broker_result');
+        expect(JSON.stringify(diagnosticForError(error))).not.toContain(
+          'FOREIGN_DIAGNOSTIC_CANARY'
+        );
+      }
+    }
+  });
+  test('A4 timeout and thrown error preserve null exit without changing transport outcome', async () => {
+    const { result } = await diagnosticFixture({ timedOut: true, exitCode: 124 });
+    expect(result.diagnostic?.exitCode).toBeNull();
+    expect(result.diagnostic?.terminationClass).toBe('timeout');
+    const timed = await evaluatePullRequest(input, deps({ invokeModel: async () => result }));
+    expect(timed.verdict).toBe('TRANSPORT_ERROR');
+    const thrown = await evaluatePullRequest(
+      input,
+      deps({
+        invokeModel: async () => {
+          throw new Error('PRIVATE_EXCEPTION_CANARY');
+        },
+      })
+    );
+    expect(thrown.verdict).toBe('INDETERMINATE');
+    expect(thrown.diagnostics?.[0].terminationClass).toBe('unknown_error');
+    expect(thrown.diagnostics?.[0].exitCode).toBeNull();
+    expect(JSON.stringify(thrown.diagnostics)).not.toContain('PRIVATE_EXCEPTION_CANARY');
+    const absent = await mkdtemp(join(tmpdir(), 'diagnostic-unavailable-'));
+    try {
+      await submitReviewerBrokerJob(
+        { checkout: '/synthetic', expectedHead: HEAD_A, argv: ['synthetic'] },
+        { env: { OVERSEER_REVIEW_SPOOL: absent } }
+      ).then(
+        () => {
+          throw new Error('must refuse');
+        },
+        error => {
+          expect(diagnosticForError(error)?.terminationClass).toBe('broker_unavailable');
+          expect(diagnosticForError(error)?.exitCode).toBeNull();
+        }
+      );
+      expect(await readdir(absent)).toEqual([]);
+    } finally {
+      await rm(absent, { recursive: true, force: true });
+    }
+  });
+  test('A5 primary and fallback ordered identities survive without replacing primary', async () => {
+    const { result, requestId } = await diagnosticFixture({});
+    const evaluated = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'cursor'],
+        invokeModel: async binary => {
+          if (binary === 'codex') return result;
+          throw new Error('pr_review_native_sandbox_unsupported_binary');
+        },
+      })
+    );
+    expect(evaluated.diagnostics?.map(entry => entry.terminationClass)).toEqual([
+      'unknown_nonzero',
+      'unsupported_binary',
+    ]);
+    expect(evaluated.diagnostics?.[0].correlationId).toBe(requestId);
+    expect(evaluated.diagnostics?.[1].correlationId).not.toBe(requestId);
+  });
+  test('A6 diagnostic metadata drops all private canaries across native result classes', async () => {
+    for (const stderr of [
+      'PRIVATE_PROMPT_CANARY',
+      'PRIVATE_ARGV_CANARY',
+      'PRIVATE_CREDENTIAL_CANARY authentication required',
+    ]) {
+      const { result } = await diagnosticFixture({ stdout: 'PRIVATE_STDOUT_CANARY', stderr });
+      const safe = JSON.stringify(result.diagnostic);
+      for (const canary of [
+        'PRIVATE_PROMPT_CANARY',
+        'PRIVATE_ARGV_CANARY',
+        'PRIVATE_CREDENTIAL_CANARY',
+        'PRIVATE_STDOUT_CANARY',
+      ])
+        expect(safe).not.toContain(canary);
+    }
+  });
+  test('A7 success and old doubles keep existing outcomes and no failure entries', async () => {
+    const success = await evaluatePullRequest(input, deps());
+    expect(success.verdict).toBe('APPROVE');
+    expect(success.diagnostics).toBeUndefined();
+    const old = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 1, stdout: '', timedOut: false }) })
+    );
+    expect(old.verdict).toBe('INDETERMINATE');
+    expect(old.diagnostics?.[0].terminationClass).toBe('unknown_nonzero');
+    const first = await diagnosticFixture({});
+    const second = await diagnosticFixture({});
+    expect(first.requestId).not.toBe(second.requestId);
   });
 });
