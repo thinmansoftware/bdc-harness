@@ -29,7 +29,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 export function terminationDiagnostic(
   terminationClass: SanitizedTermination['terminationClass'],
   exitCode: number | null,
-  correlationId = randomUUID()
+  correlationId: string = randomUUID()
 ): SanitizedTermination {
   const entry = Object.freeze({ terminationClass, exitCode, correlationId });
   if (
