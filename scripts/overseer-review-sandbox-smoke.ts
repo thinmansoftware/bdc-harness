@@ -577,6 +577,100 @@ export async function runFableBunStartup(
   }
 }
 
+/** One marker-only JS measurement using the unchanged MODEL construction and observer. */
+export async function runFableInlineJs(
+  input: { scratch: string; executable: string; account: string; env: Record<string, string> },
+  observe: (
+    argv: string[],
+    options: { cwd: string; env: Record<string, string>; marker: string }
+  ) => Promise<FableObservedResult> = observedFableRun
+): Promise<{ ok: boolean; exit: number | null; failureClass: string }> {
+  try {
+    const marker = `FABLE_INLINE_JS_OK:${randomUUID()}`;
+    const result = await observe(
+      fableNamespaceArgv({
+        ...input,
+        argv: ['/model/cli', '--eval', `console.log(${JSON.stringify(marker)})`],
+      }),
+      { cwd: input.scratch, env: input.env, marker }
+    );
+    const exit = Number.isSafeInteger(result.code) ? result.code : null;
+    if (exit !== 0) return { ok: false, exit, failureClass: fableFixtureFailure(result) };
+    if (result.observerQualified !== true || result.stdout.trim() !== marker)
+      return { ok: false, exit, failureClass: 'inline_js_unqualified' };
+    return { ok: true, exit: 0, failureClass: 'none' };
+  } catch {
+    return { ok: false, exit: null, failureClass: 'inline_js_unknown' };
+  }
+}
+
+export function fableProbeStages(mode: 'model' | 'check'): string[] {
+  return [
+    'probe_entry_begin',
+    'probe_entry_done',
+    'fs_begin',
+    'fs_done',
+    'net_import_begin',
+    'net_import_done',
+    'socket_begin',
+    'socket_done',
+    'scratch_begin',
+    'scratch_done',
+    ...(mode === 'model'
+      ? [
+          'model_branch_begin',
+          'model_repo_begin',
+          'model_repo_done',
+          'model_nonce_begin',
+          'model_nonce_done',
+          'model_auth_read_begin',
+          'model_auth_read_done',
+          'model_auth_write_begin',
+          'model_auth_write_done',
+          'model_branch_done',
+        ]
+      : [
+          'check_branch_begin',
+          'check_auth_begin',
+          'check_auth_done',
+          'check_repo_begin',
+          'check_repo_done',
+          'check_network_begin',
+          'check_network_done',
+          'check_branch_done',
+        ]),
+    'descriptor_begin',
+    'descriptor_done',
+    'probe_done',
+  ];
+}
+/** Private bounded parser: returns constants from the plan, never child-supplied values. */
+export function parseFableProbeStages(
+  stderr: string,
+  marker: string,
+  mode: 'model' | 'check'
+): { lastCompleted: string; nextExpected: string } {
+  const unknown = { lastCompleted: 'UNKNOWN', nextExpected: 'UNKNOWN' };
+  if (
+    typeof stderr !== 'string' ||
+    Buffer.byteLength(stderr) > 128 * 1024 ||
+    !/^FABLE_WRAPPER_OK:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      marker
+    )
+  )
+    return unknown;
+  const stages = fableProbeStages(mode);
+  let index = 0;
+  let lastCompleted = 'UNKNOWN';
+  for (const line of stderr.split(/\r?\n/)) {
+    if (!line.includes('FABLE_PROBE')) continue;
+    if (index >= stages.length || line !== `FABLE_PROBE:${marker}:${stages[index]}`) return unknown;
+    if (stages[index].endsWith('_done')) lastCompleted = stages[index];
+    index++;
+  }
+  return { lastCompleted, nextExpected: stages[index] ?? 'NONE' };
+}
+
 /** Same production wrapper, fake local executable/account only; never provider traffic. */
 async function fableSyntheticSmoke(): Promise<void> {
   const root = await mkdtemp('/tmp/fable-synthetic-');
@@ -612,25 +706,56 @@ async function fableSyntheticSmoke(): Promise<void> {
     const marker = `FABLE_WRAPPER_OK:${randomUUID()}`;
     const probe = `
       import { readFileSync, writeFileSync, fstatSync } from 'node:fs';
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:probe_entry_begin`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:probe_entry_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:fs_begin`)});
       const denied = path => { try { readFileSync(path); } catch (error) { if (['ENOENT','EACCES','EPERM'].includes(error.code)) return; throw new Error('fable_fixture_denial_unknown'); } throw new Error('fable_fixture_read_allowed'); };
       for (const path of ${JSON.stringify([outside, account, '/app/package.json', '/home/reviewer/.codex/auth.json', '/home/appuser/.codex/auth.json', '/proc/1/environ'])}) {
         denied(path); // Proc absence is structural only; controller independently verifies PID isolation.
       }
       denied(${JSON.stringify(`/proc/${process.pid}/environ`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:fs_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:net_import_begin`)});
       const { createConnection } = await import('node:net');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:net_import_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:socket_begin`)});
       await new Promise((resolve, reject) => { const socket = createConnection(${JSON.stringify(socketPath)}); socket.on('connect', () => { socket.destroy(); reject(new Error('fable_fixture_socket_allowed')); }); socket.on('error', error => ['ENOENT','EACCES','EPERM'].includes(error.code) ? resolve() : reject(new Error('fable_fixture_socket_denial_unknown'))); });
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:socket_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:scratch_begin`)});
       writeFileSync('/scratch/permitted', 'isolated');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:scratch_done`)});
       if (process.argv.includes('model')) {
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_branch_begin`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_repo_begin`)});
         denied('/repo/repo-canary');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_repo_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_nonce_begin`)});
         if (await (await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(3000) })).text() !== ${JSON.stringify(nonce)}) throw new Error('fable_fixture_model_network');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_nonce_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_auth_read_begin`)});
         if (!readFileSync('/home/model/.claude/.credentials.json', 'utf8').includes('SYNTHETIC_ONLY')) throw new Error('fable_fixture_account_binding');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_auth_read_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_auth_write_begin`)});
         try { writeFileSync('/home/model/.claude/.credentials.json', 'bad'); throw new Error('fable_fixture_auth_writable'); } catch (error) { if (error.message === 'fable_fixture_auth_writable') throw error; }
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_auth_write_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_branch_done`)});
       } else {
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_branch_begin`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_auth_begin`)});
         denied('/home/model/.claude/.credentials.json');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_auth_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_repo_begin`)});
         if (readFileSync('/repo/repo-canary', 'utf8') !== 'SYNTHETIC_REPO') throw new Error('fable_fixture_repository_binding');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_repo_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_network_begin`)});
         try { await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(1000) }); throw new Error('fable_fixture_network_allowed'); } catch (error) { if (!['ECONNREFUSED','ENETUNREACH','EHOSTUNREACH','ConnectionRefused'].includes(error.code)) throw new Error('fable_fixture_network_denial_unknown'); }
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_network_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_branch_done`)});
       }
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:descriptor_begin`)});
       try { if (fstatSync(3).isFile()) throw new Error('fable_fixture_observer_unknown'); } catch(error) { if(error.code !== 'EBADF') throw error; }
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:descriptor_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:probe_done`)});
       console.log(${JSON.stringify(marker)});
     `;
     await writeFile(join(scratch, 'probe.ts'), probe);
@@ -646,6 +771,17 @@ async function fableSyntheticSmoke(): Promise<void> {
         `fable_bun_startup_failed:exit=${startup.exit ?? 'UNKNOWN'}:class=${startup.failureClass}`
       );
     console.log('overseer-fable-bun-startup: ok');
+    const inline = await runFableInlineJs({
+      scratch,
+      executable: process.execPath,
+      account,
+      env: cleanEnv,
+    });
+    if (!inline.ok)
+      throw new Error(
+        `fable_inline_js_failed:exit=${inline.exit ?? 'UNKNOWN'}:class=${inline.failureClass}`
+      );
+    console.log('overseer-fable-inline-js: ok');
     const model = await observedFableRun(
       fableNamespaceArgv({
         scratch,
@@ -657,7 +793,7 @@ async function fableSyntheticSmoke(): Promise<void> {
     );
     if (model.code !== 0 || !model.stdout.includes('FABLE_WRAPPER_OK'))
       throw new Error(
-        `fable_model_wrapper_failed:exit=${model.code}:class=${fableFixtureFailure(model)}`
+        `fable_model_wrapper_failed:exit=${model.code}:class=${fableFixtureFailure(model)}:last=${parseFableProbeStages(model.stderr, marker, 'model').lastCompleted}:next=${parseFableProbeStages(model.stderr, marker, 'model').nextExpected}`
       );
     const check = await observedFableRun(
       fableNamespaceArgv({
@@ -669,7 +805,7 @@ async function fableSyntheticSmoke(): Promise<void> {
     );
     if (check.code !== 0 || !check.stdout.includes('FABLE_WRAPPER_OK'))
       throw new Error(
-        `fable_check_wrapper_failed:exit=${check.code}:class=${fableFixtureFailure(check)}`
+        `fable_check_wrapper_failed:exit=${check.code}:class=${fableFixtureFailure(check)}:last=${parseFableProbeStages(check.stderr, marker, 'check').lastCompleted}:next=${parseFableProbeStages(check.stderr, marker, 'check').nextExpected}`
       );
     // Startup-only, no prompt/login/auth/provider traffic. Restrict network further for version probes.
     const require = createRequire(import.meta.url);

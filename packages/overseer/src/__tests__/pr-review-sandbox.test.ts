@@ -1522,3 +1522,72 @@ describe('same-mask Bun startup diagnostic', () => {
     }
   });
 });
+
+describe('finite inline JS and probe-stage diagnostics', () => {
+  test('inline JS uses one same-model call before original script and requires observer proof', async () => {
+    const { runFableInlineJs } = await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const { fableNamespaceArgv } = await import('../../../../scripts/overseer-reviewer-broker');
+    let calls = 0;
+    const input = {
+      scratch: '/synthetic',
+      executable: '/packaged/bun',
+      account: '/fake',
+      env: { PATH: '/usr/bin' },
+    };
+    const positive = await runFableInlineJs(input, async (argv, options) => {
+      calls++;
+      const code = argv.at(-1)!;
+      expect(code).toBe(`console.log(${JSON.stringify(options.marker)})`);
+      expect(argv).toEqual(fableNamespaceArgv({ ...input, argv: ['/model/cli', '--eval', code] }));
+      return { code: 0, stdout: options.marker, stderr: '', observerQualified: true };
+    });
+    expect(positive.ok).toBe(true);
+    expect(calls).toBe(1);
+    for (const kind of ['nonzero', 'missing_metadata', 'wrong_marker']) {
+      const bad = await runFableInlineJs(input, async (_argv, options) => ({
+        code: kind === 'nonzero' ? 134 : 0,
+        stdout: kind === 'wrong_marker' ? 'PRIVATE_CANARY' : options.marker,
+        stderr: 'PRIVATE_ERROR_CANARY',
+        observerQualified: kind !== 'missing_metadata',
+      }));
+      expect(bad.ok).toBe(false);
+      expect(JSON.stringify(bad)).not.toContain('CANARY');
+    }
+    const source = await readFile(
+      join(import.meta.dir, '../../../../scripts/overseer-review-sandbox-smoke.ts'),
+      'utf8'
+    );
+    const body = source.slice(source.indexOf('async function fableSyntheticSmoke'));
+    expect(body.indexOf('await runFableBunStartup')).toBeLessThan(
+      body.indexOf('await runFableInlineJs')
+    );
+    expect(body.indexOf('await runFableInlineJs')).toBeLessThan(
+      body.indexOf('const model = await observedFableRun')
+    );
+  });
+  test('ordered launch-bound breadcrumbs project only fixed completed/next names', async () => {
+    const { parseFableProbeStages, fableProbeStages } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const marker = 'FABLE_WRAPPER_OK:11111111-1111-4111-8111-111111111111';
+    const stages = fableProbeStages('model');
+    const line = (stage: string) => `FABLE_PROBE:${marker}:${stage}`;
+    expect(parseFableProbeStages(stages.slice(0, 3).map(line).join('\n'), marker, 'model')).toEqual(
+      { lastCompleted: 'probe_entry_done', nextExpected: 'fs_done' }
+    );
+    for (const text of [
+      line(stages[1]),
+      line(stages[0]) + '\n' + line(stages[0]),
+      line(stages[0]) + '\n' + line('PRIVATE_CANARY'),
+      line(stages[0]).replace(marker, 'unbound'),
+      'FABLE_PROBE:PRIVATE_CANARY',
+    ]) {
+      const result = parseFableProbeStages(text, marker, 'model');
+      expect(result).toEqual({ lastCompleted: 'UNKNOWN', nextExpected: 'UNKNOWN' });
+      expect(JSON.stringify(result)).not.toContain('PRIVATE_CANARY');
+    }
+    expect(parseFableProbeStages('', marker, 'model')).toEqual({
+      lastCompleted: 'UNKNOWN',
+      nextExpected: 'probe_entry_begin',
+    });
+  });
+});
