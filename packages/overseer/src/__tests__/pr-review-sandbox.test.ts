@@ -1453,7 +1453,8 @@ describe('private kernel observer validator', () => {
       'false'
     );
     expect(mutated).not.toBe(source);
-    const unsafe = Function(`return (${mutated})`)() as typeof validateFableObserver;
+    const { runInNewContext } = await import('node:vm');
+    const unsafe = runInNewContext(`(${mutated})`, { Buffer }) as typeof validateFableObserver;
     expect(unsafe(JSON.stringify({ 'child-pid': 12, 'pid-namespace': 41 }), binding)).toBe(true); // Deliberately removed inequality is detected.
   });
 });
