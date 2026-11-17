@@ -1,3 +1,4 @@
+import { isTrustedTermination, type SanitizedTermination } from './reviewer-broker-client';
 /**
  * Real dependency composition for the PR-event review route
  * (WO-HARNESS-OVERSEER-REVIEW-ROUTE-01; route registration authorized by XO
@@ -1164,6 +1165,8 @@ interface RealSubmitWiringOverrides {
   reviewerModel?: string;
   evaluate?: (input: PrReviewInput, deps: PrReviewDeps) => Promise<PrReviewResult>;
   invokeModel?: PrReviewDeps['invokeModel'];
+  /** Private injection seam for isolated execution-proof fixtures; default is the real observer. */
+  observeExecution?: typeof observeReviewExecution;
   recordApprovalVerdict?: typeof recordReviewApprovalVerdict;
   createReceiptMessage?: typeof dispatch.createAuthenticatedMessage;
 }
@@ -1217,11 +1220,18 @@ export function buildRequiredContextsBlockedSummary(error: string | undefined): 
  * identifier charset, so a malformed error string cannot smuggle text into a
  * public review body.
  */
-export function buildIndeterminateSummary(error: string | undefined): string {
+export function buildIndeterminateSummary(
+  error: string | undefined,
+  diagnostics?: readonly SanitizedTermination[]
+): string {
   const code = reviewErrorCode(error);
-  return code
+  const summary = code
     ? `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.`
     : INDETERMINATE_REVIEW_SUMMARY;
+  const safe = Array.isArray(diagnostics) ? diagnostics.filter(isTrustedTermination) : [];
+  return safe.length
+    ? `${summary}\n\nReviewer diagnostic (sanitized):\n${safe.map(entry => JSON.stringify(entry)).join('\n')}\nEnd reviewer diagnostic.`
+    : summary;
 }
 
 /**
@@ -1259,7 +1269,7 @@ export function createRealSubmitDeps(
       let executionProof: ReviewExecutionProof | undefined;
       try {
         executionProof = work.executionContext
-          ? await observeReviewExecution(work.executionContext)
+          ? await (overrides.observeExecution ?? observeReviewExecution)(work.executionContext)
           : undefined;
       } catch (error) {
         if (error instanceof ReviewerBrokerError) {
@@ -1411,7 +1421,10 @@ export function createRealSubmitDeps(
               .map(finding => `[${finding.severity}] ${finding.scope}: ${finding.summary}`)
               .join('\n')
           : result.verdict === 'INDETERMINATE'
-            ? buildIndeterminateSummary(result.error)
+            ? buildIndeterminateSummary(
+                result.error,
+                executionProof ? result.diagnostics : undefined
+              )
             : 'No blocking findings.';
       // #847: the INDETERMINATE reason code travels to the submit receipt as
       // well as the PR body, so the event store says WHY (usage_limit_until,
