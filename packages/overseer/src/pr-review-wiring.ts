@@ -1,3 +1,12 @@
+import { isTrustedNativeInvocation, type NativeInvocation } from './reviewer-broker-client';
+import {
+  FABLE_POLICY,
+  FABLE_MODEL,
+  readFablePermitSnapshot,
+  selectFablePermit,
+  type FablePermit,
+} from './judge-transport';
+import { isTrustedFableEvidence, type FableExecutionEvidence } from './reviewer-broker-client';
 import { isTrustedTermination, type SanitizedTermination } from './reviewer-broker-client';
 /**
  * Real dependency composition for the PR-event review route
@@ -29,6 +38,7 @@ import {
   createRealOctokitClient,
   createRealReadOnlyPatOctokitClient,
   createRealSubmitPullRequestReview,
+  createObserveReviewPublication,
   summarizeChecks,
 } from './adapters/github-real-deps';
 import type { ExactHeadPullRequestEvidence } from './adapters/github-real-deps.ts';
@@ -353,7 +363,8 @@ const EMPTY_TREE_IDS: ReadonlySet<string> = new Set([
 
 /** Server-observed native execution. No model field can manufacture this proof. */
 export async function observeReviewExecution(
-  context: ReviewExecutionContext
+  context: ReviewExecutionContext,
+  fablePermit?: FablePermit
 ): Promise<ReviewExecutionProof | undefined> {
   if (process.platform !== 'linux' || !context.checkoutPath || context.checkPlanStatus === 'unsafe')
     return undefined;
@@ -371,8 +382,10 @@ export async function observeReviewExecution(
         checkout: before.cwd,
         expectedHead: context.headSha,
         argv: reviewInspectionArgv(context.headSha),
+        ...(fablePermit ? { fablePermit } : {}),
       });
-      if (!inspection.ok) return undefined;
+      if (!inspection.ok || (fablePermit && inspection.checkPolicy !== FABLE_POLICY))
+        return undefined;
       if (inspection.stdout.trim().length === 0)
         throw new ReviewExecutionIncompleteError(REVIEW_HEAD_TREE_EMPTY);
       const checks: ReviewExecutionProof['checks'][number][] = [];
@@ -384,6 +397,7 @@ export async function observeReviewExecution(
           checkout: before.cwd,
           expectedHead: context.headSha,
           argv,
+          ...(fablePermit ? { fablePermit } : {}),
         });
         const checkEnded = new Date().toISOString();
         checks.push({
@@ -413,7 +427,7 @@ export async function observeReviewExecution(
         headSha: before.headSha,
         treeSha: before.treeSha,
         cwd: before.cwd,
-        nativePolicy: 'codex_bubblewrap',
+        nativePolicy: fablePermit ? FABLE_POLICY : 'codex_bubblewrap',
         nativeVersion: CODEX_JUDGE_CLI_VERSION,
         runtimeUid: inspection.uid,
         inspectionObserved: true,
@@ -1167,6 +1181,9 @@ interface RealSubmitWiringOverrides {
   invokeModel?: PrReviewDeps['invokeModel'];
   /** Private injection seam for isolated execution-proof fixtures; default is the real observer. */
   observeExecution?: typeof observeReviewExecution;
+  /** Private hermetic adapters; production always reads the operator snapshot and real custody. */
+  readFablePermits?: typeof readFablePermitSnapshot;
+  hasCustody?: (context: ReviewExecutionContext) => Promise<boolean>;
   recordApprovalVerdict?: typeof recordReviewApprovalVerdict;
   createReceiptMessage?: typeof dispatch.createAuthenticatedMessage;
 }
@@ -1255,9 +1272,62 @@ export function createRealSubmitDeps(
     model: overrides.reviewerModel ?? configuredModelReviewer.model,
   };
   const runEvaluation = overrides.evaluate ?? evaluatePullRequest;
+  let permitSnapshot: readonly FablePermit[] = [];
+  let permitConfigInvalid = false;
+  try {
+    permitSnapshot = (overrides.readFablePermits ?? readFablePermitSnapshot)();
+  } catch {
+    permitConfigInvalid = true;
+  }
+  const ownsCustody =
+    overrides.hasCustody ??
+    (async (context: ReviewExecutionContext): Promise<boolean> => {
+      const message = await dispatch.renewMessageLease({
+        id: context.requestId,
+        worker_id: context.workerId,
+        fencing_token: context.fencingToken,
+      });
+      return message !== null;
+    });
   return {
     reviewerIdentity,
+    lookupPublication: dispatch.getReviewPublicationIntent,
+    admitPublication: dispatch.admitReviewPublication,
+    observePublication: createObserveReviewPublication(octokit),
     async runReviewer(work): Promise<ReviewerVerdict> {
+      const refused = (reasonCode: string): ReviewerVerdict => ({
+        approved: false,
+        summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+        reviewedHeadSha: work.headSha,
+        reasonCode,
+      });
+      if (permitConfigInvalid) return refused('fable_configuration_invalid');
+      let fablePermit: FablePermit | undefined;
+      try {
+        const designated = permitSnapshot.some(
+          value =>
+            value.owner === work.owner &&
+            value.repo === work.repo &&
+            value.prNumber === work.prNumber
+        );
+        if (designated) {
+          const context = work.executionContext;
+          if (
+            context?.owner !== work.owner ||
+            context.repo !== work.repo ||
+            context.prNumber !== work.prNumber ||
+            context.headSha !== work.headSha
+          )
+            return refused('fable_permission_refused');
+          fablePermit = selectFablePermit(permitSnapshot, context);
+          if (!fablePermit || !(await ownsCustody(context)))
+            return refused('fable_permission_refused');
+        }
+      } catch {
+        return refused('fable_permission_refused');
+      }
+      let fableEvidence: FableExecutionEvidence | undefined;
+      let nativeInvocation: NativeInvocation | undefined;
       if (work.executionContext?.checkoutFailure) {
         return {
           approved: false,
@@ -1269,7 +1339,10 @@ export function createRealSubmitDeps(
       let executionProof: ReviewExecutionProof | undefined;
       try {
         executionProof = work.executionContext
-          ? await (overrides.observeExecution ?? observeReviewExecution)(work.executionContext)
+          ? await (overrides.observeExecution ?? observeReviewExecution)(
+              work.executionContext,
+              fablePermit
+            )
           : undefined;
       } catch (error) {
         if (error instanceof ReviewerBrokerError) {
@@ -1305,7 +1378,8 @@ export function createRealSubmitDeps(
           head_sha: work.headSha,
         },
         {
-          reviewer: modelReviewer,
+          reviewer: fablePermit ? { provider: 'claude', model: FABLE_MODEL } : modelReviewer,
+          ...(fablePermit ? { ladder: [FABLE_MODEL] } : {}),
           fetchEvidence: request =>
             fetchEvidence({
               owner: request.owner,
@@ -1316,14 +1390,36 @@ export function createRealSubmitDeps(
           // No authorized runtime WO-spec source exists in this repository.
           // Missing criteria is an explicit, recorded degrade path.
           fetchAcceptanceCriteria: async () => null,
-          invokeModel: overrides.invokeModel ?? invokeConfiguredReviewModel,
+          invokeModel: async (binary, prompt, context) => {
+            if (executionProof && nativeInvocation)
+              executionProof = { ...executionProof, nativeInvocation };
+            if (fablePermit) {
+              if (
+                !work.executionContext ||
+                selectFablePermit([fablePermit], work.executionContext) !== fablePermit ||
+                !(await ownsCustody(work.executionContext))
+              )
+                throw new Error('fable_permission_refused');
+            }
+            const modelResult = await (overrides.invokeModel ?? invokeConfiguredReviewModel)(
+              binary,
+              prompt,
+              context
+            );
+            if (isTrustedNativeInvocation(modelResult.nativeInvocation))
+              nativeInvocation = modelResult.nativeInvocation;
+            if (fablePermit && isTrustedFableEvidence(modelResult.fableEvidence))
+              fableEvidence = modelResult.fableEvidence;
+            return modelResult;
+          },
           ...(work.executionContext
             ? {
                 executionContext: {
                   kind: 'pr-review' as const,
                   cwd: work.executionContext.checkoutPath,
                   expectedHeadSha: work.executionContext.headSha,
-                  nativePolicy: 'codex_bubblewrap' as const,
+                  nativePolicy: fablePermit ? FABLE_POLICY : ('codex_bubblewrap' as const),
+                  ...(fablePermit ? { fablePermit } : {}),
                 },
               }
             : {}),
@@ -1332,6 +1428,27 @@ export function createRealSubmitDeps(
           recordRungOutage: recordJudgeRungOutage,
         }
       );
+      if (fablePermit) {
+        if (
+          executionProof?.nativePolicy !== FABLE_POLICY ||
+          !work.executionContext ||
+          !isTrustedFableEvidence(fableEvidence) ||
+          !(await ownsCustody(work.executionContext))
+        )
+          return refused('fable_execution_unqualified');
+        try {
+          selectFablePermit([fablePermit], work.executionContext);
+        } catch {
+          return refused('fable_permission_refused');
+        }
+        executionProof = {
+          ...executionProof,
+          fablePermit,
+          fableEvidence,
+          nativeVersion: fableEvidence.version,
+          endedAt: new Date().toISOString(),
+        };
+      }
       if (work.executionContext) {
         const checkoutPath = work.executionContext.checkoutPath;
         const expectedHead = work.executionContext.headSha;
@@ -1433,7 +1550,9 @@ export function createRealSubmitDeps(
         result.verdict === 'INDETERMINATE' ? reviewErrorCode(result.error) : null;
       return {
         approved: result.verdict === 'APPROVE',
-        summary,
+        summary: fableEvidence
+          ? `Observed reviewer: claude/${FABLE_MODEL} (${FABLE_POLICY}).\n\n${summary}`
+          : summary,
         reviewedHeadSha: result.reviewed_head_sha,
         // Structured findings ride alongside the flattened summary so
         // remediation classification can read severity per finding. The
@@ -1464,14 +1583,7 @@ export function createRealSubmitDeps(
       if (typeof draft !== 'boolean') throw new Error('pr_draft_unknown');
       return draft;
     },
-    async hasCustody(context): Promise<boolean> {
-      const message = await dispatch.renewMessageLease({
-        id: context.requestId,
-        worker_id: context.workerId,
-        fencing_token: context.fencingToken,
-      });
-      return message !== null;
-    },
+    hasCustody: ownsCustody,
     async recordExecutionProof({ work, proof }): Promise<void> {
       await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
         { kind: 'system', sender: REVIEW_SENDER },
@@ -1531,7 +1643,13 @@ export function createRealSubmitDeps(
       // Merge-ready state is last: both execution proof and the actual GitHub
       // response identity are durable in receipts before this can run.
       await maybeRecordReviewApprovalVerdict(
-        { ...input, model: modelReviewer.model },
+        {
+          ...input,
+          model:
+            input.originalPublication?.attestation.model ??
+            input.executionProof?.fableEvidence?.model ??
+            modelReviewer.model,
+        },
         {
           record: overrides.recordApprovalVerdict,
           onError: error => {

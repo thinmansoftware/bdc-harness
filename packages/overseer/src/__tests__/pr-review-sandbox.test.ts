@@ -635,6 +635,11 @@ async function reviewObservedCheckout(input: {
   try {
     const result = await runAndSubmitReview(item, {
       ...wired,
+      // Checkout-focused fixture, not durable publication: match the existing server fixture.
+      // Real publication DAL/claim/fence tests remain separate and unchanged.
+      lookupPublication: async () => null,
+      admitPublication: undefined,
+      observePublication: undefined,
       currentHeadSha: async () => input.head,
       // The stub octokit has no pulls.get; the PR is not a draft (WO-HARNESS-MERGE-GATES-01 Amendment 1).
       isDraft: async () => false,
@@ -1008,4 +1013,672 @@ describe.serial('observed checkout integrity and check environment', () => {
       }
     }
   );
+});
+
+describe('Phase B broker closed configuration and inert protocol', () => {
+  test('F3 wrapper creates a user namespace for pinned non-setuid bubblewrap', async () => {
+    const { fableNamespaceArgv } = await import('../../../../scripts/overseer-reviewer-broker');
+    const argv = fableNamespaceArgv({
+      scratch: '/private/synthetic',
+      executable: '/private/cli',
+      account: '/private/oauth',
+      argv: ['/model/cli'],
+    });
+    expect(argv).toContain('--unshare-user');
+    expect(argv).toContain('--unshare-pid');
+    expect(argv).not.toContain('--ro-bind-try');
+    expect(argv).not.toContain('/app');
+  });
+
+  test('F1 configuration is closed, unique, pinned and Ultra-only', async () => {
+    const { parseFableBrokerConfig, fableModelArgv } =
+      await import('../../../../scripts/overseer-reviewer-broker');
+    const config = {
+      version: 1,
+      modelBinding: {
+        executablePath: process.platform === 'win32' ? 'C:/synthetic/cli' : '/synthetic/cli',
+        executableSha256: 'a'.repeat(64),
+        version: '2.1.325 (Claude Code)',
+        catalogModelId: 'claude-fable-5-2',
+        cliModelToken: 'claude-fable-5-2',
+      },
+      accountBindings: [
+        {
+          bindingId: 'ultra',
+          accountClass: 'ultra',
+          oauthSourceFile: process.platform === 'win32' ? 'C:/synthetic/oauth' : '/synthetic/oauth',
+          bindMode: 'read_only',
+        },
+      ],
+    };
+    expect(parseFableBrokerConfig(JSON.stringify(config)).accountBindings).toHaveLength(1);
+    for (const value of [
+      { ...config, extra: true },
+      { ...config, accountBindings: [...config.accountBindings, ...config.accountBindings] },
+      { ...config, accountBindings: [{ ...config.accountBindings[0], accountClass: 'team' }] },
+      { ...config, modelBinding: { ...config.modelBinding, cliModelToken: 'bad --tools all' } },
+    ])
+      expect(() => parseFableBrokerConfig(JSON.stringify(value))).toThrow(
+        'fable_configuration_invalid'
+      );
+    const argv = fableModelArgv('claude-fable-5-2');
+    expect(argv[argv.indexOf('--tools') + 1]).toBe('');
+    expect(argv[argv.indexOf('--mcp-config') + 1]).toBe('{"mcpServers":{}}');
+    expect(argv).not.toContain('--bare');
+    expect(argv).not.toContain('--dangerously-skip-permissions');
+    expect(argv).not.toContain('--fallback-model');
+  });
+  test('F2 protocol refuses tools, extra frames, missing or forged identity', async () => {
+    const { decodeFableProtocol } = await import('../../../../scripts/overseer-reviewer-broker');
+    const init = {
+      type: 'system',
+      subtype: 'init',
+      model: 'claude-fable-5-2',
+      tools: [],
+      mcp_servers: [],
+      session_id: 'private-session',
+    };
+    const result = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'immutable verdict',
+      session_id: 'private-session',
+    };
+    const frames = (values: unknown[]): string =>
+      values.map(value => JSON.stringify(value)).join('\n');
+    expect(decodeFableProtocol(frames([init, result]), init.model).text).toBe('immutable verdict');
+    for (const values of [
+      [{ ...init, model: 'other' }, result],
+      [{ ...init, tools: ['Bash'] }, result],
+      [init, { type: 'tool_use', command: 'CANARY' }, result],
+      [init, result, result],
+      [init, { ...result, session_id: 'wrong' }],
+      [init, { ...result, is_error: true }],
+    ])
+      expect(() => decodeFableProtocol(frames(values), init.model)).toThrow(
+        'fable_protocol_refused'
+      );
+  });
+  test('F1 egress covers opaque access/refresh values and generic secrets without returning them', async () => {
+    const { fableEgressAllowed } = await import('../../../../scripts/overseer-reviewer-broker');
+    const credentials = JSON.stringify({
+      claudeAiOauth: { accessToken: 'opaque-access-CANARY', refreshToken: 'opaque-refresh-CANARY' },
+    });
+    expect(fableEgressAllowed('safe verdict', '', credentials)).toBe(true);
+    for (const value of [
+      'opaque-access-CANARY',
+      'opaque-refresh-CANARY',
+      'Bearer abcdefghijklmnop',
+    ])
+      expect(fableEgressAllowed('safe', value, credentials)).toBe(false);
+    expect(fableEgressAllowed('safe', '', '{}')).toBe(false);
+    expect(fableEgressAllowed('safe', '', 'not json')).toBe(false);
+  });
+});
+
+describe('Phase B post-invocation proof', () => {
+  test('F4 forged/pre-model Fable evidence cannot approve', async () => {
+    const { FABLE_POLICY, FABLE_MODEL } = await import('../judge-transport');
+    const permit = {
+      owner: context.owner,
+      repo: context.repo,
+      prNumber: context.prNumber,
+      headSha: head,
+      requestId: context.requestId,
+      workerId: context.workerId,
+      fencingToken: context.fencingToken,
+      modelId: FABLE_MODEL,
+      policy: FABLE_POLICY,
+      accountBindingId: 'ultra',
+      permitId: 'permit',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    };
+    const forged = {
+      ...proof,
+      nativePolicy: FABLE_POLICY,
+      fablePermit: permit,
+      fableEvidence: {
+        policy: FABLE_POLICY,
+        provider: 'claude' as const,
+        model: FABLE_MODEL,
+        executableSha256: 'a'.repeat(64),
+        version: 'synthetic',
+        accountBindingId: 'ultra',
+        invocationId: '11111111-1111-4111-8111-111111111111',
+        requestId: context.requestId,
+        workerId: context.workerId,
+        fencingToken: context.fencingToken,
+        headSha: head,
+        permitId: 'permit',
+        credentialEgressPassed: true as const,
+      },
+    };
+    const d = deps(forged);
+    expect((await runAndSubmitReview(work, d.value)).disposition).toBe('review_incomplete');
+    expect(d.posts).toEqual(['COMMENT']);
+  });
+  test('F4 client accepts only request-bound broker evidence and cleans private spool', async () => {
+    const { FABLE_POLICY, FABLE_MODEL } = await import('../judge-transport');
+    const { submitReviewerBrokerJob, isTrustedFableEvidence } =
+      await import('../reviewer-broker-client');
+    const root = await mkdtemp(join(tmpdir(), 'fable-private-client-'));
+    const id = '11111111-1111-4111-8111-111111111111';
+    const permit = {
+      owner: context.owner,
+      repo: context.repo,
+      prNumber: context.prNumber,
+      headSha: head,
+      requestId: context.requestId,
+      workerId: context.workerId,
+      fencingToken: context.fencingToken,
+      modelId: FABLE_MODEL,
+      policy: FABLE_POLICY,
+      accountBindingId: 'ultra',
+      permitId: 'permit',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    };
+    const evidence = {
+      policy: FABLE_POLICY,
+      provider: 'claude',
+      model: FABLE_MODEL,
+      executableSha256: 'a'.repeat(64),
+      version: 'synthetic',
+      accountBindingId: 'ultra',
+      invocationId: id,
+      requestId: context.requestId,
+      workerId: context.workerId,
+      fencingToken: context.fencingToken,
+      headSha: head,
+      permitId: 'permit',
+      credentialEgressPassed: true,
+    };
+    const payload = {
+      id,
+      uid: 1002,
+      ok: true,
+      exitCode: 0,
+      stdout: 'bounded verdict',
+      stderr: '',
+      timedOut: false,
+      outputTruncated: false,
+      fableEvidence: evidence,
+    };
+    const job = {
+      checkout: '/private/fake',
+      expectedHead: head,
+      argv: ['fable-model-only'],
+      prompt: 'synthetic',
+      fablePermit: permit,
+    };
+    try {
+      await writeFile(join(root, 'ready'), 'synthetic');
+      for (const field of [
+        'requestId',
+        'workerId',
+        'headSha',
+        'accountBindingId',
+        'invocationId',
+      ]) {
+        await writeFile(
+          join(root, `${id}.result.json`),
+          JSON.stringify({ ...payload, fableEvidence: { ...evidence, [field]: 'wrong' } })
+        );
+        await expect(
+          submitReviewerBrokerJob(job, { id, env: { OVERSEER_REVIEW_SPOOL: root } })
+        ).rejects.toThrow('reviewer_broker_unavailable');
+      }
+      await writeFile(join(root, `${id}.result.json`), JSON.stringify(payload));
+      const result = await submitReviewerBrokerJob(job, {
+        id,
+        env: { OVERSEER_REVIEW_SPOOL: root },
+      });
+      expect(isTrustedFableEvidence(result.fableEvidence)).toBe(true);
+      expect(isTrustedFableEvidence(evidence)).toBe(false);
+      expect((await readdir(root)).sort()).toEqual(['ready']);
+      if (linux) {
+        // Hosted disposable Linux only: the existing final generic guard sees no real profile.
+        const d = deps({
+          ...proof,
+          nativePolicy: FABLE_POLICY,
+          nativeVersion: 'synthetic',
+          runtimeUid: 1002,
+          fablePermit: permit,
+          fableEvidence: result.fableEvidence,
+        });
+        expect((await runAndSubmitReview(work, d.value)).disposition).toBe('approved');
+        expect(d.posts).toEqual(['APPROVE']);
+        const stale = deps({
+          ...proof,
+          nativePolicy: FABLE_POLICY,
+          fablePermit: { ...permit, expiresAt: '2020-01-01T00:00:00.000Z' },
+          fableEvidence: result.fableEvidence,
+        });
+        expect((await runAndSubmitReview(work, stale.value)).disposition).toBe('review_incomplete');
+        expect(stale.posts).toEqual(['COMMENT']);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('finite synthetic Fable launcher diagnostics', () => {
+  test('every allowed phase and fixed assertion emits only a finite class', async () => {
+    const { fableFixtureFailure } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const cases = [
+      ['bwrap: clone failed: Operation not permitted', 'clone_refused'],
+      [
+        'bwrap: Creating new user namespace failed: Operation not permitted',
+        'user_namespace_refused',
+      ],
+      ['bwrap: Failed to make / slave: Operation not permitted', 'root_mount_refused'],
+      [
+        "bwrap: Can't mount proc on /PRIVATE_PATH_CANARY: Operation not permitted",
+        'proc_mount_refused',
+      ],
+      [
+        "bwrap: Can't bind mount /PRIVATE_PATH_CANARY on /scratch: Permission denied",
+        'bind_mount_refused',
+      ],
+      ['bwrap: execvp /PRIVATE_PATH_CANARY: No such file or directory', 'exec_refused'],
+      ['error: fable_fixture_socket_denial_unknown', 'fable_fixture_socket_denial_unknown'],
+    ];
+    for (const [stderr, phase] of cases) {
+      const input = { code: 1, stdout: 'PRIVATE_STDOUT_CANARY', stderr };
+      const observed = fableFixtureFailure(input);
+      expect(observed).toBe(phase);
+      const sink = `fable_model_wrapper_failed:exit=${input.code}:class=${observed}`;
+      for (const canary of ['PRIVATE_PATH_CANARY', 'PRIVATE_STDOUT_CANARY', stderr])
+        expect(sink).not.toContain(canary);
+    }
+  });
+  test('malformed, conflicting and misleading data remains unknown without getter reads', async () => {
+    const { fableFixtureFailure } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    let reads = 0;
+    const getter = Object.defineProperty({}, 'stderr', {
+      get() {
+        reads++;
+        throw new Error('PRIVATE_GETTER_CANARY');
+      },
+    });
+    for (const value of [
+      null,
+      {},
+      getter,
+      { code: '1', stdout: '', stderr: '' },
+      { code: NaN, stdout: '', stderr: '' },
+      { code: 1, stdout: '', stderr: 'bwrap: Operation not permitted' },
+      {
+        code: 1,
+        stdout: '',
+        stderr: 'PRIVATE_RAW_CANARY bwrap: clone failed: Operation not permitted',
+      },
+      { code: 1, stdout: '', stderr: 'error: fable_fixture_read_allowed PRIVATE_RAW_CANARY' },
+      { code: 1, stdout: '', stderr: 'bwrap: clone failed: bad\nbwrap: execvp /private: missing' },
+      { code: 1, stdout: '', stderr: 'bwrap: clone failed: bad\0PRIVATE_RAW_CANARY' },
+    ])
+      expect(fableFixtureFailure(value)).toBe('unclassified');
+    expect(reads).toBe(0);
+  });
+
+  test('bind and proc permission failures retain exact launcher phase', async () => {
+    const { fableFixtureFailure } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    expect(
+      fableFixtureFailure({
+        code: 1,
+        stdout: '',
+        stderr:
+          "bwrap: Can't bind mount /PRIVATE_PATH_CANARY on /newroot/scratch: Operation not permitted",
+      })
+    ).toBe('bind_mount_refused');
+    expect(
+      fableFixtureFailure({
+        code: 1,
+        stdout: '',
+        stderr: "bwrap: Can't mount proc on /newroot/proc: Operation not permitted",
+      })
+    ).toBe('proc_mount_refused');
+  });
+  test('stdout, generic permission and raw canaries are not launcher evidence', async () => {
+    const { fableFixtureFailure } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    for (const value of [
+      { code: 1, stdout: 'bwrap: clone failed: Operation not permitted', stderr: '' },
+      { code: 1, stdout: '', stderr: 'Operation not permitted PRIVATE_RAW_CANARY' },
+      {
+        code: 1,
+        stdout: '',
+        stderr: 'bwrap: Creating new namespace failed: Operation not permitted',
+      },
+      { code: 1, stdout: '', stderr: 'PRIVATE_RAW_CANARY' },
+    ])
+      expect(fableFixtureFailure(value)).toBe('unclassified');
+  });
+});
+
+describe('no-new-proc observer source contract', () => {
+  test('production-derived argv keeps isolation with no proc exposure', async () => {
+    const { fableNamespaceArgv } = await import('../../../../scripts/overseer-reviewer-broker');
+    for (const input of [
+      { scratch: '/synthetic', executable: '/cli', account: '/fake', argv: ['/model/cli'] },
+      { scratch: '/synthetic', checkout: '/repo', argv: ['git'] },
+    ]) {
+      const argv = fableNamespaceArgv(input);
+      expect(argv).not.toContain('--proc');
+      expect(argv).not.toContain('/proc');
+      for (const flag of [
+        '--unshare-user',
+        '--unshare-ipc',
+        '--unshare-pid',
+        '--cap-drop',
+        '--clearenv',
+      ])
+        expect(argv).toContain(flag);
+      expect(argv).not.toContain('--unshare-uts');
+      expect(argv).not.toContain('--unshare-cgroup');
+    }
+  });
+  test('observer validator rejects stale, substituted, malformed and nonisolated observations', async () => {
+    const { validateFableObserver } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const binding = {
+      launchId: 'one',
+      expectedLaunchId: 'one',
+      fileIdentity: 'private-one',
+      expectedFileIdentity: 'private-one',
+      outsidePidNamespace: 42,
+      code: 0,
+      stdout: 'BOUND_MARKER',
+      marker: 'BOUND_MARKER',
+    };
+    const metadata = JSON.stringify({ 'child-pid': 7, 'pid-namespace': 43 });
+    expect(validateFableObserver(metadata, binding)).toBe(true);
+    for (const value of [
+      '',
+      '{}',
+      metadata + '\n' + metadata,
+      JSON.stringify({ 'child-pid': 0, 'pid-namespace': 43 }),
+      JSON.stringify({ 'child-pid': 7, 'pid-namespace': 42 }),
+    ])
+      expect(validateFableObserver(value, binding)).toBe(false);
+    for (const change of [
+      { expectedLaunchId: 'stale' },
+      { fileIdentity: 'substituted' },
+      { code: 1 },
+      { stdout: '' },
+      { stdout: metadata },
+      { outsidePidNamespace: 43 },
+    ])
+      expect(validateFableObserver(metadata, { ...binding, ...change })).toBe(false);
+    expect(validateFableObserver('', { ...binding, stdout: metadata })).toBe(false);
+  });
+});
+
+describe('private kernel observer validator', () => {
+  test('requires fresh descriptor binding, one record, positive execution and namespace difference', async () => {
+    const { validateFableObserver } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const binding = {
+      launchId: 'one',
+      expectedLaunchId: 'one',
+      fileIdentity: '1:2',
+      expectedFileIdentity: '1:2',
+      outsidePidNamespace: 41,
+      code: 0,
+      stdout: 'FIXTURE_MARKER',
+      marker: 'FIXTURE_MARKER',
+    };
+    const metadata = JSON.stringify({ 'child-pid': 12, 'pid-namespace': 42, 'user-namespace': 43 });
+    expect(validateFableObserver(metadata, binding)).toBe(true);
+    for (const changed of [
+      { ...binding, launchId: 'stale' },
+      { ...binding, fileIdentity: 'other' },
+      { ...binding, code: 1 },
+      { ...binding, stdout: 'wrong' },
+      { ...binding, stdout: 'FIXTURE_MARKER\nFIXTURE_MARKER' },
+    ])
+      expect(validateFableObserver(metadata, changed)).toBe(false);
+    for (const raw of [
+      '',
+      '{}',
+      metadata + metadata,
+      JSON.stringify({ 'child-pid': 0, 'pid-namespace': 42 }),
+      JSON.stringify({ 'child-pid': 12, 'pid-namespace': 41 }),
+      JSON.stringify({ 'child-pid': 12, 'pid-namespace': 42, stdout: 'FORGED' }),
+    ])
+      expect(validateFableObserver(raw, binding)).toBe(false);
+    expect(validateFableObserver('', { ...binding, stdout: metadata })).toBe(false); // stdout cannot become the private descriptor record.
+    const source = validateFableObserver.toString();
+    const mutated = source.replace(
+      /record\[(?:'|")pid-namespace(?:'|")\]\s*===\s*binding.outsidePidNamespace/,
+      'false'
+    );
+    expect(mutated).not.toBe(source);
+    const { runInNewContext } = await import('node:vm');
+    const unsafe = runInNewContext(`(${mutated})`, { Buffer }) as typeof validateFableObserver;
+    expect(unsafe(JSON.stringify({ 'child-pid': 12, 'pid-namespace': 41 }), binding)).toBe(true); // Deliberately removed inequality is detected.
+  });
+});
+
+describe('same-mask Bun startup diagnostic', () => {
+  test('uses exact pinned version before original probe with identical model namespace flags', async () => {
+    const { runFableBunStartup } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const { fableNamespaceArgv } = await import('../../../../scripts/overseer-reviewer-broker');
+    let calls = 0;
+    const input = {
+      scratch: '/synthetic',
+      executable: '/packaged/bun',
+      account: '/synthetic/account',
+      env: { PATH: '/usr/bin' },
+    };
+    const expected = fableNamespaceArgv({ ...input, argv: ['/model/cli', '--version'] });
+    const result = await runFableBunStartup(input, async (argv, options) => {
+      calls++;
+      expect(argv).toEqual(expected);
+      expect(options.marker).toBe('1.3.11');
+      expect(argv).not.toContain('--unshare-net');
+      return { code: 0, stdout: '1.3.11\n', stderr: '', observerQualified: true };
+    });
+    expect(calls).toBe(1);
+    expect(result.ok).toBe(true);
+    const source = await readFile(
+      join(import.meta.dir, '../../../../scripts/overseer-review-sandbox-smoke.ts'),
+      'utf8'
+    );
+    const body = source.slice(source.indexOf('async function fableSyntheticSmoke'));
+    expect(body.indexOf('await runFableBunStartup')).toBeLessThan(
+      body.indexOf('const model = await observedFableRun')
+    );
+  });
+  test('nonzero, version mismatch, missing observer and forged output never pass or leak', async () => {
+    const { runFableBunStartup } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const unknown = await runFableBunStartup(
+      { scratch: '/synthetic', executable: '/bun', account: '/fake', env: {} },
+      async () => {
+        throw new Error('PRIVATE_EXCEPTION_CANARY');
+      }
+    );
+    expect(unknown).toEqual({ ok: false, exit: null, failureClass: 'bun_startup_unknown' });
+    for (const response of [
+      { code: 134, stdout: 'PRIVATE_STDOUT_CANARY', stderr: 'PRIVATE_STDERR_CANARY' },
+      { code: 0, stdout: '1.3.99', stderr: '', observerQualified: true },
+      { code: 0, stdout: '1.3.11', stderr: '' },
+      { code: 0, stdout: '1.3.11\nPRIVATE_RAW_CANARY', stderr: '', observerQualified: true },
+      { code: 0, stdout: '{"observerQualified":true}', stderr: '', observerQualified: true },
+    ]) {
+      const result = await runFableBunStartup(
+        { scratch: '/synthetic', executable: '/bun', account: '/fake', env: {} },
+        async () => response
+      );
+      expect(result.ok).toBe(false);
+      for (const canary of [
+        'PRIVATE_STDOUT_CANARY',
+        'PRIVATE_STDERR_CANARY',
+        'PRIVATE_RAW_CANARY',
+        'observerQualified',
+      ])
+        expect(JSON.stringify(result)).not.toContain(canary);
+    }
+  });
+});
+
+describe('finite inline JS and probe-stage diagnostics', () => {
+  test('inline JS uses one same-model call before original script and requires observer proof', async () => {
+    const { runFableInlineJs } = await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const { fableNamespaceArgv } = await import('../../../../scripts/overseer-reviewer-broker');
+    let calls = 0;
+    const input = {
+      scratch: '/synthetic',
+      executable: '/packaged/bun',
+      account: '/fake',
+      env: { PATH: '/usr/bin' },
+    };
+    const positive = await runFableInlineJs(input, async (argv, options) => {
+      calls++;
+      const code = argv.at(-1)!;
+      expect(code).toBe(`console.log(${JSON.stringify(options.marker)})`);
+      expect(argv).toEqual(fableNamespaceArgv({ ...input, argv: ['/model/cli', '--eval', code] }));
+      return { code: 0, stdout: options.marker, stderr: '', observerQualified: true };
+    });
+    expect(positive.ok).toBe(true);
+    expect(calls).toBe(1);
+    for (const kind of ['nonzero', 'missing_metadata', 'wrong_marker']) {
+      const bad = await runFableInlineJs(input, async (_argv, options) => ({
+        code: kind === 'nonzero' ? 134 : 0,
+        stdout: kind === 'wrong_marker' ? 'PRIVATE_CANARY' : options.marker,
+        stderr: 'PRIVATE_ERROR_CANARY',
+        observerQualified: kind !== 'missing_metadata',
+      }));
+      expect(bad.ok).toBe(false);
+      expect(JSON.stringify(bad)).not.toContain('CANARY');
+    }
+    const source = await readFile(
+      join(import.meta.dir, '../../../../scripts/overseer-review-sandbox-smoke.ts'),
+      'utf8'
+    );
+    const body = source.slice(source.indexOf('async function fableSyntheticSmoke'));
+    expect(body.indexOf('await runFableBunStartup')).toBeLessThan(
+      body.indexOf('await runFableInlineJs')
+    );
+    expect(body.indexOf('await runFableInlineJs')).toBeLessThan(
+      body.indexOf('const model = await observedFableRun')
+    );
+  });
+  test('ordered launch-bound breadcrumbs project only fixed completed/next names', async () => {
+    const { parseFableProbeStages, fableProbeStages } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const marker = 'FABLE_WRAPPER_OK:11111111-1111-4111-8111-111111111111';
+    const stages = fableProbeStages('model');
+    const line = (stage: string) => `FABLE_PROBE:${marker}:${stage}`;
+    expect(parseFableProbeStages(stages.slice(0, 3).map(line).join('\n'), marker, 'model')).toEqual(
+      { lastCompleted: 'probe_entry_done', nextExpected: 'fs_done' }
+    );
+    for (const text of [
+      line(stages[1]),
+      line(stages[0]) + '\n' + line(stages[0]),
+      line(stages[0]) + '\n' + line('PRIVATE_CANARY'),
+      line(stages[0]).replace(marker, 'unbound'),
+      'FABLE_PROBE:PRIVATE_CANARY',
+    ]) {
+      const result = parseFableProbeStages(text, marker, 'model');
+      expect(result).toEqual({ lastCompleted: 'UNKNOWN', nextExpected: 'UNKNOWN' });
+      expect(JSON.stringify(result)).not.toContain('PRIVATE_CANARY');
+    }
+    expect(parseFableProbeStages('', marker, 'model')).toEqual({
+      lastCompleted: 'UNKNOWN',
+      nextExpected: 'probe_entry_begin',
+    });
+  });
+});
+
+describe('fixed runtime comparison controls', () => {
+  test('versions retain NEWNET, Node JS retains MODEL boundary and first failure stops', async () => {
+    const { runFableRuntimeControls } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const input = {
+      scratch: '/private',
+      account: '/fake',
+      env: {},
+      claudeExecutable: '/packaged/claude',
+      claudeVersion: '9.9.9 (Claude Code)',
+    };
+    for (const failure of [-1, 0, 1, 2]) {
+      const calls: string[][] = [];
+      const result = await runFableRuntimeControls(input, async (argv, options) => {
+        const index = calls.length;
+        calls.push(argv);
+        if (index === failure) return { code: 134, stdout: 'RAW_CANARY', stderr: 'PRIVATE_CANARY' };
+        return { code: 0, stdout: options.marker, stderr: '', observerQualified: true };
+      });
+      expect(calls).toHaveLength(failure < 0 ? 3 : failure + 1);
+      expect(calls[0]).toContain('/opt/node26/bin/node');
+      expect(calls[0]).toContain('--unshare-net');
+      if (calls[1]) {
+        expect(calls[1]).toContain('/packaged/claude');
+        expect(calls[1]).toContain('--unshare-net');
+      }
+      if (calls[2]) {
+        expect(calls[2]).toContain('/opt/node26/bin/node');
+        expect(calls[2]).not.toContain('--unshare-net');
+        expect(calls[2]).toContain('--eval');
+      }
+      expect(result.ok).toBe(failure < 0);
+      expect(result.stage).toBe(
+        failure === 0
+          ? 'node26_version'
+          : failure === 1
+            ? 'packaged_claude_version'
+            : 'node26_inline_js'
+      );
+      expect(JSON.stringify(result)).not.toContain('CANARY');
+    }
+  });
+  test('missing observer and wrong marker refuse without later launch or raw leakage', async () => {
+    const { runFableRuntimeControls } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    for (const qualified of [false, true]) {
+      let calls = 0;
+      const result = await runFableRuntimeControls(
+        {
+          scratch: '/private',
+          account: '/fake',
+          env: {},
+          claudeExecutable: '/claude',
+          claudeVersion: '1',
+        },
+        async (_argv, options) => {
+          calls++;
+          return {
+            code: 0,
+            stdout: qualified ? 'RAW_CANARY' : options.marker,
+            stderr: 'PRIVATE_CANARY',
+            observerQualified: qualified,
+          };
+        }
+      );
+      expect(calls).toBe(1);
+      expect(result.ok).toBe(false);
+      expect(JSON.stringify(result)).not.toContain('CANARY');
+    }
+    const source = await readFile(
+      join(import.meta.dir, '../../../../scripts/overseer-review-sandbox-smoke.ts'),
+      'utf8'
+    );
+    const body = source.slice(source.indexOf('async function fableSyntheticSmoke'));
+    expect(body.indexOf('await runFableBunStartup')).toBeLessThan(
+      body.indexOf('await runFableRuntimeControls')
+    );
+    expect(body.indexOf('await runFableRuntimeControls')).toBeLessThan(
+      body.indexOf('await runFableInlineJs')
+    );
+    expect(body.indexOf('await runFableInlineJs')).toBeLessThan(
+      body.indexOf('const model = await observedFableRun')
+    );
+  });
 });

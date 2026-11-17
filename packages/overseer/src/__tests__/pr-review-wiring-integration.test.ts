@@ -53,6 +53,14 @@ function test(name: string, fn: () => Promise<unknown>, timeout?: number): void 
   );
 }
 
+/** Native fingerprinting intentionally uses Linux setsid; Ubuntu remains mandatory proof. */
+function nativeLinuxTest(name: string, fn: () => Promise<unknown>): void {
+  bunTest.skipIf(process.platform !== 'linux')(name, () => {
+    if (!db) throw new Error('pr-review sqlite adapter was not created');
+    return runWithBoundDatabase(db, () => Promise.resolve(fn()));
+  });
+}
+
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
 const {
   createRealIngestDeps,
@@ -1629,207 +1637,216 @@ describe('Phase A production diagnostic return wiring', () => {
     cleanupDb(currentDbPath);
   });
 
-  test('A8 real native-client evaluator submit wiring keeps exact safe body and proof gates', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'diagnostic-return-'));
-    await writeFile(join(root, 'ready'), 'synthetic');
-    try {
-      const checkout = join(root, 'checkout');
-      await mkdir(checkout);
-      await writeFile(join(checkout, 'fixture.txt'), 'synthetic repository\n');
-      const git = (args: string[]): string => {
-        const result = Bun.spawnSync(['git', '-C', checkout, ...args], {
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        expect(result.exitCode).toBe(0);
-        return result.stdout.toString().trim();
-      };
-      git(['init', '-q']);
-      git(['add', 'fixture.txt']);
-      git([
-        '-c',
-        'user.name=Synthetic Reviewer',
-        '-c',
-        'user.email=fixture@example.invalid',
-        'commit',
-        '-qm',
-        'synthetic fixture',
-      ]);
-      const head = git(['rev-parse', 'HEAD']);
-      const tree = git(['rev-parse', 'HEAD^{tree}']);
-      const native = await invokeConfiguredReviewModel(
-        'codex',
-        'PRIVATE_PROMPT_CANARY',
-        {
-          kind: 'pr-review',
-          cwd: checkout,
-          expectedHeadSha: head,
-          nativePolicy: 'codex_bubblewrap',
-        },
-        1000,
-        async (job, options) => {
-          await writeFile(
-            join(root, `${options?.id}.result.json`),
-            JSON.stringify({
-              id: options?.id,
-              ok: false,
-              exitCode: 1,
-              stdout: 'PRIVATE_STDOUT_CANARY',
-              stderr: 'PRIVATE_CREDENTIAL_CANARY authentication required',
-              uid: 1002,
-            })
-          );
-          return submitReviewerBrokerJob(job, { ...options, env: { OVERSEER_REVIEW_SPOOL: root } });
-        }
-      );
-      expect((await readdir(root)).sort()).toEqual(['checkout', 'ready']);
-      const context = {
-        requestId: 'synthetic-request',
-        workerId: 'synthetic-worker',
-        fencingToken: 1,
-        owner: 'thinmansoftware',
-        repo: 'fixture',
-        prNumber: 1,
-        headSha: head,
-        checkoutPath: checkout,
-        reviewerIdentity: 'thinman-overseer[bot]',
-        rung: 'codex',
-        checkPlanStatus: 'absent' as const,
-        checkPlan: [],
-      };
-      const proof: ReviewExecutionProof = {
-        requestId: context.requestId,
-        headSha: head,
-        treeSha: tree,
-        cwd: checkout,
-        nativePolicy: 'codex_bubblewrap',
-        nativeVersion: 'synthetic-version',
-        runtimeUid: 1002,
-        inspectionObserved: true,
-        check_plan: 'absent',
-        checks: [],
-        startedAt: '2026-01-01T00:00:00Z',
-        endedAt: '2026-01-01T00:00:01Z',
-      };
-      const work: ReviewWorkItem = {
-        correlationId: 'synthetic-review',
-        messageId: 'synthetic-message',
-        owner: context.owner,
-        repo: context.repo,
-        prNumber: 1,
-        headSha: head,
-        author: 'fixture-author',
-        executionContext: context,
-      };
-      const evaluator = async () =>
-        evaluatePullRequest(
-          { owner: work.owner, repo: work.repo, pr_number: 1, head_sha: head },
+  nativeLinuxTest(
+    'A8 real native-client evaluator submit wiring keeps exact safe body and proof gates',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'diagnostic-return-'));
+      await writeFile(join(root, 'ready'), 'synthetic');
+      try {
+        const checkout = join(root, 'checkout');
+        await mkdir(checkout);
+        await writeFile(join(checkout, 'fixture.txt'), 'synthetic repository\n');
+        const git = (args: string[]): string => {
+          const result = Bun.spawnSync(['git', '-C', checkout, ...args], {
+            stdout: 'pipe',
+            stderr: 'pipe',
+          });
+          expect(result.exitCode).toBe(0);
+          return result.stdout.toString().trim();
+        };
+        git(['init', '-q']);
+        git(['add', 'fixture.txt']);
+        git([
+          '-c',
+          'user.name=Synthetic Reviewer',
+          '-c',
+          'user.email=fixture@example.invalid',
+          'commit',
+          '-qm',
+          'synthetic fixture',
+        ]);
+        const head = git(['rev-parse', 'HEAD']);
+        const tree = git(['rev-parse', 'HEAD^{tree}']);
+        const native = await invokeConfiguredReviewModel(
+          'codex',
+          'PRIVATE_PROMPT_CANARY',
           {
-            reviewer: { provider: 'synthetic', model: 'synthetic' },
-            fetchEvidence: async () => ({
-              diff: '+synthetic',
-              checks: [{ name: 'synthetic-ci', status: 'completed', conclusion: 'success' }],
-              requiredContexts: ['synthetic-ci'],
-            }),
-            fetchAcceptanceCriteria: async () => null,
-            ladder: ['codex', 'cursor'],
-            invokeModel: async binary =>
-              binary === 'codex'
-                ? native
-                : invokeConfiguredReviewModel(
-                    binary,
-                    'PRIVATE_FALLBACK_PROMPT_CANARY',
-                    {
-                      kind: 'pr-review',
-                      cwd: checkout,
-                      expectedHeadSha: head,
-                      nativePolicy: 'codex_bubblewrap',
-                    },
-                    1000,
-                    async () => {
-                      throw new Error('unexpected_fake_broker_call');
-                    }
-                  ),
+            kind: 'pr-review',
+            cwd: checkout,
+            expectedHeadSha: head,
+            nativePolicy: 'codex_bubblewrap',
+          },
+          1000,
+          async (job, options) => {
+            await writeFile(
+              join(root, `${options?.id}.result.json`),
+              JSON.stringify({
+                id: options?.id,
+                ok: false,
+                exitCode: 1,
+                stdout: 'PRIVATE_STDOUT_CANARY',
+                stderr: 'PRIVATE_CREDENTIAL_CANARY authentication required',
+                uid: 1002,
+              })
+            );
+            return submitReviewerBrokerJob(job, {
+              ...options,
+              env: { OVERSEER_REVIEW_SPOOL: root },
+            });
           }
         );
-      const production = createRealSubmitDeps('thinman-overseer[bot]', {
-        octokit: stubOctokit(),
-        patOctokit: null,
-        evaluate: evaluator,
-        observeExecution: async () => proof,
-      });
-      const bodies: { body: string; commitId?: string; event: string }[] = [];
-      const receipts: unknown[] = [];
-      const isolated = {
-        ...production,
-        currentHeadSha: async () => head,
-        isDraft: async () => false,
-        hasCustody: async () => true,
-        recordReceipt: async (receipt: Parameters<typeof production.recordReceipt>[0]) => {
-          receipts.push(receipt);
-        },
-        submitReview: async (request: Parameters<typeof production.submitReview>[0]) => {
-          bodies.push(request);
-          return {
-            submitted: true,
-            review: {
-              id: 1,
-              url: 'https://example.invalid/review',
-              commitSha: head,
-              state: 'CHANGES_REQUESTED',
-            },
-          };
-        },
-      };
-      const outcome = await runAndSubmitReview(work, isolated);
-      expect(outcome).toMatchObject({ disposition: 'changes_requested' });
-      expect(bodies).toHaveLength(1);
-      expect(bodies[0].event).toBe('REQUEST_CHANGES');
-      expect(bodies[0].commitId).toBe(head);
-      const body = bodies[0].body;
-      expect(body).toContain('Reviewer diagnostic (sanitized):');
-      expect(body).toContain(JSON.stringify(native.diagnostic));
-      expect(body).toContain('End reviewer diagnostic.');
-      const safeEntries = body
-        .split('Reviewer diagnostic (sanitized):\n')[1]
-        .split('\nEnd reviewer diagnostic.')[0]
-        .split('\n')
-        .map(line => JSON.parse(line));
-      expect(safeEntries).toHaveLength(2);
-      expect(safeEntries[0]).toEqual(native.diagnostic);
-      expect(safeEntries[1].terminationClass).toBe('unsupported_binary');
-      expect(safeEntries[1].exitCode).toBeNull();
-      expect(safeEntries[1].correlationId).not.toBe(safeEntries[0].correlationId);
-      expect(body).toContain(head);
-      expect(body.length).toBeLessThanOrEqual(60_000);
-      for (const canary of [
-        'PRIVATE_PROMPT_CANARY',
-        'PRIVATE_STDOUT_CANARY',
-        'PRIVATE_CREDENTIAL_CANARY',
-        'PRIVATE_FALLBACK_PROMPT_CANARY',
-        'reviewer_auth_missing',
-      ]) {
-        expect(JSON.stringify(bodies)).not.toContain(canary);
-        expect(JSON.stringify(receipts)).not.toContain(canary);
+        expect((await readdir(root)).sort()).toEqual(['checkout', 'ready']);
+        const context = {
+          requestId: 'synthetic-request',
+          workerId: 'synthetic-worker',
+          fencingToken: 1,
+          owner: 'thinmansoftware',
+          repo: 'fixture',
+          prNumber: 1,
+          headSha: head,
+          checkoutPath: checkout,
+          reviewerIdentity: 'thinman-overseer[bot]',
+          rung: 'codex',
+          checkPlanStatus: 'absent' as const,
+          checkPlan: [],
+        };
+        const proof: ReviewExecutionProof = {
+          requestId: context.requestId,
+          headSha: head,
+          treeSha: tree,
+          cwd: checkout,
+          nativePolicy: 'codex_bubblewrap',
+          nativeVersion: 'synthetic-version',
+          runtimeUid: 1002,
+          inspectionObserved: true,
+          check_plan: 'absent',
+          checks: [],
+          startedAt: '2026-01-01T00:00:00Z',
+          endedAt: '2026-01-01T00:00:01Z',
+        };
+        const work: ReviewWorkItem = {
+          correlationId: 'synthetic-review',
+          messageId: 'synthetic-message',
+          owner: context.owner,
+          repo: context.repo,
+          prNumber: 1,
+          headSha: head,
+          author: 'fixture-author',
+          executionContext: context,
+        };
+        const evaluator = async () =>
+          evaluatePullRequest(
+            { owner: work.owner, repo: work.repo, pr_number: 1, head_sha: head },
+            {
+              reviewer: { provider: 'synthetic', model: 'synthetic' },
+              fetchEvidence: async () => ({
+                diff: '+synthetic',
+                checks: [{ name: 'synthetic-ci', status: 'completed', conclusion: 'success' }],
+                requiredContexts: ['synthetic-ci'],
+              }),
+              fetchAcceptanceCriteria: async () => null,
+              ladder: ['codex', 'cursor'],
+              invokeModel: async binary =>
+                binary === 'codex'
+                  ? native
+                  : invokeConfiguredReviewModel(
+                      binary,
+                      'PRIVATE_FALLBACK_PROMPT_CANARY',
+                      {
+                        kind: 'pr-review',
+                        cwd: checkout,
+                        expectedHeadSha: head,
+                        nativePolicy: 'codex_bubblewrap',
+                      },
+                      1000,
+                      async () => {
+                        throw new Error('unexpected_fake_broker_call');
+                      }
+                    ),
+            }
+          );
+        const production = createRealSubmitDeps('thinman-overseer[bot]', {
+          octokit: stubOctokit(),
+          patOctokit: null,
+          evaluate: evaluator,
+          observeExecution: async () => proof,
+        });
+        const bodies: { body: string; commitId?: string; event: string }[] = [];
+        const receipts: unknown[] = [];
+        const isolated = {
+          ...production,
+          lookupPublication: undefined,
+          admitPublication: undefined,
+          observePublication: undefined,
+          currentHeadSha: async () => head,
+          isDraft: async () => false,
+          hasCustody: async () => true,
+          recordReceipt: async (receipt: Parameters<typeof production.recordReceipt>[0]) => {
+            receipts.push(receipt);
+          },
+          submitReview: async (request: Parameters<typeof production.submitReview>[0]) => {
+            bodies.push(request);
+            return {
+              submitted: true,
+              review: {
+                id: 1,
+                url: 'https://example.invalid/review',
+                commitSha: head,
+                state: 'CHANGES_REQUESTED',
+              },
+            };
+          },
+        };
+        const outcome = await runAndSubmitReview(work, isolated);
+        expect(outcome).toMatchObject({ disposition: 'changes_requested' });
+        expect(bodies).toHaveLength(1);
+        expect(bodies[0].event).toBe('REQUEST_CHANGES');
+        expect(bodies[0].commitId).toBe(head);
+        const body = bodies[0].body;
+        expect(body).toContain('Reviewer diagnostic (sanitized):');
+        expect(body).toContain(JSON.stringify(native.diagnostic));
+        expect(body).toContain('End reviewer diagnostic.');
+        const safeEntries = body
+          .split('Reviewer diagnostic (sanitized):\n')[1]
+          .split('\nEnd reviewer diagnostic.')[0]
+          .split('\n')
+          .map(line => JSON.parse(line));
+        expect(safeEntries).toHaveLength(2);
+        expect(safeEntries[0]).toEqual(native.diagnostic);
+        expect(safeEntries[1].terminationClass).toBe('unsupported_binary');
+        expect(safeEntries[1].exitCode).toBeNull();
+        expect(safeEntries[1].correlationId).not.toBe(safeEntries[0].correlationId);
+        expect(body).toContain(head);
+        expect(body.length).toBeLessThanOrEqual(60_000);
+        for (const canary of [
+          'PRIVATE_PROMPT_CANARY',
+          'PRIVATE_STDOUT_CANARY',
+          'PRIVATE_CREDENTIAL_CANARY',
+          'PRIVATE_FALLBACK_PROMPT_CANARY',
+          'reviewer_auth_missing',
+        ]) {
+          expect(JSON.stringify(bodies)).not.toContain(canary);
+          expect(JSON.stringify(receipts)).not.toContain(canary);
+        }
+        // Actual production proof-refusal branch must remain a COMMENT, with no forced section.
+        const incomplete = createRealSubmitDeps('thinman-overseer[bot]', {
+          octokit: stubOctokit(),
+          patOctokit: null,
+          evaluate: evaluator,
+          observeExecution: async () => undefined,
+        });
+        const refused = await runAndSubmitReview(work, {
+          ...isolated,
+          runReviewer: incomplete.runReviewer,
+        });
+        expect(refused.disposition).toBe('review_incomplete');
+        expect(bodies.at(-1)?.event).toBe('COMMENT');
+        expect(bodies.at(-1)?.body).not.toContain('Reviewer diagnostic (sanitized):');
+      } finally {
+        await rm(root, { recursive: true, force: true });
       }
-      // Actual production proof-refusal branch must remain a COMMENT, with no forced section.
-      const incomplete = createRealSubmitDeps('thinman-overseer[bot]', {
-        octokit: stubOctokit(),
-        patOctokit: null,
-        evaluate: evaluator,
-        observeExecution: async () => undefined,
-      });
-      const refused = await runAndSubmitReview(work, {
-        ...isolated,
-        runReviewer: incomplete.runReviewer,
-      });
-      expect(refused.disposition).toBe('review_incomplete');
-      expect(bodies.at(-1)?.event).toBe('COMMENT');
-      expect(bodies.at(-1)?.body).not.toContain('Reviewer diagnostic (sanitized):');
-    } finally {
-      await rm(root, { recursive: true, force: true });
     }
-  });
+  );
 
   test('A9 renderer refuses caller/model metadata without invoking malicious getters', async () => {
     let reads = 0;
@@ -1864,4 +1881,328 @@ describe('Phase A production diagnostic return wiring', () => {
       'Reviewer diagnostic (sanitized):'
     );
   });
+});
+
+describe('Phase B factory snapshots and designated refusal', () => {
+  bunTest(
+    'F1/F6 factory reads once; designated missing context refuses without observer/model/fallback',
+    async () => {
+      const { FABLE_MODEL, FABLE_POLICY, parseFablePermits } = await import('../judge-transport');
+      let reads = 0;
+      let invocations = 0;
+      const permit = {
+        owner: 'o',
+        repo: 'r',
+        prNumber: 1,
+        headSha: 'a'.repeat(40),
+        requestId: 'request',
+        workerId: 'worker',
+        fencingToken: 1,
+        modelId: FABLE_MODEL,
+        policy: FABLE_POLICY,
+        accountBindingId: 'ultra',
+        permitId: 'permit',
+        expiresAt: new Date(Date.now() + 60000).toISOString(),
+      };
+      const snapshot = parseFablePermits(JSON.stringify({ version: 1, entries: [permit] }));
+      const overrides = {
+        octokit: {} as never,
+        patOctokit: null,
+        readFablePermits: () => {
+          reads++;
+          return snapshot;
+        },
+        observeExecution: async () => {
+          invocations++;
+          return undefined;
+        },
+        invokeModel: async () => {
+          invocations++;
+          throw new Error('MUST_NOT_RUN');
+        },
+      };
+      const deps = createRealSubmitDeps('bot', overrides);
+      expect(reads).toBe(1);
+      const work = {
+        owner: 'o',
+        repo: 'r',
+        prNumber: 1,
+        headSha: permit.headSha,
+        correlationId: 'synthetic',
+        messageId: 'request',
+      };
+      for (let i = 0; i < 2; i++) {
+        const result = await deps.runReviewer(work);
+        expect(result.approved).toBe(false);
+        expect(result.reasonCode).toBe('fable_permission_refused');
+      }
+      expect(reads).toBe(1);
+      expect(invocations).toBe(0);
+      createRealSubmitDeps('bot', overrides);
+      expect(reads).toBe(2);
+    }
+  );
+  bunTest('F1 invalid configured snapshot refuses every item before native execution', async () => {
+    const deps = createRealSubmitDeps('bot', {
+      octokit: {} as never,
+      patOctokit: null,
+      readFablePermits: () => {
+        throw new Error('PRIVATE_PATH_CANARY');
+      },
+    });
+    const result = await deps.runReviewer({
+      owner: 'o',
+      repo: 'r',
+      prNumber: 1,
+      headSha: 'a'.repeat(40),
+      correlationId: 'synthetic',
+      messageId: 'request',
+    });
+    expect(result.reasonCode).toBe('fable_configuration_invalid');
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_PATH_CANARY');
+  });
+});
+
+describe('Phase B existing submission boundary characterization', () => {
+  bunTest(
+    'F7 ambiguous lost response stays failure; existing adapter provides no replay dedupe',
+    async () => {
+      const { createRealSubmitPullRequestReview } = await import('../adapters/github-real-deps');
+      let calls = 0;
+      const submit = createRealSubmitPullRequestReview({
+        pulls: {
+          createReview: async () => {
+            calls++;
+            throw new Error('SYNTHETIC_POST_SUCCESS_LOST_RESPONSE');
+          },
+        },
+      } as never);
+      const input = {
+        owner: 'o',
+        repo: 'r',
+        number: 1,
+        event: 'APPROVE' as const,
+        commitId: 'a'.repeat(40),
+        body: 'synthetic',
+      };
+      expect(await submit(input)).toEqual({
+        submitted: false,
+        message: 'github_review_transport_ambiguous',
+      });
+      expect(calls).toBe(1);
+      expect(await submit(input)).toEqual({
+        submitted: false,
+        message: 'github_review_transport_ambiguous',
+      });
+      expect(calls).toBe(2); // Characterization, NOT F7 acceptance: no adapter dedupe/readback exists.
+    }
+  );
+});
+
+describe('Phase B exact native-client evaluator factory return', () => {
+  bunTest.skipIf(process.platform !== 'linux')(
+    'F4/F5/F6 actual post-invocation proof, exact attribution, lost custody and malformed output',
+    async () => {
+      const { FABLE_MODEL, FABLE_POLICY, parseFablePermits } = await import('../judge-transport');
+      const root = await mkdtemp(join(tmpdir(), 'fable-factory-return-'));
+      const checkout = join(root, 'checkout');
+      await mkdir(checkout);
+      await writeFile(join(checkout, 'fixture'), 'noncustomer synthetic');
+      const git = (args: string[]): string => {
+        const result = Bun.spawnSync(['git', '-C', checkout, ...args], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        expect(result.exitCode).toBe(0);
+        return result.stdout.toString().trim();
+      };
+      git(['init', '-q']);
+      git(['add', 'fixture']);
+      git([
+        '-c',
+        'user.name=Synthetic',
+        '-c',
+        'user.email=fixture@example.invalid',
+        'commit',
+        '-qm',
+        'fixture',
+      ]);
+      const head = git(['rev-parse', 'HEAD']);
+      const context = {
+        owner: 'o',
+        repo: 'r',
+        prNumber: 1,
+        headSha: head,
+        requestId: 'synthetic-request',
+        workerId: 'synthetic-worker',
+        fencingToken: 1,
+        checkoutPath: checkout,
+        reviewerIdentity: 'thinman-overseer[bot]',
+        rung: 'pr-review',
+        checkPlanStatus: 'absent' as const,
+        checkPlan: [],
+      };
+      const work: ReviewWorkItem = {
+        owner: 'o',
+        repo: 'r',
+        prNumber: 1,
+        headSha: head,
+        messageId: context.requestId,
+        correlationId: 'synthetic',
+        author: 'other',
+        executionContext: context,
+      };
+      const permit = {
+        owner: 'o',
+        repo: 'r',
+        prNumber: 1,
+        headSha: head,
+        requestId: context.requestId,
+        workerId: context.workerId,
+        fencingToken: 1,
+        modelId: FABLE_MODEL,
+        policy: FABLE_POLICY,
+        accountBindingId: 'ultra',
+        expiresAt: new Date(Date.now() + 60000).toISOString(),
+        permitId: 'one',
+      };
+      const snapshot = parseFablePermits(JSON.stringify({ version: 1, entries: [permit] }));
+      let custody = true;
+      let malformed = false;
+      let calls = 0;
+      let inspectionFinished = false;
+      const observed: ReviewExecutionProof = {
+        requestId: context.requestId,
+        headSha: head,
+        treeSha: git(['rev-parse', 'HEAD^{tree}']),
+        cwd: checkout,
+        nativePolicy: FABLE_POLICY,
+        nativeVersion: 'inspection',
+        runtimeUid: 1002,
+        inspectionObserved: true,
+        check_plan: 'absent',
+        checks: [],
+        startedAt: '2026-01-01T00:00:00Z',
+        endedAt: '2026-01-01T00:00:01Z',
+      };
+      try {
+        await writeFile(join(root, 'ready'), 'synthetic');
+        const production = createRealSubmitDeps('thinman-overseer[bot]', {
+          octokit: stubOctokit(),
+          patOctokit: null,
+          readFablePermits: () => snapshot,
+          hasCustody: async () => custody,
+          observeExecution: async (_context, selected) => {
+            expect(selected).toEqual(permit);
+            inspectionFinished = true;
+            return observed;
+          },
+          evaluate: (input, deps) =>
+            evaluatePullRequest(input, {
+              ...deps,
+              fetchEvidence: async () => ({
+                diff: '+synthetic',
+                checks: [{ name: 'ci', status: 'completed', conclusion: 'success' }],
+                requiredContexts: ['ci'],
+              }),
+            }),
+          invokeModel: async (binary, prompt, transportContext) => {
+            expect(inspectionFinished).toBe(true);
+            expect(binary).toBe(FABLE_MODEL);
+            calls++;
+            return invokeConfiguredReviewModel(
+              binary,
+              prompt,
+              transportContext,
+              1000,
+              async (job, options) => {
+                const id = options!.id!;
+                await writeFile(
+                  join(root, `${id}.result.json`),
+                  JSON.stringify({
+                    id,
+                    ok: true,
+                    uid: 1002,
+                    exitCode: 0,
+                    stdout: malformed
+                      ? 'malformed inert text'
+                      : JSON.stringify({
+                          verdict: 'APPROVE',
+                          findings: [],
+                          reviewed_head_sha: head,
+                        }),
+                    stderr: '',
+                    timedOut: false,
+                    outputTruncated: false,
+                    fableEvidence: {
+                      policy: FABLE_POLICY,
+                      provider: 'claude',
+                      model: FABLE_MODEL,
+                      executableSha256: 'a'.repeat(64),
+                      version: 'synthetic',
+                      accountBindingId: 'ultra',
+                      invocationId: id,
+                      requestId: context.requestId,
+                      workerId: context.workerId,
+                      fencingToken: 1,
+                      headSha: head,
+                      permitId: 'one',
+                      credentialEgressPassed: true,
+                    },
+                  })
+                );
+                return submitReviewerBrokerJob(job, {
+                  ...options,
+                  env: { OVERSEER_REVIEW_SPOOL: root },
+                });
+              }
+            );
+          },
+        });
+        const bodies: { body: string; commitId?: string; event: string }[] = [];
+        const isolated = {
+          ...production,
+          lookupPublication: undefined,
+          admitPublication: undefined,
+          observePublication: undefined,
+          currentHeadSha: async () => head,
+          isDraft: async () => false,
+          recordExecutionProof: async () => undefined,
+          recordReceipt: async () => undefined,
+          recordApprovalVerdict: async () => undefined,
+          submitReview: async (request: Parameters<typeof production.submitReview>[0]) => {
+            bodies.push(request);
+            return {
+              submitted: true,
+              review: {
+                id: 1,
+                url: 'https://example.invalid/1',
+                commitSha: head,
+                state: request.event === 'APPROVE' ? 'APPROVED' : 'CHANGES_REQUESTED',
+              },
+            };
+          },
+        };
+        const result = await runAndSubmitReview(work, isolated);
+        expect(result.disposition).toBe('approved');
+        expect(calls).toBe(1);
+        expect(bodies[0].commitId).toBe(head);
+        expect(bodies[0].event).toBe('APPROVE');
+        expect(bodies[0].body).toContain(
+          'Observed reviewer: claude/claude-fable-5-2 (claude_model_only_broker_v1).'
+        );
+        malformed = true;
+        const invalid = await runAndSubmitReview(work, isolated);
+        expect(invalid.disposition).toBe('changes_requested');
+        expect(calls).toBe(2);
+        expect(bodies[1].body).toContain('Reviewer diagnostic (sanitized):');
+        expect(bodies[1].body).not.toContain('malformed inert text');
+        custody = false;
+        expect((await runAndSubmitReview(work, isolated)).disposition).toBe('review_incomplete');
+        expect(calls).toBe(2);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  );
 });

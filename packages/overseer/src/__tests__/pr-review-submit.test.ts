@@ -533,3 +533,241 @@ describe('buildReviewBody', () => {
     expect(body.length).toBeLessThanOrEqual(60_000);
   });
 });
+
+describe('F7 original publication recovery', () => {
+  test('existing intent skips model and POST; current head and custody still gate original receipt', async () => {
+    const { randomUUID } = await import('node:crypto');
+    const originId = randomUUID();
+    const work = {
+      ...WORK,
+      messageId: originId,
+      executionContext: {
+        requestId: originId,
+        workerId: 'new-worker',
+        fencingToken: 9,
+        owner: WORK.owner,
+        repo: WORK.repo,
+        prNumber: WORK.prNumber,
+        headSha: HEAD,
+        checkoutPath: '/not-used',
+        reviewerIdentity: REVIEWER,
+        rung: 'pr-review',
+        checkPlanStatus: 'absent' as const,
+        checkPlan: [],
+      },
+    };
+    const intent = {
+      version: 1 as const,
+      publicationId: randomUUID(),
+      originId,
+      owner: WORK.owner,
+      repo: WORK.repo,
+      prNumber: WORK.prNumber,
+      headSha: HEAD,
+      event: 'APPROVE' as const,
+      actorLogin: REVIEWER,
+      actorType: 'Bot' as const,
+      workerId: 'old-worker',
+      fencingToken: 1,
+      bodySha256: 'b'.repeat(64),
+      attestation: {
+        version: 1 as const,
+        requestId: originId,
+        headSha: HEAD,
+        treeSha: 'c'.repeat(40),
+        policy: 'claude_model_only_broker_v1' as const,
+        nativeVersion: 'synthetic',
+        runtimeUid: 1002,
+        provider: 'claude',
+        model: 'claude-fable-5-2',
+        invocationId: randomUUID(),
+        checkPlan: 'absent' as const,
+        checkDigests: [],
+        startedAt: '2026-01-01T00:00:00Z',
+        endedAt: '2026-01-01T00:00:01Z',
+      },
+    };
+    let model = 0;
+    let posts = 0;
+    let current = HEAD;
+    let custody = true;
+    let visible = true;
+    const receipt = { id: 7, url: 'https://example.invalid/7', commitSha: HEAD, state: 'APPROVED' };
+    const deps: SubmitDeps = {
+      reviewerIdentity: REVIEWER,
+      lookupPublication: async () => intent,
+      observePublication: async () => (visible ? receipt : null),
+      runReviewer: async () => {
+        model++;
+        throw new Error('MUST_NOT_RUN');
+      },
+      submitReview: async () => {
+        posts++;
+        return { submitted: true };
+      },
+      currentHeadSha: async () => current,
+      isDraft: async () => false,
+      hasCustody: async () => custody,
+      recordReceipt: async () => undefined,
+    };
+    const recovered = await runAndSubmitReview(work, deps);
+    expect(recovered.disposition).toBe('approved');
+    expect(recovered.originalPublication?.fencingToken).toBe(1);
+    expect(recovered.executionProof).toBeUndefined();
+    expect(model).toBe(0);
+    expect(posts).toBe(0);
+    visible = false;
+    expect((await runAndSubmitReview(work, deps)).disposition).toBe('review_incomplete');
+    visible = true;
+    current = NEW_HEAD;
+    expect((await runAndSubmitReview(work, deps)).disposition).toBe('review_incomplete');
+    current = HEAD;
+    custody = false;
+    expect((await runAndSubmitReview(work, deps)).disposition).toBe('review_incomplete');
+    expect(model).toBe(0); // Only incomplete COMMENTs, never a second formal POST.
+  });
+});
+
+describe('F7 single-use publication after lost response', () => {
+  test.skipIf(process.platform !== 'linux')(
+    'actual native client proof reaches one POST; reclaim observes original without model replay',
+    async () => {
+      const { randomUUID } = await import('node:crypto');
+      const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { invokeConfiguredReviewModel } = await import('../pr-review-evaluator');
+      const { submitReviewerBrokerJob } = await import('../reviewer-broker-client');
+      const root = await mkdtemp(join(tmpdir(), 'publication-client-'));
+      const originId = randomUUID();
+      const work = {
+        ...WORK,
+        messageId: originId,
+        executionContext: {
+          requestId: originId,
+          workerId: 'worker',
+          fencingToken: 1,
+          owner: WORK.owner,
+          repo: WORK.repo,
+          prNumber: WORK.prNumber,
+          headSha: HEAD,
+          checkoutPath: '/private/fake',
+          reviewerIdentity: REVIEWER,
+          rung: 'pr-review',
+          checkPlanStatus: 'absent' as const,
+          checkPlan: [],
+        },
+      };
+      let intent: import('@archon/core/db/dispatch').ReviewPublicationIntent | null = null;
+      let posts = 0;
+      let models = 0;
+      let visible = false;
+      try {
+        await writeFile(join(root, 'ready'), 'synthetic');
+        const deps: SubmitDeps = {
+          reviewerIdentity: REVIEWER,
+          lookupPublication: async () => intent,
+          admitPublication: async value => {
+            if (intent) return { intent, inserted: false };
+            intent = value;
+            return { intent, inserted: true };
+          },
+          observePublication: async value =>
+            visible
+              ? {
+                  id: 8,
+                  url: 'https://example.invalid/8',
+                  commitSha: value.headSha,
+                  state: 'APPROVED',
+                }
+              : null,
+          runReviewer: async () => {
+            models++;
+            const actual = await invokeConfiguredReviewModel(
+              'codex',
+              'synthetic',
+              {
+                kind: 'pr-review',
+                cwd: '/private/fake',
+                expectedHeadSha: HEAD,
+                nativePolicy: 'codex_bubblewrap',
+              },
+              1000,
+              async (job, options) => {
+                await writeFile(
+                  join(root, `${options!.id}.result.json`),
+                  JSON.stringify({
+                    id: options!.id,
+                    uid: 1002,
+                    ok: true,
+                    exitCode: 0,
+                    stdout: 'synthetic',
+                    stderr: '',
+                    timedOut: false,
+                    outputTruncated: false,
+                  })
+                );
+                return submitReviewerBrokerJob(job, {
+                  ...options,
+                  env: { OVERSEER_REVIEW_SPOOL: root },
+                });
+              }
+            );
+            return {
+              approved: true,
+              summary: 'synthetic safe review',
+              reviewedHeadSha: HEAD,
+              executionProof: {
+                requestId: originId,
+                headSha: HEAD,
+                treeSha: 'c'.repeat(40),
+                cwd: '/private/fake',
+                nativePolicy: 'codex_bubblewrap',
+                nativeVersion: 'synthetic',
+                runtimeUid: 1002,
+                inspectionObserved: true,
+                check_plan: 'absent',
+                checks: [],
+                startedAt: '2026-01-01T00:00:00Z',
+                endedAt: '2026-01-01T00:00:01Z',
+                nativeInvocation: actual.nativeInvocation,
+              },
+            };
+          },
+          submitReview: async input => {
+            if (input.event === 'APPROVE') {
+              posts++;
+              visible = true;
+              throw new Error('SYNTHETIC_POST_SUCCESS_LOST_RESPONSE');
+            }
+            return { submitted: true };
+          },
+          currentHeadSha: async () => HEAD,
+          isDraft: async () => false,
+          hasCustody: async () => true,
+          recordExecutionProof: async () => undefined,
+          recordReceipt: async () => undefined,
+        };
+        expect((await runAndSubmitReview(work, deps)).disposition).toBe('approved');
+        expect(posts).toBe(1);
+        expect(models).toBe(1);
+        expect(
+          (
+            await runAndSubmitReview(
+              { ...work, executionContext: { ...work.executionContext, fencingToken: 2 } },
+              deps
+            )
+          ).originalPublication?.fencingToken
+        ).toBe(1);
+        expect(posts).toBe(1);
+        expect(models).toBe(1);
+        visible = false;
+        expect((await runAndSubmitReview(work, deps)).disposition).toBe('review_incomplete');
+        expect(posts).toBe(1);
+        expect(models).toBe(1);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  );
+});

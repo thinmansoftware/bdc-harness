@@ -144,6 +144,8 @@ export interface PrReviewResult {
 }
 
 export interface PrReviewModelResult {
+  nativeInvocation?: import('./reviewer-broker-client').NativeInvocation;
+  fableEvidence?: import('./reviewer-broker-client').FableExecutionEvidence;
   diagnostic?: SanitizedTermination;
   exitCode: number;
   stdout: string;
@@ -917,7 +919,14 @@ export async function invokeConfiguredReviewModel(
       const payload = result.stdout.trim().length > 0 ? result.stdout : result.stderr;
       return {
         exitCode: result.exitCode,
-        stdout: codexExecJsonlVerdictText(payload),
+        nativeInvocation: result.nativeInvocation,
+        stdout:
+          context.nativePolicy === 'claude_model_only_broker_v1'
+            ? result.ok
+              ? result.stdout
+              : ''
+            : codexExecJsonlVerdictText(payload),
+        ...(result.fableEvidence ? { fableEvidence: result.fableEvidence } : {}),
         timedOut: result.timedOut === true,
         diagnostic: result.diagnostic,
       };

@@ -45,6 +45,7 @@
  * ordering: a child that never reads stdin back-pressures the write past the
  * ~64 KB pipe buffer and parks it forever.
  */
+import { constants, closeSync, fstatSync, openSync, readFileSync } from 'node:fs';
 import { chmod, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -58,14 +59,21 @@ export interface JudgeTransport {
   /** Private 0700 directory containing `promptFile`; removed with it. */
   promptDir?: string;
   /** PR review jobs are submitted to the UID-1002 broker, never spawned here. */
-  brokerJob?: { checkout: string; expectedHead: string; argv: string[]; prompt: string };
+  brokerJob?: {
+    checkout: string;
+    expectedHead: string;
+    argv: string[];
+    prompt: string;
+    fablePermit?: FablePermit;
+  };
 }
 
 export interface PrReviewTransportContext {
   readonly kind: 'pr-review';
   readonly cwd: string;
   readonly expectedHeadSha: string;
-  readonly nativePolicy: 'codex_bubblewrap';
+  readonly nativePolicy: 'codex_bubblewrap' | typeof FABLE_POLICY;
+  readonly fablePermit?: FablePermit;
 }
 
 /** PR-only transport. Shared judge callers continue to use buildJudgeTransport unchanged. */
@@ -74,6 +82,25 @@ export async function buildPrReviewTransport(
   prompt: string,
   context: PrReviewTransportContext
 ): Promise<JudgeTransport> {
+  if (context.nativePolicy === FABLE_POLICY) {
+    const permit = context.fablePermit;
+    if (
+      binary !== FABLE_MODEL ||
+      permit?.headSha !== context.expectedHeadSha ||
+      permit.expiresAt <= new Date().toISOString()
+    )
+      throw new Error('fable_permission_refused');
+    return {
+      argv: ['fable-model-only'],
+      brokerJob: {
+        checkout: context.cwd,
+        expectedHead: context.expectedHeadSha,
+        argv: ['fable-model-only'],
+        prompt,
+        fablePermit: permit,
+      },
+    };
+  }
   if (binary !== 'codex') {
     throw new Error('pr_review_native_sandbox_unsupported_binary');
   }
@@ -325,4 +352,143 @@ export function destroyStdin(stdin: unknown): void {
       // Best effort: teardown never changes the judgment's outcome.
     }
   }
+}
+
+/** Closed per-work authority; these values contain no credential or profile path. */
+export const FABLE_POLICY = 'claude_model_only_broker_v1' as const;
+export const FABLE_MODEL = 'claude-fable-5-2' as const;
+export interface FablePermit {
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly headSha: string;
+  readonly requestId: string;
+  readonly workerId: string;
+  readonly fencingToken: number;
+  readonly modelId: typeof FABLE_MODEL;
+  readonly policy: typeof FABLE_POLICY;
+  readonly accountBindingId: string;
+  readonly expiresAt: string;
+  readonly permitId: string;
+}
+export type FablePermitContext = Pick<
+  FablePermit,
+  'owner' | 'repo' | 'prNumber' | 'headSha' | 'requestId' | 'workerId' | 'fencingToken'
+>;
+export const FABLE_CONFIG_ERROR = 'fable_configuration_invalid';
+export function closedData(
+  value: unknown,
+  keys: readonly string[]
+): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const fields = Object.getOwnPropertyDescriptors(value);
+  return (
+    Object.keys(fields).sort().join(',') === [...keys].sort().join(',') &&
+    Object.values(fields).every(field => 'value' in field)
+  );
+}
+export function fableToken(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value);
+}
+export function parseFablePermits(text: string, now = Date.now()): readonly FablePermit[] {
+  try {
+    if (Buffer.byteLength(text) > 65536) throw new Error();
+    const root: unknown = JSON.parse(text);
+    if (
+      !closedData(root, ['version', 'entries']) ||
+      root.version !== 1 ||
+      !Array.isArray(root.entries) ||
+      root.entries.length > 100
+    )
+      throw new Error();
+    const seen = new Set<string>();
+    const entries = root.entries.map((entry: unknown) => {
+      if (
+        !closedData(entry, [
+          'owner',
+          'repo',
+          'prNumber',
+          'headSha',
+          'requestId',
+          'workerId',
+          'fencingToken',
+          'modelId',
+          'policy',
+          'accountBindingId',
+          'expiresAt',
+          'permitId',
+        ])
+      )
+        throw new Error();
+      for (const key of ['owner', 'repo', 'requestId', 'workerId', 'accountBindingId', 'permitId'])
+        if (!fableToken(entry[key])) throw new Error();
+      if (
+        typeof entry.headSha !== 'string' ||
+        !/^[0-9a-f]{40}$/.test(entry.headSha) ||
+        !Number.isSafeInteger(entry.prNumber) ||
+        Number(entry.prNumber) < 1 ||
+        !Number.isSafeInteger(entry.fencingToken) ||
+        Number(entry.fencingToken) < 1 ||
+        entry.modelId !== FABLE_MODEL ||
+        entry.policy !== FABLE_POLICY ||
+        typeof entry.expiresAt !== 'string' ||
+        !Number.isFinite(Date.parse(entry.expiresAt)) ||
+        new Date(entry.expiresAt).toISOString() !== entry.expiresAt ||
+        Date.parse(entry.expiresAt) > now + 4 * 60 * 60 * 1000
+      )
+        throw new Error();
+      const tuple = JSON.stringify([entry.owner, entry.repo, entry.prNumber]);
+      if (seen.has(tuple)) throw new Error();
+      seen.add(tuple);
+      return Object.freeze({ ...entry }) as unknown as FablePermit;
+    });
+    return Object.freeze(entries);
+  } catch {
+    throw new Error(FABLE_CONFIG_ERROR);
+  }
+}
+/** Config metadata is checked before bounded reading; no default path or watch. */
+export function readFableOperatorFile(path: string): string {
+  try {
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const meta = fstatSync(fd);
+      if (!meta.isFile() || meta.uid !== 0 || (meta.mode & 0o022) !== 0 || meta.size > 65536)
+        throw new Error();
+      const text = readFileSync(fd, 'utf8');
+      if (Buffer.byteLength(text) > 65536) throw new Error();
+      return text;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    throw new Error(FABLE_CONFIG_ERROR);
+  }
+}
+export function readFablePermitSnapshot(
+  env: Record<string, string | undefined> = process.env
+): readonly FablePermit[] {
+  const path = env.OVERSEER_FABLE_REVIEW_PERMITS_PATH;
+  return path === undefined ? Object.freeze([]) : parseFablePermits(readFableOperatorFile(path));
+}
+export function selectFablePermit(
+  snapshot: readonly FablePermit[],
+  context: FablePermitContext,
+  now = Date.now()
+): FablePermit | undefined {
+  const entry = snapshot.find(
+    value =>
+      value.owner === context.owner &&
+      value.repo === context.repo &&
+      value.prNumber === context.prNumber
+  );
+  if (!entry) return undefined;
+  if (
+    Date.parse(entry.expiresAt) <= now ||
+    ['headSha', 'requestId', 'workerId', 'fencingToken'].some(
+      key => entry[key as keyof FablePermit] !== context[key as keyof FablePermitContext]
+    )
+  )
+    throw new Error('fable_permission_refused');
+  return entry;
 }

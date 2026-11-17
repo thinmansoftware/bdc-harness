@@ -33,6 +33,12 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify exact seccomp namespace policy
+        run: node scripts/verify-seccomp-userns.mjs
+
+      - name: Seccomp namespace policy regressions
+        run: node --test scripts/verify-seccomp-userns.test.mjs
+
       - name: Check bundled defaults
         run: bun run check:bundled
 

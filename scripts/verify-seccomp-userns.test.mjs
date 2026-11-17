@@ -72,13 +72,13 @@ function cloneScenario(arch, flags, other = 0) {
   return { syscall: 'clone', arch, caps: [], args };
 }
 
-test('pinned baseline keeps the upstream prefix, six-rule suffix, and clone3 errno 38', () => {
+test('pinned baseline keeps the upstream prefix, eight-rule suffix, and clone3 errno 38', () => {
   const upstreamBytes = repoBytes('docker/seccomp-upstream-29.3.0.json');
   assert.equal(createHash('sha256').update(upstreamBytes).digest('hex'), UPSTREAM_SHA256);
   const { upstream, archon } = loadProfiles();
   verifyDelta(upstream, archon);
   assert.deepEqual(archon.syscalls.slice(0, upstream.syscalls.length), upstream.syscalls);
-  assert.equal(archon.syscalls.length, upstream.syscalls.length + 6);
+  assert.equal(archon.syscalls.length, upstream.syscalls.length + 8);
   const clone3 = upstream.syscalls.find(
     rule => rule.names?.includes('clone3') && rule.action === 'SCMP_ACT_ERRNO'
   );
@@ -89,7 +89,7 @@ test('pinned baseline keeps the upstream prefix, six-rule suffix, and clone3 err
     .flatMap(rule => (rule.args ?? []).map(arg => arg.valueTwo))
     .filter(value => value !== undefined)
     .sort((left, right) => left - right);
-  assert.deepEqual(valueTwos, [268435456, 268435456, 2013396992, 2013396992]);
+  assert.deepEqual(valueTwos, [268435456, 268435456, 939655168, 939655168, 2013396992, 2013396992]);
 });
 
 test('compose wires the profile only on the app service', () => {
@@ -120,7 +120,7 @@ test('explicit false privileged and empty cap_add stay allowed', () => {
 test('effective amd64 and s390x clone decisions', () => {
   assert.equal(COMBINED, CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET);
   const { archon } = loadProfiles();
-  const allowed = [SIGCHLD, CLONE_NEWUSER | SIGCHLD, COMBINED | SIGCHLD];
+  const allowed = [SIGCHLD, CLONE_NEWUSER | SIGCHLD, COMBINED | SIGCHLD, 0x38020000 | SIGCHLD];
   const denied = [
     CLONE_NEWNS,
     CLONE_NEWNET,
@@ -424,4 +424,35 @@ test('documentation rejects closing parent issues or a production PASS claim', (
   assert.throws(() => verifyDoc(`${original}\ncloses #3258\n`));
   assert.throws(() => verifyDoc(`${original}\nproduction activation is PASS\n`));
   assert.throws(() => verifyDoc(`${original}\nfull sandbox acceptance is PASS\n`));
+});
+
+test('model pair keeps exact mask, architecture and capability conditions', () => {
+  const { archon } = loadProfiles();
+  const rules = archon.syscalls.filter(rule => rule.args?.[0]?.valueTwo === 939655168);
+  assert.equal(rules.length, 2);
+  for (const rule of rules) {
+    assert.equal(rule.args[0].value, 0x7e020000);
+    assert.equal(rule.args[0].op, 'SCMP_CMP_MASKED_EQ');
+    assert.deepEqual(rule.excludes.caps, ['CAP_SYS_ADMIN']);
+  }
+  for (const mutate of [
+    r => (r.args[0].value = 0),
+    r => (r.args[0].index = 2),
+    r => (r.args[0].valueTwo |= CLONE_NEWUTS),
+    r => (r.excludes.caps = []),
+  ]) {
+    assertRejected(pair =>
+      mutate(pair.archon.syscalls.find(r => r.args?.[0]?.valueTwo === 939655168))
+    );
+  }
+});
+
+test('the original six-rule suffix stays ordered before the two model additions', () => {
+  assertRejected(pair => {
+    const start = pair.upstream.syscalls.length;
+    [pair.archon.syscalls[start], pair.archon.syscalls[start + 1]] = [
+      pair.archon.syscalls[start + 1],
+      pair.archon.syscalls[start],
+    ];
+  });
 });

@@ -1,8 +1,14 @@
+import { runInNewContext } from 'node:vm';
+import { createRequire } from 'node:module';
+import { dirname } from 'node:path';
+import { spawn as spawnObserved } from 'node:child_process';
+import { openSync, closeSync, fstatSync, lstatSync, readSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { CODEX_JUDGE_CLI_VERSION } from '../packages/overseer/src/judge-transport';
-import { prepareModelWorkingCopy } from './overseer-reviewer-broker';
+import { fableNamespaceArgv, prepareModelWorkingCopy } from './overseer-reviewer-broker';
 
 const SPOOL = '/var/lib/overseer-review';
 /**
@@ -312,5 +318,607 @@ async function brokerSmoke(): Promise<void> {
   }
 }
 
-if (process.argv.includes('--reviewer-bwrap')) await reviewerBwrapSmoke();
-else await brokerSmoke();
+/** Synthetic-only classification: never print captured child output, paths or account canaries. */
+export function fableFixtureFailure(result: unknown): string {
+  if (!result || typeof result !== 'object') return 'unclassified';
+  const fields = Object.getOwnPropertyDescriptors(result);
+  if (
+    Object.keys(fields).sort().join(',') !== 'code,stderr,stdout' ||
+    Object.values(fields).some(field => !('value' in field)) ||
+    !Number.isSafeInteger(fields.code.value) ||
+    typeof fields.stdout.value !== 'string' ||
+    typeof fields.stderr.value !== 'string' ||
+    fields.stderr.value.length > 65536 ||
+    fields.stderr.value.includes('\0')
+  )
+    return 'unclassified';
+  // Only the private launcher's stderr is evidence. Model/stdout text cannot name a phase.
+  const lines = fields.stderr.value.split(/\r?\n/);
+  const phases = new Set<string>();
+  const patterns: readonly [RegExp, string][] = [
+    [/^bwrap: (?:Can't|Failed to) mount proc(?: on .+)?: .+$/i, 'proc_mount_refused'],
+    [/^bwrap: (?:Can't|Failed to) bind mount .+: .+$/i, 'bind_mount_refused'],
+    [/^bwrap: Failed to make \/ (?:slave|private): .+$/i, 'root_mount_refused'],
+    [/^bwrap: (?:clone(?:\(\))? failed|Failed to clone(?: new namespace)?): .+$/i, 'clone_refused'],
+    [
+      /^bwrap: (?:Creating new user namespace failed|Failed to (?:create|unshare) user namespace): .+$/i,
+      'user_namespace_refused',
+    ],
+    [/^bwrap: execvp .+: .+$/i, 'exec_refused'],
+  ];
+  const fixture =
+    /^(?:error: )?(fable_fixture_(?:read_allowed|parent_environment|account_binding|auth_writable|repository_binding|network_allowed|denial_unknown|model_network|network_denial_unknown|socket_allowed|socket_denial_unknown|observer_unknown))$/;
+  for (const line of lines) {
+    const assertion = fixture.exec(line)?.[1];
+    if (assertion) phases.add(assertion);
+    for (const [pattern, phase] of patterns) if (pattern.test(line)) phases.add(phase);
+  }
+  return phases.size === 1 ? [...phases][0] : 'unclassified';
+}
+
+export interface FableObserverBinding {
+  launchId: string;
+  expectedLaunchId: string;
+  fileIdentity: string;
+  expectedFileIdentity: string;
+  outsidePidNamespace: number;
+  code: number;
+  stdout: string;
+  marker: string;
+}
+/** Pure validator. Its caller supplies only its fresh descriptor record, never child output JSON. */
+export function validateFableObserver(metadata: string, binding: FableObserverBinding): boolean {
+  try {
+    if (
+      typeof binding.launchId !== 'string' ||
+      !binding.launchId ||
+      typeof binding.fileIdentity !== 'string' ||
+      !binding.fileIdentity ||
+      binding.launchId !== binding.expectedLaunchId ||
+      binding.fileIdentity !== binding.expectedFileIdentity ||
+      !Number.isSafeInteger(binding.outsidePidNamespace) ||
+      binding.outsidePidNamespace <= 0 ||
+      binding.code !== 0 ||
+      !binding.marker ||
+      binding.stdout.split(/\r?\n/).filter(line => line === binding.marker).length !== 1 ||
+      typeof metadata !== 'string' ||
+      Buffer.byteLength(metadata) > 8192
+    )
+      return false;
+    const record = JSON.parse(metadata) as Record<string, unknown>;
+    if (
+      !record ||
+      typeof record !== 'object' ||
+      Array.isArray(record) ||
+      Object.keys(record).length !==
+        (metadata.match(/"(?:child-pid|[a-z]+-namespace)"\s*:/g) ?? []).length ||
+      Object.keys(record).some(
+        key =>
+          key !== 'child-pid' &&
+          ![
+            'user-namespace',
+            'mnt-namespace',
+            'ipc-namespace',
+            'pid-namespace',
+            'net-namespace',
+            'uts-namespace',
+            'cgroup-namespace',
+          ].includes(key)
+      ) ||
+      Object.values(record).some(value => !Number.isSafeInteger(value) || Number(value) <= 0) ||
+      !Number.isSafeInteger(record['child-pid']) ||
+      !Number.isSafeInteger(record['pid-namespace'])
+    )
+      return false;
+    if (record['pid-namespace'] === binding.outsidePidNamespace) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+export interface FableObservedResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  observerQualified?: boolean;
+}
+
+/** CI-only FD3 capture for the same bwrap argv, no new operational launch API. */
+async function observedFableRun(
+  argv: string[],
+  options: { cwd: string; env: Record<string, string>; marker: string }
+): Promise<FableObservedResult> {
+  const observerRoot = await mkdtemp('/tmp/fable-private-observer-');
+  const observerPath = join(observerRoot, 'metadata');
+  const launchId = randomUUID();
+  let fd: number | undefined;
+  const execute = async (): Promise<FableObservedResult> => {
+    try {
+      fd = openSync(observerPath, 'wx+', 0o600);
+      const initial = fstatSync(fd);
+      const identity = `${initial.dev}:${initial.ino}`;
+      const outsidePidNamespace = statSync('/proc/self/ns/pid').ino;
+      if (
+        argv[0] !== 'bwrap' ||
+        argv.includes('--proc') ||
+        argv.includes('/proc') ||
+        argv.includes('--info-fd')
+      )
+        throw new Error();
+      const child = spawnObserved(argv[0], ['--info-fd', '3', ...argv.slice(1)], {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: ['ignore', 'pipe', 'pipe', fd],
+      });
+      const chunks: { stdout: Buffer[]; stderr: Buffer[] } = { stdout: [], stderr: [] };
+      let bytes = 0;
+      let overflow = false;
+      for (const key of ['stdout', 'stderr'] as const)
+        child[key]?.on('data', (chunk: Buffer) => {
+          bytes += chunk.length;
+          if (bytes > 128 * 1024) {
+            overflow = true;
+            child.kill('SIGKILL');
+            return;
+          }
+          chunks[key].push(Buffer.from(chunk));
+        });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
+      const code = await new Promise<number>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', value => {
+          resolve(value ?? 125);
+        });
+      }).finally(() => {
+        clearTimeout(timer);
+      });
+      const result = {
+        code,
+        stdout: Buffer.concat(chunks.stdout).toString('utf8'),
+        stderr: Buffer.concat(chunks.stderr).toString('utf8'),
+      };
+      if (code !== 0) return result; // Fixed phase classifier owns the private child text.
+      const final = fstatSync(fd);
+      const pathInfo = lstatSync(observerPath);
+      if (
+        overflow ||
+        final.size <= 0 ||
+        final.size > 8192 ||
+        pathInfo.isSymbolicLink() ||
+        `${pathInfo.dev}:${pathInfo.ino}` !== identity
+      )
+        throw new Error();
+      const bytesRead = Buffer.alloc(final.size);
+      readSync(fd, bytesRead, 0, bytesRead.length, 0);
+      const metadata = bytesRead.toString('utf8');
+      const binding = {
+        launchId,
+        expectedLaunchId: launchId,
+        fileIdentity: `${final.dev}:${final.ino}`,
+        expectedFileIdentity: identity,
+        outsidePidNamespace,
+        code,
+        stdout: result.stdout,
+        marker: options.marker,
+      };
+      if (!validateFableObserver(metadata, binding)) throw new Error();
+      // Actual outside-namespace substitution, not a weakened launcher or guessed missing path.
+      const outsideRecord = { ...JSON.parse(metadata), 'pid-namespace': outsidePidNamespace };
+      const negative = JSON.stringify(outsideRecord);
+      if (validateFableObserver(negative, binding)) throw new Error();
+      const source = validateFableObserver.toString();
+      const mutated = source.replace(
+        /record\[(?:'|")pid-namespace(?:'|")\]\s*===\s*binding.outsidePidNamespace/,
+        'false'
+      );
+      if (mutated === source) throw new Error();
+      const unsafe = runInNewContext(
+        `(${mutated})`,
+        { Buffer },
+        { timeout: 1000 }
+      ) as typeof validateFableObserver;
+      if (!unsafe(negative, binding)) throw new Error();
+      return { ...result, observerQualified: true };
+    } catch {
+      return { code: 125, stdout: '', stderr: 'error: fable_fixture_observer_unknown' };
+    }
+  };
+  let result = await execute();
+  try {
+    if (fd !== undefined) closeSync(fd);
+  } catch {
+    result = { code: 125, stdout: '', stderr: 'error: fable_fixture_observer_unknown' };
+  }
+  try {
+    await rm(observerRoot, { recursive: true, force: true });
+  } catch {
+    result = { code: 125, stdout: '', stderr: 'error: fable_fixture_observer_unknown' };
+  }
+  return result;
+}
+
+const FABLE_STARTUP_BUN_VERSION = '1.3.11';
+/** Same MODEL construction, measured once before the script; no alternate flags/runtime. */
+export async function runFableBunStartup(
+  input: { scratch: string; executable: string; account: string; env: Record<string, string> },
+  observe: (
+    argv: string[],
+    options: { cwd: string; env: Record<string, string>; marker: string }
+  ) => Promise<FableObservedResult> = observedFableRun
+): Promise<{ ok: boolean; exit: number | null; failureClass: string }> {
+  try {
+    const argv = fableNamespaceArgv({
+      scratch: input.scratch,
+      executable: input.executable,
+      account: input.account,
+      argv: ['/model/cli', '--version'],
+    });
+    const result = await observe(argv, {
+      cwd: input.scratch,
+      env: input.env,
+      marker: FABLE_STARTUP_BUN_VERSION,
+    });
+    const exit = Number.isSafeInteger(result.code) ? result.code : null;
+    if (exit !== 0)
+      return {
+        ok: false,
+        exit,
+        failureClass: fableFixtureFailure({
+          code: result.code,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        }),
+      };
+    if (result.observerQualified !== true || result.stdout.trim() !== FABLE_STARTUP_BUN_VERSION)
+      return { ok: false, exit, failureClass: 'bun_startup_unqualified' };
+    return { ok: true, exit: 0, failureClass: 'none' };
+  } catch {
+    return { ok: false, exit: null, failureClass: 'bun_startup_unknown' };
+  }
+}
+
+/** One marker-only JS measurement using the unchanged MODEL construction and observer. */
+export async function runFableInlineJs(
+  input: { scratch: string; executable: string; account: string; env: Record<string, string> },
+  observe: (
+    argv: string[],
+    options: { cwd: string; env: Record<string, string>; marker: string }
+  ) => Promise<FableObservedResult> = observedFableRun
+): Promise<{ ok: boolean; exit: number | null; failureClass: string }> {
+  try {
+    const marker = `FABLE_INLINE_JS_OK:${randomUUID()}`;
+    const result = await observe(
+      fableNamespaceArgv({
+        ...input,
+        argv: ['/model/cli', '--eval', `console.log(${JSON.stringify(marker)})`],
+      }),
+      { cwd: input.scratch, env: input.env, marker }
+    );
+    const exit = Number.isSafeInteger(result.code) ? result.code : null;
+    if (exit !== 0) return { ok: false, exit, failureClass: fableFixtureFailure(result) };
+    if (result.observerQualified !== true || result.stdout.trim() !== marker)
+      return { ok: false, exit, failureClass: 'inline_js_unqualified' };
+    return { ok: true, exit: 0, failureClass: 'none' };
+  } catch {
+    return { ok: false, exit: null, failureClass: 'inline_js_unknown' };
+  }
+}
+
+/** Fixed startup comparison, never fallback: first failure terminates before Bun JS. */
+export async function runFableRuntimeControls(
+  input: {
+    scratch: string;
+    account: string;
+    env: Record<string, string>;
+    claudeExecutable: string;
+    claudeVersion: string;
+  },
+  observe: (
+    argv: string[],
+    options: { cwd: string; env: Record<string, string>; marker: string }
+  ) => Promise<FableObservedResult> = observedFableRun
+): Promise<{ ok: boolean; stage: string; exit: number | null; failureClass: string }> {
+  for (const runtime of [
+    { stage: 'node26_version', executable: '/opt/node26/bin/node', marker: 'v26.13.0' },
+    {
+      stage: 'packaged_claude_version',
+      executable: input.claudeExecutable,
+      marker: input.claudeVersion,
+    },
+  ]) {
+    try {
+      const argv = fableNamespaceArgv({
+        scratch: input.scratch,
+        executable: runtime.executable,
+        account: input.account,
+        argv: ['/model/cli', '--version'],
+      });
+      argv.splice(1, 0, '--unshare-net');
+      const version = await observe(argv, {
+        cwd: input.scratch,
+        env: input.env,
+        marker: runtime.marker,
+      });
+      const exit = Number.isSafeInteger(version.code) ? version.code : null;
+      if (exit !== 0)
+        return {
+          ok: false,
+          stage: runtime.stage,
+          exit,
+          failureClass: fableFixtureFailure(version),
+        };
+      if (version.observerQualified !== true || version.stdout.trim() !== runtime.marker)
+        return {
+          ok: false,
+          stage: runtime.stage,
+          exit,
+          failureClass: 'runtime_control_unqualified',
+        };
+    } catch {
+      return {
+        ok: false,
+        stage: runtime.stage,
+        exit: null,
+        failureClass: 'runtime_control_unknown',
+      };
+    }
+  }
+  const inline = await runFableInlineJs(
+    {
+      scratch: input.scratch,
+      executable: '/opt/node26/bin/node',
+      account: input.account,
+      env: input.env,
+    },
+    observe
+  );
+  return { ...inline, stage: 'node26_inline_js' };
+}
+
+export function fableProbeStages(mode: 'model' | 'check'): string[] {
+  return [
+    'probe_entry_begin',
+    'probe_entry_done',
+    'fs_begin',
+    'fs_done',
+    'net_import_begin',
+    'net_import_done',
+    'socket_begin',
+    'socket_done',
+    'scratch_begin',
+    'scratch_done',
+    ...(mode === 'model'
+      ? [
+          'model_branch_begin',
+          'model_repo_begin',
+          'model_repo_done',
+          'model_nonce_begin',
+          'model_nonce_done',
+          'model_auth_read_begin',
+          'model_auth_read_done',
+          'model_auth_write_begin',
+          'model_auth_write_done',
+          'model_branch_done',
+        ]
+      : [
+          'check_branch_begin',
+          'check_auth_begin',
+          'check_auth_done',
+          'check_repo_begin',
+          'check_repo_done',
+          'check_network_begin',
+          'check_network_done',
+          'check_branch_done',
+        ]),
+    'descriptor_begin',
+    'descriptor_done',
+    'probe_done',
+  ];
+}
+/** Private bounded parser: returns constants from the plan, never child-supplied values. */
+export function parseFableProbeStages(
+  stderr: string,
+  marker: string,
+  mode: 'model' | 'check'
+): { lastCompleted: string; nextExpected: string } {
+  const unknown = { lastCompleted: 'UNKNOWN', nextExpected: 'UNKNOWN' };
+  if (
+    typeof stderr !== 'string' ||
+    Buffer.byteLength(stderr) > 128 * 1024 ||
+    !/^FABLE_WRAPPER_OK:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      marker
+    )
+  )
+    return unknown;
+  const stages = fableProbeStages(mode);
+  let index = 0;
+  let lastCompleted = 'UNKNOWN';
+  for (const line of stderr.split(/\r?\n/)) {
+    if (!line.includes('FABLE_PROBE')) continue;
+    if (index >= stages.length || line !== `FABLE_PROBE:${marker}:${stages[index]}`) return unknown;
+    if (stages[index].endsWith('_done')) lastCompleted = stages[index];
+    index++;
+  }
+  return { lastCompleted, nextExpected: stages[index] ?? 'NONE' };
+}
+
+/** Same production wrapper, fake local executable/account only; never provider traffic. */
+async function fableSyntheticSmoke(): Promise<void> {
+  const root = await mkdtemp('/tmp/fable-synthetic-');
+  const scratch = join(root, 'scratch');
+  const repo = join(root, 'repo');
+  const outside = join(root, 'outside');
+  const account = join(root, 'oauth');
+  const nonce = randomUUID();
+  const server = createServer(socket =>
+    socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${nonce.length}\r\n\r\n${nonce}`)
+  );
+  const socketPath = join(root, 'control.sock');
+  const unixServer = createServer(socket => socket.end('synthetic'));
+  try {
+    await mkdir(scratch, { mode: 0o700 });
+    await mkdir(repo, { mode: 0o700 });
+    await writeFile(join(repo, 'repo-canary'), 'SYNTHETIC_REPO');
+    await writeFile(outside, 'SYNTHETIC_CONTROLPLANE');
+    await writeFile(account, '{"accessToken":"SYNTHETIC_ONLY"}', { mode: 0o600 });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    await new Promise<void>(resolve => unixServer.listen(socketPath, resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('fable_fixture_control_failed');
+    const url = `http://127.0.0.1:${address.port}`;
+    if ((await (await fetch(url)).text()) !== nonce)
+      throw new Error('fable_fixture_control_failed');
+    if (
+      !statSync('/proc/self/status').isFile() ||
+      !statSync(`/proc/${process.pid}/environ`).isFile() ||
+      !statSync('/proc/1/environ').isFile()
+    )
+      throw new Error('fable_fixture_observer_unknown');
+    const marker = `FABLE_WRAPPER_OK:${randomUUID()}`;
+    const probe = `
+      import { readFileSync, writeFileSync, fstatSync } from 'node:fs';
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:probe_entry_begin`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:probe_entry_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:fs_begin`)});
+      const denied = path => { try { readFileSync(path); } catch (error) { if (['ENOENT','EACCES','EPERM'].includes(error.code)) return; throw new Error('fable_fixture_denial_unknown'); } throw new Error('fable_fixture_read_allowed'); };
+      for (const path of ${JSON.stringify([outside, account, '/app/package.json', '/home/reviewer/.codex/auth.json', '/home/appuser/.codex/auth.json', '/proc/1/environ'])}) {
+        denied(path); // Proc absence is structural only; controller independently verifies PID isolation.
+      }
+      denied(${JSON.stringify(`/proc/${process.pid}/environ`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:fs_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:net_import_begin`)});
+      const { createConnection } = await import('node:net');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:net_import_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:socket_begin`)});
+      await new Promise((resolve, reject) => { const socket = createConnection(${JSON.stringify(socketPath)}); socket.on('connect', () => { socket.destroy(); reject(new Error('fable_fixture_socket_allowed')); }); socket.on('error', error => ['ENOENT','EACCES','EPERM'].includes(error.code) ? resolve() : reject(new Error('fable_fixture_socket_denial_unknown'))); });
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:socket_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:scratch_begin`)});
+      writeFileSync('/scratch/permitted', 'isolated');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:scratch_done`)});
+      if (process.argv.includes('model')) {
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_branch_begin`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_repo_begin`)});
+        denied('/repo/repo-canary');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_repo_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_nonce_begin`)});
+        if (await (await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(3000) })).text() !== ${JSON.stringify(nonce)}) throw new Error('fable_fixture_model_network');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_nonce_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_auth_read_begin`)});
+        if (!readFileSync('/home/model/.claude/.credentials.json', 'utf8').includes('SYNTHETIC_ONLY')) throw new Error('fable_fixture_account_binding');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_auth_read_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_auth_write_begin`)});
+        try { writeFileSync('/home/model/.claude/.credentials.json', 'bad'); throw new Error('fable_fixture_auth_writable'); } catch (error) { if (error.message === 'fable_fixture_auth_writable') throw error; }
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_auth_write_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:model_branch_done`)});
+      } else {
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_branch_begin`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_auth_begin`)});
+        denied('/home/model/.claude/.credentials.json');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_auth_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_repo_begin`)});
+        if (readFileSync('/repo/repo-canary', 'utf8') !== 'SYNTHETIC_REPO') throw new Error('fable_fixture_repository_binding');
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_repo_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_network_begin`)});
+        try { await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(1000) }); throw new Error('fable_fixture_network_allowed'); } catch (error) { if (!['ECONNREFUSED','ENETUNREACH','EHOSTUNREACH','ConnectionRefused'].includes(error.code)) throw new Error('fable_fixture_network_denial_unknown'); }
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_network_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:check_branch_done`)});
+      }
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:descriptor_begin`)});
+      try { if (fstatSync(3).isFile()) throw new Error('fable_fixture_observer_unknown'); } catch(error) { if(error.code !== 'EBADF') throw error; }
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:descriptor_done`)});
+      console.error(${JSON.stringify(`FABLE_PROBE:${marker}:probe_done`)});
+      console.log(${JSON.stringify(marker)});
+    `;
+    await writeFile(join(scratch, 'probe.ts'), probe);
+    const cleanEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: scratch };
+    const startup = await runFableBunStartup({
+      scratch,
+      executable: process.execPath,
+      account,
+      env: cleanEnv,
+    });
+    if (!startup.ok)
+      throw new Error(
+        `fable_bun_startup_failed:exit=${startup.exit ?? 'UNKNOWN'}:class=${startup.failureClass}`
+      );
+    console.log('overseer-fable-bun-startup: ok');
+    // Startup-only, no prompt/login/auth/provider traffic. Restrict network further for version probes.
+    const require = createRequire(import.meta.url);
+    const sdkPath = require.resolve('@anthropic-ai/claude-agent-sdk/package.json');
+    const sdk = JSON.parse(await readFile(sdkPath, 'utf8')) as { claudeCodeVersion: string };
+    const nativePackage = require.resolve(
+      `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/package.json`,
+      { paths: [dirname(sdkPath)] }
+    );
+    const controls = await runFableRuntimeControls({
+      scratch,
+      account,
+      env: cleanEnv,
+      claudeExecutable: join(dirname(nativePackage), 'claude'),
+      claudeVersion: `${sdk.claudeCodeVersion} (Claude Code)`,
+    });
+    if (!controls.ok)
+      throw new Error(
+        `fable_runtime_control_failed:stage=${controls.stage}:exit=${controls.exit ?? 'UNKNOWN'}:class=${controls.failureClass}`
+      );
+    console.log('overseer-fable-runtime-controls: ok');
+    const inline = await runFableInlineJs({
+      scratch,
+      executable: process.execPath,
+      account,
+      env: cleanEnv,
+    });
+    if (!inline.ok)
+      throw new Error(
+        `fable_inline_js_failed:exit=${inline.exit ?? 'UNKNOWN'}:class=${inline.failureClass}`
+      );
+    console.log('overseer-fable-inline-js: ok');
+    const model = await observedFableRun(
+      fableNamespaceArgv({
+        scratch,
+        executable: process.execPath,
+        account,
+        argv: ['/model/cli', '/scratch/probe.ts', 'model'],
+      }),
+      { cwd: scratch, env: cleanEnv, marker }
+    );
+    if (model.code !== 0 || !model.stdout.includes('FABLE_WRAPPER_OK'))
+      throw new Error(
+        `fable_model_wrapper_failed:exit=${model.code}:class=${fableFixtureFailure(model)}:last=${parseFableProbeStages(model.stderr, marker, 'model').lastCompleted}:next=${parseFableProbeStages(model.stderr, marker, 'model').nextExpected}`
+      );
+    const check = await observedFableRun(
+      fableNamespaceArgv({
+        scratch,
+        checkout: repo,
+        argv: ['/usr/local/bin/bun', '/scratch/probe.ts', 'check'],
+      }),
+      { cwd: scratch, env: cleanEnv, marker }
+    );
+    if (check.code !== 0 || !check.stdout.includes('FABLE_WRAPPER_OK'))
+      throw new Error(
+        `fable_check_wrapper_failed:exit=${check.code}:class=${fableFixtureFailure(check)}:last=${parseFableProbeStages(check.stderr, marker, 'check').lastCompleted}:next=${parseFableProbeStages(check.stderr, marker, 'check').nextExpected}`
+      );
+    if ((await readFile(outside, 'utf8')) !== 'SYNTHETIC_CONTROLPLANE')
+      throw new Error('fable_fixture_outside_mutated');
+    if ((await readFile(account, 'utf8')) !== '{"accessToken":"SYNTHETIC_ONLY"}')
+      throw new Error('fable_fixture_account_mutated');
+    await rm(scratch, { recursive: true });
+    try {
+      await readFile(join(scratch, 'permitted'));
+      throw new Error('fable_fixture_cleanup_failed');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    console.log('overseer-fable-synthetic: ok');
+  } finally {
+    server.close();
+    unixServer.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+if (import.meta.main) {
+  if (process.argv.includes('--reviewer-bwrap')) await reviewerBwrapSmoke();
+  else await brokerSmoke();
+  await fableSyntheticSmoke();
+}

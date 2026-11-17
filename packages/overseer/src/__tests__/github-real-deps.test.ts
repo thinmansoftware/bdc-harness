@@ -1524,3 +1524,58 @@ describe('findPullRequest required-check evidence pages', () => {
     expect(evidence.commitStatuses?.some(status => status.context === 'ci/circleci')).toBe(true);
   });
 });
+
+describe('F7 complete exact publication observation', () => {
+  test('requires full pagination, exact Bot/head/event/marker/digest; ambiguity never proves absence', async () => {
+    const { createObserveReviewPublication } = await import('../adapters/github-real-deps');
+    const { createHash, randomUUID } = await import('node:crypto');
+    const publicationId = randomUUID();
+    const body = `synthetic\n<!-- overseer-review-publication:${publicationId} -->`;
+    const intent = {
+      publicationId,
+      owner: 'o',
+      repo: 'r',
+      prNumber: 1,
+      headSha: 'a'.repeat(40),
+      actorLogin: 'thinman-overseer[bot]',
+      event: 'APPROVE',
+      bodySha256: createHash('sha256').update(body).digest('hex'),
+    } as never;
+    const good = {
+      id: 7,
+      body,
+      commit_id: 'a'.repeat(40),
+      state: 'APPROVED',
+      html_url: 'https://example.invalid/7',
+      user: { login: 'thinman-overseer[bot]', type: 'Bot' },
+    };
+    let calls = 0;
+    const observer = (pages: unknown[][]) =>
+      createObserveReviewPublication({
+        pulls: { listReviews: async () => ({ data: pages[calls++] ?? [] }) },
+      } as never);
+    const filler = Array.from({ length: 100 }, (_, id) => ({ id: id + 20, body: 'unrelated' }));
+    expect((await observer([filler, [good]])(intent))?.id).toBe(7);
+    expect(calls).toBe(2);
+    for (const rows of [
+      [],
+      [good, good],
+      [{ ...good, user: { ...good.user, type: 'User' } }],
+      [{ ...good, commit_id: 'b'.repeat(40) }],
+      [{ ...good, body: body + 'changed' }],
+      [{ ...good, state: 'COMMENTED' }],
+    ]) {
+      calls = 0;
+      expect(await observer([rows])(intent)).toBeNull();
+    }
+    expect(
+      await createObserveReviewPublication({
+        pulls: {
+          listReviews: async () => {
+            throw new Error('PRIVATE_ERROR');
+          },
+        },
+      } as never)(intent)
+    ).toBeNull();
+  });
+});

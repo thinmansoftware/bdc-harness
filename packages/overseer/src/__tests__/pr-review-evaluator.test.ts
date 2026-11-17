@@ -1167,3 +1167,97 @@ describe('Phase A sanitized termination production seams', () => {
     expect(first.requestId).not.toBe(second.requestId);
   });
 });
+
+describe('Phase B model-only evaluator transport', () => {
+  test('F2 client does not decode an error or manufacture Fable identity', async () => {
+    const { invokeConfiguredReviewModel } = await import('../pr-review-evaluator');
+    const { FABLE_POLICY, FABLE_MODEL } = await import('../judge-transport');
+    const permit = {
+      owner: 'o',
+      repo: 'r',
+      prNumber: 1,
+      headSha: 'a'.repeat(40),
+      requestId: 'request',
+      workerId: 'worker',
+      fencingToken: 1,
+      modelId: FABLE_MODEL,
+      policy: FABLE_POLICY,
+      accountBindingId: 'ultra',
+      permitId: 'permit',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    };
+    let calls = 0;
+    const result = await invokeConfiguredReviewModel(
+      FABLE_MODEL,
+      'synthetic immutable evidence',
+      {
+        kind: 'pr-review',
+        cwd: '/private/fake',
+        expectedHeadSha: permit.headSha,
+        nativePolicy: FABLE_POLICY,
+        fablePermit: permit,
+      },
+      1000,
+      async job => {
+        calls++;
+        expect(job.argv).toEqual(['fable-model-only']);
+        expect(job.fablePermit).toEqual(permit);
+        return {
+          id: 'fake',
+          uid: 1002,
+          ok: false,
+          exitCode: 125,
+          stdout: 'RAW_CANARY',
+          stderr: 'RAW_ERROR_CANARY',
+        };
+      }
+    );
+    expect(calls).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.fableEvidence).toBeUndefined();
+  });
+});
+
+describe('trusted native invocation return boundary', () => {
+  test('actual private client evidence survives invoker and is excluded from warning sink', async () => {
+    const { isTrustedNativeInvocation } = await import('../reviewer-broker-client');
+    const root = await mkdtemp(join(tmpdir(), 'native-invocation-return-'));
+    try {
+      await writeFile(join(root, 'ready'), 'synthetic');
+      const value = await invokeConfiguredReviewModel(
+        'codex',
+        'synthetic',
+        {
+          kind: 'pr-review',
+          cwd: '/private/fake',
+          expectedHeadSha: HEAD_A,
+          nativePolicy: 'codex_bubblewrap',
+        },
+        1000,
+        async (job, options) => {
+          await writeFile(
+            join(root, `${options!.id}.result.json`),
+            JSON.stringify({
+              id: options!.id,
+              uid: 1002,
+              ok: false,
+              exitCode: 1,
+              stdout: '',
+              stderr: 'PRIVATE_OUTPUT_CANARY',
+              timedOut: false,
+              outputTruncated: false,
+            })
+          );
+          return submitReviewerBrokerJob(job, { ...options, env: { OVERSEER_REVIEW_SPOOL: root } });
+        }
+      );
+      expect(isTrustedNativeInvocation(value.nativeInvocation)).toBe(true);
+      expect(value.nativeInvocation?.headSha).toBe(HEAD_A);
+      const { readFile } = await import('node:fs/promises');
+      const source = await readFile(join(import.meta.dir, '../pr-review-evaluator.ts'), 'utf8');
+      expect(source).not.toMatch(/getLog\(\)\.warn\(\s*\{[^}]*nativeInvocation/s); // Actual warning object must not carry private evidence.
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

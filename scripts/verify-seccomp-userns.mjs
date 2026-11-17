@@ -8,6 +8,7 @@ const UPSTREAM_SHA256 = '01536f1d1df938ae611eba20d6349e0de7a99b6ecdee1549427a0b0
 const CLONE_MASK = 2114060288;
 const USER_NAMESPACE = 268435456;
 const COMBINED_NAMESPACES = 2013396992;
+const MODEL_NAMESPACES = 939655168;
 const SECCOMP_OPT = 'seccomp=./docker/seccomp-archon.json';
 // WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01: the app loads the archon-bwrap
 // AppArmor profile (docker-default plus mount only for /usr/bin/bwrap).
@@ -191,9 +192,9 @@ export function verifyDelta(upstreamValue, archonValue) {
   if (!deepEqual(upstream.archMap, archon.archMap)) {
     throw new Error('archMap changed');
   }
-  if (archon.syscalls.length !== upstream.syscalls.length + 6) {
+  if (archon.syscalls.length !== upstream.syscalls.length + 8) {
     throw new Error(
-      `candidate must append exactly six rules, found ${archon.syscalls.length - upstream.syscalls.length}`
+      `candidate must append exactly eight rules, found ${archon.syscalls.length - upstream.syscalls.length}`
     );
   }
   const prefix = archon.syscalls.slice(0, upstream.syscalls.length);
@@ -225,12 +226,14 @@ export function verifyDelta(upstreamValue, archonValue) {
     withValueTwo(s390, COMBINED_NAMESPACES),
     { names: ['unshare'], action: 'SCMP_ACT_ALLOW' },
     BWRAP_MOUNT_RULE,
+    withValueTwo(normal, MODEL_NAMESPACES),
+    withValueTwo(s390, MODEL_NAMESPACES),
   ];
   const actual = archon.syscalls.slice(upstream.syscalls.length);
-  const actualKeys = actual.map(rule => canonical(rule)).sort();
-  const expectedKeys = expected.map(rule => canonical(rule)).sort();
+  const actualKeys = actual.map(rule => canonical(rule));
+  const expectedKeys = expected.map(rule => canonical(rule));
   if (!deepEqual(actualKeys, expectedKeys)) {
-    throw new Error('appended seccomp rules are not the six-rule user-namespace delta');
+    throw new Error('appended seccomp rules are not the eight-rule user-namespace delta');
   }
 }
 

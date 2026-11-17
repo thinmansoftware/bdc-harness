@@ -1,3 +1,4 @@
+import { FABLE_POLICY, FABLE_MODEL, closedData, type FablePermit } from './judge-transport';
 import { randomUUID } from 'node:crypto';
 import { access, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -100,6 +101,7 @@ export interface ReviewerBrokerJob {
   readonly prompt?: string;
   /** Model jobs only: wall clock the broker enforces on the model child. */
   readonly timeoutMs?: number;
+  readonly fablePermit?: FablePermit;
 }
 
 export interface ReviewerBrokerResult {
@@ -113,6 +115,9 @@ export interface ReviewerBrokerResult {
   readonly outputTruncated?: boolean;
   readonly timedOut?: boolean;
   readonly diagnostic?: SanitizedTermination;
+  readonly fableEvidence?: FableExecutionEvidence;
+  readonly nativeInvocation?: NativeInvocation;
+  readonly checkPolicy?: typeof FABLE_POLICY;
 }
 
 export class ReviewerBrokerError extends Error {
@@ -197,8 +202,10 @@ async function submitReviewerBrokerJobInternal(
             UUID.test(id) ? terminationDiagnostic('invalid_broker_result', null, id) : undefined
           );
         }
+        qualifyFableBrokerResult(value, job, id);
         return {
           ...value,
+          nativeInvocation: observedNativeInvocation(job, value, id),
           ...(UUID.test(id) ? { diagnostic: classifyBrokerTermination(value, id) } : {}),
         };
       } catch (error) {
@@ -223,4 +230,110 @@ async function submitReviewerBrokerJobInternal(
       rm(resultPath, { force: true }),
     ]);
   }
+}
+
+export interface FableExecutionEvidence {
+  readonly policy: typeof FABLE_POLICY;
+  readonly provider: 'claude';
+  readonly model: typeof FABLE_MODEL;
+  readonly executableSha256: string;
+  readonly version: string;
+  readonly accountBindingId: string;
+  readonly invocationId: string;
+  readonly requestId: string;
+  readonly workerId: string;
+  readonly fencingToken: number;
+  readonly headSha: string;
+  readonly permitId: string;
+  readonly credentialEgressPassed: true;
+}
+const trustedFableEvidence = new WeakSet();
+export function isTrustedFableEvidence(value: unknown): value is FableExecutionEvidence {
+  return !!value && typeof value === 'object' && trustedFableEvidence.has(value);
+}
+function qualifyFableBrokerResult(
+  value: ReviewerBrokerResult,
+  job: ReviewerBrokerJob,
+  id: string
+): void {
+  const permit = job.fablePermit;
+  if (!permit || !value.ok) return;
+  if (value.uid !== 1002 || value.exitCode !== 0 || value.timedOut || value.outputTruncated)
+    throw new ReviewerBrokerError();
+  if (job.prompt === undefined) {
+    if (value.checkPolicy !== FABLE_POLICY) throw new ReviewerBrokerError();
+    return;
+  }
+  const proof = value.fableEvidence;
+  if (
+    !closedData(proof, [
+      'policy',
+      'provider',
+      'model',
+      'executableSha256',
+      'version',
+      'accountBindingId',
+      'invocationId',
+      'requestId',
+      'workerId',
+      'fencingToken',
+      'headSha',
+      'permitId',
+      'credentialEgressPassed',
+    ]) ||
+    proof.policy !== FABLE_POLICY ||
+    proof.provider !== 'claude' ||
+    proof.model !== FABLE_MODEL ||
+    typeof proof.executableSha256 !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(proof.executableSha256) ||
+    typeof proof.version !== 'string' ||
+    !proof.version ||
+    !proof.credentialEgressPassed ||
+    proof.invocationId !== id ||
+    proof.accountBindingId !== permit.accountBindingId ||
+    proof.permitId !== permit.permitId ||
+    proof.requestId !== permit.requestId ||
+    proof.workerId !== permit.workerId ||
+    proof.fencingToken !== permit.fencingToken ||
+    proof.headSha !== permit.headSha ||
+    Date.parse(permit.expiresAt) <= Date.now()
+  )
+    throw new ReviewerBrokerError();
+  Object.freeze(proof);
+  trustedFableEvidence.add(proof);
+}
+
+export interface NativeInvocation {
+  readonly invocationId: string;
+  readonly headSha: string;
+  readonly provider: 'codex';
+  readonly model: string;
+}
+const trustedNativeInvocations = new WeakSet();
+export function isTrustedNativeInvocation(value: unknown): value is NativeInvocation {
+  return !!value && typeof value === 'object' && trustedNativeInvocations.has(value);
+}
+function observedNativeInvocation(
+  job: ReviewerBrokerJob,
+  result: ReviewerBrokerResult,
+  id: string
+): NativeInvocation | undefined {
+  const index = job.argv.indexOf('--model');
+  if (
+    job.fablePermit ||
+    job.prompt === undefined ||
+    index < 0 ||
+    result.uid !== 1002 ||
+    typeof result.timedOut !== 'boolean' ||
+    typeof result.outputTruncated !== 'boolean'
+  )
+    return undefined;
+  const value = Object.freeze({
+    invocationId: id,
+    headSha: job.expectedHead,
+    provider: 'codex' as const,
+    model: job.argv[index + 1],
+  });
+  trustedNativeInvocations.add(value);
+  return value;
 }

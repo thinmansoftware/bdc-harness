@@ -1,3 +1,11 @@
+import { isTrustedNativeInvocation, type NativeInvocation } from './reviewer-broker-client';
+import { createHash as publicationHash, randomUUID as publicationUuid } from 'node:crypto';
+import {
+  parseReviewPublicationIntent,
+  type ReviewPublicationIntent,
+} from '@archon/core/db/dispatch';
+import { FABLE_POLICY, FABLE_MODEL, selectFablePermit, type FablePermit } from './judge-transport';
+import { isTrustedFableEvidence, type FableExecutionEvidence } from './reviewer-broker-client';
 /**
  * Governed reviewer -> GitHub review submission
  * (WO-HARNESS-OVERSEER-REVIEW-ROUTE-01, XO authorization 2026-08-17).
@@ -129,7 +137,10 @@ export interface ReviewExecutionProof {
   readonly headSha: string;
   readonly treeSha: string;
   readonly cwd: string;
-  readonly nativePolicy: 'codex_bubblewrap';
+  readonly nativePolicy: 'codex_bubblewrap' | typeof FABLE_POLICY;
+  readonly nativeInvocation?: NativeInvocation;
+  readonly fablePermit?: FablePermit;
+  readonly fableEvidence?: FableExecutionEvidence;
   readonly nativeVersion: string;
   readonly runtimeUid: number;
   readonly inspectionObserved: boolean;
@@ -230,6 +241,7 @@ export interface SubmitOutcome {
   event?: OverseerReviewEvent;
   executionProof?: ReviewExecutionProof;
   githubReview?: SubmitPullRequestReviewResult['review'];
+  originalPublication?: ReviewPublicationIntent;
   /**
    * Present only on a changes_requested disposition. Reports whether the
    * verdict was handed back to Taskmaster and, when it was not, why it stopped
@@ -272,6 +284,14 @@ export interface SubmitOutcome {
 }
 
 export interface SubmitDeps {
+  lookupPublication?(originId: string): Promise<ReviewPublicationIntent | null>;
+  admitPublication?(
+    intent: ReviewPublicationIntent
+  ): Promise<{ intent: ReviewPublicationIntent; inserted: boolean }>;
+  observePublication?(
+    intent: ReviewPublicationIntent
+  ): Promise<SubmitPullRequestReviewResult['review'] | null>;
+
   reviewerIdentity: string;
   /** Runs the governed reviewer against an exact head. */
   runReviewer(work: ReviewWorkItem): Promise<ReviewerVerdict>;
@@ -306,6 +326,7 @@ export interface SubmitDeps {
     remediation?: RemediationOutcome;
     executionProof?: ReviewExecutionProof;
     githubReview?: SubmitPullRequestReviewResult['review'];
+    originalPublication?: ReviewPublicationIntent;
   }): Promise<void>;
 
   /** Revalidates the dispatch fence. Required for execution-context work. */
@@ -423,6 +444,16 @@ export async function runAndSubmitReview(
       disposition: 'merge_custody_conflict',
       reason: 'merge_manager_shares_reviewer_identity_m153',
     });
+  }
+
+  // A durable old intent always enters observation before model execution.
+  if (work.executionContext && deps.lookupPublication) {
+    try {
+      const prior = await deps.lookupPublication(work.messageId);
+      if (prior) return await recoverPublication(work, deps, prior);
+    } catch {
+      return await submitIncomplete(work, deps, 'review_publication_storage_unknown');
+    }
   }
 
   let verdict: ReviewerVerdict;
@@ -634,7 +665,7 @@ export async function runAndSubmitReview(
   }
 
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
-  const body = buildReviewBody(work, verdict);
+  let body = buildReviewBody(work, verdict);
 
   if (work.executionContext) {
     const leak = await findCredentialInReviewBody(body);
@@ -675,8 +706,77 @@ export async function runAndSubmitReview(
     });
   }
 
+  let publication: ReviewPublicationIntent | undefined;
+  let sendPermit: object | undefined;
+  if (work.executionContext && deps.admitPublication) {
+    try {
+      const proof = verdict.executionProof;
+      if (
+        !proof ||
+        !qualifiesExecution(work.executionContext, proof) ||
+        verdict.summary.includes('overseer-review-publication:')
+      )
+        return await submitIncomplete(work, deps, 'review_publication_proof_refused');
+      const publicationId = publicationUuid();
+      const marker = `<!-- overseer-review-publication:${publicationId} -->`;
+      // Reserve marker space before digest; no model-authored marker or truncation of identity.
+      body = `${body.slice(0, MAX_EVIDENCE_BODY - marker.length - 2)}\n\n${marker}`;
+      const evidence = proof.fableEvidence;
+      const native = proof.nativeInvocation;
+      if (!evidence && (!isTrustedNativeInvocation(native) || native.headSha !== work.headSha))
+        return await submitIncomplete(work, deps, 'review_publication_identity_unqualified');
+      const identity = evidence ?? native;
+      if (!identity)
+        return await submitIncomplete(work, deps, 'review_publication_identity_unqualified');
+      const intent: ReviewPublicationIntent = {
+        version: 1,
+        publicationId,
+        originId: work.messageId,
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+        headSha: work.headSha,
+        event,
+        actorLogin: deps.reviewerIdentity,
+        actorType: 'Bot',
+        workerId: work.executionContext.workerId,
+        fencingToken: work.executionContext.fencingToken,
+        bodySha256: publicationHash('sha256').update(body).digest('hex'),
+        attestation: {
+          version: 1,
+          requestId: proof.requestId,
+          headSha: proof.headSha,
+          treeSha: proof.treeSha,
+          policy: proof.nativePolicy,
+          nativeVersion: proof.nativeVersion,
+          runtimeUid: proof.runtimeUid,
+          provider: identity.provider,
+          model: identity.model,
+          invocationId: identity.invocationId,
+          checkPlan: proof.check_plan,
+          checkDigests: proof.checks.map(check => check.outputDigest),
+          startedAt: proof.startedAt,
+          endedAt: proof.endedAt,
+        },
+      };
+      const admitted = await deps.admitPublication(intent);
+      if (!admitted.inserted) return await recoverPublication(work, deps, admitted.intent);
+      if (JSON.stringify(admitted.intent) !== JSON.stringify(intent))
+        return await submitIncomplete(work, deps, 'review_publication_insert_unknown');
+      publication = intent;
+      sendPermit = {};
+      publicationSendPermits.add(sendPermit);
+    } catch {
+      return await submitIncomplete(work, deps, 'review_publication_admission_unknown');
+    }
+  }
+
   let submission: SubmitPullRequestReviewResult;
   try {
+    if (publication) {
+      if (!sendPermit || !publicationSendPermits.delete(sendPermit))
+        return await submitIncomplete(work, deps, 'review_publication_send_refused');
+    }
     submission = await deps.submitReview({
       owner: work.owner,
       repo: work.repo,
@@ -690,6 +790,7 @@ export async function runAndSubmitReview(
       commitId: work.headSha,
     });
   } catch (error) {
+    if (publication) return await recoverPublication(work, deps, publication);
     // A rate-limit answer (or the local pool gate) means GitHub did not create
     // the review, so retrying later cannot double-post. Any other throw stays
     // terminal: its outcome on GitHub is unknown.
@@ -701,6 +802,8 @@ export async function runAndSubmitReview(
       event,
     });
   }
+
+  if (publication) return await recoverPublication(work, deps, publication);
 
   if (!submission.submitted) {
     return finish(deps, work, work.headSha, {
@@ -870,7 +973,33 @@ function qualifiesExecution(
   proof: ReviewExecutionProof | undefined
 ): proof is ReviewExecutionProof {
   if (proof?.requestId !== context.requestId || proof.headSha !== context.headSha) return false;
-  if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_bubblewrap') return false;
+  if (!proof.inspectionObserved) return false;
+  if (proof.nativePolicy === FABLE_POLICY) {
+    const permit = proof.fablePermit;
+    const evidence = proof.fableEvidence;
+    if (
+      !permit ||
+      !isTrustedFableEvidence(evidence) ||
+      proof.runtimeUid !== 1002 ||
+      proof.nativeVersion !== evidence.version ||
+      proof.cwd !== context.checkoutPath ||
+      evidence.model !== FABLE_MODEL ||
+      evidence.policy !== FABLE_POLICY ||
+      evidence.requestId !== context.requestId ||
+      evidence.workerId !== context.workerId ||
+      evidence.fencingToken !== context.fencingToken ||
+      evidence.headSha !== context.headSha ||
+      evidence.permitId !== permit.permitId ||
+      evidence.accountBindingId !== permit.accountBindingId ||
+      !evidence.credentialEgressPassed
+    )
+      return false;
+    try {
+      if (selectFablePermit([permit], context) !== permit) return false;
+    } catch {
+      return false;
+    }
+  } else if (proof.nativePolicy !== 'codex_bubblewrap') return false;
   if (!Number.isInteger(proof.runtimeUid) || proof.runtimeUid === 0 || !proof.treeSha || !proof.cwd)
     return false;
   if (context.checkPlanStatus === 'unsafe') return false;
@@ -1033,6 +1162,7 @@ async function finish(
       ...(outcome.remediation ? { remediation: outcome.remediation } : {}),
       ...(outcome.executionProof ? { executionProof: outcome.executionProof } : {}),
       ...(outcome.githubReview ? { githubReview: outcome.githubReview } : {}),
+      ...(outcome.originalPublication ? { originalPublication: outcome.originalPublication } : {}),
     });
   } catch {
     // A posted approval whose actual response cannot be made durable is
@@ -1048,4 +1178,50 @@ async function finish(
   // The retry instant is part of the outcome, not the receipt: the worker reads
   // it off the return value to schedule the deferral.
   return outcome;
+}
+
+const publicationSendPermits = new WeakSet();
+/** Recovered receipts preserve original attestation/fence, never mint current execution proof. */
+async function recoverPublication(
+  work: ReviewWorkItem,
+  deps: SubmitDeps,
+  raw: ReviewPublicationIntent
+): Promise<SubmitOutcome> {
+  try {
+    const intent = parseReviewPublicationIntent(JSON.stringify(raw));
+    const context = work.executionContext;
+    if (
+      !context ||
+      intent.originId !== work.messageId ||
+      intent.originId !== context.requestId ||
+      intent.owner !== work.owner ||
+      intent.repo !== work.repo ||
+      intent.prNumber !== work.prNumber ||
+      intent.headSha !== work.headSha ||
+      intent.actorLogin !== deps.reviewerIdentity ||
+      !deps.observePublication ||
+      (deps.isDraft && (await deps.isDraft(work))) ||
+      (await deps.currentHeadSha(work)) !== intent.headSha ||
+      !deps.hasCustody ||
+      !(await deps.hasCustody(context))
+    )
+      throw new Error();
+    const receipt = await deps.observePublication(intent);
+    if (
+      receipt?.commitSha !== intent.headSha ||
+      receipt.state !== (intent.event === 'APPROVE' ? 'APPROVED' : 'CHANGES_REQUESTED') ||
+      (await deps.currentHeadSha(work)) !== intent.headSha ||
+      !(await deps.hasCustody(context))
+    )
+      throw new Error();
+    return await finish(deps, work, work.headSha, {
+      disposition: intent.event === 'APPROVE' ? 'approved' : 'changes_requested',
+      event: intent.event,
+      reason: 'review_publication_observed_original',
+      githubReview: receipt,
+      originalPublication: intent,
+    });
+  } catch {
+    return await submitIncomplete(work, deps, 'review_publication_unknown');
+  }
 }
