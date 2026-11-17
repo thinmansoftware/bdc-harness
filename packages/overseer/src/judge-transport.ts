@@ -68,13 +68,18 @@ export interface PrReviewTransportContext {
   readonly nativePolicy: 'codex_bubblewrap';
 }
 
+/** Capability selection only; this never enables a new native transport. */
+export function supportedPrReviewLadder(ladder: readonly string[]): string[] {
+  return [...new Set(ladder.map(binary => binary.trim()).filter(binary => binary === 'codex'))];
+}
+
 /** PR-only transport. Shared judge callers continue to use buildJudgeTransport unchanged. */
 export async function buildPrReviewTransport(
   binary: string,
   prompt: string,
   context: PrReviewTransportContext
 ): Promise<JudgeTransport> {
-  if (binary !== 'codex') {
+  if (!supportedPrReviewLadder([binary]).includes(binary)) {
     throw new Error('pr_review_native_sandbox_unsupported_binary');
   }
   if (!context.cwd || !context.expectedHeadSha) {

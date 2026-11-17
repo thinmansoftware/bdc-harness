@@ -73,7 +73,7 @@ import {
   applyLadderRestoredRequest,
   recoverParkedJudgeHeads,
 } from '@archon/overseer/judge-ladder-health';
-import { defaultReviewLadder } from '@archon/overseer/pr-review-evaluator';
+import { supportedReviewLadder } from '@archon/overseer/pr-review-evaluator';
 import type { IngestDeps } from '@archon/overseer/pr-review-ingest';
 import {
   createRealIngestDeps,
@@ -360,7 +360,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
       ),
     judgeLadderRecovery: (config): Promise<{ recovered: string[]; stillParked: number }> => {
       ingestDeps ??= createRealIngestDeps(config);
-      return recoverParkedJudgeHeads(ingestDeps, defaultReviewLadder());
+      return recoverParkedJudgeHeads(ingestDeps, supportedReviewLadder());
     },
     evictCheckouts: createReviewCheckoutEvictor({
       listClaimedReviews: listMessagesBySeqCursor,

@@ -930,6 +930,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
     // cannot send a second one even though the in-memory hour marker is gone.
     judgeLadderBreaker: createJudgeLadderBreaker({
       ladder: defaultReviewLadder(),
+      nativePrReview: true,
       async sendOperatorMessage(input): Promise<void> {
         await dispatch.createAuthenticatedMessage(
           { kind: 'system', sender: REVIEW_SENDER },
