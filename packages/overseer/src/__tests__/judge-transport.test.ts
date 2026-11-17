@@ -448,3 +448,45 @@ describe('WO-HARNESS-OVERSEER-REVIEW-JSONL-VERDICT-01 -- sandboxed PR review arg
     expect(transport.argv).toContain('sandbox_workspace_write.network_access=false');
   });
 });
+
+describe('Phase B closed Fable transport', () => {
+  test('requires a designated exact permit and never changes generic Claude transport', async () => {
+    const { FABLE_POLICY, FABLE_MODEL, selectFablePermit, parseFablePermits } =
+      await import('../judge-transport');
+    const context = {
+      owner: 'o',
+      repo: 'r',
+      prNumber: 7,
+      headSha: 'a'.repeat(40),
+      requestId: 'request',
+      workerId: 'worker',
+      fencingToken: 2,
+    };
+    const entry = {
+      ...context,
+      modelId: FABLE_MODEL,
+      policy: FABLE_POLICY,
+      accountBindingId: 'ultra-one',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+      permitId: 'permit-one',
+    };
+    const snapshot = parseFablePermits(JSON.stringify({ version: 1, entries: [entry] }));
+    expect(selectFablePermit(snapshot, context)).toEqual(entry);
+    expect(selectFablePermit(snapshot, { ...context, prNumber: 8 })).toBeUndefined();
+    expect(() => selectFablePermit(snapshot, { ...context, fencingToken: 3 })).toThrow(
+      'fable_permission_refused'
+    );
+    expect(() => selectFablePermit(snapshot, { ...context, headSha: 'b'.repeat(40) })).toThrow(
+      'fable_permission_refused'
+    );
+    expect(() => selectFablePermit(snapshot, context, Date.now() + 120000)).toThrow(
+      'fable_permission_refused'
+    );
+    expect(() =>
+      parseFablePermits(JSON.stringify({ version: 1, entries: [entry, entry] }))
+    ).toThrow('fable_configuration_invalid');
+    expect(() =>
+      parseFablePermits(JSON.stringify({ version: 1, entries: [{ ...entry, argv: ['bad'] }] }))
+    ).toThrow('fable_configuration_invalid');
+  });
+});

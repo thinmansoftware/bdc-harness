@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promise
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { CODEX_JUDGE_CLI_VERSION } from '../packages/overseer/src/judge-transport';
-import { prepareModelWorkingCopy } from './overseer-reviewer-broker';
+import { fableNamespaceArgv, prepareModelWorkingCopy } from './overseer-reviewer-broker';
 
 const SPOOL = '/var/lib/overseer-review';
 /**
@@ -312,5 +312,88 @@ async function brokerSmoke(): Promise<void> {
   }
 }
 
+/** Same production wrapper, fake local executable/account only; never provider traffic. */
+async function fableSyntheticSmoke(): Promise<void> {
+  const root = await mkdtemp('/tmp/fable-synthetic-');
+  const scratch = join(root, 'scratch');
+  const repo = join(root, 'repo');
+  const outside = join(root, 'outside');
+  const account = join(root, 'oauth');
+  const server = createServer(socket =>
+    socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok')
+  );
+  try {
+    await mkdir(scratch, { mode: 0o700 });
+    await mkdir(repo, { mode: 0o700 });
+    await writeFile(join(repo, 'repo-canary'), 'SYNTHETIC_REPO');
+    await writeFile(outside, 'SYNTHETIC_CONTROLPLANE');
+    await writeFile(account, '{"accessToken":"SYNTHETIC_ONLY"}', { mode: 0o600 });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('fable_fixture_control_failed');
+    const url = `http://127.0.0.1:${address.port}`;
+    if ((await (await fetch(url)).text()) !== 'ok') throw new Error('fable_fixture_control_failed');
+    const probe = `
+      import { readFileSync, writeFileSync } from 'node:fs';
+      const denied = path => { try { readFileSync(path); } catch { return; } throw new Error('fable_fixture_read_allowed'); };
+      for (const path of ${JSON.stringify([outside, account, '/app/package.json', '/home/reviewer/.codex/auth.json', '/home/appuser/.codex/auth.json', '/proc/1/environ'])}) {
+        if (path === '/proc/1/environ') { const text = readFileSync(path, 'utf8'); if (/GITHUB_|ARCHON_|_TOKEN=/.test(text)) throw new Error('fable_fixture_parent_environment'); }
+        else denied(path);
+      }
+      writeFileSync('/scratch/permitted', 'isolated');
+      if (process.argv.includes('model')) {
+        denied('/repo/repo-canary');
+        if (!readFileSync('/home/model/.claude/.credentials.json', 'utf8').includes('SYNTHETIC_ONLY')) throw new Error('fable_fixture_account_binding');
+        try { writeFileSync('/home/model/.claude/.credentials.json', 'bad'); throw new Error('fable_fixture_auth_writable'); } catch (error) { if (error.message === 'fable_fixture_auth_writable') throw error; }
+      } else {
+        denied('/home/model/.claude/.credentials.json');
+        if (readFileSync('/repo/repo-canary', 'utf8') !== 'SYNTHETIC_REPO') throw new Error('fable_fixture_repository_binding');
+        try { await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(1000) }); throw new Error('fable_fixture_network_allowed'); } catch (error) { if (error.message === 'fable_fixture_network_allowed') throw error; }
+      }
+      console.log('FABLE_WRAPPER_OK');
+    `;
+    await writeFile(join(scratch, 'probe.ts'), probe);
+    const cleanEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: scratch };
+    const model = await run(
+      fableNamespaceArgv({
+        scratch,
+        executable: process.execPath,
+        account,
+        argv: ['/model/cli', '/scratch/probe.ts', 'model'],
+      }),
+      { cwd: scratch, env: cleanEnv }
+    );
+    if (model.code !== 0 || !model.stdout.includes('FABLE_WRAPPER_OK'))
+      throw new Error('fable_model_wrapper_failed');
+    const check = await run(
+      fableNamespaceArgv({
+        scratch,
+        checkout: repo,
+        argv: ['/usr/local/bin/bun', '/scratch/probe.ts', 'check'],
+      }),
+      { cwd: scratch, env: cleanEnv }
+    );
+    if (check.code !== 0 || !check.stdout.includes('FABLE_WRAPPER_OK'))
+      throw new Error('fable_check_wrapper_failed');
+    if ((await readFile(outside, 'utf8')) !== 'SYNTHETIC_CONTROLPLANE')
+      throw new Error('fable_fixture_outside_mutated');
+    if ((await readFile(account, 'utf8')) !== '{"accessToken":"SYNTHETIC_ONLY"}')
+      throw new Error('fable_fixture_account_mutated');
+    await rm(scratch, { recursive: true });
+    try {
+      await readFile(join(scratch, 'permitted'));
+      throw new Error('fable_fixture_cleanup_failed');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    console.log('overseer-fable-synthetic: ok');
+  } finally {
+    server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 if (process.argv.includes('--reviewer-bwrap')) await reviewerBwrapSmoke();
 else await brokerSmoke();
+
+await fableSyntheticSmoke();

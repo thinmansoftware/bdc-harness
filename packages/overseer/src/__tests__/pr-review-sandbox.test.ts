@@ -1009,3 +1009,237 @@ describe.serial('observed checkout integrity and check environment', () => {
     }
   );
 });
+
+describe('Phase B broker closed configuration and inert protocol', () => {
+  test('F1 configuration is closed, unique, pinned and Ultra-only', async () => {
+    const { parseFableBrokerConfig, fableModelArgv } =
+      await import('../../../../scripts/overseer-reviewer-broker');
+    const config = {
+      version: 1,
+      modelBinding: {
+        executablePath: process.platform === 'win32' ? 'C:/synthetic/cli' : '/synthetic/cli',
+        executableSha256: 'a'.repeat(64),
+        version: '2.1.325 (Claude Code)',
+        catalogModelId: 'claude-fable-5-2',
+        cliModelToken: 'claude-fable-5-2',
+      },
+      accountBindings: [
+        {
+          bindingId: 'ultra',
+          accountClass: 'ultra',
+          oauthSourceFile: process.platform === 'win32' ? 'C:/synthetic/oauth' : '/synthetic/oauth',
+          bindMode: 'read_only',
+        },
+      ],
+    };
+    expect(parseFableBrokerConfig(JSON.stringify(config)).accountBindings).toHaveLength(1);
+    for (const value of [
+      { ...config, extra: true },
+      { ...config, accountBindings: [...config.accountBindings, ...config.accountBindings] },
+      { ...config, accountBindings: [{ ...config.accountBindings[0], accountClass: 'team' }] },
+      { ...config, modelBinding: { ...config.modelBinding, cliModelToken: 'bad --tools all' } },
+    ])
+      expect(() => parseFableBrokerConfig(JSON.stringify(value))).toThrow(
+        'fable_configuration_invalid'
+      );
+    const argv = fableModelArgv('claude-fable-5-2');
+    expect(argv[argv.indexOf('--tools') + 1]).toBe('');
+    expect(argv[argv.indexOf('--mcp-config') + 1]).toBe('{"mcpServers":{}}');
+    expect(argv).not.toContain('--bare');
+    expect(argv).not.toContain('--dangerously-skip-permissions');
+    expect(argv).not.toContain('--fallback-model');
+  });
+  test('F2 protocol refuses tools, extra frames, missing or forged identity', async () => {
+    const { decodeFableProtocol } = await import('../../../../scripts/overseer-reviewer-broker');
+    const init = {
+      type: 'system',
+      subtype: 'init',
+      model: 'claude-fable-5-2',
+      tools: [],
+      mcp_servers: [],
+      session_id: 'private-session',
+    };
+    const result = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      result: 'immutable verdict',
+      session_id: 'private-session',
+    };
+    const frames = (values: unknown[]): string =>
+      values.map(value => JSON.stringify(value)).join('\n');
+    expect(decodeFableProtocol(frames([init, result]), init.model).text).toBe('immutable verdict');
+    for (const values of [
+      [{ ...init, model: 'other' }, result],
+      [{ ...init, tools: ['Bash'] }, result],
+      [init, { type: 'tool_use', command: 'CANARY' }, result],
+      [init, result, result],
+      [init, { ...result, session_id: 'wrong' }],
+      [init, { ...result, is_error: true }],
+    ])
+      expect(() => decodeFableProtocol(frames(values), init.model)).toThrow(
+        'fable_protocol_refused'
+      );
+  });
+  test('F1 egress covers opaque access/refresh values and generic secrets without returning them', async () => {
+    const { fableEgressAllowed } = await import('../../../../scripts/overseer-reviewer-broker');
+    const credentials = JSON.stringify({
+      claudeAiOauth: { accessToken: 'opaque-access-CANARY', refreshToken: 'opaque-refresh-CANARY' },
+    });
+    expect(fableEgressAllowed('safe verdict', '', credentials)).toBe(true);
+    for (const value of [
+      'opaque-access-CANARY',
+      'opaque-refresh-CANARY',
+      'Bearer abcdefghijklmnop',
+    ])
+      expect(fableEgressAllowed('safe', value, credentials)).toBe(false);
+    expect(fableEgressAllowed('safe', '', '{}')).toBe(false);
+    expect(fableEgressAllowed('safe', '', 'not json')).toBe(false);
+  });
+});
+
+describe('Phase B post-invocation proof', () => {
+  test('F4 forged/pre-model Fable evidence cannot approve', async () => {
+    const { FABLE_POLICY, FABLE_MODEL } = await import('../judge-transport');
+    const permit = {
+      owner: context.owner,
+      repo: context.repo,
+      prNumber: context.prNumber,
+      headSha: head,
+      requestId: context.requestId,
+      workerId: context.workerId,
+      fencingToken: context.fencingToken,
+      modelId: FABLE_MODEL,
+      policy: FABLE_POLICY,
+      accountBindingId: 'ultra',
+      permitId: 'permit',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    };
+    const forged = {
+      ...proof,
+      nativePolicy: FABLE_POLICY,
+      fablePermit: permit,
+      fableEvidence: {
+        policy: FABLE_POLICY,
+        provider: 'claude' as const,
+        model: FABLE_MODEL,
+        executableSha256: 'a'.repeat(64),
+        version: 'synthetic',
+        accountBindingId: 'ultra',
+        invocationId: '11111111-1111-4111-8111-111111111111',
+        requestId: context.requestId,
+        workerId: context.workerId,
+        fencingToken: context.fencingToken,
+        headSha: head,
+        permitId: 'permit',
+        credentialEgressPassed: true as const,
+      },
+    };
+    const d = deps(forged);
+    expect((await runAndSubmitReview(work, d.value)).disposition).toBe('review_incomplete');
+    expect(d.posts).toEqual(['COMMENT']);
+  });
+  test('F4 client accepts only request-bound broker evidence and cleans private spool', async () => {
+    const { FABLE_POLICY, FABLE_MODEL } = await import('../judge-transport');
+    const { submitReviewerBrokerJob, isTrustedFableEvidence } =
+      await import('../reviewer-broker-client');
+    const root = await mkdtemp(join(tmpdir(), 'fable-private-client-'));
+    const id = '11111111-1111-4111-8111-111111111111';
+    const permit = {
+      owner: context.owner,
+      repo: context.repo,
+      prNumber: context.prNumber,
+      headSha: head,
+      requestId: context.requestId,
+      workerId: context.workerId,
+      fencingToken: context.fencingToken,
+      modelId: FABLE_MODEL,
+      policy: FABLE_POLICY,
+      accountBindingId: 'ultra',
+      permitId: 'permit',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    };
+    const evidence = {
+      policy: FABLE_POLICY,
+      provider: 'claude',
+      model: FABLE_MODEL,
+      executableSha256: 'a'.repeat(64),
+      version: 'synthetic',
+      accountBindingId: 'ultra',
+      invocationId: id,
+      requestId: context.requestId,
+      workerId: context.workerId,
+      fencingToken: context.fencingToken,
+      headSha: head,
+      permitId: 'permit',
+      credentialEgressPassed: true,
+    };
+    const payload = {
+      id,
+      uid: 1002,
+      ok: true,
+      exitCode: 0,
+      stdout: 'bounded verdict',
+      stderr: '',
+      timedOut: false,
+      outputTruncated: false,
+      fableEvidence: evidence,
+    };
+    const job = {
+      checkout: '/private/fake',
+      expectedHead: head,
+      argv: ['fable-model-only'],
+      prompt: 'synthetic',
+      fablePermit: permit,
+    };
+    try {
+      await writeFile(join(root, 'ready'), 'synthetic');
+      for (const field of [
+        'requestId',
+        'workerId',
+        'headSha',
+        'accountBindingId',
+        'invocationId',
+      ]) {
+        await writeFile(
+          join(root, `${id}.result.json`),
+          JSON.stringify({ ...payload, fableEvidence: { ...evidence, [field]: 'wrong' } })
+        );
+        await expect(
+          submitReviewerBrokerJob(job, { id, env: { OVERSEER_REVIEW_SPOOL: root } })
+        ).rejects.toThrow('reviewer_broker_unavailable');
+      }
+      await writeFile(join(root, `${id}.result.json`), JSON.stringify(payload));
+      const result = await submitReviewerBrokerJob(job, {
+        id,
+        env: { OVERSEER_REVIEW_SPOOL: root },
+      });
+      expect(isTrustedFableEvidence(result.fableEvidence)).toBe(true);
+      expect(isTrustedFableEvidence(evidence)).toBe(false);
+      expect((await readdir(root)).sort()).toEqual(['ready']);
+      if (linux) {
+        // Hosted disposable Linux only: the existing final generic guard sees no real profile.
+        const d = deps({
+          ...proof,
+          nativePolicy: FABLE_POLICY,
+          nativeVersion: 'synthetic',
+          runtimeUid: 1002,
+          fablePermit: permit,
+          fableEvidence: result.fableEvidence,
+        });
+        expect((await runAndSubmitReview(work, d.value)).disposition).toBe('approved');
+        expect(d.posts).toEqual(['APPROVE']);
+        const stale = deps({
+          ...proof,
+          nativePolicy: FABLE_POLICY,
+          fablePermit: { ...permit, expiresAt: '2020-01-01T00:00:00.000Z' },
+          fableEvidence: result.fableEvidence,
+        });
+        expect((await runAndSubmitReview(work, stale.value)).disposition).toBe('review_incomplete');
+        expect(stale.posts).toEqual(['COMMENT']);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

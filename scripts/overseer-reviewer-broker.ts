@@ -10,7 +10,19 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises';
-import { basename, join, resolve, sep } from 'node:path';
+import { createHash } from 'node:crypto';
+import { lstatSync, readFileSync } from 'node:fs';
+import {
+  FABLE_MODEL,
+  FABLE_POLICY,
+  FABLE_CONFIG_ERROR,
+  closedData,
+  fableToken,
+  parseFablePermits,
+  readFableOperatorFile,
+  type FablePermit,
+} from '../packages/overseer/src/judge-transport';
+import { basename, isAbsolute, join, resolve, sep } from 'node:path';
 import { CODEX_JUDGE_CLI_VERSION as CODEX_VERSION } from '../packages/overseer/src/judge-transport';
 
 const SPOOL = process.env.OVERSEER_REVIEW_SPOOL ?? '/var/lib/overseer-review';
@@ -25,6 +37,7 @@ interface BrokerJob {
   prompt?: string;
   /** Model jobs only: the trusted parent's configured model wall clock. */
   timeoutMs?: number;
+  fablePermit?: FablePermit;
 }
 
 interface BrokerResult {
@@ -37,6 +50,8 @@ interface BrokerResult {
   reason?: string;
   outputTruncated?: boolean;
   timedOut?: boolean;
+  fableEvidence?: FableBrokerEvidence;
+  checkPolicy?: typeof FABLE_POLICY;
 }
 
 const OUTPUT_LIMIT = 128 * 1024;
@@ -44,6 +59,444 @@ const EXECUTION_TIMEOUT_MS = 60_000;
 /** A model job streams `codex exec --json` events, far larger than check output. */
 const MODEL_OUTPUT_LIMIT = 4 * 1024 * 1024;
 const MODEL_TIMEOUT_MAX_MS = 30 * 60_000;
+
+export interface FableBrokerEvidence {
+  readonly policy: typeof FABLE_POLICY;
+  readonly provider: 'claude';
+  readonly model: typeof FABLE_MODEL;
+  readonly executableSha256: string;
+  readonly version: string;
+  readonly accountBindingId: string;
+  readonly invocationId: string;
+  readonly requestId: string;
+  readonly workerId: string;
+  readonly fencingToken: number;
+  readonly headSha: string;
+  readonly permitId: string;
+  readonly credentialEgressPassed: true;
+}
+export interface FableBrokerConfig {
+  readonly version: 1;
+  readonly modelBinding: {
+    readonly executablePath: string;
+    readonly executableSha256: string;
+    readonly version: string;
+    readonly catalogModelId: typeof FABLE_MODEL;
+    readonly cliModelToken: string;
+  };
+  readonly accountBindings: readonly {
+    readonly bindingId: string;
+    readonly accountClass: 'ultra';
+    readonly oauthSourceFile: string;
+    readonly bindMode: 'read_only';
+  }[];
+}
+export function parseFableBrokerConfig(text: string): FableBrokerConfig {
+  try {
+    if (Buffer.byteLength(text) > 65536) throw new Error();
+    const root: unknown = JSON.parse(text);
+    if (
+      !closedData(root, ['version', 'modelBinding', 'accountBindings']) ||
+      root.version !== 1 ||
+      !Array.isArray(root.accountBindings) ||
+      root.accountBindings.length > 100
+    )
+      throw new Error();
+    const model = root.modelBinding;
+    if (
+      !closedData(model, [
+        'executablePath',
+        'executableSha256',
+        'version',
+        'catalogModelId',
+        'cliModelToken',
+      ]) ||
+      typeof model.executablePath !== 'string' ||
+      !isAbsolute(model.executablePath) ||
+      typeof model.executableSha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(model.executableSha256) ||
+      typeof model.version !== 'string' ||
+      !/^[\x20-\x7e]{1,160}$/.test(model.version) ||
+      model.catalogModelId !== FABLE_MODEL ||
+      !fableToken(model.cliModelToken)
+    )
+      throw new Error();
+    const seen = new Set<string>();
+    const bindings = root.accountBindings.map((entry: unknown) => {
+      if (
+        !closedData(entry, ['bindingId', 'accountClass', 'oauthSourceFile', 'bindMode']) ||
+        !fableToken(entry.bindingId) ||
+        entry.accountClass !== 'ultra' ||
+        entry.bindMode !== 'read_only' ||
+        typeof entry.oauthSourceFile !== 'string' ||
+        !isAbsolute(entry.oauthSourceFile) ||
+        seen.has(entry.bindingId)
+      )
+        throw new Error();
+      seen.add(entry.bindingId);
+      return Object.freeze({ ...entry });
+    });
+    return Object.freeze({
+      version: 1,
+      modelBinding: Object.freeze({ ...model }),
+      accountBindings: Object.freeze(bindings),
+    }) as unknown as FableBrokerConfig;
+  } catch {
+    throw new Error(FABLE_CONFIG_ERROR);
+  }
+}
+export function loadFableBrokerConfig(
+  env: Record<string, string | undefined> = process.env
+): FableBrokerConfig | undefined {
+  const path = env.OVERSEER_FABLE_BROKER_CONFIG_PATH;
+  return path === undefined ? undefined : parseFableBrokerConfig(readFableOperatorFile(path));
+}
+/** Exact grammar. Neither work/model text nor the permit supplies CLI arguments. */
+export function fableModelArgv(modelToken: string): string[] {
+  if (!fableToken(modelToken)) throw new Error(FABLE_CONFIG_ERROR);
+  return [
+    '/model/cli',
+    '--print',
+    '--verbose',
+    '--output-format',
+    'stream-json',
+    '--tools',
+    '',
+    '--strict-mcp-config',
+    '--mcp-config',
+    '{"mcpServers":{}}',
+    '--disable-slash-commands',
+    '--setting-sources',
+    '',
+    '--no-session-persistence',
+    '--model',
+    modelToken,
+  ];
+}
+/** Fresh mount/PID/IPC/UTS namespace; check jobs alone also unshare network. */
+export function fableNamespaceArgv(input: {
+  scratch: string;
+  executable?: string;
+  account?: string;
+  checkout?: string;
+  argv: readonly string[];
+}): string[] {
+  const args = [
+    'bwrap',
+    '--die-with-parent',
+    '--new-session',
+    '--unshare-pid',
+    '--unshare-ipc',
+    '--unshare-uts',
+    '--unshare-cgroup',
+    '--cap-drop',
+    'ALL',
+    '--clearenv',
+    '--ro-bind',
+    '/lib',
+    '/lib',
+    '--ro-bind',
+    '/usr/lib',
+    '/usr/lib',
+  ];
+  if (lstatSync('/lib64', { throwIfNoEntry: false })) args.push('--ro-bind', '/lib64', '/lib64');
+  args.push(
+    '--proc',
+    '/proc',
+    '--dev',
+    '/dev',
+    '--tmpfs',
+    '/tmp',
+    '--dir',
+    '/home',
+    '--dir',
+    '/home/model',
+    '--dir',
+    '/home/model/.claude',
+    '--dir',
+    '/empty-codex',
+    '--bind',
+    input.scratch,
+    '/scratch',
+    '--chdir',
+    '/scratch',
+    '--setenv',
+    'PATH',
+    '/usr/local/bin:/usr/bin:/bin',
+    '--setenv',
+    'HOME',
+    '/home/model',
+    '--setenv',
+    'CLAUDE_CONFIG_DIR',
+    '/home/model/.claude',
+    '--setenv',
+    'CODEX_HOME',
+    '/empty-codex',
+    '--setenv',
+    'TMPDIR',
+    '/tmp',
+    '--setenv',
+    'LANG',
+    'C.UTF-8'
+  );
+  if (input.checkout)
+    args.push(
+      '--unshare-net',
+      '--ro-bind',
+      '/usr/bin',
+      '/usr/bin',
+      '--ro-bind',
+      '/usr/local/bin',
+      '/usr/local/bin',
+      '--ro-bind',
+      '/bin',
+      '/bin',
+      '--ro-bind',
+      input.checkout,
+      '/repo',
+      '--chdir',
+      '/repo'
+    );
+  else {
+    if (!input.executable || !input.account) throw new Error('fable_binding_unavailable');
+    args.push(
+      '--dir',
+      '/model',
+      '--ro-bind',
+      input.executable,
+      '/model/cli',
+      '--ro-bind',
+      input.account,
+      '/home/model/.claude/.credentials.json',
+      '--ro-bind',
+      '/etc/ssl/certs',
+      '/etc/ssl/certs',
+      '--ro-bind',
+      '/etc/resolv.conf',
+      '/etc/resolv.conf',
+      '--ro-bind',
+      '/etc/hosts',
+      '/etc/hosts'
+    );
+  }
+  return [...args, '--', ...input.argv];
+}
+/** Only init + one successful terminal result. Tool/assistant/additional frames refuse. */
+export function decodeFableProtocol(
+  text: string,
+  expectedModel: string
+): { text: string; observedModel: string } {
+  try {
+    const frames = text
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    if (frames.length < 2 || frames.length > 64) throw new Error();
+    const init = frames[0];
+    const result = frames[frames.length - 1];
+    const texts = frames.slice(1, -1);
+    if (
+      texts.some(
+        frame =>
+          frame.type !== 'assistant' ||
+          frame.session_id !== init.session_id ||
+          !frame.message ||
+          typeof frame.message !== 'object' ||
+          !Array.isArray((frame.message as { content?: unknown }).content) ||
+          (frame.message as { content: unknown[] }).content.some(
+            block =>
+              !closedData(block, ['type', 'text']) ||
+              block.type !== 'text' ||
+              typeof block.text !== 'string'
+          )
+      )
+    )
+      throw new Error();
+    if (
+      init.type !== 'system' ||
+      init.subtype !== 'init' ||
+      init.model !== expectedModel ||
+      !Array.isArray(init.tools) ||
+      init.tools.length !== 0 ||
+      !Array.isArray(init.mcp_servers) ||
+      init.mcp_servers.length !== 0 ||
+      result.type !== 'result' ||
+      result.subtype !== 'success' ||
+      result.is_error !== false ||
+      typeof result.result !== 'string' ||
+      !result.result.trim() ||
+      typeof init.session_id !== 'string' ||
+      result.session_id !== init.session_id
+    )
+      throw new Error();
+    return { text: result.result, observedModel: expectedModel };
+  } catch {
+    throw new Error('fable_protocol_refused');
+  }
+}
+/** Secrets remain private to the broker and never become evidence fields. */
+export function fableEgressAllowed(stdout: string, stderr: string, credentials: string): boolean {
+  try {
+    const root: unknown = JSON.parse(credentials);
+    const secrets: string[] = [];
+    const visit = (value: unknown, key = ''): void => {
+      if (typeof value === 'string' && /token|secret|password|key/i.test(key)) {
+        if (!value.length) throw new Error();
+        secrets.push(value);
+      } else if (value && typeof value === 'object')
+        for (const [name, child] of Object.entries(value)) visit(child, name);
+    };
+    visit(root);
+    const text = `${stdout}\n${stderr}`;
+    return (
+      secrets.length > 0 &&
+      !secrets.some(secret => text.includes(secret)) &&
+      !/(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer\s+[A-Za-z0-9._~-]{8,})/i.test(
+        text
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+function pinnedFableFile(path: string): void {
+  const info = lstatSync(path);
+  if (!info.isFile() || info.isSymbolicLink() || info.uid !== 0 || (info.mode & 0o022) !== 0)
+    throw new Error('fable_binding_unavailable');
+}
+async function runFableJob(
+  job: BrokerJob,
+  scratch: string,
+  config: FableBrokerConfig | undefined,
+  limits: { timeoutMs: number; outputLimit: number }
+): Promise<BrokerResult> {
+  if (!config || !job.fablePermit) throw new Error('fable_binding_unavailable');
+  const permit = parseFablePermits(JSON.stringify({ version: 1, entries: [job.fablePermit] }))[0];
+  if (permit.headSha !== job.expectedHead || Date.parse(permit.expiresAt) <= Date.now())
+    throw new Error('fable_permission_refused');
+  const temp = join(scratch, 'isolated');
+  await mkdir(temp, { recursive: true, mode: 0o700 });
+  await chmod(scratch, 0o700);
+  const env = {
+    PATH: '/usr/local/bin:/usr/bin:/bin',
+    HOME: temp,
+    CODEX_HOME: temp,
+    LANG: 'C.UTF-8',
+  };
+  // BEFORE any legacy auth copy. Repository/check children receive no account capability.
+  const head = await runBrokerProcess(
+    fableNamespaceArgv({
+      scratch: temp,
+      checkout: job.checkout,
+      argv: ['git', '-c', 'safe.directory=/repo', '-C', '/repo', 'rev-parse', 'HEAD'],
+    }),
+    temp,
+    env
+  );
+  if (head.exitCode !== 0 || head.stdout.trim() !== job.expectedHead)
+    throw new Error('checkout_identity_failure');
+  if (job.prompt === undefined) {
+    const result = await runBrokerProcess(
+      fableNamespaceArgv({
+        scratch: temp,
+        checkout: job.checkout,
+        argv: job.argv.map(value => (value === job.checkout ? '/repo' : value)),
+      }),
+      temp,
+      env,
+      undefined,
+      limits
+    );
+    return {
+      id: job.id,
+      uid: process.getuid?.() ?? -1,
+      ok: result.exitCode === 0 && !result.timedOut && !result.outputTruncated,
+      ...result,
+      checkPolicy: FABLE_POLICY,
+    };
+  }
+  if (JSON.stringify(job.argv) !== '["fable-model-only"]') throw new Error('model_argv_invalid');
+  const binding = config.accountBindings.find(value => value.bindingId === permit.accountBindingId);
+  if (!binding) throw new Error('fable_binding_unavailable');
+  const model = config.modelBinding;
+  pinnedFableFile(model.executablePath);
+  pinnedFableFile(binding.oauthSourceFile);
+  if (
+    createHash('sha256').update(readFileSync(model.executablePath)).digest('hex') !==
+    model.executableSha256
+  )
+    throw new Error('fable_binding_unavailable');
+  const credentials = readFileSync(binding.oauthSourceFile, 'utf8');
+  const wrapper = (argv: string[]): string[] =>
+    fableNamespaceArgv({
+      scratch: temp,
+      executable: model.executablePath,
+      account: binding.oauthSourceFile,
+      argv,
+    });
+  const version = await runBrokerProcess(wrapper(['/model/cli', '--version']), temp, env);
+  const help = await runBrokerProcess(wrapper(['/model/cli', '--help']), temp, env);
+  if (
+    !fableEgressAllowed(version.stdout + help.stdout, version.stderr + help.stderr, credentials) ||
+    version.exitCode !== 0 ||
+    version.stdout.trim() !== model.version ||
+    help.exitCode !== 0 ||
+    [
+      '--tools',
+      '--strict-mcp-config',
+      '--mcp-config',
+      '--disable-slash-commands',
+      '--setting-sources',
+      '--no-session-persistence',
+      '--model',
+      '--output-format',
+    ].some(flag => !help.stdout.includes(flag))
+  )
+    throw new Error('fable_binding_unavailable');
+  if (Date.parse(permit.expiresAt) <= Date.now()) throw new Error('fable_permission_refused');
+  const result = await runBrokerProcess(
+    wrapper(fableModelArgv(model.cliModelToken)),
+    temp,
+    env,
+    job.prompt,
+    { timeoutMs: job.timeoutMs ?? limits.timeoutMs, outputLimit: MODEL_OUTPUT_LIMIT }
+  );
+  if (!fableEgressAllowed(result.stdout, result.stderr, credentials))
+    throw new Error('fable_credential_egress_refused');
+  if (result.exitCode !== 0 || result.timedOut || result.outputTruncated)
+    return {
+      id: job.id,
+      uid: process.getuid?.() ?? -1,
+      ok: false,
+      ...result,
+      stdout: '',
+      stderr: '',
+    };
+  const decoded = decodeFableProtocol(result.stdout, model.cliModelToken);
+  return {
+    id: job.id,
+    uid: process.getuid?.() ?? -1,
+    ok: true,
+    ...result,
+    stdout: decoded.text,
+    stderr: '',
+    fableEvidence: {
+      policy: FABLE_POLICY,
+      provider: 'claude',
+      model: FABLE_MODEL,
+      executableSha256: model.executableSha256,
+      version: model.version,
+      accountBindingId: binding.bindingId,
+      invocationId: job.id,
+      requestId: permit.requestId,
+      workerId: permit.workerId,
+      fencingToken: permit.fencingToken,
+      headSha: job.expectedHead,
+      permitId: permit.permitId,
+      credentialEgressPassed: true,
+    },
+  };
+}
 
 function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
@@ -294,19 +747,23 @@ export async function runBrokerProcess(
 export async function processJob(
   path: string,
   spool = SPOOL,
-  limits: { timeoutMs: number; outputLimit: number } = brokerLimits()
+  limits: { timeoutMs: number; outputLimit: number } = brokerLimits(),
+  fableConfig?: FableBrokerConfig
 ): Promise<BrokerResult> {
   const id = basename(path, '.request.json');
   const scratch = join(spool, `${id}.scratch`);
+  let fableJob = false;
   try {
     const raw = JSON.parse(await readFile(path, 'utf8')) as unknown;
     if (!validJob(raw) || raw.id !== id) throw new Error('invalid_job');
     const job = raw;
+    fableJob = job.fablePermit !== undefined;
     const spoolReal = await realpath(spool);
     const checkout = await realpath(job.checkout);
     if (!inside(checkout, spoolReal)) throw new Error('checkout_outside_spool');
     const info = await stat(checkout);
     if (!info.isDirectory()) throw new Error('checkout_invalid');
+    if (job.fablePermit !== undefined) return await runFableJob(job, scratch, fableConfig, limits);
     if (job.prompt !== undefined && !isPinnedModelArgv(job.argv, checkout)) {
       throw new Error('model_argv_invalid');
     }
@@ -378,7 +835,11 @@ export async function processJob(
       stdout: '',
       stderr: '',
       uid: process.getuid?.() ?? -1,
-      reason: error instanceof Error ? error.message : 'broker_failure',
+      reason: fableJob
+        ? 'fable_broker_refused'
+        : error instanceof Error
+          ? error.message
+          : 'broker_failure',
     };
   } finally {
     await rm(scratch, { recursive: true, force: true });
@@ -392,12 +853,18 @@ async function main(): Promise<never> {
   await writeFile(join(SPOOL, 'ready.tmp'), `${process.pid}\n`, { mode: 0o640 });
   await rename(join(SPOOL, 'ready.tmp'), join(SPOOL, 'ready'));
 
+  let fableConfig: FableBrokerConfig | undefined;
+  try {
+    fableConfig = loadFableBrokerConfig();
+  } catch {
+    /* Invalid configured capability remains disabled, never fallback. */
+  }
   for (;;) {
     const names = (await readdir(SPOOL)).filter(name => name.endsWith('.request.json')).sort();
     for (const name of names) {
       const path = resolve(SPOOL, name);
       if (!inside(path, resolve(SPOOL))) continue;
-      const result = await processJob(path);
+      const result = await processJob(path, SPOOL, brokerLimits(), fableConfig);
       await writeFile(join(SPOOL, `${result.id}.result.tmp`), JSON.stringify(result), {
         mode: 0o640,
       });

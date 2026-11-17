@@ -1,3 +1,5 @@
+import { FABLE_POLICY, FABLE_MODEL, selectFablePermit, type FablePermit } from './judge-transport';
+import { isTrustedFableEvidence, type FableExecutionEvidence } from './reviewer-broker-client';
 /**
  * Governed reviewer -> GitHub review submission
  * (WO-HARNESS-OVERSEER-REVIEW-ROUTE-01, XO authorization 2026-08-17).
@@ -129,7 +131,9 @@ export interface ReviewExecutionProof {
   readonly headSha: string;
   readonly treeSha: string;
   readonly cwd: string;
-  readonly nativePolicy: 'codex_bubblewrap';
+  readonly nativePolicy: 'codex_bubblewrap' | typeof FABLE_POLICY;
+  readonly fablePermit?: FablePermit;
+  readonly fableEvidence?: FableExecutionEvidence;
   readonly nativeVersion: string;
   readonly runtimeUid: number;
   readonly inspectionObserved: boolean;
@@ -870,7 +874,33 @@ function qualifiesExecution(
   proof: ReviewExecutionProof | undefined
 ): proof is ReviewExecutionProof {
   if (proof?.requestId !== context.requestId || proof.headSha !== context.headSha) return false;
-  if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_bubblewrap') return false;
+  if (!proof.inspectionObserved) return false;
+  if (proof.nativePolicy === FABLE_POLICY) {
+    const permit = proof.fablePermit;
+    const evidence = proof.fableEvidence;
+    if (
+      !permit ||
+      !isTrustedFableEvidence(evidence) ||
+      proof.runtimeUid !== 1002 ||
+      proof.nativeVersion !== evidence.version ||
+      proof.cwd !== context.checkoutPath ||
+      evidence.model !== FABLE_MODEL ||
+      evidence.policy !== FABLE_POLICY ||
+      evidence.requestId !== context.requestId ||
+      evidence.workerId !== context.workerId ||
+      evidence.fencingToken !== context.fencingToken ||
+      evidence.headSha !== context.headSha ||
+      evidence.permitId !== permit.permitId ||
+      evidence.accountBindingId !== permit.accountBindingId ||
+      !evidence.credentialEgressPassed
+    )
+      return false;
+    try {
+      if (selectFablePermit([permit], context) !== permit) return false;
+    } catch {
+      return false;
+    }
+  } else if (proof.nativePolicy !== 'codex_bubblewrap') return false;
   if (!Number.isInteger(proof.runtimeUid) || proof.runtimeUid === 0 || !proof.treeSha || !proof.cwd)
     return false;
   if (context.checkPlanStatus === 'unsafe') return false;

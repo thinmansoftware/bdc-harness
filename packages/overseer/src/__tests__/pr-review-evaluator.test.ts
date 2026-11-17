@@ -1167,3 +1167,53 @@ describe('Phase A sanitized termination production seams', () => {
     expect(first.requestId).not.toBe(second.requestId);
   });
 });
+
+describe('Phase B model-only evaluator transport', () => {
+  test('F2 client does not decode an error or manufacture Fable identity', async () => {
+    const { invokeConfiguredReviewModel } = await import('../pr-review-evaluator');
+    const { FABLE_POLICY, FABLE_MODEL } = await import('../judge-transport');
+    const permit = {
+      owner: 'o',
+      repo: 'r',
+      prNumber: 1,
+      headSha: 'a'.repeat(40),
+      requestId: 'request',
+      workerId: 'worker',
+      fencingToken: 1,
+      modelId: FABLE_MODEL,
+      policy: FABLE_POLICY,
+      accountBindingId: 'ultra',
+      permitId: 'permit',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    };
+    let calls = 0;
+    const result = await invokeConfiguredReviewModel(
+      FABLE_MODEL,
+      'synthetic immutable evidence',
+      {
+        kind: 'pr-review',
+        cwd: '/private/fake',
+        expectedHeadSha: permit.headSha,
+        nativePolicy: FABLE_POLICY,
+        fablePermit: permit,
+      },
+      1000,
+      async job => {
+        calls++;
+        expect(job.argv).toEqual(['fable-model-only']);
+        expect(job.fablePermit).toEqual(permit);
+        return {
+          id: 'fake',
+          uid: 1002,
+          ok: false,
+          exitCode: 125,
+          stdout: 'RAW_CANARY',
+          stderr: 'RAW_ERROR_CANARY',
+        };
+      }
+    );
+    expect(calls).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.fableEvidence).toBeUndefined();
+  });
+});
