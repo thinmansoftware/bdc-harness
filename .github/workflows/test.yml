@@ -197,6 +197,8 @@ jobs:
         run: bun test packages/core/src/db/taskmaster-fire-cap.postgres.test.ts
       - name: CE scope approvals PostgreSQL integration
         run: bun test packages/core/src/db/board-scope-approvals.postgres.test.ts
+      - name: T3 fire outcome marker migration PostgreSQL integration
+        run: bun test packages/core/src/db/t3-command-admissions.postgres.test.ts
 
   docker-build:
     if: github.event_name != 'schedule'

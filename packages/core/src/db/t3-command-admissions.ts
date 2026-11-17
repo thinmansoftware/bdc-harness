@@ -38,6 +38,12 @@ export interface T3CommandAdmissionRow {
   reply_message_id: string | null;
   /** Set immediately before the verb's side effect; null = nothing executed. */
   effect_started_at: string | null;
+  /**
+   * WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01: the Dispatch row that told the
+   * originating thread how this fire ended. Null = not sent yet;
+   * 'pre-outcome-backfill' = admitted before the change, never sent.
+   */
+  outcome_message_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -290,6 +296,37 @@ export async function recordReply(
     `UPDATE t3_command_admissions SET reply_message_id = $2, updated_at = $3
      WHERE request_id = $1`,
     [requestId, replyMessageId, now]
+  );
+}
+
+/**
+ * WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01: every admitted fire whose outcome
+ * message has not been sent, oldest first. No LIMIT and no reply_message_id
+ * condition: a fire whose decision reply failed or was dead-lettered must still
+ * be evaluated on every tick, or it would never get its outcome.
+ */
+export async function listFiresAwaitingOutcome(
+  db: IDatabase = getDatabase()
+): Promise<T3CommandAdmissionRow[]> {
+  const result = await db.query<T3CommandAdmissionRow>(
+    `SELECT * FROM t3_command_admissions
+      WHERE verb = 'fire' AND state = 'admitted' AND outcome_message_id IS NULL
+      ORDER BY created_at ASC, request_id ASC`
+  );
+  return [...result.rows];
+}
+
+/** Record the outcome message for a fire, once (an already-set marker is kept). */
+export async function recordOutcome(
+  requestId: string,
+  messageId: string,
+  now: string,
+  db: IDatabase = getDatabase()
+): Promise<void> {
+  await db.query(
+    `UPDATE t3_command_admissions SET outcome_message_id = $2, updated_at = $3
+      WHERE request_id = $1 AND outcome_message_id IS NULL`,
+    [requestId, messageId, now]
   );
 }
 

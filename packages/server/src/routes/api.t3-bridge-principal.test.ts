@@ -792,6 +792,9 @@ describe('Tests 11-12: consumer approve uses the real resume path', () => {
     );
     const deps: CauldronFireConsumerDeps = {
       ...real,
+      // WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01: never read cascade records from
+      // this test's working directory.
+      getFireOutcome: async () => null,
       db,
       listCommands: async () => (acked.includes(command.id) ? [] : [command]),
       sendReply: async input => {
