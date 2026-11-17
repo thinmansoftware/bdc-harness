@@ -24,6 +24,7 @@ export interface SanitizedTermination {
   readonly correlationId: string;
 }
 const trustedDiagnostics = new WeakSet();
+const processDiagnostics = new WeakSet();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 /** Internal factory, never called with model-selected identity or free-form class text. */
 export function terminationDiagnostic(
@@ -49,10 +50,21 @@ export function isTrustedTermination(value: unknown): value is SanitizedTerminat
     Object.values(fields).every(field => 'value' in field)
   );
 }
+/** A factory-created diagnostic alone does not establish an observed child result. */
+export function isTrustedProcessTermination(value: unknown): value is SanitizedTermination {
+  return isTrustedTermination(value) && processDiagnostics.has(value);
+}
 export function classifyBrokerTermination(
   result: ReviewerBrokerResult,
   correlationId: string
 ): SanitizedTermination {
+  if (
+    result.id !== correlationId ||
+    result.uid !== 1002 ||
+    !Number.isSafeInteger(result.exitCode) ||
+    result.ok !== (result.exitCode === 0)
+  )
+    return terminationDiagnostic('invalid_broker_result', null, correlationId);
   if (result.exitCode === 125) {
     const boundBroker = result.id === correlationId && result.uid === 1002 && !result.ok;
     // Pinned processJob catch: no runBrokerProcess flags or observed child exit.
@@ -79,7 +91,19 @@ export function classifyBrokerTermination(
     exit === 0
       ? 'invalid_model_output'
       : (classifyJudgeOutage(`${result.stderr}\n${result.stdout}`)?.kind ?? 'unknown_nonzero');
-  return terminationDiagnostic(kind, exit, correlationId);
+  const diagnostic = terminationDiagnostic(kind, exit, correlationId);
+  if (
+    UUID.test(correlationId) &&
+    result.id === correlationId &&
+    result.uid === 1002 &&
+    Number.isSafeInteger(result.exitCode) &&
+    result.ok === (result.exitCode === 0) &&
+    result.timedOut === false &&
+    result.outputTruncated === false &&
+    result.reason === undefined
+  )
+    processDiagnostics.add(diagnostic);
+  return diagnostic;
 }
 
 const errorDiagnostics = new WeakMap<object, SanitizedTermination>();

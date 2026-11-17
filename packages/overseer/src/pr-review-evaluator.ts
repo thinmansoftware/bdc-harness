@@ -17,12 +17,14 @@ import {
   type JudgeChildSpawn,
   type JudgeTransport,
   type PrReviewTransportContext,
+  supportedPrReviewLadder,
 } from './judge-transport';
 import {
   submitReviewerBrokerJob,
   diagnosticForError,
   terminationDiagnostic,
   isTrustedTermination,
+  isTrustedProcessTermination,
   type SanitizedTermination,
 } from './reviewer-broker-client';
 
@@ -484,6 +486,22 @@ export function reviewErrorCode(error: string | undefined): string | null {
   return /^[a-z0-9_]{1,40}$/.test(code) ? code : null;
 }
 
+function trustedProcessOutage(result: PrReviewModelResult): JudgeOutage | null {
+  const diagnostic = result.diagnostic;
+  if (!isTrustedProcessTermination(diagnostic) || diagnostic.exitCode !== result.exitCode)
+    return null;
+  switch (diagnostic.terminationClass) {
+    case 'auth_expired':
+    case 'usage_limit':
+    case 'usage_limit_until':
+    case 'provider_credits_exhausted':
+      // The public projection has no raw provider date. Use the existing bounded TTL.
+      return { kind: diagnostic.terminationClass, code: diagnostic.terminationClass };
+    default:
+      return null;
+  }
+}
+
 /**
  * Terminality of a PR's check suite for review purposes.
  *
@@ -665,6 +683,7 @@ export async function evaluatePullRequest(
     acceptanceCriteria,
   });
   const ladder = deps.ladder ?? defaultReviewLadder();
+  const supported = deps.executionContext ? supportedPrReviewLadder(ladder) : ladder;
   const diagnostics: SanitizedTermination[] = [];
   let lastError = 'model_unavailable';
   // TRANSPORT vs JUDGMENT across the whole ladder.
@@ -694,6 +713,11 @@ export async function evaluatePullRequest(
   let transportFailure: string | null = null;
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
+    if (!supported.includes(binary)) {
+      diagnostics.push(terminationDiagnostic('unsupported_binary', null));
+      if (lastError === 'model_unavailable') lastError = 'unsupported_binary';
+      continue;
+    }
     const rungStartedAt = Date.now();
     const invocationId = randomUUID();
     getLog().info(
@@ -735,7 +759,9 @@ export async function evaluatePullRequest(
         // had hit its usage limit and grok had no credits (2026-09-14, every
         // review from ~20:45Z). The code now says which, and the rung's outage
         // is reported so the ladder breaker can stop spawning dead rungs.
-        const outage = classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`);
+        const outage = deps.executionContext
+          ? trustedProcessOutage(result)
+          : classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`);
         if (outage) deps.recordRungOutage?.(binary, outage);
         lastError = outage ? outage.code : `model_exit_nonzero:${binary}`;
         getLog().warn(
@@ -784,9 +810,13 @@ export async function evaluatePullRequest(
       const kind =
         message === 'pr_review_native_sandbox_unsupported_binary'
           ? 'unsupported_binary'
-          : (classifyJudgeOutage(message)?.kind ??
+          : ((deps.executionContext ? undefined : classifyJudgeOutage(message)?.kind) ??
             (isTransportError(error) ? 'transport_error' : 'unknown_error'));
       diagnostics.push(known ?? terminationDiagnostic(kind, null, invocationId));
+      if (kind === 'unsupported_binary') {
+        if (lastError === 'model_unavailable') lastError = 'unsupported_binary';
+        continue;
+      }
       // A rate limit raised by the model seam (the judge CLIs read GitHub too)
       // is the same deferral, and must abandon the ladder immediately: walking
       // to the next binary would spend more of a budget that is already
@@ -801,9 +831,11 @@ export async function evaluatePullRequest(
       // error will recur, so it is terminal and named. Classified on the FULL
       // message -- the Codex retry date sits past the 120-char slice that
       // `errorMessage` keeps for the detail half.
-      const outage = classifyJudgeOutage(
-        error instanceof Error ? error.message : typeof error === 'string' ? error : ''
-      );
+      const outage = deps.executionContext
+        ? null
+        : classifyJudgeOutage(
+            error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+          );
       if (outage) {
         deps.recordRungOutage?.(binary, outage);
         lastError = outage.code;
@@ -814,7 +846,7 @@ export async function evaluatePullRequest(
         );
         continue;
       }
-      lastError = `model_error:${errorMessage(error)}`;
+      lastError = deps.executionContext ? 'model_error' : `model_error:${errorMessage(error)}`;
       if (isTransportError(error)) {
         // E2BIG and friends: the process never ran, so this rung was not reached.
         transportFailure ??= lastError;
@@ -828,7 +860,11 @@ export async function evaluatePullRequest(
         {
           binary,
           rungMs,
-          errorMessage: error instanceof Error ? error.message : String(error),
+          errorMessage: deps.executionContext
+            ? 'private_native_error'
+            : error instanceof Error
+              ? error.message
+              : String(error),
           isTransport: isTransportError(error),
           prNumber: input.pr_number,
         },
@@ -855,6 +891,11 @@ export function defaultReviewLadder(): string[] {
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
+}
+
+/** Shared native policy for the evaluator, ingest breaker and parked-head recovery. */
+export function supportedReviewLadder(): string[] {
+  return supportedPrReviewLadder(defaultReviewLadder());
 }
 
 /** Existing judge CLI convention, exposed for the real dependency composition. */
