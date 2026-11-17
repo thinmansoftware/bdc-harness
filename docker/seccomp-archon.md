@@ -40,8 +40,8 @@ errnoRet 38 and the `CAP_SYS_ADMIN` exclusion. These five rules are appended fir
 
 All four added `clone` rules keep mask value `2114060288` (`0x7e020000`) and
 `op` `SCMP_CMP_MASKED_EQ`. `SIGCHLD` sits outside that namespace mask, so it
-still matches when paired with the allowed namespace bits. No other
-`CLONE_NEWUSER` combination is allowed. `CLONE_NEWUTS` and `CLONE_NEWCGROUP`
+still matches when paired with the allowed namespace bits. Apart from the expressly selected Phase B model pair below, no other
+`CLONE_NEWUSER` clone combination is allowed. `CLONE_NEWUTS` and `CLONE_NEWCGROUP`
 stay denied. Original no-namespace `clone` behavior stays unchanged.
 
 `setns` was not added. The isolated trace did not reach `setns` before the

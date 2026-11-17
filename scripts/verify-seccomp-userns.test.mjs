@@ -446,3 +446,13 @@ test('model pair keeps exact mask, architecture and capability conditions', () =
     );
   }
 });
+
+test('the original six-rule suffix stays ordered before the two model additions', () => {
+  assertRejected(pair => {
+    const start = pair.upstream.syscalls.length;
+    [pair.archon.syscalls[start], pair.archon.syscalls[start + 1]] = [
+      pair.archon.syscalls[start + 1],
+      pair.archon.syscalls[start],
+    ];
+  });
+});

@@ -230,8 +230,8 @@ export function verifyDelta(upstreamValue, archonValue) {
     withValueTwo(s390, MODEL_NAMESPACES),
   ];
   const actual = archon.syscalls.slice(upstream.syscalls.length);
-  const actualKeys = actual.map(rule => canonical(rule)).sort();
-  const expectedKeys = expected.map(rule => canonical(rule)).sort();
+  const actualKeys = actual.map(rule => canonical(rule));
+  const expectedKeys = expected.map(rule => canonical(rule));
   if (!deepEqual(actualKeys, expectedKeys)) {
     throw new Error('appended seccomp rules are not the eight-rule user-namespace delta');
   }
