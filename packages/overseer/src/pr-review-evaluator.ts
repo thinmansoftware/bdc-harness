@@ -734,6 +734,18 @@ export async function evaluatePullRequest(
         isTrustedTermination(result.diagnostic)
           ? result.diagnostic
           : terminationDiagnostic(kind, exit, invocationId);
+      // A native success must be an observed, consistent process result. Never
+      // clear the breaker or parse a verdict merely because exitCode is zero.
+      if (
+        deps.executionContext &&
+        (result.diagnostic?.terminationClass === 'invalid_broker_result' ||
+          (result.exitCode === 0 && !isTrustedProcessTermination(result.diagnostic)))
+      ) {
+        diagnostics.push(diagnostic('invalid_broker_result', null));
+        lastError = 'invalid_broker_result';
+        nonTransportFailure = true;
+        continue;
+      }
       if (result.timedOut) {
         diagnostics.push(diagnostic('timeout', null));
         // A timeout is transport, not judgment: the process started but never
@@ -955,6 +967,25 @@ export async function invokeConfiguredReviewModel(
         },
         { id: correlationId }
       );
+      // Refuse the envelope BEFORE consuming even well-formed APPROVE text.
+      // Failure diagnostics retain Phase A's shape; only qualified exit-zero
+      // process results may supply a candidate verdict or clear an outage.
+      if (
+        !isTrustedTermination(result.diagnostic) ||
+        result.diagnostic.terminationClass === 'invalid_broker_result' ||
+        (result.exitCode === 0 && !isTrustedProcessTermination(result.diagnostic))
+      ) {
+        return {
+          exitCode: 1,
+          stdout: '',
+          timedOut: false,
+          diagnostic:
+            isTrustedTermination(result.diagnostic) &&
+            result.diagnostic.terminationClass === 'invalid_broker_result'
+              ? result.diagnostic
+              : terminationDiagnostic('invalid_broker_result', null, correlationId),
+        };
+      }
       const payload = result.stdout.trim().length > 0 ? result.stdout : result.stderr;
       return {
         exitCode: result.exitCode,

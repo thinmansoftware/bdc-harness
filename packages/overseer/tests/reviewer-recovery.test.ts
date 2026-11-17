@@ -290,3 +290,49 @@ test('R3 qualified success remains determinate and clears the supported outage',
     }).check()
   ).toBeNull();
 });
+
+for (const fields of [
+  { uid: 999 },
+  { ok: false },
+  { outputTruncated: true },
+  { timedOut: undefined },
+]) {
+  test(`R2 valid APPROVE payload cannot outvote malformed native envelope ${JSON.stringify(fields)}`, async () => {
+    recordJudgeRungOutage('codex', { kind: 'auth_expired', code: 'auth_expired' });
+    const callbacks: unknown[] = [];
+    const result = await nativeResult({
+      ok: true,
+      exitCode: 0,
+      stderr: '',
+      stdout: JSON.stringify({
+        type: 'item.completed',
+        item: {
+          type: 'agent_message',
+          text: JSON.stringify({ verdict: 'APPROVE', findings: [], reviewed_head_sha: head }),
+        },
+      }),
+      ...fields,
+    });
+    const evaluated = await evaluatePullRequest(
+      input,
+      deps(async () => result, {
+        recordRungOutage: (binary, outage) => {
+          callbacks.push(outage);
+          recordJudgeRungOutage(binary, outage);
+        },
+      })
+    );
+    expect(evaluated.verdict).toBe('INDETERMINATE');
+    expect(evaluated.error).toBe('invalid_broker_result');
+    expect(callbacks).toEqual([]);
+    expect(
+      createJudgeLadderBreaker({
+        ladder: ['codex'],
+        nativePrReview: true,
+        sendOperatorMessage: async () => {},
+      }).check()?.rungs[0].code
+    ).toBe('auth_expired');
+    expect(result.stdout).toBe('');
+    expect(JSON.stringify(evaluated)).not.toContain(canary);
+  });
+}
