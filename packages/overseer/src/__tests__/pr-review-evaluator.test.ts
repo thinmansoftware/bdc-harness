@@ -953,6 +953,114 @@ describe('Phase A sanitized termination production seams', () => {
     expect(evaluated.diagnostics?.[0].terminationClass).toBe('unknown_nonzero');
     expect(evaluated.diagnostics?.[0].exitCode).toBe(1);
   });
+  test('A2 broker catch125 is unavailable, observed125 stays observed, and provenance refuses', async () => {
+    const cases: [Partial<ReviewerBrokerResult>, string, number | null][] = [
+      [
+        { exitCode: 125, stdout: '', stderr: '', reason: 'reviewer_auth_missing' },
+        'broker_unavailable',
+        null,
+      ],
+      [
+        { exitCode: 125, stdout: '', stderr: '', timedOut: false, outputTruncated: false },
+        'unknown_nonzero',
+        125,
+      ],
+      [
+        {
+          exitCode: 125,
+          stdout: '',
+          stderr: '',
+          timedOut: true,
+          outputTruncated: false,
+          reason: 'execution_timeout',
+        },
+        'timeout',
+        null,
+      ],
+      [
+        {
+          exitCode: 125,
+          stdout: '',
+          stderr: '',
+          timedOut: false,
+          outputTruncated: true,
+          reason: 'output_limit_exceeded',
+        },
+        'unknown_nonzero',
+        125,
+      ],
+      [{ exitCode: 125, stdout: '', stderr: '' }, 'invalid_broker_result', null],
+      [
+        {
+          exitCode: 125,
+          stdout: '',
+          stderr: '',
+          timedOut: false,
+          outputTruncated: false,
+          reason: 'reviewer_auth_missing',
+        },
+        'invalid_broker_result',
+        null,
+      ],
+      [
+        { exitCode: 125, stdout: '', stderr: '', uid: 999, reason: 'reviewer_auth_missing' },
+        'invalid_broker_result',
+        null,
+      ],
+    ];
+    for (const [fields, kind, exit] of cases) {
+      const { result, requestId } = await diagnosticFixture(fields);
+      expect(result.diagnostic).toEqual({
+        terminationClass: kind,
+        exitCode: exit,
+        correlationId: requestId,
+      });
+      expect(JSON.stringify(result.diagnostic)).not.toContain('reviewer_auth_missing');
+      expect(JSON.stringify(result.diagnostic)).not.toContain('PRIVATE_');
+    }
+  });
+  test('A3 caller nonUUID override refuses before consuming a private result', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'diagnostic-id-'));
+    const id = 'synthetic-non-uuid';
+    try {
+      await writeFile(join(root, 'ready'), 'synthetic');
+      await writeFile(
+        join(root, `${id}.result.json`),
+        JSON.stringify({ id, ok: false, exitCode: 1, stdout: '', stderr: '', uid: 1002 })
+      );
+      await expect(
+        submitReviewerBrokerJob(
+          { checkout: '/synthetic', expectedHead: HEAD_A, argv: ['synthetic'] },
+          { id, env: { OVERSEER_REVIEW_SPOOL: root } }
+        )
+      ).rejects.toThrow('reviewer_broker_unavailable');
+      expect((await readdir(root)).sort()).toEqual(['ready', `${id}.result.json`].sort());
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  test('A7 head mismatch preserves earlier safe attempts without changing verdict', async () => {
+    const { result } = await diagnosticFixture({
+      exitCode: 125,
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      outputTruncated: false,
+    });
+    const evaluated = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['first', 'second'],
+        invokeModel: async binary =>
+          binary === 'first'
+            ? result
+            : { exitCode: 0, timedOut: false, stdout: output('APPROVE', [], HEAD_B) },
+      })
+    );
+    expect(evaluated.verdict).toBe('INDETERMINATE');
+    expect(evaluated.error).toBe('reviewed_head_mismatch');
+    expect(evaluated.diagnostics).toEqual([result.diagnostic!]);
+  });
   test('A3 wrong result identity and malformed types refuse and clean private spool', async () => {
     for (const bad of [
       { id: 'FOREIGN_DIAGNOSTIC_CANARY' },

@@ -50,9 +50,29 @@ export function isTrustedTermination(value: unknown): value is SanitizedTerminat
   );
 }
 export function classifyBrokerTermination(
-  result: Pick<ReviewerBrokerResult, 'exitCode' | 'stdout' | 'stderr' | 'timedOut'>,
+  result: ReviewerBrokerResult,
   correlationId: string
 ): SanitizedTermination {
+  if (result.exitCode === 125) {
+    const boundBroker = result.id === correlationId && result.uid === 1002 && !result.ok;
+    // Pinned processJob catch: no runBrokerProcess flags or observed child exit.
+    // Only the data shape matters; the private reason is never interpreted.
+    const brokerCatch =
+      boundBroker &&
+      result.stdout === '' &&
+      result.stderr === '' &&
+      typeof result.reason === 'string' &&
+      Object.keys(result).sort().join(',') === 'exitCode,id,ok,reason,stderr,stdout,uid';
+    if (brokerCatch) return terminationDiagnostic('broker_unavailable', null, correlationId);
+    const observedProcess =
+      boundBroker &&
+      typeof result.timedOut === 'boolean' &&
+      typeof result.outputTruncated === 'boolean' &&
+      (result.reason === undefined ||
+        ((result.timedOut || result.outputTruncated) && typeof result.reason === 'string'));
+    if (!observedProcess)
+      return terminationDiagnostic('invalid_broker_result', null, correlationId);
+  }
   if (result.timedOut) return terminationDiagnostic('timeout', null, correlationId);
   const exit = Number.isSafeInteger(result.exitCode) ? result.exitCode : null;
   const kind =
@@ -133,7 +153,7 @@ async function submitReviewerBrokerJobInternal(
   const env = options.env ?? process.env;
   const spool = env.OVERSEER_REVIEW_SPOOL?.trim() || DEFAULT_SPOOL;
   const id = options.id ?? randomUUID();
-  if (!/^[A-Za-z0-9_-]{1,80}$/.test(id))
+  if (!UUID.test(id))
     throw new ReviewerBrokerError(
       REVIEWER_BROKER_UNAVAILABLE,
       UUID.test(id) ? terminationDiagnostic('broker_unavailable', null, id) : undefined

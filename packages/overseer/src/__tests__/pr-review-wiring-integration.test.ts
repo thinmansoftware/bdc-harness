@@ -1732,8 +1732,24 @@ describe('Phase A production diagnostic return wiring', () => {
               requiredContexts: ['synthetic-ci'],
             }),
             fetchAcceptanceCriteria: async () => null,
-            ladder: ['codex'],
-            invokeModel: async () => native,
+            ladder: ['codex', 'cursor'],
+            invokeModel: async binary =>
+              binary === 'codex'
+                ? native
+                : invokeConfiguredReviewModel(
+                    binary,
+                    'PRIVATE_FALLBACK_PROMPT_CANARY',
+                    {
+                      kind: 'pr-review',
+                      cwd: checkout,
+                      expectedHeadSha: head,
+                      nativePolicy: 'codex_bubblewrap',
+                    },
+                    1000,
+                    async () => {
+                      throw new Error('unexpected_fake_broker_call');
+                    }
+                  ),
           }
         );
       const production = createRealSubmitDeps('thinman-overseer[bot]', {
@@ -1743,12 +1759,15 @@ describe('Phase A production diagnostic return wiring', () => {
         observeExecution: async () => proof,
       });
       const bodies: { body: string; commitId?: string; event: string }[] = [];
+      const receipts: unknown[] = [];
       const isolated = {
         ...production,
         currentHeadSha: async () => head,
         isDraft: async () => false,
         hasCustody: async () => true,
-        recordReceipt: async () => {},
+        recordReceipt: async (receipt: Parameters<typeof production.recordReceipt>[0]) => {
+          receipts.push(receipt);
+        },
         submitReview: async (request: Parameters<typeof production.submitReview>[0]) => {
           bodies.push(request);
           return {
@@ -1763,7 +1782,7 @@ describe('Phase A production diagnostic return wiring', () => {
         },
       };
       const outcome = await runAndSubmitReview(work, isolated);
-      expect(outcome.disposition).toBe('changes_requested');
+      expect(outcome).toMatchObject({ disposition: 'changes_requested' });
       expect(bodies).toHaveLength(1);
       expect(bodies[0].event).toBe('REQUEST_CHANGES');
       expect(bodies[0].commitId).toBe(head);
@@ -1771,14 +1790,28 @@ describe('Phase A production diagnostic return wiring', () => {
       expect(body).toContain('Reviewer diagnostic (sanitized):');
       expect(body).toContain(JSON.stringify(native.diagnostic));
       expect(body).toContain('End reviewer diagnostic.');
+      const safeEntries = body
+        .split('Reviewer diagnostic (sanitized):\n')[1]
+        .split('\nEnd reviewer diagnostic.')[0]
+        .split('\n')
+        .map(line => JSON.parse(line));
+      expect(safeEntries).toHaveLength(2);
+      expect(safeEntries[0]).toEqual(native.diagnostic);
+      expect(safeEntries[1].terminationClass).toBe('unsupported_binary');
+      expect(safeEntries[1].exitCode).toBeNull();
+      expect(safeEntries[1].correlationId).not.toBe(safeEntries[0].correlationId);
       expect(body).toContain(head);
       expect(body.length).toBeLessThanOrEqual(60_000);
       for (const canary of [
         'PRIVATE_PROMPT_CANARY',
         'PRIVATE_STDOUT_CANARY',
         'PRIVATE_CREDENTIAL_CANARY',
-      ])
-        expect(body).not.toContain(canary);
+        'PRIVATE_FALLBACK_PROMPT_CANARY',
+        'reviewer_auth_missing',
+      ]) {
+        expect(JSON.stringify(bodies)).not.toContain(canary);
+        expect(JSON.stringify(receipts)).not.toContain(canary);
+      }
       // Actual production proof-refusal branch must remain a COMMENT, with no forced section.
       const incomplete = createRealSubmitDeps('thinman-overseer[bot]', {
         octokit: stubOctokit(),

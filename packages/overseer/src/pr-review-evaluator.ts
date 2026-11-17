@@ -763,7 +763,10 @@ export async function evaluatePullRequest(
       try {
         assertCandidateIsCurrentHead(input.head_sha, parsed.reviewed_head_sha);
       } catch {
-        return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
+        return {
+          ...indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch'),
+          ...(diagnostics.length > 0 ? { diagnostics } : {}),
+        };
       }
       getLog().info(
         { binary, model: describeJudgeModel(binary), rungMs, prNumber: input.pr_number },
