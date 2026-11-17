@@ -109,7 +109,11 @@ beforeAll(async () => {
       -- isolated schema rather than running the migrations, so a principal
       -- seeded by migration 046 still has to be declared here.
       ('taskmaster', 'Taskmaster', 'worker_poll', TRUE),
-      ('overseer', 'Overseer', 'notify_only', TRUE)
+      ('overseer', 'Overseer', 'notify_only', TRUE),
+      -- Existing production recipients used by the publication source/intent.
+      -- This isolated schema mirrors their canonical seed; no new principal.
+      ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
+      ('operator', 'Operator', 'drain_on_start', TRUE)
   `);
   await db.query(`
     CREATE TABLE agent_dispatch_messages (
