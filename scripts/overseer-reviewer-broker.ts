@@ -185,6 +185,8 @@ export function fableNamespaceArgv(input: {
     'bwrap',
     '--die-with-parent',
     '--new-session',
+    // The pinned Docker binary is explicitly non-setuid; mounts require this namespace.
+    '--unshare-user',
     '--unshare-pid',
     '--unshare-ipc',
     '--unshare-uts',

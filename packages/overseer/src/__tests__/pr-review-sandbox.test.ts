@@ -1011,6 +1011,20 @@ describe.serial('observed checkout integrity and check environment', () => {
 });
 
 describe('Phase B broker closed configuration and inert protocol', () => {
+  test('F3 wrapper creates a user namespace for pinned non-setuid bubblewrap', async () => {
+    const { fableNamespaceArgv } = await import('../../../../scripts/overseer-reviewer-broker');
+    const argv = fableNamespaceArgv({
+      scratch: '/private/synthetic',
+      executable: '/private/cli',
+      account: '/private/oauth',
+      argv: ['/model/cli'],
+    });
+    expect(argv).toContain('--unshare-user');
+    expect(argv).toContain('--unshare-pid');
+    expect(argv).not.toContain('--ro-bind-try');
+    expect(argv).not.toContain('/app');
+  });
+
   test('F1 configuration is closed, unique, pinned and Ultra-only', async () => {
     const { parseFableBrokerConfig, fableModelArgv } =
       await import('../../../../scripts/overseer-reviewer-broker');

@@ -312,6 +312,20 @@ async function brokerSmoke(): Promise<void> {
   }
 }
 
+/** Synthetic-only classification: never print captured child output, paths or account canaries. */
+function fableFixtureFailure(result: { code: number; stdout: string; stderr: string }): string {
+  const text = `${result.stdout}\n${result.stderr}`;
+  const fixed =
+    /fable_fixture_(?:read_allowed|parent_environment|account_binding|auth_writable|repository_binding|network_allowed)/.exec(
+      text
+    )?.[0];
+  if (fixed) return fixed;
+  if (/bwrap:.*(?:namespace|unshare|permitted)/i.test(text)) return 'namespace_refused';
+  if (/bwrap:.*(?:mount|bind|symlink|directory)/i.test(text)) return 'mount_refused';
+  if (/bwrap:.*exec|not found|shared librar/i.test(text)) return 'runtime_unavailable';
+  return 'unclassified';
+}
+
 /** Same production wrapper, fake local executable/account only; never provider traffic. */
 async function fableSyntheticSmoke(): Promise<void> {
   const root = await mkdtemp('/tmp/fable-synthetic-');
@@ -364,7 +378,9 @@ async function fableSyntheticSmoke(): Promise<void> {
       { cwd: scratch, env: cleanEnv }
     );
     if (model.code !== 0 || !model.stdout.includes('FABLE_WRAPPER_OK'))
-      throw new Error('fable_model_wrapper_failed');
+      throw new Error(
+        `fable_model_wrapper_failed:exit=${model.code}:class=${fableFixtureFailure(model)}`
+      );
     const check = await run(
       fableNamespaceArgv({
         scratch,
@@ -374,7 +390,9 @@ async function fableSyntheticSmoke(): Promise<void> {
       { cwd: scratch, env: cleanEnv }
     );
     if (check.code !== 0 || !check.stdout.includes('FABLE_WRAPPER_OK'))
-      throw new Error('fable_check_wrapper_failed');
+      throw new Error(
+        `fable_check_wrapper_failed:exit=${check.code}:class=${fableFixtureFailure(check)}`
+      );
     if ((await readFile(outside, 'utf8')) !== 'SYNTHETIC_CONTROLPLANE')
       throw new Error('fable_fixture_outside_mutated');
     if ((await readFile(account, 'utf8')) !== '{"accessToken":"SYNTHETIC_ONLY"}')
