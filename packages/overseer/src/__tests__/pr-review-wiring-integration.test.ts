@@ -1,3 +1,13 @@
+import { mkdtemp, mkdir, writeFile, rm, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { invokeConfiguredReviewModel, evaluatePullRequest } from '../pr-review-evaluator.ts';
+import { terminationDiagnostic, submitReviewerBrokerJob } from '../reviewer-broker-client.ts';
+import { buildIndeterminateSummary } from '../pr-review-wiring.ts';
+import {
+  runAndSubmitReview,
+  type ReviewWorkItem,
+  type ReviewExecutionProof,
+} from '../pr-review-submit.ts';
 /**
  * WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 -- integration test against a REAL
  * database, not a fake IngestDeps.
@@ -1603,5 +1613,255 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
       [REMEDIATION_RECIPIENT]
     );
     expect(Number(rows.rows[0]?.n ?? 0)).toBe(MAX_REMEDIATION_ATTEMPTS);
+  });
+});
+
+describe('Phase A production diagnostic return wiring', () => {
+  beforeEach(() => {
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-diagnostic-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+  afterEach(async () => {
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  test('A8 real native-client evaluator submit wiring keeps exact safe body and proof gates', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'diagnostic-return-'));
+    await writeFile(join(root, 'ready'), 'synthetic');
+    try {
+      const checkout = join(root, 'checkout');
+      await mkdir(checkout);
+      await writeFile(join(checkout, 'fixture.txt'), 'synthetic repository\n');
+      const git = (args: string[]): string => {
+        const result = Bun.spawnSync(['git', '-C', checkout, ...args], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        expect(result.exitCode).toBe(0);
+        return result.stdout.toString().trim();
+      };
+      git(['init', '-q']);
+      git(['add', 'fixture.txt']);
+      git([
+        '-c',
+        'user.name=Synthetic Reviewer',
+        '-c',
+        'user.email=fixture@example.invalid',
+        'commit',
+        '-qm',
+        'synthetic fixture',
+      ]);
+      const head = git(['rev-parse', 'HEAD']);
+      const tree = git(['rev-parse', 'HEAD^{tree}']);
+      const native = await invokeConfiguredReviewModel(
+        'codex',
+        'PRIVATE_PROMPT_CANARY',
+        {
+          kind: 'pr-review',
+          cwd: checkout,
+          expectedHeadSha: head,
+          nativePolicy: 'codex_bubblewrap',
+        },
+        1000,
+        async (job, options) => {
+          await writeFile(
+            join(root, `${options?.id}.result.json`),
+            JSON.stringify({
+              id: options?.id,
+              ok: false,
+              exitCode: 1,
+              stdout: 'PRIVATE_STDOUT_CANARY',
+              stderr: 'PRIVATE_CREDENTIAL_CANARY authentication required',
+              uid: 1002,
+            })
+          );
+          return submitReviewerBrokerJob(job, { ...options, env: { OVERSEER_REVIEW_SPOOL: root } });
+        }
+      );
+      expect((await readdir(root)).sort()).toEqual(['checkout', 'ready']);
+      const context = {
+        requestId: 'synthetic-request',
+        workerId: 'synthetic-worker',
+        fencingToken: 1,
+        owner: 'thinmansoftware',
+        repo: 'fixture',
+        prNumber: 1,
+        headSha: head,
+        checkoutPath: checkout,
+        reviewerIdentity: 'thinman-overseer[bot]',
+        rung: 'codex',
+        checkPlanStatus: 'absent' as const,
+        checkPlan: [],
+      };
+      const proof: ReviewExecutionProof = {
+        requestId: context.requestId,
+        headSha: head,
+        treeSha: tree,
+        cwd: checkout,
+        nativePolicy: 'codex_bubblewrap',
+        nativeVersion: 'synthetic-version',
+        runtimeUid: 1002,
+        inspectionObserved: true,
+        check_plan: 'absent',
+        checks: [],
+        startedAt: '2026-01-01T00:00:00Z',
+        endedAt: '2026-01-01T00:00:01Z',
+      };
+      const work: ReviewWorkItem = {
+        correlationId: 'synthetic-review',
+        messageId: 'synthetic-message',
+        owner: context.owner,
+        repo: context.repo,
+        prNumber: 1,
+        headSha: head,
+        author: 'fixture-author',
+        executionContext: context,
+      };
+      const evaluator = async () =>
+        evaluatePullRequest(
+          { owner: work.owner, repo: work.repo, pr_number: 1, head_sha: head },
+          {
+            reviewer: { provider: 'synthetic', model: 'synthetic' },
+            fetchEvidence: async () => ({
+              diff: '+synthetic',
+              checks: [{ name: 'synthetic-ci', status: 'completed', conclusion: 'success' }],
+              requiredContexts: ['synthetic-ci'],
+            }),
+            fetchAcceptanceCriteria: async () => null,
+            ladder: ['codex', 'cursor'],
+            invokeModel: async binary =>
+              binary === 'codex'
+                ? native
+                : invokeConfiguredReviewModel(
+                    binary,
+                    'PRIVATE_FALLBACK_PROMPT_CANARY',
+                    {
+                      kind: 'pr-review',
+                      cwd: checkout,
+                      expectedHeadSha: head,
+                      nativePolicy: 'codex_bubblewrap',
+                    },
+                    1000,
+                    async () => {
+                      throw new Error('unexpected_fake_broker_call');
+                    }
+                  ),
+          }
+        );
+      const production = createRealSubmitDeps('thinman-overseer[bot]', {
+        octokit: stubOctokit(),
+        patOctokit: null,
+        evaluate: evaluator,
+        observeExecution: async () => proof,
+      });
+      const bodies: { body: string; commitId?: string; event: string }[] = [];
+      const receipts: unknown[] = [];
+      const isolated = {
+        ...production,
+        currentHeadSha: async () => head,
+        isDraft: async () => false,
+        hasCustody: async () => true,
+        recordReceipt: async (receipt: Parameters<typeof production.recordReceipt>[0]) => {
+          receipts.push(receipt);
+        },
+        submitReview: async (request: Parameters<typeof production.submitReview>[0]) => {
+          bodies.push(request);
+          return {
+            submitted: true,
+            review: {
+              id: 1,
+              url: 'https://example.invalid/review',
+              commitSha: head,
+              state: 'CHANGES_REQUESTED',
+            },
+          };
+        },
+      };
+      const outcome = await runAndSubmitReview(work, isolated);
+      expect(outcome).toMatchObject({ disposition: 'changes_requested' });
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0].event).toBe('REQUEST_CHANGES');
+      expect(bodies[0].commitId).toBe(head);
+      const body = bodies[0].body;
+      expect(body).toContain('Reviewer diagnostic (sanitized):');
+      expect(body).toContain(JSON.stringify(native.diagnostic));
+      expect(body).toContain('End reviewer diagnostic.');
+      const safeEntries = body
+        .split('Reviewer diagnostic (sanitized):\n')[1]
+        .split('\nEnd reviewer diagnostic.')[0]
+        .split('\n')
+        .map(line => JSON.parse(line));
+      expect(safeEntries).toHaveLength(2);
+      expect(safeEntries[0]).toEqual(native.diagnostic);
+      expect(safeEntries[1].terminationClass).toBe('unsupported_binary');
+      expect(safeEntries[1].exitCode).toBeNull();
+      expect(safeEntries[1].correlationId).not.toBe(safeEntries[0].correlationId);
+      expect(body).toContain(head);
+      expect(body.length).toBeLessThanOrEqual(60_000);
+      for (const canary of [
+        'PRIVATE_PROMPT_CANARY',
+        'PRIVATE_STDOUT_CANARY',
+        'PRIVATE_CREDENTIAL_CANARY',
+        'PRIVATE_FALLBACK_PROMPT_CANARY',
+        'reviewer_auth_missing',
+      ]) {
+        expect(JSON.stringify(bodies)).not.toContain(canary);
+        expect(JSON.stringify(receipts)).not.toContain(canary);
+      }
+      // Actual production proof-refusal branch must remain a COMMENT, with no forced section.
+      const incomplete = createRealSubmitDeps('thinman-overseer[bot]', {
+        octokit: stubOctokit(),
+        patOctokit: null,
+        evaluate: evaluator,
+        observeExecution: async () => undefined,
+      });
+      const refused = await runAndSubmitReview(work, {
+        ...isolated,
+        runReviewer: incomplete.runReviewer,
+      });
+      expect(refused.disposition).toBe('review_incomplete');
+      expect(bodies.at(-1)?.event).toBe('COMMENT');
+      expect(bodies.at(-1)?.body).not.toContain('Reviewer diagnostic (sanitized):');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('A9 renderer refuses caller/model metadata without invoking malicious getters', async () => {
+    let reads = 0;
+    const foreign = {
+      terminationClass: 'auth_expired',
+      exitCode: 1,
+      correlationId: '11111111-1111-4111-8111-111111111111',
+      secret: 'PRIVATE_FOREIGN_CANARY',
+    };
+    const getter = Object.defineProperty({}, 'terminationClass', {
+      get() {
+        reads++;
+        throw new Error('PRIVATE_GETTER_CANARY');
+      },
+    });
+    const safe = terminationDiagnostic('unknown_error', null);
+    const summary = buildIndeterminateSummary('model_error:PRIVATE_EXCEPTION_CANARY', [
+      foreign,
+      getter,
+      safe,
+    ] as never);
+    expect(reads).toBe(0);
+    expect(summary).toContain(JSON.stringify(safe));
+    expect(summary).not.toContain(foreign.correlationId);
+    for (const canary of [
+      'PRIVATE_FOREIGN_CANARY',
+      'PRIVATE_GETTER_CANARY',
+      'PRIVATE_EXCEPTION_CANARY',
+    ])
+      expect(summary).not.toContain(canary);
+    expect(buildIndeterminateSummary('model_error', [foreign] as never)).not.toContain(
+      'Reviewer diagnostic (sanitized):'
+    );
   });
 });
