@@ -13,7 +13,7 @@ const textDiff =
   'diff --git a/spec.md b/spec.md\n--- a/spec.md\n+++ b/spec.md\n@@ -1 +1 @@\n-old\n+' +
   'large text\n+'.repeat(12000) +
   'real hunk\n';
-function fixture(response: unknown, patch?: string, filename = 'spec.md') {
+function fixture(response: unknown, patch?: string | null, filename = 'spec.md') {
   const calls: Record<string, unknown>[] = [];
   const client = {
     pulls: {
@@ -60,6 +60,12 @@ test('ordinary listing patches preserve the existing path without fallback', asy
   const f = fixture(new Error('must not call'), '@@ -1 +1 @@\n-old\n+new');
   expect((await f.fetch(request)).diff).toContain('+new');
   expect(f.calls).toHaveLength(1);
+});
+
+test('null patch is missing evidence too', async () => {
+  const f = fixture(textDiff, null);
+  expect((await f.fetch(request)).diff).toBe(textDiff);
+  expect(f.calls).toHaveLength(2);
 });
 
 test('binary whole diff retains the explicit unavailable marker', async () => {

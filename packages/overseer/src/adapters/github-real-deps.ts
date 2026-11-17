@@ -592,7 +592,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
     let diff = files
       .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
       .join('\n');
-    if (files.some(file => file.patch === undefined)) {
+    if (files.some(file => typeof file.patch !== 'string')) {
       try {
         // The file listing omits large text patches as well as binary patches.
         // Compare immutable SHAs, never a moving PR ref or an unauthenticated URL.
@@ -612,7 +612,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
           throw new Error('invalid_diff_response');
         }
         const blocks = body.split(/(?=^diff --git )/m);
-        for (const file of files.filter(file => file.patch === undefined)) {
+        for (const file of files.filter(file => typeof file.patch !== 'string')) {
           const block = blocks.find(block =>
             block.split('\n', 1)[0]?.endsWith(` b/${file.filename}`)
           );
