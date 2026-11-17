@@ -1,3 +1,5 @@
+import { createHash as publicationHash } from 'node:crypto';
+import type { ReviewPublicationIntent } from '@archon/core/db/dispatch';
 import { createHash } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
@@ -2919,5 +2921,66 @@ export function createRealGitHubClientDeps(
       // A full page may hide more files: unreadable, so the caller treats the merge as not spec-only.
       return response.data.length >= 100 ? null : response.data.map(file => file.filename);
     },
+  };
+}
+
+/** Complete exact-target observation only; absence/error never authorizes a second POST. */
+export function createObserveReviewPublication(
+  octokit: RealGitHubOctokitLike
+): (intent: ReviewPublicationIntent) => Promise<SubmitPullRequestReviewResult['review'] | null> {
+  return async intent => {
+    try {
+      if (!octokit.pulls.listReviews) return null;
+      const marker = `<!-- overseer-review-publication:${intent.publicationId} -->`;
+      const matches: NonNullable<SubmitPullRequestReviewResult['review']>[] = [];
+      let complete = false;
+      for (let page = 1; page <= 100; page++) {
+        const response = await octokit.pulls.listReviews({
+          owner: intent.owner,
+          repo: intent.repo,
+          pull_number: intent.prNumber,
+          per_page: 100,
+          page,
+        });
+        if (!Array.isArray(response.data)) return null;
+        for (const raw of response.data) {
+          const row = raw as unknown as {
+            id?: unknown;
+            body?: unknown;
+            commit_id?: unknown;
+            state?: unknown;
+            html_url?: unknown;
+            user?: { login?: unknown; type?: unknown };
+          };
+          if (typeof row.body !== 'string') return null;
+          if (!row.body.includes(marker)) continue;
+          if (
+            row.body.split(marker).length !== 2 ||
+            row.user?.type !== 'Bot' ||
+            row.user.login !== intent.actorLogin ||
+            row.commit_id !== intent.headSha ||
+            row.state !== (intent.event === 'APPROVE' ? 'APPROVED' : 'CHANGES_REQUESTED') ||
+            !Number.isSafeInteger(row.id) ||
+            Number(row.id) <= 0 ||
+            typeof row.html_url !== 'string' ||
+            publicationHash('sha256').update(row.body).digest('hex') !== intent.bodySha256
+          )
+            return null;
+          matches.push({
+            id: Number(row.id),
+            url: row.html_url,
+            commitSha: intent.headSha,
+            state: String(row.state),
+          });
+        }
+        if (response.data.length < 100) {
+          complete = true;
+          break;
+        }
+      }
+      return complete && matches.length === 1 ? matches[0] : null;
+    } catch {
+      return null;
+    }
   };
 }

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
@@ -316,7 +317,7 @@ async function brokerSmoke(): Promise<void> {
 function fableFixtureFailure(result: { code: number; stdout: string; stderr: string }): string {
   const text = `${result.stdout}\n${result.stderr}`;
   const fixed =
-    /fable_fixture_(?:read_allowed|parent_environment|account_binding|auth_writable|repository_binding|network_allowed)/.exec(
+    /fable_fixture_(?:read_allowed|parent_environment|account_binding|auth_writable|repository_binding|network_allowed|denial_unknown|model_network|network_denial_unknown|socket_allowed|socket_denial_unknown)/.exec(
       text
     )?.[0];
   if (fixed) return fixed;
@@ -333,9 +334,12 @@ async function fableSyntheticSmoke(): Promise<void> {
   const repo = join(root, 'repo');
   const outside = join(root, 'outside');
   const account = join(root, 'oauth');
+  const nonce = randomUUID();
   const server = createServer(socket =>
-    socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok')
+    socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${nonce.length}\r\n\r\n${nonce}`)
   );
+  const socketPath = join(root, 'control.sock');
+  const unixServer = createServer(socket => socket.end('synthetic'));
   try {
     await mkdir(scratch, { mode: 0o700 });
     await mkdir(repo, { mode: 0o700 });
@@ -343,26 +347,32 @@ async function fableSyntheticSmoke(): Promise<void> {
     await writeFile(outside, 'SYNTHETIC_CONTROLPLANE');
     await writeFile(account, '{"accessToken":"SYNTHETIC_ONLY"}', { mode: 0o600 });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    await new Promise<void>(resolve => unixServer.listen(socketPath, resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('fable_fixture_control_failed');
     const url = `http://127.0.0.1:${address.port}`;
-    if ((await (await fetch(url)).text()) !== 'ok') throw new Error('fable_fixture_control_failed');
+    if ((await (await fetch(url)).text()) !== nonce)
+      throw new Error('fable_fixture_control_failed');
     const probe = `
       import { readFileSync, writeFileSync } from 'node:fs';
-      const denied = path => { try { readFileSync(path); } catch { return; } throw new Error('fable_fixture_read_allowed'); };
+      const denied = path => { try { readFileSync(path); } catch (error) { if (['ENOENT','EACCES','EPERM'].includes(error.code)) return; throw new Error('fable_fixture_denial_unknown'); } throw new Error('fable_fixture_read_allowed'); };
       for (const path of ${JSON.stringify([outside, account, '/app/package.json', '/home/reviewer/.codex/auth.json', '/home/appuser/.codex/auth.json', '/proc/1/environ'])}) {
         if (path === '/proc/1/environ') { const text = readFileSync(path, 'utf8'); if (/GITHUB_|ARCHON_|_TOKEN=/.test(text)) throw new Error('fable_fixture_parent_environment'); }
         else denied(path);
       }
+      denied(${JSON.stringify(`/proc/${process.pid}/environ`)});
+      const { createConnection } = await import('node:net');
+      await new Promise((resolve, reject) => { const socket = createConnection(${JSON.stringify(socketPath)}); socket.on('connect', () => { socket.destroy(); reject(new Error('fable_fixture_socket_allowed')); }); socket.on('error', error => ['ENOENT','EACCES','EPERM'].includes(error.code) ? resolve() : reject(new Error('fable_fixture_socket_denial_unknown'))); });
       writeFileSync('/scratch/permitted', 'isolated');
       if (process.argv.includes('model')) {
         denied('/repo/repo-canary');
+        if (await (await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(3000) })).text() !== ${JSON.stringify(nonce)}) throw new Error('fable_fixture_model_network');
         if (!readFileSync('/home/model/.claude/.credentials.json', 'utf8').includes('SYNTHETIC_ONLY')) throw new Error('fable_fixture_account_binding');
         try { writeFileSync('/home/model/.claude/.credentials.json', 'bad'); throw new Error('fable_fixture_auth_writable'); } catch (error) { if (error.message === 'fable_fixture_auth_writable') throw error; }
       } else {
         denied('/home/model/.claude/.credentials.json');
         if (readFileSync('/repo/repo-canary', 'utf8') !== 'SYNTHETIC_REPO') throw new Error('fable_fixture_repository_binding');
-        try { await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(1000) }); throw new Error('fable_fixture_network_allowed'); } catch (error) { if (error.message === 'fable_fixture_network_allowed') throw error; }
+        try { await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(1000) }); throw new Error('fable_fixture_network_allowed'); } catch (error) { if (!['ECONNREFUSED','ENETUNREACH','EHOSTUNREACH','ConnectionRefused'].includes(error.code)) throw new Error('fable_fixture_network_denial_unknown'); }
       }
       console.log('FABLE_WRAPPER_OK');
     `;
@@ -407,6 +417,7 @@ async function fableSyntheticSmoke(): Promise<void> {
     console.log('overseer-fable-synthetic: ok');
   } finally {
     server.close();
+    unixServer.close();
     await rm(root, { recursive: true, force: true });
   }
 }

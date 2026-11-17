@@ -2422,3 +2422,240 @@ export async function reconcileDispatchOutcomeNotices(
   }
   return created;
 }
+
+/** Closed source-owned publication metadata, never a model/body command or assignment. */
+export interface ReviewPublicationAttestation {
+  version: 1;
+  requestId: string;
+  headSha: string;
+  treeSha: string;
+  policy: 'codex_bubblewrap' | 'claude_model_only_broker_v1';
+  nativeVersion: string;
+  runtimeUid: number;
+  provider: string;
+  model: string;
+  invocationId: string;
+  checkPlan: 'absent' | 'present';
+  checkDigests: readonly string[];
+  startedAt: string;
+  endedAt: string;
+}
+export interface ReviewPublicationIntent {
+  version: 1;
+  publicationId: string;
+  originId: string;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+  event: 'APPROVE' | 'REQUEST_CHANGES';
+  actorLogin: string;
+  actorType: 'Bot';
+  workerId: string;
+  fencingToken: number;
+  bodySha256: string;
+  attestation: ReviewPublicationAttestation;
+}
+const PUBLICATION_PREFIX = 'overseer:review-publication:v1:';
+const PUBLICATION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function publicationKeys(value: unknown, keys: string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const props = Object.getOwnPropertyDescriptors(value);
+  return (
+    Object.keys(props).sort().join(',') === keys.sort().join(',') &&
+    Object.values(props).every(prop => 'value' in prop)
+  );
+}
+export function parseReviewPublicationIntent(body: string): ReviewPublicationIntent {
+  try {
+    if (Buffer.byteLength(body) > 32768) throw new Error();
+    const v: unknown = JSON.parse(body);
+    if (
+      !publicationKeys(v, [
+        'version',
+        'publicationId',
+        'originId',
+        'owner',
+        'repo',
+        'prNumber',
+        'headSha',
+        'event',
+        'actorLogin',
+        'actorType',
+        'workerId',
+        'fencingToken',
+        'bodySha256',
+        'attestation',
+      ])
+    )
+      throw new Error();
+    if (
+      v.version !== 1 ||
+      !PUBLICATION_UUID.test(String(v.originId)) ||
+      !PUBLICATION_UUID.test(String(v.publicationId)) ||
+      !Number.isSafeInteger(v.prNumber) ||
+      Number(v.prNumber) < 1 ||
+      !Number.isSafeInteger(v.fencingToken) ||
+      Number(v.fencingToken) < 1 ||
+      !/^[0-9a-f]{40}$/.test(String(v.headSha)) ||
+      !/^[0-9a-f]{64}$/.test(String(v.bodySha256)) ||
+      !['APPROVE', 'REQUEST_CHANGES'].includes(String(v.event)) ||
+      v.actorType !== 'Bot'
+    )
+      throw new Error();
+    for (const key of ['owner', 'repo', 'actorLogin', 'workerId'])
+      if (typeof v[key] !== 'string' || !/^[A-Za-z0-9_.:[\]-]{1,160}$/.test(v[key]))
+        throw new Error();
+    const a = v.attestation;
+    if (
+      !publicationKeys(a, [
+        'version',
+        'requestId',
+        'headSha',
+        'treeSha',
+        'policy',
+        'nativeVersion',
+        'runtimeUid',
+        'provider',
+        'model',
+        'invocationId',
+        'checkPlan',
+        'checkDigests',
+        'startedAt',
+        'endedAt',
+      ]) ||
+      a.version !== 1 ||
+      a.requestId !== v.originId ||
+      a.headSha !== v.headSha ||
+      !/^[0-9a-f]{40}$/.test(String(a.treeSha)) ||
+      !['codex_bubblewrap', 'claude_model_only_broker_v1'].includes(String(a.policy)) ||
+      !Number.isSafeInteger(a.runtimeUid) ||
+      Number(a.runtimeUid) <= 0 ||
+      !['absent', 'present'].includes(String(a.checkPlan)) ||
+      !Array.isArray(a.checkDigests) ||
+      a.checkDigests.length > 100 ||
+      a.checkDigests.some(d => typeof d !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(d))
+    )
+      throw new Error();
+    for (const key of ['nativeVersion', 'provider', 'model', 'invocationId'])
+      if (typeof a[key] !== 'string' || !/^[\x20-\x7e]{1,160}$/.test(a[key])) throw new Error();
+    for (const key of ['startedAt', 'endedAt'])
+      if (typeof a[key] !== 'string' || !Number.isFinite(Date.parse(a[key]))) throw new Error();
+    if (
+      Date.parse(String(a.endedAt)) < Date.parse(String(a.startedAt)) ||
+      (a.checkPlan === 'absent' && a.checkDigests.length !== 0)
+    )
+      throw new Error();
+    if (
+      a.policy === 'claude_model_only_broker_v1' &&
+      (a.provider !== 'claude' ||
+        a.model !== 'claude-fable-5-2' ||
+        a.runtimeUid !== 1002 ||
+        !PUBLICATION_UUID.test(String(a.invocationId)))
+    )
+      throw new Error();
+    return v as unknown as ReviewPublicationIntent;
+  } catch {
+    throw new Error('review_publication_intent_invalid');
+  }
+}
+function publicationFromRow(row: DispatchMessageRow, originId: string): ReviewPublicationIntent {
+  if (
+    row.sender !== 'overseer' ||
+    row.sender_principal_id !== 'system:overseer' ||
+    row.recipient !== 'operator' ||
+    row.task_type !== 'run_report' ||
+    row.idempotency_key !== PUBLICATION_PREFIX + originId
+  )
+    throw new Error('review_publication_intent_invalid');
+  const value = parseReviewPublicationIntent(row.body);
+  if (value.originId !== originId) throw new Error('review_publication_intent_invalid');
+  return value;
+}
+export async function getReviewPublicationIntent(
+  originId: string
+): Promise<ReviewPublicationIntent | null> {
+  if (!PUBLICATION_UUID.test(originId)) throw new Error('review_publication_origin_invalid');
+  const result = await getDatabase().query<DispatchMessageRow>(
+    'SELECT * FROM agent_dispatch_messages WHERE sender_principal_id = $1 AND idempotency_key = $2',
+    ['system:overseer', PUBLICATION_PREFIX + originId]
+  );
+  if (result.rows.length > 1) throw new Error('review_publication_intent_conflict');
+  return result.rows[0] ? publicationFromRow(result.rows[0], originId) : null;
+}
+/** Origin row lock plus first insertion, never generic idempotent helper return as permission. */
+export async function admitReviewPublication(
+  input: ReviewPublicationIntent
+): Promise<{ intent: ReviewPublicationIntent; inserted: boolean }> {
+  const intent = parseReviewPublicationIntent(JSON.stringify(input));
+  const db = getDatabase();
+  const run = async (
+    query: DispatchQueryExecutor
+  ): Promise<{ intent: ReviewPublicationIntent; inserted: boolean }> => {
+    const source = await query<DispatchMessageRow>(
+      `SELECT * FROM agent_dispatch_messages WHERE id = $1${db.dialect === 'postgres' ? ' FOR UPDATE' : ''}`,
+      [intent.originId]
+    );
+    const origin = source.rows[0];
+    if (
+      origin?.task_type !== 'run_review' ||
+      origin.status !== 'claimed' ||
+      origin.lease_owner !== intent.workerId ||
+      Number(origin.fencing_token) !== intent.fencingToken ||
+      !origin.lease_expires_at ||
+      Date.parse(origin.lease_expires_at) <= Date.now()
+    )
+      throw new Error('review_publication_custody_refused');
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse(origin.body) as Record<string, unknown>;
+    } catch {
+      throw new Error('review_publication_origin_invalid');
+    }
+    if (
+      body.owner !== intent.owner ||
+      body.repo !== intent.repo ||
+      body.prNumber !== intent.prNumber ||
+      body.headSha !== intent.headSha
+    )
+      throw new Error('review_publication_origin_invalid');
+    const found = await query<DispatchMessageRow>(
+      'SELECT * FROM agent_dispatch_messages WHERE sender_principal_id = $1 AND idempotency_key = $2',
+      ['system:overseer', PUBLICATION_PREFIX + intent.originId]
+    );
+    if (found.rows[0]) {
+      const old = publicationFromRow(found.rows[0], intent.originId);
+      if (
+        old.owner !== intent.owner ||
+        old.repo !== intent.repo ||
+        old.prNumber !== intent.prNumber ||
+        old.headSha !== intent.headSha ||
+        old.event !== intent.event ||
+        old.actorLogin !== intent.actorLogin ||
+        old.bodySha256 !== intent.bodySha256
+      )
+        throw new Error('review_publication_intent_conflict');
+      return { intent: old, inserted: false };
+    }
+    const message = await createAuthenticatedMessageWithQuery(query, {
+      bound: { sender: 'overseer', sender_principal_id: 'system:overseer' },
+      data: {
+        correlation_id: origin.correlation_id,
+        idempotency_key: PUBLICATION_PREFIX + intent.originId,
+        task_type: 'run_report',
+        recipient: 'operator',
+        body: JSON.stringify(intent),
+        subject_key: origin.subject_key ?? undefined,
+        repeat_reason: 'review_publication_intent',
+      },
+    });
+    // The source lock serializes contenders; still require exact freshly proposed UUID.
+    const stored = parseReviewPublicationIntent(message.body);
+    if (stored.publicationId !== intent.publicationId)
+      throw new Error('review_publication_insert_unknown');
+    return { intent: stored, inserted: true };
+  };
+  return db.dialect === 'sqlite'
+    ? withOverseerControlPlaneImmediateTransaction(db, run)
+    : db.withTransaction(run);
+}

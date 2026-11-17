@@ -1762,6 +1762,9 @@ describe('Phase A production diagnostic return wiring', () => {
       const receipts: unknown[] = [];
       const isolated = {
         ...production,
+        lookupPublication: undefined,
+        admitPublication: undefined,
+        observePublication: undefined,
         currentHeadSha: async () => head,
         isDraft: async () => false,
         hasCustody: async () => true,
@@ -2145,6 +2148,9 @@ describe('Phase B exact native-client evaluator factory return', () => {
         const bodies: { body: string; commitId?: string; event: string }[] = [];
         const isolated = {
           ...production,
+          lookupPublication: undefined,
+          admitPublication: undefined,
+          observePublication: undefined,
           currentHeadSha: async () => head,
           isDraft: async () => false,
           recordExecutionProof: async () => undefined,

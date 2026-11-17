@@ -144,6 +144,7 @@ export interface PrReviewResult {
 }
 
 export interface PrReviewModelResult {
+  nativeInvocation?: import('./reviewer-broker-client').NativeInvocation;
   fableEvidence?: import('./reviewer-broker-client').FableExecutionEvidence;
   diagnostic?: SanitizedTermination;
   exitCode: number;
@@ -744,6 +745,7 @@ export async function evaluatePullRequest(
             binary,
             rungMs,
             exitCode: result.exitCode,
+            nativeInvocation: result.nativeInvocation,
             outageCode: outage?.code ?? null,
             prNumber: input.pr_number,
           },

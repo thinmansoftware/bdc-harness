@@ -157,3 +157,16 @@ Namespace success does not close #3654 or #3258. Issue #3654 remains the
 fail-closed review contract. Issue #3258 remains the reliability parent. Full
 sandbox acceptance still needs a successful native execution and no
 sandbox-start failure in a real review.
+
+## Phase B model-client clone pair (source only)
+
+The original six appended rules and upstream bytes remain. Two architecture-paired
+clone rules add valueTwo939655168 (0x38020000): USER/MOUNT/IPC/PID, with no NEWNET.
+The suffix is eight rules; total clone allowances are the original six plus two.
+Mask2114060288, normal argument0/s390 argument1 and capability/architecture
+conditions remain exact. Checks retain0x78020000 and no network. The candidate
+requests no NEWUTS/NEWCGROUP. clone3 errnoRet38 and existing unshare/AppArmor stay.
+This is container-wide, including with Fable disabled; the trusted fixed model
+client inherits container network, not vendor-only egress. Existing unrestricted
+unshare means clone-mask denial is not a blanket UTS/CGROUP prohibition.
+Source design approval is not installation or effective confinement evidence.

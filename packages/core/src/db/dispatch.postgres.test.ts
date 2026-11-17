@@ -193,6 +193,87 @@ afterAll(async () => {
 });
 
 describe('dispatch Phase 1.5 PostgreSQL integration', () => {
+  test('independent-pool publication intent races keep one immutable slot and stale claims cannot send', async () => {
+    const { admitReviewPublication, getReviewPublicationIntent } = await import('./dispatch');
+    const { randomUUID } = await import('node:crypto');
+    const origin = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'overseer' },
+      {
+        correlation_id: randomUUID(),
+        idempotency_key: randomUUID(),
+        task_type: 'run_review',
+        recipient: 'overseer-reviewer',
+        body: JSON.stringify({ owner: 'o', repo: 'r', prNumber: 1, headSha: 'a'.repeat(40) }),
+      }
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET status='claimed',lease_owner=$1,lease_expires_at=$2,fencing_token=1 WHERE id=$3",
+      ['synthetic-worker', new Date(Date.now() + 60000).toISOString(), origin.id]
+    );
+    const intent = {
+      version: 1 as const,
+      publicationId: randomUUID(),
+      originId: origin.id,
+      owner: 'o',
+      repo: 'r',
+      prNumber: 1,
+      headSha: 'a'.repeat(40),
+      event: 'APPROVE' as const,
+      actorLogin: 'thinman-overseer[bot]',
+      actorType: 'Bot' as const,
+      workerId: 'synthetic-worker',
+      fencingToken: 1,
+      bodySha256: 'b'.repeat(64),
+      attestation: {
+        version: 1 as const,
+        requestId: origin.id,
+        headSha: 'a'.repeat(40),
+        treeSha: 'c'.repeat(40),
+        policy: 'claude_model_only_broker_v1' as const,
+        nativeVersion: 'synthetic',
+        runtimeUid: 1002,
+        provider: 'claude',
+        model: 'claude-fable-5-2',
+        invocationId: randomUUID(),
+        checkPlan: 'absent' as const,
+        checkDigests: [],
+        startedAt: '2026-01-01T00:00:00Z',
+        endedAt: '2026-01-01T00:00:01Z',
+      },
+    };
+    const primary = db;
+    const secondary = new PostgresAdapter(
+      withSchemaSearchPath(
+        requireLoopbackUrl(process.env.DISPATCH_POSTGRES_PHASE15_TEST_URL),
+        schemaName
+      )
+    );
+    let results;
+    try {
+      const first = admitReviewPublication(intent);
+      db = secondary;
+      const second = admitReviewPublication(intent);
+      db = primary;
+      results = await Promise.all([first, second]);
+    } finally {
+      db = primary;
+      await secondary.close();
+    }
+    expect(results.filter(result => result.inserted)).toHaveLength(1);
+    expect(await getReviewPublicationIntent(origin.id)).toEqual(intent);
+    await expect(admitReviewPublication({ ...intent, bodySha256: 'd'.repeat(64) })).rejects.toThrow(
+      'review_publication_intent_conflict'
+    );
+    await expect(admitReviewPublication({ ...intent, fencingToken: 2 })).rejects.toThrow(
+      'review_publication_custody_refused'
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET status='done',acknowledged_at=$1 WHERE sender_principal_id='system:overseer' AND idempotency_key=$2",
+      [new Date().toISOString(), 'overseer:review-publication:v1:' + origin.id]
+    );
+    expect(await getReviewPublicationIntent(origin.id)).toEqual(intent);
+  });
+
   test('authenticated Chief successful fenced result and reconciliation create one reply', async () => {
     const cutoff = '2000-01-01T00:00:00.000Z';
     process.env.DISPATCH_PHASE1_ACTIVATED_AT = cutoff;

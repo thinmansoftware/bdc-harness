@@ -189,8 +189,6 @@ export function fableNamespaceArgv(input: {
     '--unshare-user',
     '--unshare-pid',
     '--unshare-ipc',
-    '--unshare-uts',
-    '--unshare-cgroup',
     '--cap-drop',
     'ALL',
     '--clearenv',

@@ -1,3 +1,4 @@
+import { isTrustedNativeInvocation, type NativeInvocation } from './reviewer-broker-client';
 import {
   FABLE_POLICY,
   FABLE_MODEL,
@@ -37,6 +38,7 @@ import {
   createRealOctokitClient,
   createRealReadOnlyPatOctokitClient,
   createRealSubmitPullRequestReview,
+  createObserveReviewPublication,
   summarizeChecks,
 } from './adapters/github-real-deps';
 import type { ExactHeadPullRequestEvidence } from './adapters/github-real-deps.ts';
@@ -1289,6 +1291,9 @@ export function createRealSubmitDeps(
     });
   return {
     reviewerIdentity,
+    lookupPublication: dispatch.getReviewPublicationIntent,
+    admitPublication: dispatch.admitReviewPublication,
+    observePublication: createObserveReviewPublication(octokit),
     async runReviewer(work): Promise<ReviewerVerdict> {
       const refused = (reasonCode: string): ReviewerVerdict => ({
         approved: false,
@@ -1322,6 +1327,7 @@ export function createRealSubmitDeps(
         return refused('fable_permission_refused');
       }
       let fableEvidence: FableExecutionEvidence | undefined;
+      let nativeInvocation: NativeInvocation | undefined;
       if (work.executionContext?.checkoutFailure) {
         return {
           approved: false,
@@ -1385,6 +1391,8 @@ export function createRealSubmitDeps(
           // Missing criteria is an explicit, recorded degrade path.
           fetchAcceptanceCriteria: async () => null,
           invokeModel: async (binary, prompt, context) => {
+            if (executionProof && nativeInvocation)
+              executionProof = { ...executionProof, nativeInvocation };
             if (fablePermit) {
               if (
                 !work.executionContext ||
@@ -1398,6 +1406,8 @@ export function createRealSubmitDeps(
               prompt,
               context
             );
+            if (isTrustedNativeInvocation(modelResult.nativeInvocation))
+              nativeInvocation = modelResult.nativeInvocation;
             if (fablePermit && isTrustedFableEvidence(modelResult.fableEvidence))
               fableEvidence = modelResult.fableEvidence;
             return modelResult;
@@ -1633,7 +1643,13 @@ export function createRealSubmitDeps(
       // Merge-ready state is last: both execution proof and the actual GitHub
       // response identity are durable in receipts before this can run.
       await maybeRecordReviewApprovalVerdict(
-        { ...input, model: modelReviewer.model },
+        {
+          ...input,
+          model:
+            input.originalPublication?.attestation.model ??
+            input.executionProof?.fableEvidence?.model ??
+            modelReviewer.model,
+        },
         {
           record: overrides.recordApprovalVerdict,
           onError: error => {

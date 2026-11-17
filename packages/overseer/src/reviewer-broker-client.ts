@@ -116,6 +116,7 @@ export interface ReviewerBrokerResult {
   readonly timedOut?: boolean;
   readonly diagnostic?: SanitizedTermination;
   readonly fableEvidence?: FableExecutionEvidence;
+  readonly nativeInvocation?: NativeInvocation;
   readonly checkPolicy?: typeof FABLE_POLICY;
 }
 
@@ -204,6 +205,7 @@ async function submitReviewerBrokerJobInternal(
         qualifyFableBrokerResult(value, job, id);
         return {
           ...value,
+          nativeInvocation: observedNativeInvocation(job, value, id),
           ...(UUID.test(id) ? { diagnostic: classifyBrokerTermination(value, id) } : {}),
         };
       } catch (error) {
@@ -299,4 +301,39 @@ function qualifyFableBrokerResult(
     throw new ReviewerBrokerError();
   Object.freeze(proof);
   trustedFableEvidence.add(proof);
+}
+
+export interface NativeInvocation {
+  readonly invocationId: string;
+  readonly headSha: string;
+  readonly provider: 'codex';
+  readonly model: string;
+}
+const trustedNativeInvocations = new WeakSet();
+export function isTrustedNativeInvocation(value: unknown): value is NativeInvocation {
+  return !!value && typeof value === 'object' && trustedNativeInvocations.has(value);
+}
+function observedNativeInvocation(
+  job: ReviewerBrokerJob,
+  result: ReviewerBrokerResult,
+  id: string
+): NativeInvocation | undefined {
+  const index = job.argv.indexOf('--model');
+  if (
+    job.fablePermit ||
+    job.prompt === undefined ||
+    index < 0 ||
+    result.uid !== 1002 ||
+    typeof result.timedOut !== 'boolean' ||
+    typeof result.outputTruncated !== 'boolean'
+  )
+    return undefined;
+  const value = Object.freeze({
+    invocationId: id,
+    headSha: job.expectedHead,
+    provider: 'codex' as const,
+    model: job.argv[index + 1],
+  });
+  trustedNativeInvocations.add(value);
+  return value;
 }
