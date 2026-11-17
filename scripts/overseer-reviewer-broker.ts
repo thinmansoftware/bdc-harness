@@ -201,8 +201,6 @@ export function fableNamespaceArgv(input: {
   ];
   if (lstatSync('/lib64', { throwIfNoEntry: false })) args.push('--ro-bind', '/lib64', '/lib64');
   args.push(
-    '--proc',
-    '/proc',
     '--dev',
     '/dev',
     '--tmpfs',

@@ -745,7 +745,6 @@ export async function evaluatePullRequest(
             binary,
             rungMs,
             exitCode: result.exitCode,
-            nativeInvocation: result.nativeInvocation,
             outageCode: outage?.code ?? null,
             prNumber: input.pr_number,
           },
@@ -920,6 +919,7 @@ export async function invokeConfiguredReviewModel(
       const payload = result.stdout.trim().length > 0 ? result.stdout : result.stderr;
       return {
         exitCode: result.exitCode,
+        nativeInvocation: result.nativeInvocation,
         stdout:
           context.nativePolicy === 'claude_model_only_broker_v1'
             ? result.ok

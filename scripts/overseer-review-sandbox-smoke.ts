@@ -1,3 +1,8 @@
+import { runInNewContext } from 'node:vm';
+import { createRequire } from 'node:module';
+import { dirname } from 'node:path';
+import { spawn as spawnObserved } from 'node:child_process';
+import { openSync, closeSync, fstatSync, lstatSync, readSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -342,13 +347,187 @@ export function fableFixtureFailure(result: unknown): string {
     [/^bwrap: execvp .+: .+$/i, 'exec_refused'],
   ];
   const fixture =
-    /^(?:error: )?(fable_fixture_(?:read_allowed|parent_environment|account_binding|auth_writable|repository_binding|network_allowed|denial_unknown|model_network|network_denial_unknown|socket_allowed|socket_denial_unknown))$/;
+    /^(?:error: )?(fable_fixture_(?:read_allowed|parent_environment|account_binding|auth_writable|repository_binding|network_allowed|denial_unknown|model_network|network_denial_unknown|socket_allowed|socket_denial_unknown|observer_unknown))$/;
   for (const line of lines) {
     const assertion = fixture.exec(line)?.[1];
     if (assertion) phases.add(assertion);
     for (const [pattern, phase] of patterns) if (pattern.test(line)) phases.add(phase);
   }
   return phases.size === 1 ? [...phases][0] : 'unclassified';
+}
+
+export interface FableObserverBinding {
+  launchId: string;
+  expectedLaunchId: string;
+  fileIdentity: string;
+  expectedFileIdentity: string;
+  outsidePidNamespace: number;
+  code: number;
+  stdout: string;
+  marker: string;
+}
+/** Pure validator. Its caller supplies only its fresh descriptor record, never child output JSON. */
+export function validateFableObserver(metadata: string, binding: FableObserverBinding): boolean {
+  try {
+    if (
+      typeof binding.launchId !== 'string' ||
+      !binding.launchId ||
+      typeof binding.fileIdentity !== 'string' ||
+      !binding.fileIdentity ||
+      binding.launchId !== binding.expectedLaunchId ||
+      binding.fileIdentity !== binding.expectedFileIdentity ||
+      !Number.isSafeInteger(binding.outsidePidNamespace) ||
+      binding.outsidePidNamespace <= 0 ||
+      binding.code !== 0 ||
+      !binding.marker ||
+      binding.stdout.split(/\r?\n/).filter(line => line === binding.marker).length !== 1 ||
+      typeof metadata !== 'string' ||
+      Buffer.byteLength(metadata) > 8192
+    )
+      return false;
+    const record = JSON.parse(metadata) as Record<string, unknown>;
+    if (
+      !record ||
+      typeof record !== 'object' ||
+      Array.isArray(record) ||
+      Object.keys(record).length !==
+        (metadata.match(/"(?:child-pid|[a-z]+-namespace)"\s*:/g) ?? []).length ||
+      Object.keys(record).some(
+        key =>
+          key !== 'child-pid' &&
+          ![
+            'user-namespace',
+            'mnt-namespace',
+            'ipc-namespace',
+            'pid-namespace',
+            'net-namespace',
+            'uts-namespace',
+            'cgroup-namespace',
+          ].includes(key)
+      ) ||
+      Object.values(record).some(value => !Number.isSafeInteger(value) || Number(value) <= 0) ||
+      !Number.isSafeInteger(record['child-pid']) ||
+      !Number.isSafeInteger(record['pid-namespace'])
+    )
+      return false;
+    if (record['pid-namespace'] === binding.outsidePidNamespace) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+/** CI-only FD3 capture for the same bwrap argv, no new operational launch API. */
+async function observedFableRun(
+  argv: string[],
+  options: { cwd: string; env: Record<string, string>; marker: string }
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const observerRoot = await mkdtemp('/tmp/fable-private-observer-');
+  const observerPath = join(observerRoot, 'metadata');
+  const launchId = randomUUID();
+  let fd: number | undefined;
+  const execute = async (): Promise<{ code: number; stdout: string; stderr: string }> => {
+    try {
+      fd = openSync(observerPath, 'wx+', 0o600);
+      const initial = fstatSync(fd);
+      const identity = `${initial.dev}:${initial.ino}`;
+      const outsidePidNamespace = statSync('/proc/self/ns/pid').ino;
+      if (
+        argv[0] !== 'bwrap' ||
+        argv.includes('--proc') ||
+        argv.includes('/proc') ||
+        argv.includes('--info-fd')
+      )
+        throw new Error();
+      const child = spawnObserved(argv[0], ['--info-fd', '3', ...argv.slice(1)], {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: ['ignore', 'pipe', 'pipe', fd],
+      });
+      const chunks: { stdout: Buffer[]; stderr: Buffer[] } = { stdout: [], stderr: [] };
+      let bytes = 0;
+      let overflow = false;
+      for (const key of ['stdout', 'stderr'] as const)
+        child[key]?.on('data', (chunk: Buffer) => {
+          bytes += chunk.length;
+          if (bytes > 128 * 1024) {
+            overflow = true;
+            child.kill('SIGKILL');
+            return;
+          }
+          chunks[key].push(Buffer.from(chunk));
+        });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 15000);
+      const code = await new Promise<number>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', value => {
+          resolve(value ?? 125);
+        });
+      }).finally(() => {
+        clearTimeout(timer);
+      });
+      const result = {
+        code,
+        stdout: Buffer.concat(chunks.stdout).toString('utf8'),
+        stderr: Buffer.concat(chunks.stderr).toString('utf8'),
+      };
+      if (code !== 0) return result; // Fixed phase classifier owns the private child text.
+      const final = fstatSync(fd);
+      const pathInfo = lstatSync(observerPath);
+      if (
+        overflow ||
+        final.size <= 0 ||
+        final.size > 8192 ||
+        pathInfo.isSymbolicLink() ||
+        `${pathInfo.dev}:${pathInfo.ino}` !== identity
+      )
+        throw new Error();
+      const bytesRead = Buffer.alloc(final.size);
+      readSync(fd, bytesRead, 0, bytesRead.length, 0);
+      const metadata = bytesRead.toString('utf8');
+      const binding = {
+        launchId,
+        expectedLaunchId: launchId,
+        fileIdentity: `${final.dev}:${final.ino}`,
+        expectedFileIdentity: identity,
+        outsidePidNamespace,
+        code,
+        stdout: result.stdout,
+        marker: options.marker,
+      };
+      if (!validateFableObserver(metadata, binding)) throw new Error();
+      // Actual outside-namespace substitution, not a weakened launcher or guessed missing path.
+      const outsideRecord = { ...JSON.parse(metadata), 'pid-namespace': outsidePidNamespace };
+      const negative = JSON.stringify(outsideRecord);
+      if (validateFableObserver(negative, binding)) throw new Error();
+      const source = validateFableObserver.toString();
+      const mutated = source.replace(
+        /record\[(?:'|")pid-namespace(?:'|")\]\s*===\s*binding.outsidePidNamespace/,
+        'false'
+      );
+      if (mutated === source) throw new Error();
+      const unsafe = runInNewContext(
+        `(${mutated})`,
+        { Buffer },
+        { timeout: 1000 }
+      ) as typeof validateFableObserver;
+      if (!unsafe(negative, binding)) throw new Error();
+      return result;
+    } catch {
+      return { code: 125, stdout: '', stderr: 'error: fable_fixture_observer_unknown' };
+    }
+  };
+  let result = await execute();
+  try {
+    if (fd !== undefined) closeSync(fd);
+  } catch {
+    result = { code: 125, stdout: '', stderr: 'error: fable_fixture_observer_unknown' };
+  }
+  try {
+    await rm(observerRoot, { recursive: true, force: true });
+  } catch {
+    result = { code: 125, stdout: '', stderr: 'error: fable_fixture_observer_unknown' };
+  }
+  return result;
 }
 
 /** Same production wrapper, fake local executable/account only; never provider traffic. */
@@ -377,12 +556,18 @@ async function fableSyntheticSmoke(): Promise<void> {
     const url = `http://127.0.0.1:${address.port}`;
     if ((await (await fetch(url)).text()) !== nonce)
       throw new Error('fable_fixture_control_failed');
+    if (
+      !statSync('/proc/self/status').isFile() ||
+      !statSync(`/proc/${process.pid}/environ`).isFile() ||
+      !statSync('/proc/1/environ').isFile()
+    )
+      throw new Error('fable_fixture_observer_unknown');
+    const marker = `FABLE_WRAPPER_OK:${randomUUID()}`;
     const probe = `
-      import { readFileSync, writeFileSync } from 'node:fs';
+      import { readFileSync, writeFileSync, fstatSync } from 'node:fs';
       const denied = path => { try { readFileSync(path); } catch (error) { if (['ENOENT','EACCES','EPERM'].includes(error.code)) return; throw new Error('fable_fixture_denial_unknown'); } throw new Error('fable_fixture_read_allowed'); };
       for (const path of ${JSON.stringify([outside, account, '/app/package.json', '/home/reviewer/.codex/auth.json', '/home/appuser/.codex/auth.json', '/proc/1/environ'])}) {
-        if (path === '/proc/1/environ') { const text = readFileSync(path, 'utf8'); if (/GITHUB_|ARCHON_|_TOKEN=/.test(text)) throw new Error('fable_fixture_parent_environment'); }
-        else denied(path);
+        denied(path); // Proc absence is structural only; controller independently verifies PID isolation.
       }
       denied(${JSON.stringify(`/proc/${process.pid}/environ`)});
       const { createConnection } = await import('node:net');
@@ -398,35 +583,69 @@ async function fableSyntheticSmoke(): Promise<void> {
         if (readFileSync('/repo/repo-canary', 'utf8') !== 'SYNTHETIC_REPO') throw new Error('fable_fixture_repository_binding');
         try { await fetch(${JSON.stringify(url)}, { signal: AbortSignal.timeout(1000) }); throw new Error('fable_fixture_network_allowed'); } catch (error) { if (!['ECONNREFUSED','ENETUNREACH','EHOSTUNREACH','ConnectionRefused'].includes(error.code)) throw new Error('fable_fixture_network_denial_unknown'); }
       }
-      console.log('FABLE_WRAPPER_OK');
+      try { if (fstatSync(3).isFile()) throw new Error('fable_fixture_observer_unknown'); } catch(error) { if(error.code !== 'EBADF') throw error; }
+      console.log(${JSON.stringify(marker)});
     `;
     await writeFile(join(scratch, 'probe.ts'), probe);
     const cleanEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: scratch };
-    const model = await run(
+    const model = await observedFableRun(
       fableNamespaceArgv({
         scratch,
         executable: process.execPath,
         account,
         argv: ['/model/cli', '/scratch/probe.ts', 'model'],
       }),
-      { cwd: scratch, env: cleanEnv }
+      { cwd: scratch, env: cleanEnv, marker }
     );
     if (model.code !== 0 || !model.stdout.includes('FABLE_WRAPPER_OK'))
       throw new Error(
         `fable_model_wrapper_failed:exit=${model.code}:class=${fableFixtureFailure(model)}`
       );
-    const check = await run(
+    const check = await observedFableRun(
       fableNamespaceArgv({
         scratch,
         checkout: repo,
         argv: ['/usr/local/bin/bun', '/scratch/probe.ts', 'check'],
       }),
-      { cwd: scratch, env: cleanEnv }
+      { cwd: scratch, env: cleanEnv, marker }
     );
     if (check.code !== 0 || !check.stdout.includes('FABLE_WRAPPER_OK'))
       throw new Error(
         `fable_check_wrapper_failed:exit=${check.code}:class=${fableFixtureFailure(check)}`
       );
+    // Startup-only, no prompt/login/auth/provider traffic. Restrict network further for version probes.
+    const require = createRequire(import.meta.url);
+    const sdkPath = require.resolve('@anthropic-ai/claude-agent-sdk/package.json');
+    const sdk = JSON.parse(await readFile(sdkPath, 'utf8')) as { claudeCodeVersion: string };
+    const nativePackage = require.resolve(
+      `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/package.json`,
+      { paths: [dirname(sdkPath)] }
+    );
+    const versions = [
+      { executable: '/opt/node26/bin/node', marker: 'v26.13.0' },
+      {
+        executable: join(dirname(nativePackage), 'claude'),
+        marker: `${sdk.claudeCodeVersion} (Claude Code)`,
+      },
+    ];
+    for (const runtime of versions) {
+      const argv = fableNamespaceArgv({
+        scratch,
+        executable: runtime.executable,
+        account,
+        argv: ['/model/cli', '--version'],
+      });
+      argv.splice(1, 0, '--unshare-net');
+      const version = await observedFableRun(argv, {
+        cwd: scratch,
+        env: cleanEnv,
+        marker: runtime.marker,
+      });
+      if (version.code !== 0 || version.stdout.trim() !== runtime.marker)
+        throw new Error(
+          `fable_runtime_startup_failed:exit=${version.code}:class=${fableFixtureFailure(version)}`
+        );
+    }
     if ((await readFile(outside, 'utf8')) !== 'SYNTHETIC_CONTROLPLANE')
       throw new Error('fable_fixture_outside_mutated');
     if ((await readFile(account, 'utf8')) !== '{"accessToken":"SYNTHETIC_ONLY"}')

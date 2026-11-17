@@ -500,6 +500,12 @@ function workerHarness(input: {
           acceptance_criteria_available: false,
         }),
       }),
+      // Explicit private publication lookup/submission boundary: this fixture exercises
+      // checkout/check contracts through its existing fake submitter, not durable publication.
+      // Production UUID/store/fence defaults stay unchanged; real DAL tests cover publication.
+      lookupPublication: async () => null,
+      admitPublication: undefined,
+      observePublication: undefined,
       currentHeadSha: async () => input.head,
       // The stub octokit has no pulls.get; the PR is not a draft (WO-HARNESS-MERGE-GATES-01 Amendment 1).
       isDraft: async () => false,

@@ -1354,3 +1354,106 @@ describe('finite synthetic Fable launcher diagnostics', () => {
       expect(fableFixtureFailure(value)).toBe('unclassified');
   });
 });
+
+describe('no-new-proc observer source contract', () => {
+  test('production-derived argv keeps isolation with no proc exposure', async () => {
+    const { fableNamespaceArgv } = await import('../../../../scripts/overseer-reviewer-broker');
+    for (const input of [
+      { scratch: '/synthetic', executable: '/cli', account: '/fake', argv: ['/model/cli'] },
+      { scratch: '/synthetic', checkout: '/repo', argv: ['git'] },
+    ]) {
+      const argv = fableNamespaceArgv(input);
+      expect(argv).not.toContain('--proc');
+      expect(argv).not.toContain('/proc');
+      for (const flag of [
+        '--unshare-user',
+        '--unshare-ipc',
+        '--unshare-pid',
+        '--cap-drop',
+        '--clearenv',
+      ])
+        expect(argv).toContain(flag);
+      expect(argv).not.toContain('--unshare-uts');
+      expect(argv).not.toContain('--unshare-cgroup');
+    }
+  });
+  test('observer validator rejects stale, substituted, malformed and nonisolated observations', async () => {
+    const { validateFableObserver } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const binding = {
+      launchId: 'one',
+      expectedLaunchId: 'one',
+      fileIdentity: 'private-one',
+      expectedFileIdentity: 'private-one',
+      outsidePidNamespace: 42,
+      code: 0,
+      stdout: 'BOUND_MARKER',
+      marker: 'BOUND_MARKER',
+    };
+    const metadata = JSON.stringify({ 'child-pid': 7, 'pid-namespace': 43 });
+    expect(validateFableObserver(metadata, binding)).toBe(true);
+    for (const value of [
+      '',
+      '{}',
+      metadata + '\n' + metadata,
+      JSON.stringify({ 'child-pid': 0, 'pid-namespace': 43 }),
+      JSON.stringify({ 'child-pid': 7, 'pid-namespace': 42 }),
+    ])
+      expect(validateFableObserver(value, binding)).toBe(false);
+    for (const change of [
+      { expectedLaunchId: 'stale' },
+      { fileIdentity: 'substituted' },
+      { code: 1 },
+      { stdout: '' },
+      { stdout: metadata },
+      { outsidePidNamespace: 43 },
+    ])
+      expect(validateFableObserver(metadata, { ...binding, ...change })).toBe(false);
+    expect(validateFableObserver('', { ...binding, stdout: metadata })).toBe(false);
+  });
+});
+
+describe('private kernel observer validator', () => {
+  test('requires fresh descriptor binding, one record, positive execution and namespace difference', async () => {
+    const { validateFableObserver } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const binding = {
+      launchId: 'one',
+      expectedLaunchId: 'one',
+      fileIdentity: '1:2',
+      expectedFileIdentity: '1:2',
+      outsidePidNamespace: 41,
+      code: 0,
+      stdout: 'FIXTURE_MARKER',
+      marker: 'FIXTURE_MARKER',
+    };
+    const metadata = JSON.stringify({ 'child-pid': 12, 'pid-namespace': 42, 'user-namespace': 43 });
+    expect(validateFableObserver(metadata, binding)).toBe(true);
+    for (const changed of [
+      { ...binding, launchId: 'stale' },
+      { ...binding, fileIdentity: 'other' },
+      { ...binding, code: 1 },
+      { ...binding, stdout: 'wrong' },
+      { ...binding, stdout: 'FIXTURE_MARKER\nFIXTURE_MARKER' },
+    ])
+      expect(validateFableObserver(metadata, changed)).toBe(false);
+    for (const raw of [
+      '',
+      '{}',
+      metadata + metadata,
+      JSON.stringify({ 'child-pid': 0, 'pid-namespace': 42 }),
+      JSON.stringify({ 'child-pid': 12, 'pid-namespace': 41 }),
+      JSON.stringify({ 'child-pid': 12, 'pid-namespace': 42, stdout: 'FORGED' }),
+    ])
+      expect(validateFableObserver(raw, binding)).toBe(false);
+    expect(validateFableObserver('', { ...binding, stdout: metadata })).toBe(false); // stdout cannot become the private descriptor record.
+    const source = validateFableObserver.toString();
+    const mutated = source.replace(
+      /record\[(?:'|")pid-namespace(?:'|")\]\s*===\s*binding.outsidePidNamespace/,
+      'false'
+    );
+    expect(mutated).not.toBe(source);
+    const unsafe = Function(`return (${mutated})`)() as typeof validateFableObserver;
+    expect(unsafe(JSON.stringify({ 'child-pid': 12, 'pid-namespace': 41 }), binding)).toBe(true); // Deliberately removed inequality is detected.
+  });
+});

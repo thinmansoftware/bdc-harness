@@ -1217,3 +1217,47 @@ describe('Phase B model-only evaluator transport', () => {
     expect(result.fableEvidence).toBeUndefined();
   });
 });
+
+describe('trusted native invocation return boundary', () => {
+  test('actual private client evidence survives invoker and is excluded from warning sink', async () => {
+    const { isTrustedNativeInvocation } = await import('../reviewer-broker-client');
+    const root = await mkdtemp(join(tmpdir(), 'native-invocation-return-'));
+    try {
+      await writeFile(join(root, 'ready'), 'synthetic');
+      const value = await invokeConfiguredReviewModel(
+        'codex',
+        'synthetic',
+        {
+          kind: 'pr-review',
+          cwd: '/private/fake',
+          expectedHeadSha: HEAD_A,
+          nativePolicy: 'codex_bubblewrap',
+        },
+        1000,
+        async (job, options) => {
+          await writeFile(
+            join(root, `${options!.id}.result.json`),
+            JSON.stringify({
+              id: options!.id,
+              uid: 1002,
+              ok: false,
+              exitCode: 1,
+              stdout: '',
+              stderr: 'PRIVATE_OUTPUT_CANARY',
+              timedOut: false,
+              outputTruncated: false,
+            })
+          );
+          return submitReviewerBrokerJob(job, { ...options, env: { OVERSEER_REVIEW_SPOOL: root } });
+        }
+      );
+      expect(isTrustedNativeInvocation(value.nativeInvocation)).toBe(true);
+      expect(value.nativeInvocation?.headSha).toBe(HEAD_A);
+      const { readFile } = await import('node:fs/promises');
+      const source = await readFile(join(import.meta.dir, '../pr-review-evaluator.ts'), 'utf8');
+      expect(source).not.toMatch(/getLog\(\)\.warn\(\s*\{[^}]*nativeInvocation/s); // Actual warning object must not carry private evidence.
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
