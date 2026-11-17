@@ -1726,7 +1726,11 @@ describe('Phase A production diagnostic return wiring', () => {
           { owner: work.owner, repo: work.repo, pr_number: 1, head_sha: head },
           {
             reviewer: { provider: 'synthetic', model: 'synthetic' },
-            fetchEvidence: async () => ({ diff: '+synthetic', checks: [], requiredContexts: [] }),
+            fetchEvidence: async () => ({
+              diff: '+synthetic',
+              checks: [{ name: 'synthetic-ci', status: 'completed', conclusion: 'success' }],
+              requiredContexts: ['synthetic-ci'],
+            }),
             fetchAcceptanceCriteria: async () => null,
             ladder: ['codex'],
             invokeModel: async () => native,
