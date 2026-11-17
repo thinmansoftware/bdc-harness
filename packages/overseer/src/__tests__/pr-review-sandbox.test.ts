@@ -1257,3 +1257,100 @@ describe('Phase B post-invocation proof', () => {
     }
   });
 });
+
+describe('finite synthetic Fable launcher diagnostics', () => {
+  test('every allowed phase and fixed assertion emits only a finite class', async () => {
+    const { fableFixtureFailure } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const cases = [
+      ['bwrap: clone failed: Operation not permitted', 'clone_refused'],
+      [
+        'bwrap: Creating new user namespace failed: Operation not permitted',
+        'user_namespace_refused',
+      ],
+      ['bwrap: Failed to make / slave: Operation not permitted', 'root_mount_refused'],
+      [
+        "bwrap: Can't mount proc on /PRIVATE_PATH_CANARY: Operation not permitted",
+        'proc_mount_refused',
+      ],
+      [
+        "bwrap: Can't bind mount /PRIVATE_PATH_CANARY on /scratch: Permission denied",
+        'bind_mount_refused',
+      ],
+      ['bwrap: execvp /PRIVATE_PATH_CANARY: No such file or directory', 'exec_refused'],
+      ['error: fable_fixture_socket_denial_unknown', 'fable_fixture_socket_denial_unknown'],
+    ];
+    for (const [stderr, phase] of cases) {
+      const input = { code: 1, stdout: 'PRIVATE_STDOUT_CANARY', stderr };
+      const observed = fableFixtureFailure(input);
+      expect(observed).toBe(phase);
+      const sink = `fable_model_wrapper_failed:exit=${input.code}:class=${observed}`;
+      for (const canary of ['PRIVATE_PATH_CANARY', 'PRIVATE_STDOUT_CANARY', stderr])
+        expect(sink).not.toContain(canary);
+    }
+  });
+  test('malformed, conflicting and misleading data remains unknown without getter reads', async () => {
+    const { fableFixtureFailure } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    let reads = 0;
+    const getter = Object.defineProperty({}, 'stderr', {
+      get() {
+        reads++;
+        throw new Error('PRIVATE_GETTER_CANARY');
+      },
+    });
+    for (const value of [
+      null,
+      {},
+      getter,
+      { code: '1', stdout: '', stderr: '' },
+      { code: NaN, stdout: '', stderr: '' },
+      { code: 1, stdout: '', stderr: 'bwrap: Operation not permitted' },
+      {
+        code: 1,
+        stdout: '',
+        stderr: 'PRIVATE_RAW_CANARY bwrap: clone failed: Operation not permitted',
+      },
+      { code: 1, stdout: '', stderr: 'error: fable_fixture_read_allowed PRIVATE_RAW_CANARY' },
+      { code: 1, stdout: '', stderr: 'bwrap: clone failed: bad\nbwrap: execvp /private: missing' },
+      { code: 1, stdout: '', stderr: 'bwrap: clone failed: bad\0PRIVATE_RAW_CANARY' },
+    ])
+      expect(fableFixtureFailure(value)).toBe('unclassified');
+    expect(reads).toBe(0);
+  });
+
+  test('bind and proc permission failures retain exact launcher phase', async () => {
+    const { fableFixtureFailure } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    expect(
+      fableFixtureFailure({
+        code: 1,
+        stdout: '',
+        stderr:
+          "bwrap: Can't bind mount /PRIVATE_PATH_CANARY on /newroot/scratch: Operation not permitted",
+      })
+    ).toBe('bind_mount_refused');
+    expect(
+      fableFixtureFailure({
+        code: 1,
+        stdout: '',
+        stderr: "bwrap: Can't mount proc on /newroot/proc: Operation not permitted",
+      })
+    ).toBe('proc_mount_refused');
+  });
+  test('stdout, generic permission and raw canaries are not launcher evidence', async () => {
+    const { fableFixtureFailure } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    for (const value of [
+      { code: 1, stdout: 'bwrap: clone failed: Operation not permitted', stderr: '' },
+      { code: 1, stdout: '', stderr: 'Operation not permitted PRIVATE_RAW_CANARY' },
+      {
+        code: 1,
+        stdout: '',
+        stderr: 'bwrap: Creating new namespace failed: Operation not permitted',
+      },
+      { code: 1, stdout: '', stderr: 'PRIVATE_RAW_CANARY' },
+    ])
+      expect(fableFixtureFailure(value)).toBe('unclassified');
+  });
+});

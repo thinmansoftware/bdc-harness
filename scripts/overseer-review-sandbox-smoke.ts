@@ -314,17 +314,41 @@ async function brokerSmoke(): Promise<void> {
 }
 
 /** Synthetic-only classification: never print captured child output, paths or account canaries. */
-function fableFixtureFailure(result: { code: number; stdout: string; stderr: string }): string {
-  const text = `${result.stdout}\n${result.stderr}`;
-  const fixed =
-    /fable_fixture_(?:read_allowed|parent_environment|account_binding|auth_writable|repository_binding|network_allowed|denial_unknown|model_network|network_denial_unknown|socket_allowed|socket_denial_unknown)/.exec(
-      text
-    )?.[0];
-  if (fixed) return fixed;
-  if (/bwrap:.*(?:namespace|unshare|permitted)/i.test(text)) return 'namespace_refused';
-  if (/bwrap:.*(?:mount|bind|symlink|directory)/i.test(text)) return 'mount_refused';
-  if (/bwrap:.*exec|not found|shared librar/i.test(text)) return 'runtime_unavailable';
-  return 'unclassified';
+export function fableFixtureFailure(result: unknown): string {
+  if (!result || typeof result !== 'object') return 'unclassified';
+  const fields = Object.getOwnPropertyDescriptors(result);
+  if (
+    Object.keys(fields).sort().join(',') !== 'code,stderr,stdout' ||
+    Object.values(fields).some(field => !('value' in field)) ||
+    !Number.isSafeInteger(fields.code.value) ||
+    typeof fields.stdout.value !== 'string' ||
+    typeof fields.stderr.value !== 'string' ||
+    fields.stderr.value.length > 65536 ||
+    fields.stderr.value.includes('\0')
+  )
+    return 'unclassified';
+  // Only the private launcher's stderr is evidence. Model/stdout text cannot name a phase.
+  const lines = fields.stderr.value.split(/\r?\n/);
+  const phases = new Set<string>();
+  const patterns: readonly [RegExp, string][] = [
+    [/^bwrap: (?:Can't|Failed to) mount proc(?: on .+)?: .+$/i, 'proc_mount_refused'],
+    [/^bwrap: (?:Can't|Failed to) bind mount .+: .+$/i, 'bind_mount_refused'],
+    [/^bwrap: Failed to make \/ (?:slave|private): .+$/i, 'root_mount_refused'],
+    [/^bwrap: (?:clone(?:\(\))? failed|Failed to clone(?: new namespace)?): .+$/i, 'clone_refused'],
+    [
+      /^bwrap: (?:Creating new user namespace failed|Failed to (?:create|unshare) user namespace): .+$/i,
+      'user_namespace_refused',
+    ],
+    [/^bwrap: execvp .+: .+$/i, 'exec_refused'],
+  ];
+  const fixture =
+    /^(?:error: )?(fable_fixture_(?:read_allowed|parent_environment|account_binding|auth_writable|repository_binding|network_allowed|denial_unknown|model_network|network_denial_unknown|socket_allowed|socket_denial_unknown))$/;
+  for (const line of lines) {
+    const assertion = fixture.exec(line)?.[1];
+    if (assertion) phases.add(assertion);
+    for (const [pattern, phase] of patterns) if (pattern.test(line)) phases.add(phase);
+  }
+  return phases.size === 1 ? [...phases][0] : 'unclassified';
 }
 
 /** Same production wrapper, fake local executable/account only; never provider traffic. */
@@ -422,7 +446,8 @@ async function fableSyntheticSmoke(): Promise<void> {
   }
 }
 
-if (process.argv.includes('--reviewer-bwrap')) await reviewerBwrapSmoke();
-else await brokerSmoke();
-
-await fableSyntheticSmoke();
+if (import.meta.main) {
+  if (process.argv.includes('--reviewer-bwrap')) await reviewerBwrapSmoke();
+  else await brokerSmoke();
+  await fableSyntheticSmoke();
+}
