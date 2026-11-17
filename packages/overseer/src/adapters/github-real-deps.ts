@@ -359,6 +359,7 @@ export interface RealGitHubOctokitLike {
       repo: string;
       base: string;
       head: string;
+      headers?: { accept: string };
     }): Promise<{ data: { files?: { filename: string; patch?: string }[] } }>;
     /**
      * Optional: branch-protection required status-check contexts for a branch.
@@ -587,6 +588,48 @@ export function createRealFetchExactHeadPullRequestEvidence(
       // non-skipped sibling of a skipped run, which filter=latest can omit.
       listEveryCheckRun(octokit, { owner: input.owner, repo: input.repo, ref: input.headSha }),
     ]);
+    const files = comparison.data.files ?? [];
+    let diff = files
+      .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
+      .join('\n');
+    if (files.some(file => file.patch === undefined)) {
+      try {
+        // The file listing omits large text patches as well as binary patches.
+        // Compare immutable SHAs, never a moving PR ref or an unauthenticated URL.
+        const whole = await octokit.repos.compareCommits({
+          owner: input.owner,
+          repo: input.repo,
+          base: baseSha,
+          head: input.headSha,
+          headers: { accept: 'application/vnd.github.diff' },
+        });
+        const body: unknown = whole.data;
+        if (
+          typeof body !== 'string' ||
+          !body.startsWith('diff --git ') ||
+          !/^(@@ |Binary files .+ differ|GIT binary patch)/m.test(body)
+        ) {
+          throw new Error('invalid_diff_response');
+        }
+        const blocks = body.split(/(?=^diff --git )/m);
+        for (const file of files.filter(file => file.patch === undefined)) {
+          const block = blocks.find(block =>
+            block.split('\n', 1)[0]?.endsWith(` b/${file.filename}`)
+          );
+          if (!block || !/^(@@ |Binary files .+ differ|GIT binary patch)/m.test(block)) {
+            // Unknown/quoted path or incomplete evidence refuses rather than guessing binary.
+            throw new Error('missing_file_diff');
+          }
+        }
+        diff = body.replace(
+          /^(Binary files .+ differ|GIT binary patch)$/gm,
+          '$&\n[binary or patch unavailable]'
+        );
+      } catch {
+        // Fixed safe error only: neither provider messages nor private diff leak.
+        throw new Error('pr_review_diff_evidence_unavailable');
+      }
+    }
     // Required status-check contexts on the base branch are the authoritative
     // complete-suite signal: without them, one fast check completing before the
     // rest of CI registers could trigger review prematurely.
@@ -665,9 +708,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
           }
         : {}),
       ...(noChecksBlocked ? { requiredContextsBlocked: noChecksBlocked } : {}),
-      diff: (comparison.data.files ?? [])
-        .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
-        .join('\n'),
+      diff,
       checks: checkRuns.map((run, index) => ({
         id: run.id,
         name: run.name?.trim() || `check-${index + 1}`,

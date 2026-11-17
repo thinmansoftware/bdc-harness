@@ -28,6 +28,7 @@
  * only one of those two is load-bearing on its own.
  */
 import { describe, expect, test } from 'bun:test';
+import '../adapters/github-full-diff.test';
 import { Octokit } from '@octokit/rest';
 import {
   BOUND_REPOS_METHODS,
