@@ -604,6 +604,77 @@ export async function runFableInlineJs(
   }
 }
 
+/** Fixed startup comparison, never fallback: first failure terminates before Bun JS. */
+export async function runFableRuntimeControls(
+  input: {
+    scratch: string;
+    account: string;
+    env: Record<string, string>;
+    claudeExecutable: string;
+    claudeVersion: string;
+  },
+  observe: (
+    argv: string[],
+    options: { cwd: string; env: Record<string, string>; marker: string }
+  ) => Promise<FableObservedResult> = observedFableRun
+): Promise<{ ok: boolean; stage: string; exit: number | null; failureClass: string }> {
+  for (const runtime of [
+    { stage: 'node26_version', executable: '/opt/node26/bin/node', marker: 'v26.13.0' },
+    {
+      stage: 'packaged_claude_version',
+      executable: input.claudeExecutable,
+      marker: input.claudeVersion,
+    },
+  ]) {
+    try {
+      const argv = fableNamespaceArgv({
+        scratch: input.scratch,
+        executable: runtime.executable,
+        account: input.account,
+        argv: ['/model/cli', '--version'],
+      });
+      argv.splice(1, 0, '--unshare-net');
+      const version = await observe(argv, {
+        cwd: input.scratch,
+        env: input.env,
+        marker: runtime.marker,
+      });
+      const exit = Number.isSafeInteger(version.code) ? version.code : null;
+      if (exit !== 0)
+        return {
+          ok: false,
+          stage: runtime.stage,
+          exit,
+          failureClass: fableFixtureFailure(version),
+        };
+      if (version.observerQualified !== true || version.stdout.trim() !== runtime.marker)
+        return {
+          ok: false,
+          stage: runtime.stage,
+          exit,
+          failureClass: 'runtime_control_unqualified',
+        };
+    } catch {
+      return {
+        ok: false,
+        stage: runtime.stage,
+        exit: null,
+        failureClass: 'runtime_control_unknown',
+      };
+    }
+  }
+  const inline = await runFableInlineJs(
+    {
+      scratch: input.scratch,
+      executable: '/opt/node26/bin/node',
+      account: input.account,
+      env: input.env,
+    },
+    observe
+  );
+  return { ...inline, stage: 'node26_inline_js' };
+}
+
 export function fableProbeStages(mode: 'model' | 'check'): string[] {
   return [
     'probe_entry_begin',
@@ -771,6 +842,26 @@ async function fableSyntheticSmoke(): Promise<void> {
         `fable_bun_startup_failed:exit=${startup.exit ?? 'UNKNOWN'}:class=${startup.failureClass}`
       );
     console.log('overseer-fable-bun-startup: ok');
+    // Startup-only, no prompt/login/auth/provider traffic. Restrict network further for version probes.
+    const require = createRequire(import.meta.url);
+    const sdkPath = require.resolve('@anthropic-ai/claude-agent-sdk/package.json');
+    const sdk = JSON.parse(await readFile(sdkPath, 'utf8')) as { claudeCodeVersion: string };
+    const nativePackage = require.resolve(
+      `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/package.json`,
+      { paths: [dirname(sdkPath)] }
+    );
+    const controls = await runFableRuntimeControls({
+      scratch,
+      account,
+      env: cleanEnv,
+      claudeExecutable: join(dirname(nativePackage), 'claude'),
+      claudeVersion: `${sdk.claudeCodeVersion} (Claude Code)`,
+    });
+    if (!controls.ok)
+      throw new Error(
+        `fable_runtime_control_failed:stage=${controls.stage}:exit=${controls.exit ?? 'UNKNOWN'}:class=${controls.failureClass}`
+      );
+    console.log('overseer-fable-runtime-controls: ok');
     const inline = await runFableInlineJs({
       scratch,
       executable: process.execPath,
@@ -807,39 +898,6 @@ async function fableSyntheticSmoke(): Promise<void> {
       throw new Error(
         `fable_check_wrapper_failed:exit=${check.code}:class=${fableFixtureFailure(check)}:last=${parseFableProbeStages(check.stderr, marker, 'check').lastCompleted}:next=${parseFableProbeStages(check.stderr, marker, 'check').nextExpected}`
       );
-    // Startup-only, no prompt/login/auth/provider traffic. Restrict network further for version probes.
-    const require = createRequire(import.meta.url);
-    const sdkPath = require.resolve('@anthropic-ai/claude-agent-sdk/package.json');
-    const sdk = JSON.parse(await readFile(sdkPath, 'utf8')) as { claudeCodeVersion: string };
-    const nativePackage = require.resolve(
-      `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/package.json`,
-      { paths: [dirname(sdkPath)] }
-    );
-    const versions = [
-      { executable: '/opt/node26/bin/node', marker: 'v26.13.0' },
-      {
-        executable: join(dirname(nativePackage), 'claude'),
-        marker: `${sdk.claudeCodeVersion} (Claude Code)`,
-      },
-    ];
-    for (const runtime of versions) {
-      const argv = fableNamespaceArgv({
-        scratch,
-        executable: runtime.executable,
-        account,
-        argv: ['/model/cli', '--version'],
-      });
-      argv.splice(1, 0, '--unshare-net');
-      const version = await observedFableRun(argv, {
-        cwd: scratch,
-        env: cleanEnv,
-        marker: runtime.marker,
-      });
-      if (version.code !== 0 || version.stdout.trim() !== runtime.marker)
-        throw new Error(
-          `fable_runtime_startup_failed:exit=${version.code}:class=${fableFixtureFailure(version)}`
-        );
-    }
     if ((await readFile(outside, 'utf8')) !== 'SYNTHETIC_CONTROLPLANE')
       throw new Error('fable_fixture_outside_mutated');
     if ((await readFile(account, 'utf8')) !== '{"accessToken":"SYNTHETIC_ONLY"}')

@@ -635,6 +635,11 @@ async function reviewObservedCheckout(input: {
   try {
     const result = await runAndSubmitReview(item, {
       ...wired,
+      // Checkout-focused fixture, not durable publication: match the existing server fixture.
+      // Real publication DAL/claim/fence tests remain separate and unchanged.
+      lookupPublication: async () => null,
+      admitPublication: undefined,
+      observePublication: undefined,
       currentHeadSha: async () => input.head,
       // The stub octokit has no pulls.get; the PR is not a draft (WO-HARNESS-MERGE-GATES-01 Amendment 1).
       isDraft: async () => false,
@@ -1589,5 +1594,91 @@ describe('finite inline JS and probe-stage diagnostics', () => {
       lastCompleted: 'UNKNOWN',
       nextExpected: 'probe_entry_begin',
     });
+  });
+});
+
+describe('fixed runtime comparison controls', () => {
+  test('versions retain NEWNET, Node JS retains MODEL boundary and first failure stops', async () => {
+    const { runFableRuntimeControls } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const input = {
+      scratch: '/private',
+      account: '/fake',
+      env: {},
+      claudeExecutable: '/packaged/claude',
+      claudeVersion: '9.9.9 (Claude Code)',
+    };
+    for (const failure of [-1, 0, 1, 2]) {
+      const calls: string[][] = [];
+      const result = await runFableRuntimeControls(input, async (argv, options) => {
+        const index = calls.length;
+        calls.push(argv);
+        if (index === failure) return { code: 134, stdout: 'RAW_CANARY', stderr: 'PRIVATE_CANARY' };
+        return { code: 0, stdout: options.marker, stderr: '', observerQualified: true };
+      });
+      expect(calls).toHaveLength(failure < 0 ? 3 : failure + 1);
+      expect(calls[0]).toContain('/opt/node26/bin/node');
+      expect(calls[0]).toContain('--unshare-net');
+      if (calls[1]) {
+        expect(calls[1]).toContain('/packaged/claude');
+        expect(calls[1]).toContain('--unshare-net');
+      }
+      if (calls[2]) {
+        expect(calls[2]).toContain('/opt/node26/bin/node');
+        expect(calls[2]).not.toContain('--unshare-net');
+        expect(calls[2]).toContain('--eval');
+      }
+      expect(result.ok).toBe(failure < 0);
+      expect(result.stage).toBe(
+        failure === 0
+          ? 'node26_version'
+          : failure === 1
+            ? 'packaged_claude_version'
+            : 'node26_inline_js'
+      );
+      expect(JSON.stringify(result)).not.toContain('CANARY');
+    }
+  });
+  test('missing observer and wrong marker refuse without later launch or raw leakage', async () => {
+    const { runFableRuntimeControls } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    for (const qualified of [false, true]) {
+      let calls = 0;
+      const result = await runFableRuntimeControls(
+        {
+          scratch: '/private',
+          account: '/fake',
+          env: {},
+          claudeExecutable: '/claude',
+          claudeVersion: '1',
+        },
+        async (_argv, options) => {
+          calls++;
+          return {
+            code: 0,
+            stdout: qualified ? 'RAW_CANARY' : options.marker,
+            stderr: 'PRIVATE_CANARY',
+            observerQualified: qualified,
+          };
+        }
+      );
+      expect(calls).toBe(1);
+      expect(result.ok).toBe(false);
+      expect(JSON.stringify(result)).not.toContain('CANARY');
+    }
+    const source = await readFile(
+      join(import.meta.dir, '../../../../scripts/overseer-review-sandbox-smoke.ts'),
+      'utf8'
+    );
+    const body = source.slice(source.indexOf('async function fableSyntheticSmoke'));
+    expect(body.indexOf('await runFableBunStartup')).toBeLessThan(
+      body.indexOf('await runFableRuntimeControls')
+    );
+    expect(body.indexOf('await runFableRuntimeControls')).toBeLessThan(
+      body.indexOf('await runFableInlineJs')
+    );
+    expect(body.indexOf('await runFableInlineJs')).toBeLessThan(
+      body.indexOf('const model = await observedFableRun')
+    );
   });
 });
