@@ -416,16 +416,23 @@ export function validateFableObserver(metadata: string, binding: FableObserverBi
     return false;
   }
 }
+export interface FableObservedResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  observerQualified?: boolean;
+}
+
 /** CI-only FD3 capture for the same bwrap argv, no new operational launch API. */
 async function observedFableRun(
   argv: string[],
   options: { cwd: string; env: Record<string, string>; marker: string }
-): Promise<{ code: number; stdout: string; stderr: string }> {
+): Promise<FableObservedResult> {
   const observerRoot = await mkdtemp('/tmp/fable-private-observer-');
   const observerPath = join(observerRoot, 'metadata');
   const launchId = randomUUID();
   let fd: number | undefined;
-  const execute = async (): Promise<{ code: number; stdout: string; stderr: string }> => {
+  const execute = async (): Promise<FableObservedResult> => {
     try {
       fd = openSync(observerPath, 'wx+', 0o600);
       const initial = fstatSync(fd);
@@ -511,7 +518,7 @@ async function observedFableRun(
         { timeout: 1000 }
       ) as typeof validateFableObserver;
       if (!unsafe(negative, binding)) throw new Error();
-      return result;
+      return { ...result, observerQualified: true };
     } catch {
       return { code: 125, stdout: '', stderr: 'error: fable_fixture_observer_unknown' };
     }
@@ -528,6 +535,46 @@ async function observedFableRun(
     result = { code: 125, stdout: '', stderr: 'error: fable_fixture_observer_unknown' };
   }
   return result;
+}
+
+const FABLE_STARTUP_BUN_VERSION = '1.3.11';
+/** Same MODEL construction, measured once before the script; no alternate flags/runtime. */
+export async function runFableBunStartup(
+  input: { scratch: string; executable: string; account: string; env: Record<string, string> },
+  observe: (
+    argv: string[],
+    options: { cwd: string; env: Record<string, string>; marker: string }
+  ) => Promise<FableObservedResult> = observedFableRun
+): Promise<{ ok: boolean; exit: number | null; failureClass: string }> {
+  try {
+    const argv = fableNamespaceArgv({
+      scratch: input.scratch,
+      executable: input.executable,
+      account: input.account,
+      argv: ['/model/cli', '--version'],
+    });
+    const result = await observe(argv, {
+      cwd: input.scratch,
+      env: input.env,
+      marker: FABLE_STARTUP_BUN_VERSION,
+    });
+    const exit = Number.isSafeInteger(result.code) ? result.code : null;
+    if (exit !== 0)
+      return {
+        ok: false,
+        exit,
+        failureClass: fableFixtureFailure({
+          code: result.code,
+          stdout: result.stdout,
+          stderr: result.stderr,
+        }),
+      };
+    if (result.observerQualified !== true || result.stdout.trim() !== FABLE_STARTUP_BUN_VERSION)
+      return { ok: false, exit, failureClass: 'bun_startup_unqualified' };
+    return { ok: true, exit: 0, failureClass: 'none' };
+  } catch {
+    return { ok: false, exit: null, failureClass: 'bun_startup_unknown' };
+  }
 }
 
 /** Same production wrapper, fake local executable/account only; never provider traffic. */
@@ -588,6 +635,17 @@ async function fableSyntheticSmoke(): Promise<void> {
     `;
     await writeFile(join(scratch, 'probe.ts'), probe);
     const cleanEnv = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: scratch };
+    const startup = await runFableBunStartup({
+      scratch,
+      executable: process.execPath,
+      account,
+      env: cleanEnv,
+    });
+    if (!startup.ok)
+      throw new Error(
+        `fable_bun_startup_failed:exit=${startup.exit ?? 'UNKNOWN'}:class=${startup.failureClass}`
+      );
+    console.log('overseer-fable-bun-startup: ok');
     const model = await observedFableRun(
       fableNamespaceArgv({
         scratch,

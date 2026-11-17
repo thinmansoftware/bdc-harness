@@ -1458,3 +1458,67 @@ describe('private kernel observer validator', () => {
     expect(unsafe(JSON.stringify({ 'child-pid': 12, 'pid-namespace': 41 }), binding)).toBe(true); // Deliberately removed inequality is detected.
   });
 });
+
+describe('same-mask Bun startup diagnostic', () => {
+  test('uses exact pinned version before original probe with identical model namespace flags', async () => {
+    const { runFableBunStartup } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const { fableNamespaceArgv } = await import('../../../../scripts/overseer-reviewer-broker');
+    let calls = 0;
+    const input = {
+      scratch: '/synthetic',
+      executable: '/packaged/bun',
+      account: '/synthetic/account',
+      env: { PATH: '/usr/bin' },
+    };
+    const expected = fableNamespaceArgv({ ...input, argv: ['/model/cli', '--version'] });
+    const result = await runFableBunStartup(input, async (argv, options) => {
+      calls++;
+      expect(argv).toEqual(expected);
+      expect(options.marker).toBe('1.3.11');
+      expect(argv).not.toContain('--unshare-net');
+      return { code: 0, stdout: '1.3.11\n', stderr: '', observerQualified: true };
+    });
+    expect(calls).toBe(1);
+    expect(result.ok).toBe(true);
+    const source = await readFile(
+      join(import.meta.dir, '../../../../scripts/overseer-review-sandbox-smoke.ts'),
+      'utf8'
+    );
+    const body = source.slice(source.indexOf('async function fableSyntheticSmoke'));
+    expect(body.indexOf('await runFableBunStartup')).toBeLessThan(
+      body.indexOf('const model = await observedFableRun')
+    );
+  });
+  test('nonzero, version mismatch, missing observer and forged output never pass or leak', async () => {
+    const { runFableBunStartup } =
+      await import('../../../../scripts/overseer-review-sandbox-smoke');
+    const unknown = await runFableBunStartup(
+      { scratch: '/synthetic', executable: '/bun', account: '/fake', env: {} },
+      async () => {
+        throw new Error('PRIVATE_EXCEPTION_CANARY');
+      }
+    );
+    expect(unknown).toEqual({ ok: false, exit: null, failureClass: 'bun_startup_unknown' });
+    for (const response of [
+      { code: 134, stdout: 'PRIVATE_STDOUT_CANARY', stderr: 'PRIVATE_STDERR_CANARY' },
+      { code: 0, stdout: '1.3.99', stderr: '', observerQualified: true },
+      { code: 0, stdout: '1.3.11', stderr: '' },
+      { code: 0, stdout: '1.3.11\nPRIVATE_RAW_CANARY', stderr: '', observerQualified: true },
+      { code: 0, stdout: '{"observerQualified":true}', stderr: '', observerQualified: true },
+    ]) {
+      const result = await runFableBunStartup(
+        { scratch: '/synthetic', executable: '/bun', account: '/fake', env: {} },
+        async () => response
+      );
+      expect(result.ok).toBe(false);
+      for (const canary of [
+        'PRIVATE_STDOUT_CANARY',
+        'PRIVATE_STDERR_CANARY',
+        'PRIVATE_RAW_CANARY',
+        'observerQualified',
+      ])
+        expect(JSON.stringify(result)).not.toContain(canary);
+    }
+  });
+});
