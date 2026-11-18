@@ -14,6 +14,19 @@ spec.loader.exec_module(producer)
 
 
 class ProducerGuards(unittest.TestCase):
+    def test_checkout_failure_identifies_path_and_kind_without_file_contents(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            path = root / "tracked.ts"
+            path.write_bytes(b"private payload")
+            path.chmod(0o644)
+            entry = b"100644 blob " + b"0" * 40 + b"\ttracked.ts\0"
+            with patch.object(producer, "git", return_value=entry):
+                with self.assertRaises(ValueError) as error:
+                    producer.verified_checkout(root)
+            self.assertIn('"path": "tracked.ts"', str(error.exception))
+            self.assertIn('"blob_matches": false', str(error.exception))
+            self.assertNotIn("private payload", str(error.exception))
     def archive(self, name="bun-linux-x64/bun", mode=0o100755):
         data = io.BytesIO()
         with zipfile.ZipFile(data, "w") as z:

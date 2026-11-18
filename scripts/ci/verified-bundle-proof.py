@@ -86,7 +86,12 @@ def verified_checkout(root):
         raw = disk.read_bytes()
         actual = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
         if actual != oid or bool(disk.stat().st_mode & 0o111) != (mode == "100755"):
-            raise ValueError("checkout_mutated_or_transformed")
+            # Git paths/hashes/modes only: never print source, config or environment values.
+            raise ValueError("checkout_mutated_or_transformed " + json.dumps({
+                "path": path, "blob_matches": actual == oid, "expected_blob": oid,
+                "actual_blob": actual, "expected_mode": mode,
+                "actual_mode": oct(stat.S_IMODE(disk.stat().st_mode)),
+            }, sort_keys=True))
         tracked.add(path)
     assert_no_untracked_config(root, tracked)
     return git(root, "rev-parse", "HEAD^{tree}").decode().strip()
