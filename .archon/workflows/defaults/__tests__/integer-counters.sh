@@ -30,7 +30,7 @@ extract_assert_script() {
       if ($0 ~ /^      /) sub(/^      /, "")
       print
     }
-  ' "$lane" | sed 's/^IMPL=\$implement\.output$/IMPL=${IMPL_STUB:-}/'
+  ' "$lane" | sed 's/^IMPL=\$implement\.output$/IMPL=${IMPL_STUB:-}/' | python3 -c 'import shlex,sys; print(sys.stdin.read().replace("$evidence-repair-start.output", shlex.quote("{\"state\":\"not_applicable\"}")))'
 }
 
 TMP=$(mktemp -d)

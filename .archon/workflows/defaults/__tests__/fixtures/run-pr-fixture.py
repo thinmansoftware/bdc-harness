@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,15 @@ def node(name):
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith('  - id: ')), len(lines))
     start = next(i for i in range(start, end) if lines[i] == '    bash: |') + 1
     text = '\n'.join(line[6:] if line.startswith('      ') else '' for line in lines[start:end])
+    # Ordinary PR ownership/adoption fixtures do not select evidence-only repair.
+    # Supply the same machine outputs the engine substitutes before bash starts.
+    for ref, value in {
+        'evidence-repair-start': '{"state":"not_applicable"}',
+        'assert-implement-produced-work': '',
+        'evidence-repair-verify': '{"state":"not_applicable"}',
+        'evidence-repair-final': '{"state":"not_applicable"}',
+    }.items():
+        text = text.replace('$' + ref + '.output', shlex.quote(value))
     for ref, value in {
         'block-reclassify': '{"status":"BLOCKED"}',
         'plan-review': '=== APPROVED_PLAN_BEGIN ===\nCommit message: fixture\n=== APPROVED_PLAN_END ===',
