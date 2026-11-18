@@ -256,6 +256,14 @@ export async function reconcileDiff(
     const old = before.get(a),
       next = after.get(b);
     requireProof(old || next);
+    if (!old) requireProof(next && block.includes(`\nnew file mode ${next.mode}\n`));
+    if (!next) requireProof(old && block.includes(`\ndeleted file mode ${old.mode}\n`));
+    if (a !== b) {
+      requireProof(
+        block.includes(`\nrename from ${a}\nrename to ${b}\n`) ||
+          block.includes(`\ncopy from ${a}\ncopy to ${b}\n`)
+      );
+    }
     const [oldBytes, nextBytes] = await Promise.all([bytes(old), bytes(next)]);
     if (/^(Binary files .+ differ|GIT binary patch)$/m.test(block)) {
       requireProof(

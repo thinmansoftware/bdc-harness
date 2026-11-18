@@ -431,6 +431,14 @@ describe('#6357 producer and exhaustive proof guards', () => {
     const result = await reconcileDiff(f.read, f.diff, f.anchor, f.h);
     expect(result).toHaveLength(2);
   });
+  test('empty-file creation must include its complete mode metadata, not just a header', async () => {
+    const f = fixture();
+    f.h.set('empty.txt', f.entry(''));
+    f.diff += 'diff --git a/empty.txt b/empty.txt\n';
+    await expect(collectBundleCoverage(f.read, input, '')).rejects.toThrow();
+    f.diff += 'new file mode 100644\n';
+    expect((await collectBundleCoverage(f.read, input, '')).diff).toContain('new file mode 100644');
+  });
   test('a truncated recursive inventory is expanded through a complete nonrecursive tree', async () => {
     const f = fixture();
     let fallbackReads = 0;
