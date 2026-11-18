@@ -623,6 +623,9 @@ export async function evaluatePullRequest(
   try {
     evidence = await deps.fetchEvidence(input);
   } catch (error) {
+    if (error instanceof Error && error.message === 'pr_review_diff_evidence_unavailable') {
+      return transportError(input, deps, false, 'pr_review_diff_evidence_unavailable');
+    }
     // RATE LIMIT IS A DEFERRAL, NOT A VERDICT (#782 part 2). Checked BEFORE the
     // generic evidence-error branch: a 403/429 carrying rate-limit headers used
     // to fall through to INDETERMINATE, which is TERMINAL -- the review was
