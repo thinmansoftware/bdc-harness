@@ -77,6 +77,48 @@ test('metadata-only evidence with contradictory change metadata refuses', async 
   ).rejects.toThrow('pr_review_diff_evidence_unavailable');
 });
 
+const renameModeMetadata = { status: 'renamed', previous_filename: 'old.sh', changes: 0 };
+const renameLines = 'similarity index 100%\nrename from old.sh\nrename to new.sh\n';
+test('complete Git rename plus chmod is reviewable alone and in a mixed diff', async () => {
+  const diff = 'diff --git a/old.sh b/new.sh\nold mode 100644\nnew mode 100755\n' + renameLines;
+  expect((await fixture(diff, undefined, 'new.sh', renameModeMetadata).fetch(request)).diff).toBe(
+    diff
+  );
+  const mixed = diff + textDiff;
+  expect((await fixture(mixed, undefined, 'new.sh', renameModeMetadata).fetch(request)).diff).toBe(
+    mixed
+  );
+});
+
+for (const modes of [
+  'old mode 100644\n',
+  'new mode 100755\n',
+  'old mode invalid\nnew mode 100755\n',
+  'new mode 100755\nold mode 100644\n',
+  'old mode 100644\nnew mode 100755\nunexpected metadata\n',
+]) {
+  test('rename plus malformed or incomplete mode metadata refuses', async () => {
+    await expect(
+      fixture(
+        'diff --git a/old.sh b/new.sh\n' + modes + renameLines,
+        undefined,
+        'new.sh',
+        renameModeMetadata
+      ).fetch(request)
+    ).rejects.toThrow('pr_review_diff_evidence_unavailable');
+  });
+}
+
+test('rename plus chmod with contradictory API source refuses', async () => {
+  const diff = 'diff --git a/old.sh b/new.sh\nold mode 100644\nnew mode 100755\n' + renameLines;
+  await expect(
+    fixture(diff, undefined, 'new.sh', {
+      ...renameModeMetadata,
+      previous_filename: 'wrong.sh',
+    }).fetch(request)
+  ).rejects.toThrow('pr_review_diff_evidence_unavailable');
+});
+
 for (const [body, metadata] of [
   [
     'similarity index 100%\nrename from wrong.md\nrename to spec.md\n',

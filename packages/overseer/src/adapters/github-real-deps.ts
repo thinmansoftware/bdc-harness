@@ -625,17 +625,18 @@ export function createRealFetchExactHeadPullRequestEvidence(
           // Complete zero-line changes have no hunks. Require both the API's
           // change metadata and the corresponding complete Git metadata block.
           const metadata = block?.split('\n').slice(1).filter(Boolean);
+          const pairedModes =
+            metadata &&
+            /^old mode [0-7]{6}$/.test(metadata[0] ?? '') &&
+            /^new mode [0-7]{6}$/.test(metadata[1] ?? '');
           const metadataOnly =
             file.changes === 0 &&
             metadata &&
             ((file.status === 'renamed' &&
               typeof file.previous_filename === 'string' &&
-              metadata.join('\n') ===
+              (pairedModes ? metadata.slice(2) : metadata).join('\n') ===
                 `similarity index 100%\nrename from ${file.previous_filename}\nrename to ${file.filename}`) ||
-              (file.status === 'modified' &&
-                metadata.length === 2 &&
-                /^old mode [0-7]{6}$/.test(metadata[0]) &&
-                /^new mode [0-7]{6}$/.test(metadata[1])) ||
+              (file.status === 'modified' && metadata.length === 2 && pairedModes) ||
               (file.status === 'added' &&
                 metadata.length === 2 &&
                 /^new file mode [0-7]{6}$/.test(metadata[0]) &&
