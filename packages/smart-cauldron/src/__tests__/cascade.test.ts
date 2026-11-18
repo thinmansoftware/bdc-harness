@@ -2376,3 +2376,55 @@ describe('conflict-only gate verdict never climbs', () => {
     expect(record.status).toBe('won');
   });
 });
+
+test('evidence repair proof handoff stops after first tier even with aggregated terminal failures', async () => {
+  let fires = 0;
+  const record = await runCascade(
+    baseOpts({
+      entryOverride: 'cursor',
+      deps: {
+        fire: async () => {
+          fires++;
+          return makeFireOk('run-evidence-handoff');
+        },
+        poll: async () =>
+          failedGatePoll('Required nodes failed: evidence-repair-verify, blocked-terminal-gate', [
+            'evidence-repair-verify',
+            'blocked-terminal-gate',
+            'review-issue',
+          ]),
+        escalate: async () => undefined,
+        writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      },
+    })
+  );
+  expect(fires).toBe(1);
+  expect(record.status).toBe('gate-misfire');
+  expect(record.gateMisfire?.kind).toBe('evidence_repair_unavailable');
+  expect(record.telemetry.climbed).toBe(false);
+});
+
+test('final evidence receipt failure also stops without a second tier', async () => {
+  let fires = 0;
+  const record = await runCascade(
+    baseOpts({
+      entryOverride: 'cursor',
+      deps: {
+        fire: async () => {
+          fires++;
+          return makeFireOk('run-final-handoff');
+        },
+        poll: async () =>
+          failedGatePoll('Required node failed: evidence-repair-final', [
+            'evidence-repair-final',
+            'blocked-terminal-gate',
+          ]),
+        escalate: async () => undefined,
+        writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      },
+    })
+  );
+  expect(fires).toBe(1);
+  expect(record.status).toBe('gate-misfire');
+  expect(record.gateMisfire?.gateNode).toBe('evidence-repair-final');
+});

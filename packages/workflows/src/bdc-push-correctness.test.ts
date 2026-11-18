@@ -539,7 +539,13 @@ describe('F1 replay: quoted-heredoc decide capture vs node-out file capture', ()
       expect(parseResult.stdout).toContain('AUTHORIZED=<#7>');
 
       // And end-to-end: the real commit-selection guard reaches UNIQUE_BRANCH=feat/x.
-      const capture = extractCommitCapture(readFileSync(lane, 'utf8'), lane);
+      const capture = substituteNodeOutputRefs(
+        extractCommitCapture(readFileSync(lane, 'utf8'), lane),
+        new Map<string, NodeOutput>([
+          ['evidence-repair-start', { state: 'completed', output: '{"state":"not_applicable"}' }],
+        ]),
+        true
+      );
       const result = bash(capture + REPAIR_TARGET_SELECTION, worktreeDir, {
         ARCHON_NODE_OUT: nodeOutDir,
         SPEC_TEXT: spec,

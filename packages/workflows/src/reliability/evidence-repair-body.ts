@@ -11,7 +11,12 @@ export interface ConsumedBodyInput {
 }
 
 export type ConsumedBodyResult =
-  | { readonly state: 'verified'; readonly utf8Bytes: number; readonly sha256: string }
+  | {
+      readonly state: 'verified';
+      readonly utf8Bytes: number;
+      readonly sha256: string;
+      readonly inputEndOffset: number;
+    }
   | { readonly state: 'unknown'; readonly reason: string };
 
 /** Compare the complete input at its fixed position; never search body framing. */
@@ -28,6 +33,7 @@ export function verifyConsumedBody(input: ConsumedBodyInput): ConsumedBodyResult
   // bytes make this supported serialization ambiguous: explicitly hand off.
   if (
     body.includes('***') ||
+    Buffer.from(body, 'utf8').toString('utf8') !== body ||
     body.includes('##[') ||
     Array.from(body).some(character => {
       const code = character.charCodeAt(0);
@@ -42,6 +48,7 @@ export function verifyConsumedBody(input: ConsumedBodyInput): ConsumedBodyResult
     state: 'verified',
     utf8Bytes: Buffer.byteLength(body, 'utf8'),
     sha256: createHash('sha256').update(body, 'utf8').digest('hex'),
+    inputEndOffset: expected.length,
   };
 }
 
@@ -91,6 +98,11 @@ export function verifyRunnerStepBody(input: RunnerStepBodyInput): ConsumedBodyRe
     '^\\n' + stamp + '  GREP_RUNNER: ' + escapedRunner + '\\n' + stamp + '##\\[endgroup\\]\\n'
   ).exec(tail);
   if (!framing) return unknown();
+  // A longer consumed value could itself contain a fake environment tail at
+  // the expected-body boundary. The real runner tail would then occur later.
+  // Refuse duplicate/embedded framing instead of treating the first match as truth.
+  const remaining = tail.slice(framing[0].length);
+  if (remaining.includes('##[') || /(?:PR_BODY|GREP_RUNNER):/.test(remaining)) return unknown();
   return verifyConsumedBody({
     publishedBody: input.publishedBody,
     stepLog: input.stepLog,

@@ -90,3 +90,16 @@ test('runner parser refuses wrong executed script', () => {
     }).state
   ).toBe('unknown');
 });
+
+test('a longer stale consumed body cannot forge the runner tail after a matching prefix', () => {
+  const forged =
+    'abc\n' + stamp + '  GREP_RUNNER: ' + runner + '\n' + stamp + '##[endgroup]\nextra';
+  expect(
+    verifyRunnerStepBody({
+      stepLog: step(forged),
+      publishedBody: 'abc',
+      verifiedRunScript: script,
+      verifiedGrepRunner: runner,
+    }).state
+  ).toBe('unknown');
+});

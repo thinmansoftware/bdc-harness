@@ -627,6 +627,15 @@ nodes:
   # re-fire of an already-done WO (anchor 04daeafc). FAILS OPEN: if unsure, proceeds to
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
+  - id: evidence-repair-start
+    depends_on: [checkout-repair-target]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+      ER_CHECKOUT=$checkout-repair-target.output
+      bun /app/scripts/evidence-repair.ts capture "$ER_CHECKOUT"
+
   - id: check-already-satisfied
     provider: codex-native-strict
     model: gpt-6-astra
@@ -678,9 +687,14 @@ nodes:
   # emits a single JSON document on stdout for downstream when: conditions. Human-readable
   # diagnostics go to stderr so condition-evaluator can parse $gate-already-satisfied.output.
   - id: gate-already-satisfied
-    depends_on: [check-already-satisfied, checkout-repair-target]
+    depends_on: [check-already-satisfied, checkout-repair-target, evidence-repair-start]
     bash: |
       set -uo pipefail
+      ER_SNAPSHOT=$evidence-repair-start.output
+      if printf '%s' "$ER_SNAPSHOT" | grep -q '"state":"captured"'; then
+        printf '{"ALREADY_SATISFIED":false,"SATISFIED_ON_BASE":false}\n'
+        exit 0
+      fi
       # Direct assignment (not heredoc). The executor's substituteNodeOutputRefs
       # wraps the multi-line node output in single quotes via shellQuote, producing
       # a valid multi-line bash assignment: CAS='line1\nline2\n...'. The previous
@@ -1237,12 +1251,24 @@ nodes:
         sentinel, write EXACTLY two KEY=VALUE lines to that file, for example:
           printf 'COMPLETE=true\nALREADY_SATISFIED=no\n' > "$ARTIFACTS_DIR/implement.env"
         Values by outcome:
+        - EVIDENCE-ONLY REPAIR: when correcting evidence without changing source,
+          write COMPLETE=true, ALREADY_SATISFIED=no, EVIDENCE_ONLY_REPAIR=yes to
+          implement.env, then a bare COMPLETE. Preserve the repair checkout HEAD.
+          Do not wait for CI or claim success: ordinary stops, manifest publication
+          and a new original-check consumed-input receipt must still pass downstream.
+          If correction/proof cannot be obtained, use BLOCKED with an operator handoff.
         - REAL BUILD (you made in-scope changes): COMPLETE=true, ALREADY_SATISFIED=no
         - ALREADY SATISFIED (verified no-op): COMPLETE=true, ALREADY_SATISFIED=yes
         - BLOCKED (cannot proceed): COMPLETE=false, ALREADY_SATISFIED=no
         No other content, no prose, no code fences inside that file. If the file is
         missing, assert-implement-produced-work treats your completion claim as
         unproven and a clean worktree is classified FALSE_COMPLETE.
+
+        The evidence-only ending above takes precedence over the generic no-op
+        rules below. It is provisional completion of implementation only, never
+        a successful run or an ALREADY_SATISFIED claim. Run the spec stops; leave
+        PR-body publication and check observation to the mechanical nodes. Never
+        edit the PR body directly or trigger/rerun CI from implement.
 
         ## Completion Criteria + Sentinel Emission (Patch 3, 2026-05-16; Fix A 2026-05-30)
         Before emitting any completion sentinel, run this self-check IN THIS WORKTREE:
@@ -1322,6 +1348,15 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
+      ER_SNAPSHOT=$evidence-repair-start.output
+      ER_MODE='{"state":"ordinary"}'
+      if printf '%s' "$ER_SNAPSHOT" | grep -q '"state":"captured"' || grep -q '^EVIDENCE_ONLY_REPAIR=yes$' "${ARTIFACTS_DIR:-}/implement.env" 2>/dev/null; then
+        ER_MODE=$(bun /app/scripts/evidence-repair.ts classify "$ER_SNAPSHOT")
+      fi
+      if printf '%s' "$ER_MODE" | grep -qE '"state":"(evidence_only|unknown)"'; then
+        echo "checkpoint-push: evidence repair has no source checkpoint; defer to assertion"
+        exit 0
+      fi
 
       # ---- BEGIN checkpoint-wo-id-derive ----
       # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
@@ -1384,6 +1419,16 @@ nodes:
     load_bearing: true
     bash: |
       set -uo pipefail
+      ER_SNAPSHOT=$evidence-repair-start.output
+      ER_MODE='{"state":"ordinary"}'
+      if printf '%s' "$ER_SNAPSHOT" | grep -q '"state":"captured"' || grep -q '^EVIDENCE_ONLY_REPAIR=yes$' "${ARTIFACTS_DIR:-}/implement.env" 2>/dev/null; then
+        ER_MODE=$(bun /app/scripts/evidence-repair.ts classify "$ER_SNAPSHOT")
+      fi
+      case "$ER_MODE" in
+        *'"state":"evidence_only"'*) echo 'BUILD_OUTCOME=EVIDENCE_ONLY_REPAIR'; exit 0 ;;
+        *'"state":"ordinary"'*) ;;
+        *) echo 'BUILD_OUTCOME=EVIDENCE_REPAIR_HANDOFF'; echo 'operator_handoff: evidence repair identity or completion unavailable'; exit 0 ;;
+      esac
       # Artifact-mailbox (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01): implement writes
       # KEY=VALUE lines to implement.env in the artifacts dir; this gate parses ONLY
       # that file and never interpolates raw agent narration into shell. Anchor runs:
@@ -1507,6 +1552,11 @@ nodes:
     task_class: clerical
     bash: |
       set -uo pipefail
+      ER_BUILD=$assert-implement-produced-work.output
+      if printf '%s\n' "$ER_BUILD" | grep -q '^BUILD_OUTCOME=EVIDENCE_REPAIR_HANDOFF$'; then
+        printf '{"terminal":"yes","reason":"evidence_repair_operator_handoff"}\n'
+        exit 0
+      fi
       FOUND=0
       REASON=""
       if [ -n "${ARTIFACTS_DIR:-}" ] && [ -d "${ARTIFACTS_DIR}/blocked-preserve" ]; then
@@ -4541,10 +4591,7 @@ nodes:
       $diff-review-final.output
       BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003
       )
-      BUILD=$(cat <<'BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004'
-      $assert-implement-produced-work.output
-      BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004
-      )
+      BUILD=$assert-implement-produced-work.output
       PRECHECK=$(cat <<'BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005'
       $gate-already-satisfied.output
       BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005
@@ -4572,7 +4619,7 @@ nodes:
       # A missing/unparseable BUILD_OUTCOME must NOT slip through as PROCEED.
       if [ "$outcome" = "ALREADY_SATISFIED" ]; then
         STATUS=ALREADY_SATISFIED
-      elif [ "$outcome" = "REAL_BUILD" ] && [ "$final_ok" = "true" ]; then
+      elif { [ "$outcome" = "REAL_BUILD" ] || [ "$outcome" = "EVIDENCE_ONLY_REPAIR" ]; } && [ "$final_ok" = "true" ]; then
         STATUS=PROCEED
       else
         # FALSE_COMPLETE, unknown outcome, or final review not satisfied -> block.
@@ -4801,12 +4848,42 @@ nodes:
   # WO-HARNESS-BLOCKED-BUILD-NOT-COMPLETED-01: a build that ended BLOCKED must not end the run
   # as `completed`. Runs after every terminal node (salvage, issue label, ledger notes) so those
   # have already happened; fails the run with `build_blocked: <status> <note>`.
+  - id: evidence-repair-final
+    depends_on: [repair-gate-fail, tests-blocked-report, block-reclassify, noninteractive-salvage, review-issue, blocked-issue, record-wo-completion-candidate, evidence-repair-verify]
+    trigger_rule: all_done
+    task_class: clerical
+    load_bearing: true
+    timeout: 180
+    bash: |
+      set -euo pipefail
+      ER_BUILD=$assert-implement-produced-work.output
+      if ! printf '%s\n' "$ER_BUILD" | grep -q '^BUILD_OUTCOME=EVIDENCE_ONLY_REPAIR$'; then
+        printf '{"state":"not_applicable"}\n'
+        exit 0
+      fi
+      ER_SNAPSHOT=$evidence-repair-start.output
+      ER_RECEIPT=$evidence-repair-verify.output
+      ER_FINAL=$(bun /app/scripts/evidence-repair.ts terminal "$ER_SNAPSHOT" "$ER_RECEIPT")
+      printf '%s\n' "$ER_FINAL"
+      if ! printf '%s' "$ER_FINAL" | grep -q '"state":"verified"'; then
+        echo 'operator_handoff: evidence repair final head/body/check proof unavailable' >&2
+        exit 1
+      fi
+
   - id: blocked-terminal-gate
-    depends_on: [repair-gate-fail, tests-blocked-report, block-reclassify, noninteractive-salvage, review-issue, blocked-issue, record-wo-completion-candidate]
+    depends_on: [repair-gate-fail, tests-blocked-report, block-reclassify, noninteractive-salvage, review-issue, blocked-issue, record-wo-completion-candidate, evidence-repair-verify, evidence-repair-final]
     trigger_rule: all_done
     task_class: clerical
     bash: |
       set -uo pipefail
+      ER_BUILD=$assert-implement-produced-work.output
+      ER_RECEIPT=$evidence-repair-final.output
+      if printf '%s\n' "$ER_BUILD" | grep -q '^BUILD_OUTCOME=EVIDENCE_ONLY_REPAIR$'; then
+        if ! printf '%s' "$ER_RECEIPT" | grep -q '"state":"verified"'; then
+          echo 'operator_handoff: evidence repair terminal proof missing' >&2
+          exit 1
+        fi
+      fi
 
       capture_node_output() {
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
@@ -5485,6 +5562,20 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
+      ER_SNAPSHOT=$evidence-repair-start.output
+      ER_MODE='{"state":"ordinary"}'
+      if printf '%s' "$ER_SNAPSHOT" | grep -q '"state":"captured"' || grep -q '^EVIDENCE_ONLY_REPAIR=yes$' "${ARTIFACTS_DIR:-}/implement.env" 2>/dev/null; then
+        ER_MODE=$(bun /app/scripts/evidence-repair.ts classify "$ER_SNAPSHOT")
+      fi
+      case "$ER_MODE" in
+        *'"state":"evidence_only"'*)
+          ER_URL=$(printf '%s' "$ER_MODE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["prUrl"])')
+          echo "PR_URL=$ER_URL"
+          exit 0
+          ;;
+        *'"state":"ordinary"'*) ;;
+        *) echo 'operator_handoff: evidence repair source/head changed; no commit or new PR' >&2; exit 1 ;;
+      esac
       # 2026-05-16 quote-fix: substituteNodeOutputRefs with escapedForBash=true wraps
       # the output in single quotes. Wrapping the substitution in double quotes here
       # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes - line 2+ of
@@ -6049,6 +6140,20 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
+      ER_SNAPSHOT=$evidence-repair-start.output
+      ER_MODE='{"state":"ordinary"}'
+      if printf '%s' "$ER_SNAPSHOT" | grep -q '"state":"captured"' || grep -q '^EVIDENCE_ONLY_REPAIR=yes$' "${ARTIFACTS_DIR:-}/implement.env" 2>/dev/null; then
+        ER_MODE=$(bun /app/scripts/evidence-repair.ts classify "$ER_SNAPSHOT")
+      fi
+      case "$ER_MODE" in
+        *'"state":"evidence_only"'*)
+          ER_URL=$(printf '%s' "$ER_MODE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["prUrl"])')
+          echo "PR_URL=$ER_URL"
+          exit 0
+          ;;
+        *'"state":"ordinary"'*) ;;
+        *) echo 'operator_handoff: evidence repair source/head changed; no commit or new PR' >&2; exit 1 ;;
+      esac
       RPR_ORIGINAL_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
       DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
@@ -7453,7 +7558,7 @@ nodes:
         CLOSING_LINE="Closes ${ISSUE_REPO}#${ISSUE_NUM}"
       fi
 
-      BODY_FILE=$(mktemp)
+      BODY_FILE=$(mktemp "${ARTIFACTS_DIR:?}/evidence-body.XXXXXX")
       {
         printf '%s\n' "$PROSE"
         if [ -n "$CLOSING_LINE" ]; then
@@ -7472,16 +7577,66 @@ nodes:
       } > "$BODY_FILE"
 
       # -- Patch the PR body.
+      ER_BUILD=$assert-implement-produced-work.output
+      ER_PUBLICATION=""
+      if printf '%s\n' "$ER_BUILD" | grep -q '^BUILD_OUTCOME=EVIDENCE_ONLY_REPAIR$'; then
+        ER_SNAPSHOT=$evidence-repair-start.output
+        ER_PUBLICATION=$(bun /app/scripts/evidence-repair.ts publication "$ER_SNAPSHOT" "${BODY_FILE##*/}")
+        if ! printf '%s' "$ER_PUBLICATION" | grep -q '"state":"published"'; then
+          echo 'operator_handoff: evidence publication cannot be bound' >&2
+          exit 1
+        fi
+      fi
       gh pr edit "$PR_URL" --repo "$REPO" --body-file "$BODY_FILE"
+      if [ -n "$ER_PUBLICATION" ]; then echo "EVIDENCE_PUBLICATION=$ER_PUBLICATION"; fi
       echo "patch-pr-body: PR body updated with v2 manifest."
       echo "PR_URL=$PR_URL"
 
+  - id: evidence-repair-verify
+    depends_on: [patch-pr-body, manifest-evidence-check]
+    trigger_rule: all_done
+    task_class: clerical
+    load_bearing: true
+    timeout: 360
+    bash: |
+      set -euo pipefail
+      ER_BUILD=$assert-implement-produced-work.output
+      if printf '%s\n' "$ER_BUILD" | grep -q '^BUILD_OUTCOME=EVIDENCE_REPAIR_HANDOFF$'; then
+        echo 'operator_handoff: evidence repair completion or identity unavailable' >&2
+        exit 1
+      fi
+      if ! printf '%s\n' "$ER_BUILD" | grep -q '^BUILD_OUTCOME=EVIDENCE_ONLY_REPAIR$'; then
+        printf '{"state":"not_applicable"}\n'
+        exit 0
+      fi
+      ER_EVIDENCE=$manifest-evidence-check.output
+      if [ "$ER_EVIDENCE" != "OK" ]; then
+        echo 'operator_handoff: evidence repair manifest/stops did not pass' >&2
+        exit 1
+      fi
+      ER_SNAPSHOT=$evidence-repair-start.output
+      ER_PUBLICATION_OUTPUT=$patch-pr-body.output
+      ER_RECEIPT=$(bun /app/scripts/evidence-repair.ts verify "$ER_SNAPSHOT" "$ER_PUBLICATION_OUTPUT")
+      printf '%s\n' "$ER_RECEIPT"
+      if ! printf '%s' "$ER_RECEIPT" | grep -q '"state":"verified"'; then
+        echo 'operator_handoff: evidence repair consumed-input receipt unavailable' >&2
+        exit 1
+      fi
+
   - id: review-issue
-    depends_on: [build-manifest, patch-pr-body]
+    depends_on: [build-manifest, patch-pr-body, evidence-repair-verify]
     trigger_rule: all_done
     task_class: clerical
     bash: |
       set -euo pipefail
+      ER_BUILD=$assert-implement-produced-work.output
+      ER_RECEIPT=$evidence-repair-verify.output
+      if printf '%s\n' "$ER_BUILD" | grep -q '^BUILD_OUTCOME=EVIDENCE_ONLY_REPAIR$'; then
+        if ! printf '%s' "$ER_RECEIPT" | grep -q '"state":"verified"'; then
+          echo 'operator_handoff: evidence repair terminal proof missing' >&2
+          exit 1
+        fi
+      fi
 
       capture_node_output() {
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
@@ -7588,7 +7743,7 @@ nodes:
   # exits 0 -- it must not be reported as confirmed-working without a live probe.
   - id: record-wo-completion-candidate
     persona: major-build
-    depends_on: [patch-pr-body]
+    depends_on: [patch-pr-body, evidence-repair-verify]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -7598,6 +7753,14 @@ nodes:
       # quoted-heredoc shim, so they cannot be unbound) and pipefail, branch on exit
       # codes explicitly, and ALWAYS exit 0.
       set -uo pipefail
+      ER_BUILD=$assert-implement-produced-work.output
+      ER_RECEIPT=$evidence-repair-verify.output
+      if printf '%s\n' "$ER_BUILD" | grep -q '^BUILD_OUTCOME=EVIDENCE_ONLY_REPAIR$'; then
+        if ! printf '%s' "$ER_RECEIPT" | grep -q '"state":"verified"'; then
+          echo 'operator_handoff: evidence repair is not a completion candidate' >&2
+          exit 0
+        fi
+      fi
 
       LANE="bdc-feature-development-codex"
       LEDGER_REPO="thinmansoftware/bdc-xo"
