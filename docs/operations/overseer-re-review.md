@@ -4,6 +4,8 @@ Work order WO-HARNESS-OVERSEER-REREVIEW-FAILED-HEAD-COMMAND-01 (bdc-xo#5564). Sc
 
 ## When to use it
 
+`prompt_too_large` is terminal: a fully composed review prompt over 1,048,576 UTF-8 bytes invokes no model or ladder and is not automatically retried. Exactly the cap is allowed; all diff text (including generated files and binary markers) remains included. Do not re-enqueue an unchanged oversized prompt; resolve its scope through the XO first.
+
 A review row at a head ended `failed` (for example `review_incomplete` / `review_body_credential_leak`), the cause is now fixed, and the pull request has not changed. Nothing else will start a review of that head:
 
 | Path | Why it does not help |

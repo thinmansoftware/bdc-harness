@@ -1226,8 +1226,10 @@ export function buildIndeterminateSummary(
   diagnostics?: readonly SanitizedTermination[]
 ): string {
   const code = reviewErrorCode(error);
+  // Only our exact numeric oversize payload is safe to publish, never arbitrary detail.
+  const size = /^prompt_too_large:bytes=(\d{1,16}):cap=(\d{1,16})$/.exec(error ?? '');
   const summary = code
-    ? `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.`
+    ? `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.${size ? ` Prompt: ${size[1]} UTF-8 bytes; cap: ${size[2]}.` : ''}`
     : INDETERMINATE_REVIEW_SUMMARY;
   const safe = Array.isArray(diagnostics) ? diagnostics.filter(isTrustedTermination) : [];
   return safe.length
