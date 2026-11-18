@@ -137,3 +137,4 @@ describe('adapter octokit method names -- against the real Octokit, not a mock',
     expect(evidence.requiredContextsBlocked).toBeUndefined();
   });
 });
+import './bundle-review-proof.test.ts';

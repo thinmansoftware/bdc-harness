@@ -38,6 +38,7 @@ const credentialLog = createLogger('overseer/pr-review-submit');
 
 /** What the governed reviewer returns. */
 export interface ReviewerVerdict {
+  coverage?: BundleCoverage;
   /** true -> APPROVE; false -> REQUEST_CHANGES. */
   approved: boolean;
   /** Evidence. REQUIRED (non-empty) when approved === false. */
@@ -272,6 +273,11 @@ export interface SubmitOutcome {
 }
 
 export interface SubmitDeps {
+  currentReviewRefs?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<{ headSha: string; baseSha: string }>;
   reviewerIdentity: string;
   /** Runs the governed reviewer against an exact head. */
   runReviewer(work: ReviewWorkItem): Promise<ReviewerVerdict>;
@@ -373,8 +379,10 @@ const MAX_EVIDENCE_BODY = 60_000;
  */
 export function buildReviewBody(work: ReviewWorkItem, verdict: ReviewerVerdict): string {
   const header = `Independent review by the Overseer App at head \`${work.headSha}\`.`;
+  const coverage = verdict.coverage ? `\n\n${verdict.coverage.notice}` : '';
   const summary = verdict.summary.trim();
-  const body = summary.length > 0 ? `${header}\n\n${summary}` : header;
+  // Reserve coverage ahead of model findings so the body limit cannot erase it.
+  const body = summary.length > 0 ? `${header}${coverage}\n\n${summary}` : header + coverage;
   return body.length > MAX_EVIDENCE_BODY ? body.slice(0, MAX_EVIDENCE_BODY) : body;
 }
 
@@ -676,6 +684,23 @@ export async function runAndSubmitReview(
   }
 
   let submission: SubmitPullRequestReviewResult;
+  if (verdict.coverage) {
+    try {
+      if (!deps.currentReviewRefs) throw new Error('freshness_unavailable');
+      const refs = await deps.currentReviewRefs({
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+      });
+      if (refs.headSha !== work.headSha || refs.baseSha !== verdict.coverage.baseSha)
+        throw new Error('refs_changed');
+    } catch {
+      return finish(deps, work, work.headSha, {
+        disposition: 'stale_head',
+        reason: 'bundle_coverage_refs_unavailable_or_changed',
+      });
+    }
+  }
   try {
     submission = await deps.submitReview({
       owner: work.owner,
@@ -1049,3 +1074,4 @@ async function finish(
   // it off the return value to schedule the deferral.
   return outcome;
 }
+import type { BundleCoverage } from './bundle-review-proof';
