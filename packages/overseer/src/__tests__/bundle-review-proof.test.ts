@@ -61,6 +61,9 @@ function fixture() {
   ]);
   const proof: Record<string, unknown> = {
     schema: 1,
+    phase: 'preinstall',
+    dependenciesInstalled: false,
+    generator: '9cc028a6a440036c50aabd14dc385cabfa5d32520ea882779371863499c24220',
     repository: 'thinmansoftware/bdc-harness',
     run: 10,
     attempt: 1,
@@ -283,7 +286,7 @@ describe('#6357 producer and exhaustive proof guards', () => {
       [script],
       { encoding: 'utf8' }
     );
-    expect(result.stderr).toContain('Ran 9 tests');
+    expect(result.stderr).toContain('Ran 12 tests');
     expect(result.status).toBe(0);
   });
   test('authenticated new producer excludes only bundle and publishes complete provenance', async () => {
@@ -322,6 +325,8 @@ describe('#6357 producer and exhaustive proof guards', () => {
     'config',
     'base',
     'workflow',
+    'postinstall',
+    'dependencies',
   ] as const) {
     test(`${guard} proof retains full diff`, async () => {
       const f = fixture();
@@ -344,6 +349,8 @@ describe('#6357 producer and exhaustive proof guards', () => {
       if (guard === 'attempt') f.proof.attempt = 2;
       if (guard === 'checkout') f.proof.checkout = head;
       if (guard === 'workflow') f.proof.workflow = head;
+      if (guard === 'postinstall') f.proof.phase = 'postinstall';
+      if (guard === 'dependencies') f.proof.dependenciesInstalled = true;
       if (guard === 'base')
         f.responses['GET /repos/{owner}/{repo}/pulls/{pull_number}'].base = { sha: producer };
       if (guard === 'LF') {

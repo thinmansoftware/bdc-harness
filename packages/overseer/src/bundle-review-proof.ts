@@ -418,6 +418,9 @@ export async function collectBundleCoverage(
     const proof = object(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)));
     requireProof(
       proof.schema === 1 &&
+        proof.phase === 'preinstall' &&
+        proof.dependenciesInstalled === false &&
+        proof.generator === '9cc028a6a440036c50aabd14dc385cabfa5d32520ea882779371863499c24220' &&
         proof.repository === `${input.owner}/${input.repo}` &&
         proof.pr === prNumber &&
         proof.run === run.id &&

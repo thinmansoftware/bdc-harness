@@ -17,6 +17,12 @@ import zipfile
 ARCHIVE_SHA256 = "8611ba935af886f05a6f38740a15160326c15e5d5d07adef966130b4493607ed"
 ARCHIVE_URL = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.11/bun-linux-x64.zip"
 BUNDLE = "packages/workflows/src/defaults/bundled-defaults.generated.ts"
+# Approved anchor generator has exactly fs/promises and path built-in imports.
+# Exact source admission, rather than a permissive source-text import parser,
+# rejects new static/dynamic imports and transitive repository modules alike.
+BUILTIN_GENERATOR_SHA256 = "9cc028a6a440036c50aabd14dc385cabfa5d32520ea882779371863499c24220"
+BUILTIN_BUNFIG_SHA256 = "213d5743d063c71efa683a4202997ebdcc53cdd90eacd1c5bdee54a540daecb3"
+BUILTIN_PACKAGE_SHA256 = "1d95004005d3d8a59a6079e93bd811dbe9339a2c8718b90b8162f6650d9b8add"
 
 
 def digest(data):
@@ -97,6 +103,17 @@ def verified_checkout(root):
     return git(root, "rev-parse", "HEAD^{tree}").decode().strip()
 
 
+def generator_is_builtin_only(root):
+    try:
+        return (digest((root / "scripts/generate-bundled-defaults.ts").read_bytes()) == BUILTIN_GENERATOR_SHA256
+                and digest((root / "bunfig.toml").read_bytes()) == BUILTIN_BUNFIG_SHA256
+                and digest((root / "package.json").read_bytes()) == BUILTIN_PACKAGE_SHA256
+                and not (root / ".bunfig.toml").exists()
+                and not any(root.glob(".env*")))
+    except OSError:
+        return False
+
+
 def run_producer(root):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise ValueError("unsupported_runtime_platform")
@@ -130,8 +147,10 @@ def run_producer(root):
         "HOME": str(home), "BUN_INSTALL": str(home), "CI": "true",
         "HUSKY": "0", "LANG": "C.UTF-8",
     }
-    # HUSKY=0 is explicit producer delta: install must not create executable Git hooks.
-    for args in [["install", "--frozen-lockfile"], ["run", "check:bundled"]]:
+    # The only repository code allowed before proof is the exact admitted,
+    # built-in-only generator. Direct invocation avoids root package lifecycle hooks.
+    eligible_generator = generator_is_builtin_only(root)
+    if eligible_generator:
         assert_runtime(executable, runtime_sha)
         assert_runtime(controlled_node, node_sha)
         if shutil.which("bun", path=env["PATH"]) != str(executable):
@@ -140,24 +159,22 @@ def run_producer(root):
             raise ValueError("input_tree_changed")
         if git(root, "rev-parse", "HEAD").decode().strip() != checkout:
             raise ValueError("checkout_changed")
-        subprocess.run([str(executable), *args], cwd=root, env=env, check=True)
+        subprocess.run([str(executable), "run", "scripts/generate-bundled-defaults.ts", "--check"], cwd=root, env=env, check=True)
         assert_runtime(executable, runtime_sha)
         assert_runtime(controlled_node, node_sha)
-        for directory, _, names in os.walk(root / "node_modules", followlinks=False):
-            if Path(directory).name == ".bin" and any(n in names for n in ("bun", "bunx")):
-                raise ValueError("dependency_shadowed_runtime")
         if verified_checkout(root) != initial_tree:
             raise ValueError("input_tree_changed")
         if git(root, "rev-parse", "HEAD").decode().strip() != checkout:
             raise ValueError("checkout_changed")
-    raw_bundle = (root / BUNDLE).read_bytes()
-    if os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and b"\r" not in raw_bundle:
+    raw_bundle = (root / BUNDLE).read_bytes() if eligible_generator else b""
+    if eligible_generator and os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and b"\r" not in raw_bundle:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         pr = event["pull_request"]
         if parents != [pr["base"]["sha"], pr["head"]["sha"]]:
             raise ValueError("tested_merge_parents_mismatch")
         proof = {
             "schema": 1, "repository": os.environ["GITHUB_REPOSITORY"],
+            "phase": "preinstall", "dependenciesInstalled": False, "generator": BUILTIN_GENERATOR_SHA256,
             "run": int(os.environ["GITHUB_RUN_ID"]), "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
             "pr": event["number"], "head": pr["head"]["sha"], "base": pr["base"]["sha"],
             "checkout": checkout, "tree": initial_tree, "archive": ARCHIVE_SHA256,
@@ -170,9 +187,19 @@ def run_producer(root):
             "nodeSha256": node_sha,
         }
         print("BUNDLE_PROOF_V1 " + base64.b64encode(json.dumps(proof, sort_keys=True).encode()).decode(), flush=True)
+    elif not eligible_generator:
+        print("BUNDLE_PROOF_UNAVAILABLE non_builtin_or_unadmitted_generator_config", flush=True)
     elif b"\r" in raw_bundle:
         print("BUNDLE_PROOF_UNAVAILABLE raw_bundle_not_LF", flush=True)
-    # Subsequent ordinary tests use the same verified executable; proof covers install/check only.
+    # Receipt is already complete. Installation and ordinary CI are outside the
+    # equality-proof interval. Never retry or produce another receipt after install.
+    subprocess.run([str(executable), "install", "--frozen-lockfile"], cwd=root, env=env, check=True)
+    assert_runtime(executable, runtime_sha)
+    assert_runtime(controlled_node, node_sha)
+    for directory, _, names in os.walk(root / "node_modules", followlinks=False):
+        if Path(directory).name == ".bin" and any(n in names for n in ("bun", "bunx")):
+            raise ValueError("dependency_shadowed_runtime")
+    # Subsequent ordinary tests use the same verified executable.
     with open(os.environ["GITHUB_PATH"], "a") as stream:
         stream.write(str(executable.parent) + "\n")
 

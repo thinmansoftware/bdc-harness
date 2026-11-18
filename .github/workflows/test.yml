@@ -32,6 +32,9 @@ jobs:
       - name: Verified bundle producer
         run: /usr/bin/python3 scripts/ci/verified-bundle-proof.py
 
+      - name: Check bundled defaults (ordinary CI only)
+        run: bun run check:bundled
+
       - name: Check bundled skill
         run: bun run check:bundled-skill
 
