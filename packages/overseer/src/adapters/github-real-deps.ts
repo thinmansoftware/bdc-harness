@@ -360,7 +360,17 @@ export interface RealGitHubOctokitLike {
       base: string;
       head: string;
       headers?: { accept: string };
-    }): Promise<{ data: { files?: { filename: string; patch?: string }[] } }>;
+    }): Promise<{
+      data: {
+        files?: {
+          filename: string;
+          patch?: string;
+          status?: string;
+          previous_filename?: string;
+          changes?: number;
+        }[];
+      };
+    }>;
     /**
      * Optional: branch-protection required status-check contexts for a branch.
      * Present on the real Octokit client; omitted by narrow test mocks. Returns
@@ -604,11 +614,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
           headers: { accept: 'application/vnd.github.diff' },
         });
         const body: unknown = whole.data;
-        if (
-          typeof body !== 'string' ||
-          !body.startsWith('diff --git ') ||
-          !/^(@@ |Binary files .+ differ|GIT binary patch)/m.test(body)
-        ) {
+        if (typeof body !== 'string' || !body.startsWith('diff --git ')) {
           throw new Error('invalid_diff_response');
         }
         const blocks = body.split(/(?=^diff --git )/m);
@@ -616,7 +622,32 @@ export function createRealFetchExactHeadPullRequestEvidence(
           const block = blocks.find(block =>
             block.split('\n', 1)[0]?.endsWith(` b/${file.filename}`)
           );
-          if (!block || !/^(@@ |Binary files .+ differ|GIT binary patch)/m.test(block)) {
+          // Complete zero-line changes have no hunks. Require both the API's
+          // change metadata and the corresponding complete Git metadata block.
+          const metadata = block?.split('\n').slice(1).filter(Boolean);
+          const metadataOnly =
+            file.changes === 0 &&
+            metadata &&
+            ((file.status === 'renamed' &&
+              typeof file.previous_filename === 'string' &&
+              metadata.join('\n') ===
+                `similarity index 100%\nrename from ${file.previous_filename}\nrename to ${file.filename}`) ||
+              (file.status === 'modified' &&
+                metadata.length === 2 &&
+                /^old mode [0-7]{6}$/.test(metadata[0]) &&
+                /^new mode [0-7]{6}$/.test(metadata[1])) ||
+              (file.status === 'added' &&
+                metadata.length === 2 &&
+                /^new file mode [0-7]{6}$/.test(metadata[0]) &&
+                /^index 0{7,40}\.\.e69de29[0-9a-f]{0,33}$/.test(metadata[1])) ||
+              (file.status === 'removed' &&
+                metadata.length === 2 &&
+                /^deleted file mode [0-7]{6}$/.test(metadata[0]) &&
+                /^index e69de29[0-9a-f]{0,33}\.\.0{7,40}$/.test(metadata[1])));
+          if (
+            !block ||
+            (!/^(@@ |Binary files .+ differ|GIT binary patch)/m.test(block) && !metadataOnly)
+          ) {
             // Unknown/quoted path or incomplete evidence refuses rather than guessing binary.
             throw new Error('missing_file_diff');
           }
@@ -625,7 +656,9 @@ export function createRealFetchExactHeadPullRequestEvidence(
           /^(Binary files .+ differ|GIT binary patch)$/gm,
           '$&\n[binary or patch unavailable]'
         );
-      } catch {
+      } catch (error) {
+        // Preserve the existing safe rate-limit projection and Retry-After.
+        if (classifyRateLimitError(error)) throw error;
         // Fixed safe error only: neither provider messages nor private diff leak.
         throw new Error('pr_review_diff_evidence_unavailable');
       }
