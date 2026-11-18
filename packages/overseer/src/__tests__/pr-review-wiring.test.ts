@@ -7,6 +7,17 @@
  * accepts unverified input, so these tests pin that behavior.
  */
 import { describe, expect, test } from 'bun:test';
+import { buildIndeterminateSummary } from '../pr-review-wiring.ts';
+import { evaluatePullRequest } from '../pr-review-evaluator.ts';
+import { runAndSubmitReview } from '../pr-review-submit.ts';
+
+test('#6357 oversize summary names the cap and bytes without arbitrary error detail', () => {
+  const summary = buildIndeterminateSummary('prompt_too_large:bytes=1048577:cap=1048576');
+  expect(summary).toContain('Reason code: prompt_too_large');
+  expect(summary).toContain('1048577 UTF-8 bytes');
+  expect(summary).toContain('cap: 1048576');
+  expect(buildIndeterminateSummary('prompt_too_large:token=private')).not.toContain('private');
+});
 import {
   createRealSubmitDeps,
   isExactHeadCiGreen,
@@ -191,6 +202,48 @@ describe('PR review approval verdict recording', () => {
 });
 
 describe('createRealSubmitDeps -- evaluator binding', () => {
+  test('#6357 oversized evaluation submits a terminal non-approval without retry or approval receipt', async () => {
+    let modelCalls = 0;
+    let approvalReceipts = 0;
+    const submitted: unknown[] = [];
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: (input, evaluatorDeps) =>
+        evaluatePullRequest(input, {
+          ...evaluatorDeps,
+          fetchEvidence: async () => ({
+            diff: 'x'.repeat(1_048_577),
+            checks: [{ name: 'test', status: 'completed', conclusion: 'success' }],
+          }),
+          fetchAcceptanceCriteria: async () => null,
+          invokeModel: async () => {
+            modelCalls++;
+            throw new Error('must not invoke');
+          },
+        }),
+      recordApprovalVerdict: async () => {
+        approvalReceipts++;
+      },
+      createReceiptMessage: async () => ({}) as never,
+    });
+    const outcome = await runAndSubmitReview(work, {
+      ...deps,
+      isDraft: async () => false,
+      currentHeadSha: async () => HEAD,
+      submitReview: async submission => {
+        submitted.push(submission);
+        return { submitted: true };
+      },
+    });
+    expect(outcome.disposition).toBe('changes_requested');
+    expect(outcome.reason).toBe('indeterminate:prompt_too_large');
+    expect(outcome.retryAfter).toBeUndefined();
+    expect(outcome.retryAfterMs).toBeUndefined();
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0]).toMatchObject({ event: 'REQUEST_CHANGES', commitId: HEAD });
+    expect(modelCalls).toBe(0);
+    expect(approvalReceipts).toBe(0);
+  });
   test('records an approved receipt with the resolved review model', async () => {
     const recorded: Parameters<typeof recordReviewApprovalVerdict>[0][] = [];
     const deps = createRealSubmitDeps('review-app[bot]', {

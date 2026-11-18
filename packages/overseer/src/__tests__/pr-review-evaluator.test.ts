@@ -74,6 +74,121 @@ function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
   };
 }
 
+describe('#6357 -- composed prompt byte cap', () => {
+  const cap = 1_048_576;
+  const checks = [{ name: 'test', status: 'completed', conclusion: 'success' }];
+  const criteria = 'implementation is safe';
+  function composed(diff: string, acceptanceCriteria = criteria): string {
+    return buildReviewPrompt({
+      request: input,
+      diff,
+      checkPartition: partitionChecksByRequired(checks),
+      acceptanceCriteria,
+    });
+  }
+  function sizedDiff(bytes: number): string {
+    return 'x'.repeat(bytes - Buffer.byteLength(composed(''), 'utf8'));
+  }
+
+  test('over cap is terminal before reading the ladder or invoking any model', async () => {
+    let calls = 0;
+    let ladderReads = 0;
+    const d = deps({
+      fetchEvidence: async () => ({ diff: sizedDiff(cap + 1), checks }),
+      invokeModel: async () => {
+        calls++;
+        return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+      },
+    });
+    Object.defineProperty(d, 'ladder', {
+      get: () => {
+        ladderReads++;
+        return ['codex', 'grok'];
+      },
+    });
+    const result = await evaluatePullRequest(input, d);
+    expect(result.verdict).toBe('INDETERMINATE');
+    expect(result.error).toBe(`prompt_too_large:bytes=${cap + 1}:cap=${cap}`);
+    expect(result.findings).toEqual([]);
+    expect(result.reviewed_head_sha).toBe(HEAD_A);
+    expect(result.retry_after).toBeUndefined();
+    expect(result.retry_after_ms).toBeUndefined();
+    expect(calls).toBe(0);
+    expect(ladderReads).toBe(0);
+  });
+
+  for (const bytes of [cap - 1, cap]) {
+    test(`at ${bytes} bytes the complete prompt reaches the ordinary model`, async () => {
+      const diff = sizedDiff(bytes);
+      let observed = '';
+      const result = await evaluatePullRequest(
+        input,
+        deps({
+          fetchEvidence: async () => ({ diff, checks }),
+          invokeModel: async (_binary, prompt) => {
+            observed = prompt;
+            return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+          },
+        })
+      );
+      expect(Buffer.byteLength(observed, 'utf8')).toBe(bytes);
+      expect(observed).toBe(composed(diff));
+      expect(result.verdict).toBe('APPROVE');
+    });
+  }
+
+  test('counts UTF-8 bytes rather than string characters', async () => {
+    const diff = sizedDiff(cap - 2) + String.fromCodePoint(0x1f600);
+    expect(composed(diff).length).toBeLessThanOrEqual(cap);
+    let calls = 0;
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({ diff, checks }),
+        invokeModel: async () => {
+          calls++;
+          throw new Error('must not invoke');
+        },
+      })
+    );
+    expect(result.error).toBe(`prompt_too_large:bytes=${cap + 2}:cap=${cap}`);
+    expect(calls).toBe(0);
+  });
+
+  test('acceptance criteria can put an otherwise in-cap diff over the limit', async () => {
+    const diff = sizedDiff(cap);
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({ diff, checks }),
+        fetchAcceptanceCriteria: async () => criteria + 'x',
+      })
+    );
+    expect(result.verdict).toBe('INDETERMINATE');
+    expect(result.error).toBe(`prompt_too_large:bytes=${cap + 1}:cap=${cap}`);
+  });
+
+  test('full-text fallback and real binary markers remain intact below cap', async () => {
+    const diff =
+      'diff --git a/text.ts b/text.ts\n@@ -1 +1 @@\n-old\n+new\n' +
+      'diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n' +
+      '[binary or patch unavailable]';
+    let observed = '';
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({ diff, checks }),
+        invokeModel: async (_binary, prompt) => {
+          observed = prompt;
+          return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+        },
+      })
+    );
+    expect(observed).toBe(composed(diff));
+    expect(result.verdict).toBe('APPROVE');
+  });
+});
+
 describe('governed PR-code reviewer', () => {
   test('1 clean diff yields APPROVE with exact head and reviewer identity', async () => {
     const result = await evaluatePullRequest(input, deps());

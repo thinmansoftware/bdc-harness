@@ -41,6 +41,8 @@ import {
  * classification that already exists observable.
  */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
+/** Fully composed UTF-8 prompt limit; oversize is terminal, never a transport retry. */
+export const MAX_REVIEW_PROMPT_BYTES = 1_048_576;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('overseer.pr-review-evaluator');
   return cachedLog;
@@ -685,6 +687,24 @@ export async function evaluatePullRequest(
     checkPartition,
     acceptanceCriteria,
   });
+  const promptBytes = Buffer.byteLength(prompt, 'utf8');
+  if (promptBytes > MAX_REVIEW_PROMPT_BYTES) {
+    getLog().warn(
+      {
+        promptBytes,
+        cap: MAX_REVIEW_PROMPT_BYTES,
+        prNumber: input.pr_number,
+        headSha: input.head_sha,
+      },
+      'prompt_too_large'
+    );
+    return indeterminate(
+      input,
+      deps,
+      acceptanceCriteriaAvailable,
+      `prompt_too_large:bytes=${promptBytes}:cap=${MAX_REVIEW_PROMPT_BYTES}`
+    );
+  }
   const ladder = deps.ladder ?? defaultReviewLadder();
   const supported = deps.executionContext ? supportedPrReviewLadder(ladder) : ladder;
   const diagnostics: SanitizedTermination[] = [];
@@ -724,7 +744,7 @@ export async function evaluatePullRequest(
     const rungStartedAt = Date.now();
     const invocationId = randomUUID();
     getLog().info(
-      { binary, promptBytes: prompt.length, prNumber: input.pr_number, headSha: input.head_sha },
+      { binary, promptBytes, prNumber: input.pr_number, headSha: input.head_sha },
       'judge_rung_started'
     );
     try {
