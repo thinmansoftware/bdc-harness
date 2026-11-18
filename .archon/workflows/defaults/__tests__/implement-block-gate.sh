@@ -39,7 +39,14 @@ if n is None or 'bash' not in n:
     print('echo missing-node-%s >&2; exit 99' % nid)
     sys.exit(0)
 body = n['bash']
-mapping = {}
+# These fixtures exercise the ordinary build path. The production engine supplies
+# these outputs even when the evidence-only repair path is not applicable.
+mapping = {
+    'assert-implement-produced-work': '',
+    'evidence-repair-start': '{"state":"not_applicable"}',
+    'evidence-repair-verify': '{"state":"not_applicable"}',
+    'evidence-repair-final': '{"state":"not_applicable"}',
+}
 for line in open(subs, encoding='utf-8').read().split('\n'):
     if '\t' not in line:
         continue
