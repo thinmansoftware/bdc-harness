@@ -1,3 +1,9 @@
+import {
+  readValidatedWorkflow,
+  validatedWorkflowIdentity,
+  workflowDigest,
+  type ValidatedWorkflowHandle,
+} from './reliability/codex-only-binding';
 /**
  * Workflow Executor - runs DAG-based workflows
  */
@@ -13,6 +19,7 @@ import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from '.
 import {
   executeDagWorkflow,
   preparedDagBindingPolicy,
+  prepareDagBindings,
   type PreparedDagBindings,
 } from './dag-executor';
 import { finalizeRunTeardown, isTerminalRunStatus } from './run-teardown';
@@ -802,7 +809,8 @@ export async function executeWorkflow(
   preCreatedRun?: WorkflowRun,
   authoritySource?: RunAuthorityDispatch,
   modelOverride?: ModelOverride,
-  preparedBindings?: PreparedDagBindings
+  preparedBindings?: PreparedDagBindings,
+  validatedWorkflow?: ValidatedWorkflowHandle
 ): Promise<WorkflowExecutionResult> {
   // Never strip a persisted restriction through a generic provider-wait/recovery entry.
   let isProviderWait = false;
@@ -820,7 +828,7 @@ export async function executeWorkflow(
     getLog().error({}, 'workflow.continuation_classification_failed');
     return { success: false, error: 'Unable to read workflow continuation' };
   }
-  // Keep this reserved lane closed until full v2 binding and strict transport are enforced.
+  // Keep this reserved lane closed pending acceptance of the prepared binding path.
   if (workflow.name === CODEX_ONLY_WORKFLOW_NAME) {
     return { success: false, error: 'codex_only_binding_required' };
   }
@@ -829,6 +837,21 @@ export async function executeWorkflow(
     preparedDagBindingPolicy(preparedBindings) !== 'codex-only-v1'
   ) {
     return { success: false, error: 'codex_only_prepared_binding_invalid' };
+  }
+  let validatedRegistry: Awaited<ReturnType<typeof readValidatedWorkflow>>['registry'] | undefined;
+  if (validatedWorkflow) {
+    const identity = validatedWorkflowIdentity(validatedWorkflow);
+    const registered = await deps.store.getCodebase(identity.codebaseId);
+    if (!registered || codebaseId !== registered.id)
+      return { success: false, error: 'codex_only_binding_changed' };
+    const captured = await readValidatedWorkflow(validatedWorkflow, {
+      codebaseId: registered.id,
+      cwd: registered.default_cwd,
+    });
+    if (workflowDigest(workflow) !== captured.binding.workflowDigest)
+      return { success: false, error: 'codex_only_binding_changed' };
+    workflow = captured.workflow;
+    validatedRegistry = captured.registry;
   }
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
@@ -1379,6 +1402,29 @@ export async function executeWorkflow(
 
     // BDC patch: load policyFile if specified and inject as systemPrompt for all prompt nodes.
     const executableWorkflow = await applyWorkflowPolicyFile(workflow, cwd);
+    if (validatedWorkflow) {
+      if (workflowDigest(executableWorkflow) !== workflowDigest(workflow))
+        throw new Error('codex_only_binding_changed');
+      preparedBindings = await prepareDagBindings(
+        cwd,
+        executableWorkflow,
+        writtenProvider,
+        resolvedModel,
+        config,
+        modelOverride,
+        'codex-only-v1',
+        validatedRegistry
+      );
+      const metadata = {
+        ...workflowRun.metadata,
+        codex_only_dispatch: {
+          version: 'codex-only-v1',
+          ...validatedWorkflowIdentity(validatedWorkflow),
+        },
+      };
+      await deps.store.updateWorkflowRun(workflowRun.id, { metadata });
+      workflowRun.metadata = metadata;
+    }
 
     const probeDecision = await runFireTimeProbe(deps, {
       workflow: executableWorkflow,

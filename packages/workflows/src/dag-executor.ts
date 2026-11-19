@@ -2479,7 +2479,8 @@ export async function prepareDagBindings(
   workflowModel: string | undefined,
   config: WorkflowConfig,
   modelOverride?: ModelOverride,
-  identityPolicy?: 'codex-only-v1' | 'codex-only-v2'
+  identityPolicy?: 'codex-only-v1' | 'codex-only-v2',
+  validatedRegistry?: AgentRegistry
 ): Promise<PreparedDagBindings> {
   if (
     identityPolicy !== undefined &&
@@ -2519,7 +2520,9 @@ export async function prepareDagBindings(
       assertProvider(override.provider);
     }
   }
-  const registry = structuredClone(await loadAgentRegistry(join(cwd, '.archon', 'agents')));
+  const registry = structuredClone(
+    validatedRegistry ?? (await loadAgentRegistry(join(cwd, '.archon', 'agents')))
+  );
   const state: PreparedDagBindingState = { identityPolicy, inputs, registry, bindings: new Map() };
   const defaults = dagWorkflowLevelOptions(inputs.workflow);
   for (const [index, owner] of inputs.workflow.nodes.entries()) {
