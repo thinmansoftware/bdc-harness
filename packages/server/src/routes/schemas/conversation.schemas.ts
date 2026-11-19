@@ -41,6 +41,15 @@ export const createConversationBodySchema = z
   .object({
     codebaseId: z.string().optional(),
     message: z.string().optional(),
+    codexOnlyBinding: z
+      .object({
+        project: z.string().min(1),
+        codebaseId: z.string().min(1),
+        cwd: z.string().min(1),
+        workflowDigest: z.string().regex(/^[a-f0-9]{64}$/),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .openapi('CreateConversationBody');

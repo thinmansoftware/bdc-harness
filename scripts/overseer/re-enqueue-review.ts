@@ -25,7 +25,28 @@
 export const REVIEW_RECIPIENT = 'overseer-reviewer';
 export const OPERATOR_SENDER = 'operator';
 export const REREVIEW_REASON_PREFIX = 'operator_request:rereview_failed:';
+/** A done row whose verdict was indeterminate prompt_too_large (WO-HARNESS-BUNDLE-REVIEW-PROOF-REPAIR-01 D2b). */
+export const REREVIEW_INDETERMINATE_PREFIX = 'operator_request:rereview_indeterminate:';
 const HEX40 = /^[a-f0-9]{40}$/i;
+
+function verdictOf(row: ReviewRow): { disposition?: unknown; reason?: unknown } {
+  try {
+    const parsed: unknown = JSON.parse(row.result_body ?? '');
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Exactly the indeterminate prompt_too_large verdict, posted as changes_requested and mapped to done. */
+function isDoneIndeterminate(row: ReviewRow): boolean {
+  const verdict = verdictOf(row);
+  return (
+    row.status === 'done' &&
+    verdict.disposition === 'changes_requested' &&
+    verdict.reason === 'indeterminate:prompt_too_large'
+  );
+}
 
 export interface ReviewRow {
   id: string;
@@ -91,8 +112,16 @@ function order(a: ReviewRow, b: ReviewRow): number {
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
-/** Pure decision: refuse with one plain line, or build the exact message to send. */
-export function decide(rows: ReviewRow[], input: ReEnqueueInput): Decision {
+/**
+ * Pure decision: refuse with one plain line, or build the exact message to send. A newest row that
+ * is done with the indeterminate prompt_too_large verdict also qualifies, unless `failedOnly` (the
+ * rebuild-edge sweep re-runs failed rows only).
+ */
+export function decide(
+  rows: ReviewRow[],
+  input: ReEnqueueInput,
+  options: { failedOnly?: boolean } = {}
+): Decision {
   const head = input.head.toLowerCase();
   if (!HEX40.test(head))
     return { ok: false, refusal: 'the head must be a full 40-character hex sha' };
@@ -125,11 +154,17 @@ export function decide(rows: ReviewRow[], input: ReEnqueueInput): Decision {
       ok: false,
       refusal: `every review row at this head is cancelled (latest row ${atHead[atHead.length - 1].id}); nothing failed to re-run, use the push, recheck or reconcile path`,
     };
-  if (newest.status !== 'failed')
+  const indeterminate = !options.failedOnly && isDoneIndeterminate(newest);
+  if (newest.status !== 'failed' && !indeterminate) {
+    const verdict = verdictOf(newest);
+    const named = [verdict.disposition, verdict.reason]
+      .filter(part => typeof part === 'string' && part.length > 0)
+      .join('/');
     return {
       ok: false,
-      refusal: `the newest row at this head is ${newest.status}, not failed (row ${newest.id}); use the push, recheck or reconcile path`,
+      refusal: `the newest row at this head is ${newest.status}, not failed (row ${newest.id}, status ${newest.status}, verdict ${named || 'none'}); use the push, recheck or reconcile path`,
     };
+  }
   const key = `${input.repository}#${input.prNumber}@${head}`;
   return {
     ok: true,
@@ -145,7 +180,7 @@ export function decide(rows: ReviewRow[], input: ReEnqueueInput): Decision {
       recipient: REVIEW_RECIPIENT,
       body: newest.body,
       subject_key: subjectKeyOf(input.repository, input.prNumber),
-      repeat_reason: `${REREVIEW_REASON_PREFIX}${head} ${reason}`,
+      repeat_reason: `${indeterminate ? REREVIEW_INDETERMINATE_PREFIX : REREVIEW_REASON_PREFIX}${head} ${reason}`,
     },
   };
 }
@@ -164,7 +199,7 @@ export function describeRow(row: ReviewRow): string {
 export async function reEnqueue(
   port: DispatchPort,
   input: ReEnqueueInput,
-  options: { dryRun?: boolean } = {}
+  options: { dryRun?: boolean; failedOnly?: boolean } = {}
 ): Promise<{ code: 0 | 1 | 2; lines: string[] }> {
   const subject = subjectKeyOf(input.repository, input.prNumber);
   let rows: ReviewRow[];
@@ -173,7 +208,7 @@ export async function reEnqueue(
   } catch (error) {
     return { code: 1, lines: [`could not read Dispatch: ${errorText(error)}`] };
   }
-  const decision = decide(rows, input);
+  const decision = decide(rows, input, { failedOnly: options.failedOnly });
   if (!decision.ok) return { code: 2, lines: [`REFUSED ${decision.refusal}`] };
   const { message, prior } = decision;
   if (options.dryRun)
@@ -192,7 +227,7 @@ export async function reEnqueue(
   } catch (error) {
     // A concurrent run may have won: if a row is now pending at this head, report it, do not fail.
     try {
-      const again = decide(await port.list(subject), input);
+      const again = decide(await port.list(subject), input, { failedOnly: options.failedOnly });
       if (!again.ok && again.refusal.includes('already pending'))
         return { code: 0, lines: [`ALREADY_PENDING ${again.refusal}`] };
     } catch {
@@ -203,7 +238,7 @@ export async function reEnqueue(
   return {
     code: 0,
     lines: [
-      `REENQUEUED row=${sent.id} head=${input.head.toLowerCase()} prior=${prior.id}:failed sender=${message.sender}`,
+      `REENQUEUED row=${sent.id} head=${input.head.toLowerCase()} prior=${prior.id}:${prior.status === 'failed' ? 'failed' : 'done-indeterminate'} sender=${message.sender}`,
       `read it: docker exec archon-app-1 bun run /app/scripts/overseer/re-enqueue-review.ts --show ${input.repository} ${input.prNumber} ${input.head.toLowerCase()}`,
     ],
   };
@@ -298,7 +333,8 @@ export async function edgeSweep(
     const result = await reEnqueue(
       port,
       { ...target, reason: EDGE_SWEEP_REASON },
-      { dryRun: options.dryRun }
+      // The sweep re-runs failed rows only, never a done-indeterminate one.
+      { dryRun: options.dryRun, failedOnly: true }
     );
     if (result.code === 0 && result.lines.some(line => line.startsWith('REENQUEUED')))
       reenqueued += 1;
