@@ -31,6 +31,7 @@
  * PURE: no IO. The operator message and the re-enqueue are injected.
  */
 import type { IngestDeps } from './pr-review-ingest';
+import { supportedPrReviewLadder } from './judge-transport';
 
 export type JudgeOutageKind =
   | 'usage_limit_until'
@@ -115,7 +116,7 @@ const USAGE_LIMIT = /hit your usage limit|usage limit (?:reached|exceeded)/i;
 const CREDITS_EXHAUSTED =
   /insufficient[\s_-]*credits?|\b402\b|payment required|credits? (?:exhausted|depleted)/i;
 const AUTH_EXPIRED =
-  /\b401\b|unauthori[sz]ed|authentication required|invalid api key|api key (?:is )?(?:invalid|expired|missing)/i;
+  /\btoken_revoked\b|\brefresh_token_invalidated\b|\b401\b|unauthori[sz]ed|authentication required|invalid api key|api key (?:is )?(?:invalid|expired|missing)/i;
 
 /** Exported for the unit test; parses the Codex retry date to ISO-8601 UTC. */
 export function parseCodexRetryAt(text: string): string | null {
@@ -291,6 +292,8 @@ export function buildLadderExhaustedNotice(
 
 export interface JudgeLadderBreakerOptions {
   ladder: readonly string[];
+  /** Real PR callers use the native transport capability set. Legacy callers are unchanged. */
+  nativePrReview?: boolean;
   /** Real binding: a Dispatch agent_message to `operator`, keyed by the hour. */
   sendOperatorMessage(input: { idempotencyKey: string; body: string }): Promise<void>;
   now?: () => Date;
@@ -300,7 +303,10 @@ export function createJudgeLadderBreaker(options: JudgeLadderBreakerOptions): Ju
   const now = options.now ?? ((): Date => new Date());
   return {
     check(): LadderExhaustion | null {
-      return evaluateJudgeLadder(options.ladder, now());
+      return evaluateJudgeLadder(
+        options.nativePrReview ? supportedPrReviewLadder(options.ladder) : options.ladder,
+        now()
+      );
     },
     park(head): void {
       if (parked.has(head.correlationId)) return;

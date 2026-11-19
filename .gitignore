@@ -63,7 +63,7 @@ e2e-screenshots/
 # Cross-run workflow state (e.g. issue-triage memory)
 .archon/state/
 
-# Maintainer standup — per-maintainer state and briefs (direction.md is committed)
+# Maintainer standup -- per-maintainer state and briefs (direction.md is committed)
 .archon/maintainer-standup/profile.md
 .archon/maintainer-standup/state.json
 .archon/maintainer-standup/briefs/
@@ -150,3 +150,7 @@ packages/fusion/.fusion-budget-receipts-*.db
 
 scripts/dispatch-worker/config.local.json
 scripts/dispatch-worker/transcripts/
+
+# GitHub App private keys (secrets/ on the host): never track (bdc-xo#5444)
+secrets/
+*.private-key.pem

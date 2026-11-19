@@ -1,0 +1,1297 @@
+/**
+ * Taskmaster remediation-candidate consumer
+ * (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
+ *
+ * The 8 Section 7 scenarios use injected clocks and stores. Real-DAL regression
+ * cases bind getDatabase to private in-memory SQLite and restore the binding;
+ * no mock.module, so this file cannot pollute the process-wide module cache.
+ *
+ * NOTE on recipient fixtures: Section 7's prose names 'codex' as the owner
+ * thread's recipient. The real guard allowlist (TM_ALLOWED_RECIPIENTS) does not
+ * include 'codex', and tick() runs the real (unfaked) validateProposal, so a
+ * proposal addressed to 'codex' would be rejected and would never send. Per the
+ * approved plan (resolved design decision #2), the fixtures use an
+ * already-allowlisted seat ('major-build') in place of the illustrative
+ * 'codex'; the scenario's intent (the nudge routes to the matched thread's
+ * resolved recipient) is preserved. TM_ALLOWED_RECIPIENTS is intentionally NOT
+ * widened by this WO.
+ */
+import { describe, expect, spyOn, test } from 'bun:test';
+import { rootLogger } from '@archon/paths';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import * as connection from '@archon/core/db/connection';
+import { createAuthenticatedMessage, getMessage, listMessages } from '@archon/core/db/dispatch';
+import {
+  createTaskmasterState,
+  defaultListRemediationCandidates,
+  defaultConsumeRemediationCandidate,
+  tick,
+  type GithubIssueEvidence,
+  type ListedThread,
+  type PullRequestState,
+  type RemediationCandidate,
+  type TaskmasterDeps,
+} from './loop';
+import {
+  MAX_REMEDIATION_ATTEMPTS,
+  REMEDIATION_CANDIDATE_KIND,
+  type RemediationCandidateBody,
+} from '@archon/overseer/remediation-candidate';
+import type { DispatchDeliveryMode, DispatchMessage } from '@archon/core/db/dispatch';
+import { MAX_INTERVENTIONS_PER_ITEM_24H } from './rules';
+import type {
+  TmActionOutcome,
+  TmActionType,
+  TmAdoptionRow,
+  TmControlState,
+  TmGrade,
+  TmJournalEntry,
+} from '@archon/core/db/taskmaster';
+import type { HeadroomReading } from './ledger';
+
+const T0 = Date.parse('2026-10-06T12:00:00.000Z');
+const OWNER_THREAD_REF = 'gh:thinmansoftware/bdc-xo#777';
+/** See the file header: 'major-build' stands in for the prose's 'codex'. */
+const OWNER_RECIPIENT = 'major-build';
+
+interface CandidateStoreEntry extends RemediationCandidate {
+  consumed: boolean;
+}
+
+interface FakeWorld {
+  journal: TmJournalEntry[];
+  control: TmControlState;
+  sentMessages: Array<{ idempotency_key: string; recipient: string; body: string }>;
+  nowMs: number;
+  adoptionRows: TmAdoptionRow[];
+  adoptionMeta: {
+    committed_snapshot_id: string | null;
+    rebuilt_at: string | null;
+    row_count: number | null;
+    source_commit: string | null;
+    complete: number;
+  };
+  /** Remediation candidate dispatch rows, with a local consumed flag. */
+  candidates: CandidateStoreEntry[];
+  consumeCalls: string[];
+}
+
+function makeWorld(): FakeWorld {
+  return {
+    journal: [],
+    control: {
+      pause_state: 'RUNNING',
+      pause_scope: null,
+      pause_reason: null,
+      pause_actor: null,
+      epoch: 0,
+      updated_at: new Date(T0).toISOString(),
+    },
+    sentMessages: [],
+    nowMs: T0,
+    adoptionRows: [],
+    adoptionMeta: {
+      committed_snapshot_id: null,
+      rebuilt_at: null,
+      row_count: null,
+      source_commit: null,
+      complete: 0,
+    },
+    candidates: [],
+    consumeCalls: [],
+  };
+}
+
+function candidateBody(
+  overrides: Partial<RemediationCandidateBody> = {}
+): RemediationCandidateBody {
+  return {
+    kind: REMEDIATION_CANDIDATE_KIND,
+    owner: 'owner',
+    repo: 'repo',
+    prNumber: 5,
+    headSha: 'aaaaaaa1111',
+    attempt: 1,
+    maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+    findingClasses: ['migration_ordering'],
+    verdictBody: 'Independent review at head aaaaaaa1111. Migration ordering violates the FK.',
+    woId: 'WO-X-01',
+    owningLane: null,
+    ...overrides,
+  };
+}
+
+function ownerThread(overrides: Partial<ListedThread> = {}): ListedThread {
+  return {
+    ref: OWNER_THREAD_REF,
+    priority: 'P1',
+    // Recent activity -> classified healthy, so the owner thread itself produces
+    // no ordinary nudge/escalation that could pollute the assertions.
+    lastActivityAt: new Date(T0 - 1_000).toISOString(),
+    recipient: OWNER_RECIPIENT,
+    title: 'WO-X-01 remediation target',
+    ownerLogin: 'major-build',
+    labels: ['wo', 'prio:P1'],
+    isUnclaimed: false,
+    isBlocked: false,
+    isHeld: false,
+    ...overrides,
+  };
+}
+
+/** Seed a graded 'sent' intervention for a thread (feeds the 24h cap count). */
+function seedIntervention(world: FakeWorld, threadRef: string, index: number): void {
+  world.journal.push({
+    id: `seed-intervention-${index}`,
+    created_at: new Date(world.nowMs - 1_000).toISOString(),
+    thread_ref: threadRef,
+    action_type: 'nudge',
+    proposal_json: '{}',
+    idempotency_key: `seed:intervention:${threadRef}:${index}`,
+    before_hash: null,
+    proof_predicate: null,
+    proof_deadline_at: null,
+    outcome: 'sent',
+    graded_at: new Date(world.nowMs - 500).toISOString(),
+    grade: 'useful',
+  });
+}
+
+function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): TaskmasterDeps {
+  let journalSeq = world.journal.length;
+  const dal = {
+    recordAction: async (data: {
+      thread_ref: string;
+      action_type: TmActionType;
+      proposal_json: string;
+      idempotency_key?: string | null;
+      before_hash?: string | null;
+      proof_predicate?: string | null;
+      proof_deadline_at?: string | null;
+      outcome: TmActionOutcome;
+    }): Promise<TmJournalEntry> => {
+      if (data.idempotency_key) {
+        const existing = world.journal.find(j => j.idempotency_key === data.idempotency_key);
+        if (existing) return existing;
+      }
+      journalSeq += 1;
+      const row: TmJournalEntry = {
+        id: `journal-${journalSeq}`,
+        created_at: new Date(world.nowMs).toISOString(),
+        thread_ref: data.thread_ref,
+        action_type: data.action_type,
+        proposal_json: data.proposal_json,
+        idempotency_key: data.idempotency_key ?? null,
+        before_hash: data.before_hash ?? null,
+        proof_predicate: data.proof_predicate ?? null,
+        proof_deadline_at: data.proof_deadline_at ?? null,
+        outcome: data.outcome,
+        graded_at: null,
+        grade: null,
+      };
+      world.journal.push(row);
+      return row;
+    },
+    updateActionOutcome: async (id: string, outcome: TmActionOutcome, proposalJson?: string) => {
+      const row = world.journal.find(j => j.id === id) ?? null;
+      if (row) {
+        row.outcome = outcome;
+        if (proposalJson !== undefined) row.proposal_json = proposalJson;
+      }
+      return row;
+    },
+    gradeAction: async (id: string, grade: TmGrade) => {
+      const row = world.journal.find(j => j.id === id) ?? null;
+      if (row) {
+        row.grade = grade;
+        row.graded_at = new Date(world.nowMs).toISOString();
+      }
+      return row;
+    },
+    getActionsSince: async (sinceIso: string) =>
+      world.journal.filter(j => j.created_at >= sinceIso),
+    getActionByIdempotencyKey: async (key: string) =>
+      world.journal.find(j => j.idempotency_key === key) ?? null,
+    getPauseState: async () => world.control,
+    setPauseState: async (data: {
+      pause_state: TmControlState['pause_state'];
+      pause_scope?: string | null;
+      pause_reason?: string | null;
+      pause_actor: string;
+      incrementEpoch?: boolean;
+    }) => {
+      world.control = {
+        pause_state: data.pause_state,
+        pause_scope: data.pause_scope ?? null,
+        pause_reason: data.pause_reason ?? null,
+        pause_actor: data.pause_actor,
+        epoch: world.control.epoch + (data.incrementEpoch ? 1 : 0),
+        updated_at: new Date(world.nowMs).toISOString(),
+      };
+      return world.control;
+    },
+    expireParkedActions: async () => 0,
+    beginAdoptionSnapshot: async () => `snap-${world.nowMs}-${world.adoptionRows.length}`,
+    upsertAdoptionRow: async (snapshotId: string, row: Omit<TmAdoptionRow, 'snapshot_id'>) => {
+      const full: TmAdoptionRow = { ...row, snapshot_id: snapshotId };
+      const idx = world.adoptionRows.findIndex(
+        r => r.snapshot_id === snapshotId && r.thread_ref === row.thread_ref
+      );
+      if (idx >= 0) world.adoptionRows[idx] = full;
+      else world.adoptionRows.push(full);
+    },
+    commitAdoptionSnapshot: async (snapshotId: string, sourceCommit?: string | null) => {
+      world.adoptionRows = world.adoptionRows.filter(r => r.snapshot_id === snapshotId);
+      world.adoptionMeta = {
+        committed_snapshot_id: snapshotId,
+        rebuilt_at: new Date(world.nowMs).toISOString(),
+        row_count: world.adoptionRows.length,
+        source_commit: sourceCommit ?? null,
+        complete: 1,
+      };
+    },
+    abandonAdoptionSnapshot: async (snapshotId: string) => {
+      world.adoptionRows = world.adoptionRows.filter(r => r.snapshot_id !== snapshotId);
+    },
+    getAdoption: async () => {
+      const id = world.adoptionMeta.committed_snapshot_id;
+      if (!id) return [];
+      return world.adoptionRows.filter(r => r.snapshot_id === id);
+    },
+    getAdoptionMeta: async () => ({
+      id: 1,
+      committed_snapshot_id: world.adoptionMeta.committed_snapshot_id,
+      rebuilt_at: world.adoptionMeta.rebuilt_at,
+      row_count: world.adoptionMeta.row_count,
+      source_commit: world.adoptionMeta.source_commit,
+      complete: world.adoptionMeta.complete,
+    }),
+  };
+
+  const okHeadroom: HeadroomReading = {
+    state: 'OK',
+    tokensRemaining: 500_000,
+    isUnknown: false,
+    source: 'local_artifacts',
+    observedAt: new Date(T0).toISOString(),
+  };
+
+  return {
+    now: () => new Date(world.nowMs),
+    db: dal,
+    getDispatchReceiptCutoverAt: async () => new Date(T0 - 86_400_000).toISOString(),
+    headroom: async () => okHeadroom,
+    createTask: (async (
+      _context: unknown,
+      data: { idempotency_key: string; recipient: string; body: string }
+    ) => {
+      world.sentMessages.push({
+        idempotency_key: data.idempotency_key,
+        recipient: data.recipient,
+        body: data.body,
+      });
+      return { id: `msg-${world.sentMessages.length}`, status: 'queued' } as never;
+    }) as unknown as TaskmasterDeps['createTask'],
+    findEffectByIdempotencyKey: async () => null,
+    getDispatchMessageById: (async () =>
+      null) as unknown as TaskmasterDeps['getDispatchMessageById'],
+    assessDispatchRecipient: (async (recipient: string) => {
+      const nonDrain: Record<string, DispatchDeliveryMode> = {
+        'major-build': 'worker_poll',
+        'captain-ci': 'worker_poll',
+      };
+      const canonical = recipient.trim().toLowerCase();
+      return {
+        ok: true,
+        canonical_principal: canonical,
+        delivery_mode: nonDrain[canonical] ?? 'drain_on_start',
+        reason: null,
+      };
+    }) as unknown as TaskmasterDeps['assessDispatchRecipient'],
+    listUndeliveredRulings: async () => [],
+    listThreads: async () => [],
+    getGithubIssueEvidence: async () => null,
+    // Default remediation wiring, backed by the world's candidate store.
+    listRemediationCandidates: async () =>
+      world.candidates.filter(c => !c.consumed).map(c => ({ id: c.id, body: c.body })),
+    consumeRemediationCandidate: async (id: string) => {
+      world.consumeCalls.push(id);
+      const entry = world.candidates.find(c => c.id === id);
+      if (entry) entry.consumed = true;
+    },
+    ...overrides,
+  };
+}
+
+/** Remediation nudge sends (the owner nudge), isolated from digest/escalation. */
+function nudgeSends(world: FakeWorld): FakeWorld['sentMessages'] {
+  return world.sentMessages.filter(
+    m => m.idempotency_key.startsWith('tm:remediation_nudge:') && m.recipient === OWNER_RECIPIENT
+  );
+}
+
+describe('Test 1: a candidate becomes one nudge to the owner', () => {
+  test('exactly one remediation_nudge to the owner with PR ref, head, attempt, verdict, key', async () => {
+    const world = makeWorld();
+    world.candidates.push({ id: 'cand-1', consumed: false, body: candidateBody() });
+    const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    const sends = nudgeSends(world);
+    expect(sends.length).toBe(1);
+    const sent = sends[0]!;
+    expect(sent.recipient).toBe(OWNER_RECIPIENT);
+    expect(sent.idempotency_key).toBe('tm:remediation_nudge:owner/repo#5:1:aaaaaaa');
+    expect(sent.body).toContain('owner/repo#5');
+    expect(sent.body).toContain('aaaaaaa1111');
+    expect(sent.body).toContain('attempt 1');
+    expect(sent.body).toContain('Migration ordering violates the FK');
+    // The candidate was consumed exactly once on the successful send.
+    expect(world.consumeCalls).toEqual(['cand-1']);
+  });
+});
+
+describe('Test 2: the same candidate never nudges twice', () => {
+  test('three further ticks add no send and the candidate row is consumed', async () => {
+    const world = makeWorld();
+    world.candidates.push({ id: 'cand-1', consumed: false, body: candidateBody() });
+    const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    expect(nudgeSends(world).length).toBe(1);
+
+    for (let i = 0; i < 3; i += 1) {
+      world.nowMs += 60_000;
+      await tick(state, deps);
+    }
+
+    expect(nudgeSends(world).length).toBe(1);
+    expect(world.consumeCalls).toEqual(['cand-1']);
+    expect(world.candidates[0]!.consumed).toBe(true);
+  });
+});
+
+describe('Test 3: paused Taskmaster refuses and records it', () => {
+  test('paused: nothing sent, refusal recorded, candidate unconsumed; resume sends one', async () => {
+    const world = makeWorld();
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.candidates.push({ id: 'cand-1', consumed: false, body: candidateBody() });
+    const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+
+    // Nothing sent while paused; the refusal is recorded; the candidate is left
+    // unconsumed so a later tick can still deliver it.
+    expect(nudgeSends(world).length).toBe(0);
+    const refusal = world.journal.find(
+      j => j.thread_ref === OWNER_THREAD_REF && j.action_type === 'remediation_nudge'
+    );
+    expect(refusal).toBeTruthy();
+    expect(refusal!.outcome).not.toBe('sent');
+    expect(refusal!.proposal_json).toContain('"reason":"paused"');
+    expect(world.consumeCalls).toEqual([]);
+    expect(world.candidates[0]!.consumed).toBe(false);
+
+    // Resume: the very next tick delivers exactly one nudge.
+    world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+    world.nowMs += 60_000;
+    await tick(state, deps);
+
+    expect(nudgeSends(world).length).toBe(1);
+    expect(world.consumeCalls).toEqual(['cand-1']);
+  });
+});
+
+describe('remediation custody across pause and epoch fences', () => {
+  test.each([
+    ['effects', null],
+    ['effects', 'WO-UNMATCHED-99'],
+    ['all', null],
+    ['all', 'WO-UNMATCHED-99'],
+    [null, null],
+    [null, 'WO-UNMATCHED-99'],
+  ] as const)(
+    'unmatched candidate stays retryable across pause scope %s / WO %s and restart',
+    async (scope, woId) => {
+      const world = makeWorld();
+      world.control = { ...world.control, pause_state: 'PAUSED', pause_scope: scope };
+      world.candidates.push({
+        id: 'unmatched-paused',
+        consumed: false,
+        body: candidateBody({ woId }),
+      });
+      const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+      await tick(createTaskmasterState(60000), deps);
+      const row = world.journal.find(
+        item => JSON.parse(item.proposal_json).remediationCandidateId === 'unmatched-paused'
+      )!;
+      expect(row.action_type).toBe('escalate_p0');
+      expect(row.outcome).toBe('deferred');
+      expect(world.consumeCalls).toEqual([]);
+      const deadline = row.proof_deadline_at;
+      world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      const sends = world.sentMessages.filter(item =>
+        item.idempotency_key.startsWith('tm:remediation_nudge:')
+      );
+      expect(sends).toHaveLength(1);
+      expect(sends[0]?.recipient).toBe('t3-desktop');
+      expect(row.outcome).toBe('sent');
+      expect(row.proof_deadline_at).toBe(deadline);
+    }
+  );
+
+  test('a pause beyond the original deadline does not acquire fresh delivery authority', async () => {
+    const world = makeWorld();
+    world.control = { ...world.control, pause_state: 'PAUSED', pause_scope: 'effects' };
+    world.candidates.push({
+      id: 'expired-paused',
+      consumed: false,
+      body: candidateBody({ woId: null }),
+    });
+    const deps = makeDeps(world);
+    await tick(createTaskmasterState(60000), deps);
+    const row = world.journal.find(
+      item => JSON.parse(item.proposal_json).remediationCandidateId === 'expired-paused'
+    )!;
+    const deadline = row.proof_deadline_at;
+    world.nowMs += 25 * 60 * 60 * 1000;
+    world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+    await tick(createTaskmasterState(60000), deps);
+    expect(row.outcome).toBe('expired');
+    expect(row.proof_deadline_at).toBe(deadline);
+    expect(world.consumeCalls).toEqual([]);
+    expect(
+      world.sentMessages.filter(item => item.idempotency_key.startsWith('tm:remediation_nudge:'))
+    ).toHaveLength(0);
+  });
+
+  test.each(['pause-owner', 'pause-unmatched', 'epoch-owner', 'epoch-unmatched'])(
+    'pre-effect fence remains retryable without consuming candidate (%s)',
+    async mode => {
+      const world = makeWorld();
+      world.candidates.push({
+        id: 'mid-fence',
+        consumed: false,
+        body: candidateBody({ woId: mode.endsWith('unmatched') ? null : 'WO-X-01' }),
+      });
+      const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+      const record = deps.db!.recordAction;
+      let changed = false;
+      deps.db = {
+        ...deps.db!,
+        recordAction: async data => {
+          const row = await record(data);
+          if (
+            !changed &&
+            data.outcome === 'pending' &&
+            JSON.parse(data.proposal_json).remediationCandidateId === 'mid-fence'
+          ) {
+            changed = true;
+            world.control = mode.startsWith('pause')
+              ? { ...world.control, pause_state: 'PAUSED', pause_scope: 'effects' }
+              : { ...world.control, epoch: world.control.epoch + 1 };
+          }
+          return row;
+        },
+      };
+      await tick(createTaskmasterState(60000), deps);
+      const row = world.journal.find(
+        item => JSON.parse(item.proposal_json).remediationCandidateId === 'mid-fence'
+      )!;
+      expect(changed).toBe(true);
+      expect(row.outcome).toBe('deferred');
+      expect(world.consumeCalls).toEqual([]);
+      const deadline = row.proof_deadline_at;
+      world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      expect(
+        world.sentMessages.filter(item => item.idempotency_key.startsWith('tm:remediation_nudge:'))
+      ).toHaveLength(1);
+      expect(row.outcome).toBe('sent');
+      expect(row.proof_deadline_at).toBe(deadline);
+    }
+  );
+});
+
+describe('Test 4: the per-item intervention cap refuses', () => {
+  test('owner thread at the 24h cap: nothing sent and the refusal is recorded', async () => {
+    const world = makeWorld();
+    for (let i = 0; i < MAX_INTERVENTIONS_PER_ITEM_24H; i += 1) {
+      seedIntervention(world, OWNER_THREAD_REF, i);
+    }
+    world.candidates.push({ id: 'cand-1', consumed: false, body: candidateBody() });
+    const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(nudgeSends(world).length).toBe(0);
+    const refusal = world.journal.find(
+      j =>
+        j.thread_ref === OWNER_THREAD_REF &&
+        j.action_type === 'remediation_nudge' &&
+        j.outcome === 'deferred'
+    );
+    expect(refusal).toBeTruthy();
+    expect(world.consumeCalls).toEqual([]);
+  });
+});
+
+describe('Test 5: no matching work thread escalates', () => {
+  test('a null-woId candidate and an unmatched-woId candidate each escalate to the operator', async () => {
+    const world = makeWorld();
+    world.candidates.push({
+      id: 'cand-no-wo',
+      consumed: false,
+      body: candidateBody({ prNumber: 11, headSha: 'ccccccc3333', woId: null }),
+    });
+    world.candidates.push({
+      id: 'cand-unmatched',
+      consumed: false,
+      body: candidateBody({ prNumber: 12, headSha: 'ddddddd4444', woId: 'WO-OTHER-99' }),
+    });
+    // The only open thread matches neither candidate (title names WO-X-01).
+    const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    // No owner nudge (neither candidate matched a thread).
+    expect(nudgeSends(world).length).toBe(0);
+
+    const escalations = world.sentMessages.filter(m =>
+      m.idempotency_key.startsWith('tm:remediation_nudge:')
+    );
+    expect(escalations.length).toBe(2);
+    for (const escalation of escalations) {
+      expect(escalation.recipient).toBe('t3-desktop');
+    }
+    expect(escalations.map(e => e.idempotency_key).sort()).toEqual(
+      [
+        'tm:remediation_nudge:owner/repo#11:1:ccccccc',
+        'tm:remediation_nudge:owner/repo#12:1:ddddddd',
+      ].sort()
+    );
+    // Neither candidate was dropped: both were consumed via the escalation send.
+    expect(world.consumeCalls.sort()).toEqual(['cand-no-wo', 'cand-unmatched'].sort());
+  });
+});
+
+describe('Test 6: other queued rows are not consumed', () => {
+  test('non-candidate taskmaster rows and foreign rows produce no remediation_nudge', async () => {
+    const world = makeWorld();
+    // The reader (defaultListRemediationCandidates) is exercised against a fake
+    // listMessages returning: an ordinary run_review row for another recipient,
+    // a board_motion row, and a taskmaster run_review row of another kind. Only
+    // overseer_remediation_candidate rows addressed to 'taskmaster' are picked up.
+    const rows: DispatchMessage[] = [
+      fakeDispatchRow({
+        id: 'other-recipient',
+        recipient: 'captain-ci',
+        task_type: 'run_review',
+        body: JSON.stringify(candidateBody()),
+      }),
+      fakeDispatchRow({
+        id: 'board-motion',
+        recipient: 'taskmaster',
+        task_type: 'board_motion',
+        body: JSON.stringify(candidateBody()),
+      }),
+      fakeDispatchRow({
+        id: 'other-kind',
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify({ kind: 'something_else', foo: 'bar' }),
+      }),
+    ];
+    const fakeListMessages = (async (filters: { recipient?: string }) =>
+      rows.filter(r => !filters.recipient || r.recipient === filters.recipient)) as never;
+    const deps = makeDeps(world, {
+      listThreads: async () => [ownerThread()],
+      listRemediationCandidates: () => defaultListRemediationCandidates(fakeListMessages),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(
+      world.sentMessages.some(m => m.idempotency_key.startsWith('tm:remediation_nudge:'))
+    ).toBe(false);
+    expect(world.consumeCalls).toEqual([]);
+  });
+});
+
+describe('Test 7: a malformed body never breaks the tick', () => {
+  test('non-JSON and field-missing rows are ignored by id; sibling candidate still runs', async () => {
+    const world = makeWorld();
+    const rows: DispatchMessage[] = [
+      fakeDispatchRow({
+        id: 'not-json',
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: 'this is not json',
+      }),
+      fakeDispatchRow({
+        id: 'missing-fields',
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify({ kind: REMEDIATION_CANDIDATE_KIND, owner: 'owner' }),
+      }),
+      fakeDispatchRow({
+        id: 'good',
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify(candidateBody()),
+      }),
+    ];
+    const fakeListMessages = (async (filters: { recipient?: string }) =>
+      rows.filter(r => !filters.recipient || r.recipient === filters.recipient)) as never;
+    const deps = makeDeps(world, {
+      listThreads: async () => [ownerThread()],
+      listRemediationCandidates: () => defaultListRemediationCandidates(fakeListMessages),
+    });
+
+    const logChunks = captureLogChunks();
+    try {
+      await tick(createTaskmasterState(60_000), deps);
+    } finally {
+      logChunks.restore();
+    }
+
+    // The tick completed and the well-formed sibling still produced its nudge.
+    expect(nudgeSends(world).length).toBe(1);
+    // One ignore log line per malformed row, each naming the row id.
+    const ignored = logChunks
+      .text()
+      .split('\n')
+      .filter(line => line.includes('taskmaster.remediation_candidate_ignored'));
+    expect(ignored.some(line => line.includes('not-json'))).toBe(true);
+    expect(ignored.some(line => line.includes('missing-fields'))).toBe(true);
+  });
+});
+
+describe('Test 8: attempt 2 on a new head nudges again', () => {
+  test('a second candidate for the same PR with a new head and attempt 2 sends again', async () => {
+    const world = makeWorld();
+    world.candidates.push({ id: 'cand-1', consumed: false, body: candidateBody() });
+    const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    expect(nudgeSends(world).length).toBe(1);
+
+    // A fresh candidate: same PR, new reviewed head, attempt 2.
+    world.candidates.push({
+      id: 'cand-2',
+      consumed: false,
+      body: candidateBody({ headSha: 'bbbbbbb2222', attempt: 2 }),
+    });
+    world.nowMs += 60_000;
+    await tick(state, deps);
+
+    const sends = nudgeSends(world);
+    expect(sends.length).toBe(2);
+    const second = sends[1]!;
+    expect(second.idempotency_key).toBe('tm:remediation_nudge:owner/repo#5:2:bbbbbbb');
+    expect(second.body).toContain('attempt 2');
+    expect(world.consumeCalls.sort()).toEqual(['cand-1', 'cand-2'].sort());
+  });
+});
+
+describe('production candidate lifecycle composition', () => {
+  function dispatchStore(rows: DispatchMessage[], failFirst = false) {
+    const disposals: string[] = [];
+    const deps = {
+      getMessage: async (id: string) => rows.find(row => row.id === id) ?? null,
+      listMessagesBySeqCursor: (async () =>
+        rows.filter(row => row.status === 'queued' && row.route_disposition === null)) as never,
+      disposeMessageByMachine: (async (data: {
+        id: string;
+        actor: string;
+        disposition: string;
+        requireNoReceipt?: boolean;
+      }) => {
+        expect(data.actor).toBe('system:taskmaster-remediation');
+        expect(data.requireNoReceipt).toBe(true);
+        disposals.push(data.id);
+        if (failFirst && disposals.length === 1)
+          return { ok: false, reason: 'machine_actor_conflict' };
+        const row = rows.find(item => item.id === data.id)!;
+        if (row.route_disposition !== null) return { ok: false, reason: 'already_disposed' };
+        row.route_disposition = 'expired';
+        return { ok: true };
+      }) as never,
+    };
+    return { deps, disposals };
+  }
+
+  test.each(['owner', 'unmatched'])(
+    '%s retains a sent first attempt, reconciles it, and disposes only at supersession/cap',
+    async mode => {
+      const world = makeWorld();
+      const body = candidateBody({ woId: mode === 'owner' ? 'WO-X-01' : null });
+      const rows = [
+        fakeDispatchRow({
+          id: 'first',
+          recipient: 'taskmaster',
+          task_type: 'run_review',
+          body: JSON.stringify(body),
+        }),
+      ];
+      const store = dispatchStore(rows);
+      const deps = makeDeps(world, {
+        listThreads: async () => [ownerThread()],
+        listRemediationCandidates: () =>
+          defaultListRemediationCandidates(store.deps.listMessagesBySeqCursor),
+        consumeRemediationCandidate: async id => {
+          world.consumeCalls.push(id);
+          await defaultConsumeRemediationCandidate(id, store.deps);
+        },
+      });
+      await tick(createTaskmasterState(60000), deps);
+      expect(rows[0]?.route_disposition).toBeNull();
+      expect(store.disposals).toEqual([]);
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      expect(world.consumeCalls).toEqual(['first', 'first']);
+      expect(
+        world.sentMessages.filter(row => row.idempotency_key.startsWith('tm:remediation_nudge:'))
+      ).toHaveLength(1);
+      rows.push(
+        fakeDispatchRow({
+          id: 'second',
+          recipient: 'taskmaster',
+          task_type: 'run_review',
+          body: JSON.stringify({ ...body, attempt: 2, headSha: 'bbbbbbb2222' }),
+        })
+      );
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      if (mode === 'unmatched') {
+        expect(rows.map(row => row.route_disposition)).toEqual(['expired', null]);
+        expect(
+          world.sentMessages.filter(row => row.idempotency_key.startsWith('tm:remediation_nudge:'))
+        ).toHaveLength(1);
+        world.nowMs += 25 * 60 * 60 * 1000;
+        await tick(createTaskmasterState(60000), deps);
+      }
+      expect(rows.map(row => row.route_disposition)).toEqual(['expired', 'expired']);
+      expect(store.disposals.sort()).toEqual(['first', 'second']);
+      expect(
+        world.sentMessages.filter(row => row.idempotency_key.startsWith('tm:remediation_nudge:'))
+      ).toHaveLength(2);
+    }
+  );
+
+  test.each(['owner', 'unmatched'])(
+    '%s retries failed terminal disposal without sending twice',
+    async mode => {
+      const world = makeWorld();
+      const rows = [
+        fakeDispatchRow({
+          id: 'capped',
+          recipient: 'taskmaster',
+          task_type: 'run_review',
+          body: JSON.stringify(
+            candidateBody({ attempt: 2, woId: mode === 'owner' ? 'WO-X-01' : null })
+          ),
+        }),
+      ];
+      const store = dispatchStore(rows, true);
+      const deps = makeDeps(world, {
+        listThreads: async () => [ownerThread()],
+        listRemediationCandidates: () =>
+          defaultListRemediationCandidates(store.deps.listMessagesBySeqCursor),
+        consumeRemediationCandidate: id => defaultConsumeRemediationCandidate(id, store.deps),
+      });
+      await tick(createTaskmasterState(60000), deps);
+      expect(rows[0]?.route_disposition).toBeNull();
+      const sent = world.journal.find(
+        row => JSON.parse(row.proposal_json).remediationCandidateId === 'capped'
+      )!;
+      expect(sent.outcome).toBe('sent');
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      expect(rows[0]?.route_disposition).toBe('expired');
+      expect(sent.outcome).toBe('sent');
+      expect(store.disposals).toEqual(['capped', 'capped']);
+      expect(
+        world.sentMessages.filter(row => row.idempotency_key.startsWith('tm:remediation_nudge:'))
+      ).toHaveLength(1);
+    }
+  );
+
+  test.each(['agent-message', 'acknowledged', 'addressed', 'wrong-recipient', 'disposed'])(
+    'candidate-shaped %s sibling cannot authorize disposal',
+    async mode => {
+      const first = fakeDispatchRow({
+        id: 'first',
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify(candidateBody()),
+      });
+      const sibling = fakeDispatchRow({
+        id: 'not-eligible',
+        recipient: mode === 'wrong-recipient' ? 'captain-ci' : 'taskmaster',
+        task_type: mode === 'agent-message' ? 'agent_message' : 'run_review',
+        body: JSON.stringify(candidateBody({ attempt: 2 })),
+      });
+      if (mode === 'acknowledged') sibling.acknowledged_at = new Date(T0).toISOString();
+      if (mode === 'addressed') sibling.addressed_at = new Date(T0).toISOString();
+      if (mode === 'disposed') sibling.route_disposition = 'expired';
+      const store = dispatchStore([first, sibling]);
+      await defaultConsumeRemediationCandidate('first', store.deps);
+      expect(first.route_disposition).toBeNull();
+      expect(store.disposals).toEqual([]);
+    }
+  );
+
+  test('target acknowledgment during observation prevents machine disposal', async () => {
+    const target = fakeDispatchRow({
+      id: 'capped',
+      recipient: 'taskmaster',
+      task_type: 'run_review',
+      body: JSON.stringify(candidateBody({ attempt: 2 })),
+    });
+    const store = dispatchStore([target]);
+    let reads = 0;
+    await defaultConsumeRemediationCandidate('capped', {
+      ...store.deps,
+      getMessage: async () => {
+        reads++;
+        return reads === 1 ? target : { ...target, acknowledged_at: new Date(T0).toISOString() };
+      },
+    });
+    expect(reads).toBe(2);
+    expect(store.disposals).toEqual([]);
+    expect(target.route_disposition).toBeNull();
+  });
+
+  test.each(['system:taskmaster', null])(
+    'target provenance changing to %s during observation prevents machine disposal',
+    async senderPrincipalId => {
+      const target = fakeDispatchRow({
+        id: 'capped',
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify(candidateBody({ attempt: 2 })),
+      });
+      const store = dispatchStore([target]);
+      let reads = 0;
+      await defaultConsumeRemediationCandidate('capped', {
+        ...store.deps,
+        getMessage: async () => {
+          reads++;
+          return reads === 1 ? target : { ...target, sender_principal_id: senderPrincipalId };
+        },
+      });
+      expect(reads).toBe(2);
+      expect(store.disposals).toEqual([]);
+      expect(target.route_disposition).toBeNull();
+    }
+  );
+});
+
+describe('remediation consumer with the real Dispatch DAL', () => {
+  async function withDispatch(work: () => Promise<void>): Promise<void> {
+    const database = new SqliteAdapter(':memory:');
+    const binding = spyOn(connection, 'getDatabase').mockReturnValue(database);
+    try {
+      await work();
+    } finally {
+      binding.mockRestore();
+      await database.close();
+    }
+  }
+
+  async function enqueueCandidate(sender: 'overseer' | 'taskmaster', attempt: number) {
+    return createAuthenticatedMessage(
+      { kind: 'system', sender },
+      {
+        correlation_id: `provenance-${sender}-${attempt}`,
+        idempotency_key: `provenance-${sender}-${attempt}`,
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify(
+          candidateBody({ attempt, headSha: attempt === 1 ? 'aaaaaaa1111' : 'bbbbbbb2222' })
+        ),
+      }
+    );
+  }
+
+  async function enqueueUntrustedCandidate(senderPrincipalId: string | null) {
+    const message = await enqueueCandidate(
+      senderPrincipalId === null ? 'overseer' : 'taskmaster',
+      2
+    );
+    if (senderPrincipalId === null) {
+      // Legacy rows can retain the Overseer display name without authenticated provenance.
+      await connection
+        .getDatabase()
+        .query('UPDATE agent_dispatch_messages SET sender_principal_id = NULL WHERE id = $1', [
+          message.id,
+        ]);
+    }
+    expect((await getMessage(message.id))?.sender_principal_id).toBe(senderPrincipalId);
+    return message;
+  }
+
+  test.each(['system:taskmaster', null])(
+    'provenance %s cannot enter discovery, produce a nudge, or be directly consumed',
+    async senderPrincipalId => {
+      await withDispatch(async () => {
+        const untrusted = await enqueueUntrustedCandidate(senderPrincipalId);
+        expect(await defaultListRemediationCandidates()).toEqual([]);
+        const world = makeWorld();
+        const deps = makeDeps(world, {
+          listThreads: async () => [ownerThread()],
+          listRemediationCandidates: defaultListRemediationCandidates,
+        });
+        await tick(createTaskmasterState(60000), deps);
+        expect(nudgeSends(world)).toEqual([]);
+        expect(world.consumeCalls).toEqual([]);
+        await defaultConsumeRemediationCandidate(untrusted.id);
+        expect((await getMessage(untrusted.id))?.route_disposition).toBeNull();
+      });
+    }
+  );
+
+  test.each(['system:taskmaster', null])(
+    'higher-attempt provenance %s cannot supersede an authenticated Overseer candidate',
+    async senderPrincipalId => {
+      await withDispatch(async () => {
+        const legitimate = await enqueueCandidate('overseer', 1);
+        const untrusted = await enqueueUntrustedCandidate(senderPrincipalId);
+        expect((await defaultListRemediationCandidates()).map(row => row.id)).toEqual([
+          legitimate.id,
+        ]);
+        await defaultConsumeRemediationCandidate(legitimate.id);
+        expect((await getMessage(legitimate.id))?.route_disposition).toBeNull();
+        expect((await getMessage(untrusted.id))?.route_disposition).toBeNull();
+      });
+    }
+  );
+
+  test.each([null, 'WO-UNMATCHED-99'])(
+    'unmatched WO %s resumes into one real operator dispatch with a PR subject',
+    async woId => {
+      await withDispatch(async () => {
+        const world = makeWorld();
+        world.control = { ...world.control, pause_state: 'PAUSED', pause_scope: 'effects' };
+        world.candidates.push({
+          id: 'real-unmatched',
+          consumed: false,
+          body: candidateBody({ woId }),
+        });
+        const deps = makeDeps(world, {
+          listThreads: async () => [ownerThread()],
+          createTask: createAuthenticatedMessage,
+          pageOperator: async () => {
+            throw new Error('unexpected operator page');
+          },
+        });
+        const readEscalations = async () =>
+          (await listMessages({ recipient: 't3-desktop', limit: 500 })).filter(row =>
+            row.idempotency_key.startsWith('tm:remediation_nudge:')
+          );
+
+        await tick(createTaskmasterState(60000), deps);
+        expect(await readEscalations()).toHaveLength(0);
+        expect(world.consumeCalls).toEqual([]);
+        const journal = world.journal.find(
+          row => JSON.parse(row.proposal_json).remediationCandidateId === 'real-unmatched'
+        )!;
+        expect(journal.outcome).toBe('deferred');
+        const deadline = journal.proof_deadline_at;
+
+        world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+        world.nowMs += 60000;
+        await tick(createTaskmasterState(60000), deps);
+        const sent = await readEscalations();
+        expect(sent).toHaveLength(1);
+        expect(sent[0]?.subject_key).toBe('gh:owner/repo#5');
+        expect(sent[0]?.sender_principal_id).toBe('system:taskmaster');
+        expect(sent[0]?.body).toContain('CHANGES_REQUESTED');
+        expect(journal.outcome).toBe('sent');
+        expect(journal.proof_deadline_at).toBe(deadline);
+        expect(world.consumeCalls).toEqual(['real-unmatched']);
+
+        world.nowMs += 60000;
+        await tick(createTaskmasterState(60000), deps);
+        expect(await readEscalations()).toHaveLength(1);
+      });
+    }
+  );
+
+  test('discovery and supersession pass 200 retained first attempts without deleting them', async () => {
+    await withDispatch(async () => {
+      const enqueue = (body: RemediationCandidateBody) =>
+        createAuthenticatedMessage(
+          { kind: 'system', sender: 'overseer' },
+          {
+            correlation_id: `review-${body.prNumber}-${body.attempt}`,
+            idempotency_key: `candidate-${body.prNumber}-${body.attempt}`,
+            recipient: 'taskmaster',
+            task_type: 'run_review',
+            body: JSON.stringify(body),
+          }
+        );
+      const retained: DispatchMessage[] = [];
+      for (let i = 1; i <= 205; i++) {
+        retained.push(await enqueue(candidateBody({ prNumber: i })));
+      }
+      await defaultConsumeRemediationCandidate(retained[0]!.id);
+      expect((await getMessage(retained[0]!.id))?.route_disposition).toBeNull();
+
+      const next = await enqueue(
+        candidateBody({ prNumber: 1, attempt: 2, headSha: 'bbbbbbb2222' })
+      );
+      const firstRead = await defaultListRemediationCandidates();
+      expect(firstRead).toHaveLength(206);
+      expect(firstRead.some(row => row.id === next.id)).toBe(true);
+      // Supersession must find the newer attempt on page two while page one
+      // remains queued. Discovery must also work after that page mutates.
+      await defaultConsumeRemediationCandidate(retained[0]!.id);
+      expect((await getMessage(retained[0]!.id))?.route_disposition).toBe('expired');
+      const secondRead = await defaultListRemediationCandidates();
+      expect(secondRead).toHaveLength(205);
+      expect(secondRead.some(row => row.id === next.id)).toBe(true);
+      expect((await getMessage(retained[1]!.id))?.route_disposition).toBeNull();
+      await defaultConsumeRemediationCandidate(next.id);
+      expect((await getMessage(next.id))?.route_disposition).toBe('expired');
+      expect(await defaultListRemediationCandidates()).toHaveLength(204);
+    });
+  });
+});
+
+/** Minimal DispatchMessage row for the reader tests (only read fields set). */
+function fakeDispatchRow(
+  partial: Pick<DispatchMessage, 'id' | 'recipient' | 'task_type' | 'body'>
+): DispatchMessage {
+  return {
+    id: partial.id,
+    correlation_id: `corr-${partial.id}`,
+    idempotency_key: `idem-${partial.id}`,
+    task_type: partial.task_type,
+    sender: 'overseer',
+    sender_principal_id: 'system:overseer',
+    recipient: partial.recipient,
+    body: partial.body,
+    status: 'queued',
+    result_body: null,
+    created_at: new Date(T0).toISOString(),
+    claimed_at: null,
+    completed_at: null,
+    not_before: null,
+    lease_owner: null,
+    lease_expires_at: null,
+    fencing_token: 0,
+    recipient_alias: null,
+    motion_id: null,
+    motion_revision_sha: null,
+    resolved_recipient: null,
+    resolved_xo_lease_id: null,
+    resolved_xo_fencing_token: null,
+    resolved_at: null,
+    priority: 'normal',
+    task_outcome: null,
+    acknowledged_at: null,
+    acknowledged_by: null,
+    addressed_at: null,
+    addressed_by: null,
+    escalated_tg_at: null,
+    escalated_sms_at: null,
+    subject_key: null,
+    route_disposition: null,
+    route_disposed_at: null,
+    supersedes_id: null,
+    repeat_reason: null,
+  };
+}
+
+/** Capture pino log output for assertions, mirroring loop.test.ts. */
+function captureLogChunks(): { text: () => string; restore: () => void } {
+  const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+    symbol => symbol.description === 'pino.stream'
+  );
+  if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+  const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
+    streamSymbol
+  ];
+  const chunks: string[] = [];
+  const originalWrite = stream.write;
+  stream.write = (chunk: string): boolean => {
+    chunks.push(String(chunk));
+    return true;
+  };
+  return {
+    text: () => chunks.join(''),
+    restore: () => {
+      stream.write = originalWrite;
+    },
+  };
+}
+
+describe('remediation_nudge grading reads the candidate PR, not the work-item thread', () => {
+  const HOUR = 3_600_000;
+  const REJECTED_HEAD = 'aaaaaaa1111';
+  const NEW_HEAD = 'bbbbbbb2222';
+  const iso = (ms: number): string => new Date(ms).toISOString();
+
+  /** Send the nudge on a real tick, then return deps wired to grade it. */
+  async function sentNudge(
+    getPullRequestState: NonNullable<TaskmasterDeps['getPullRequestState']>,
+    getGithubIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']> = async () => null
+  ): Promise<{
+    world: FakeWorld;
+    row: TmJournalEntry;
+    grade: (atMs: number) => Promise<TmJournalEntry['grade']>;
+  }> {
+    const world = makeWorld();
+    world.candidates.push({ id: 'cand-1', consumed: false, body: candidateBody() });
+    const sendDeps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+    const state = createTaskmasterState(60_000);
+    await tick(state, sendDeps);
+    const row = world.journal.find(j => j.action_type === 'remediation_nudge')!;
+    expect(row.outcome).toBe('sent');
+    expect(JSON.parse(row.proposal_json).remediationEvidence).toEqual({
+      owner: 'owner',
+      repo: 'repo',
+      prNumber: 5,
+      headSha: REJECTED_HEAD,
+    });
+    const gradeDeps = makeDeps(world, {
+      listThreads: async () => [ownerThread()],
+      findEffectByIdempotencyKey: async key =>
+        key === row.idempotency_key ? { id: 'eff-1', status: 'sent', createdAt: iso(T0) } : null,
+      getDispatchMessageById: (async () => ({
+        recipient: OWNER_RECIPIENT,
+        resolved_recipient: OWNER_RECIPIENT,
+        acknowledged_at: iso(T0 + 1_000),
+      })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+      getPullRequestState,
+      getGithubIssueEvidence,
+    });
+    return {
+      world,
+      row,
+      grade: async (atMs: number) => {
+        world.nowMs = atMs;
+        await tick(state, gradeDeps);
+        return row.grade;
+      },
+    };
+  }
+
+  const unchangedPr = async (): Promise<PullRequestState> => ({
+    state: 'open',
+    headSha: REJECTED_HEAD,
+    headCommittedAt: null,
+    closedAt: null,
+    merged: false,
+  });
+
+  test('(a) a new head pushed to the candidate PR after the nudge grades useful', async () => {
+    const calls: unknown[][] = [];
+    const { grade } = await sentNudge(async (...args) => {
+      calls.push(args);
+      return {
+        state: 'open',
+        headSha: NEW_HEAD,
+        headCommittedAt: iso(T0 + HOUR),
+        closedAt: null,
+        merged: false,
+      };
+    });
+    expect(await grade(T0 + 2 * HOUR)).toBe('useful');
+    expect(calls[0]).toEqual(['owner', 'repo', 5, REJECTED_HEAD]);
+  });
+
+  test('(b) the candidate PR closed or merged after the nudge grades useful', async () => {
+    const { grade } = await sentNudge(async () => ({
+      state: 'closed',
+      headSha: REJECTED_HEAD,
+      headCommittedAt: null,
+      closedAt: iso(T0 + HOUR),
+      merged: true,
+    }));
+    expect(await grade(T0 + 2 * HOUR)).toBe('useful');
+  });
+
+  test('(c) deadline expiry with no new head and no closure grades noise', async () => {
+    const { grade } = await sentNudge(unchangedPr);
+    expect(await grade(T0 + 2 * HOUR)).toBeNull();
+    // The proof deadline is created_at + 24h; grading runs while the row is in the 24h window.
+    expect(await grade(T0 + 24 * HOUR)).toBe('noise');
+  });
+
+  test('(d) unrelated work-item activity with the PR unchanged is not useful', async () => {
+    const activity = async (): Promise<GithubIssueEvidence> => ({
+      state: 'closed',
+      updatedAt: iso(T0 + HOUR),
+      labels: ['wo', 'status:building'],
+      assigneeCount: 1,
+      closedAt: iso(T0 + HOUR),
+      assignedAt: iso(T0 + HOUR),
+      activeStatusAt: iso(T0 + HOUR),
+      progressRecordedAt: iso(T0 + HOUR),
+      ownerLogin: 'major-build',
+      latestMarkerKind: 'PROGRESS',
+      latestMarkerText: '[PROGRESS] working',
+      latestMarkerAt: iso(T0 + HOUR),
+      lastMovementAt: iso(T0 + HOUR),
+      lastMovementKind: 'closed',
+    });
+    const { grade } = await sentNudge(unchangedPr, activity);
+    expect(await grade(T0 + 2 * HOUR)).toBeNull();
+    expect(await grade(T0 + 24 * HOUR)).toBe('noise');
+  });
+
+  test('(e) a PR read failure is not useful before the deadline', async () => {
+    const { grade } = await sentNudge(async () => {
+      throw new Error('taskmaster_github_pull_evidence_read_failed:502');
+    });
+    expect(await grade(T0 + 2 * HOUR)).toBeNull();
+    // A null read is likewise unproven, never useful.
+    const nullRead = await sentNudge(async () => null);
+    expect(await nullRead.grade(T0 + 2 * HOUR)).toBeNull();
+  });
+
+  test('(f) a head with no usable date seen only after the deadline is not useful; a dated in-window head is', async () => {
+    const undated = await sentNudge(async () => ({
+      state: 'open',
+      headSha: NEW_HEAD,
+      headCommittedAt: null,
+      closedAt: null,
+      merged: false,
+    }));
+    // Shorten the recorded deadline to T0+3h so grading at T0+5h is after it while
+    // the row is still inside the loop's 24h grading window.
+    undated.row.proof_deadline_at = iso(T0 + 3 * HOUR);
+    expect(await undated.grade(T0 + 5 * HOUR)).toBe('noise');
+    const dated = await sentNudge(async () => ({
+      state: 'open',
+      headSha: NEW_HEAD,
+      headCommittedAt: iso(T0 + 2 * HOUR),
+      closedAt: null,
+      merged: false,
+    }));
+    dated.row.proof_deadline_at = iso(T0 + 3 * HOUR);
+    expect(await dated.grade(T0 + 5 * HOUR)).toBe('useful');
+  });
+
+  test('(g) a PR closed before the nudge was sent does not count', async () => {
+    const { grade } = await sentNudge(async () => ({
+      state: 'closed',
+      headSha: REJECTED_HEAD,
+      headCommittedAt: null,
+      closedAt: iso(T0 - HOUR),
+      merged: false,
+    }));
+    expect(await grade(T0 + 2 * HOUR)).toBeNull();
+  });
+});

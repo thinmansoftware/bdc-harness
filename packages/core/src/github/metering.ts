@@ -1,6 +1,9 @@
+import { createLogger } from '@archon/paths';
 import { getDatabase } from '../db/connection';
 import type { IDatabase } from '../db/adapters/types';
 import type { GitHubService } from './service-identity';
+
+const log = createLogger('github/metering');
 
 export interface GitHubApiObservation {
   service: GitHubService;
@@ -15,6 +18,11 @@ export interface GitHubApiObservation {
   observedAt?: number;
   /** Secondary-limit retry deadline, distinct from the quota reset header. */
   backoffUntil?: number;
+  /**
+   * What the call was: `METHOD /route` from normalizeGitHubEndpoint, or `cli:<command>`.
+   * Only used to attribute spend in the `github_call_sites` log line (bdc-xo#5449).
+   */
+  endpoint?: string;
 }
 
 interface UsageAggregate {
@@ -27,7 +35,21 @@ interface UsageAggregate {
   permissionFallbacks: number;
 }
 
+interface SiteAggregate {
+  service: GitHubService;
+  poolId: string;
+  endpoint: string;
+  calls: number;
+  rateLimited: number;
+}
+
+const UNLABELLED = 'unlabelled';
+let callSiteLogEnabled = false;
+const CALL_SITE_TOP = 25;
+
 const usage = new Map<string, UsageAggregate>();
+const sites = new Map<string, SiteAggregate>();
+let sitesIntervalStartedAt = Date.now();
 const poolState = new Map<string, GitHubApiObservation>();
 const backoff = new Map<string, number>();
 let lastFlushAt = 0;
@@ -38,6 +60,81 @@ function finiteHeader(value: string | null): number | undefined {
   if (value === null || value.trim() === '') return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * `METHOD /route` for a GitHub call: host and query removed, the owner and repo of
+ * `/repos/<o>/<r>/` as `{o}/{r}`, numeric segments as `:n`, 40-hex shas as `:sha`.
+ * Octokit route templates (`{owner}`, `{pull_number}`) pass through unchanged.
+ */
+export function normalizeGitHubEndpoint(method: string | undefined, urlOrPath: string): string {
+  let path = urlOrPath.replace(/^https?:\/\/[^/]+/i, '');
+  const q = path.search(/[?#]/);
+  if (q >= 0) path = path.slice(0, q);
+  path = path
+    .replace(/^\/repos\/[^/{]+\/[^/{]+(?=\/|$)/, '/repos/{o}/{r}')
+    .split('/')
+    .map(segment => {
+      if (/^[0-9a-f]{40}$/i.test(segment)) return ':sha';
+      if (/^\d+$/.test(segment)) return ':n';
+      return segment;
+    })
+    .join('/');
+  const verb = (method ?? 'GET').toUpperCase();
+  return `${verb} ${path}`.slice(0, 120);
+}
+
+export interface GitHubCallSiteSummary {
+  intervalMs: number;
+  total: number;
+  byService: Record<string, number>;
+  top: {
+    service: string;
+    pool: string;
+    endpoint: string;
+    calls: number;
+    rateLimited: number;
+  }[];
+}
+
+/**
+ * Turn on the `github_call_sites` log line. Only the long-running server calls this: the
+ * line goes to stdout, and the CLI scripts that flush the meter print JSON on the same
+ * stream (run-completion-report --json must stay pure JSON).
+ */
+export function enableGitHubCallSiteLog(): void {
+  callSiteLogEnabled = true;
+}
+
+export function isGitHubCallSiteLogEnabled(): boolean {
+  return callSiteLogEnabled;
+}
+
+/** Take the call-site counts since the last take (or process start) and start a new interval. */
+export function takeGitHubCallSiteSummary(top = CALL_SITE_TOP): GitHubCallSiteSummary {
+  const now = Date.now();
+  const rows = [...sites.values()].sort((a, b) => b.calls - a.calls);
+  const byService: Record<string, number> = {};
+  let total = 0;
+  for (const row of rows) {
+    total += row.calls;
+    byService[row.service] = (byService[row.service] ?? 0) + row.calls;
+  }
+  const summary: GitHubCallSiteSummary = {
+    intervalMs: now - sitesIntervalStartedAt,
+    total,
+    byService,
+    top: rows.slice(0, top).map(row => ({
+      service: row.service,
+      pool: row.poolId,
+      endpoint: row.endpoint,
+      calls: row.calls,
+      rateLimited: row.rateLimited,
+    })),
+  };
+  sites.clear();
+  sitesIntervalStartedAt = now;
+  return summary;
 }
 
 export function observationFromResponse(
@@ -96,6 +193,18 @@ export function recordGitHubApiCall(observation: GitHubApiObservation): void {
   row.rateLimited += observation.rateLimited ? 1 : 0;
   row.permissionFallbacks += observation.permissionFallback ? 1 : 0;
   usage.set(key, row);
+  const endpoint = observation.endpoint ?? UNLABELLED;
+  const siteKey = [observation.service, observation.poolId, endpoint].join('|');
+  const site = sites.get(siteKey) ?? {
+    service: observation.service,
+    poolId: observation.poolId,
+    endpoint,
+    calls: 0,
+    rateLimited: 0,
+  };
+  site.calls += 1;
+  site.rateLimited += observation.rateLimited ? 1 : 0;
+  sites.set(siteKey, site);
   if (
     observation.limit !== undefined ||
     observation.remaining !== undefined ||
@@ -185,6 +294,9 @@ async function flushBatch(db: IDatabase): Promise<void> {
   const stateRows = [...poolState.values()];
   usage.clear();
   poolState.clear();
+  // One line per flush: which endpoints spent the calls since the last flush (bdc-xo#5449).
+  const callSites = takeGitHubCallSiteSummary();
+  if (callSiteLogEnabled && callSites.total > 0) log.info(callSites, 'github_call_sites');
   try {
     await db.withTransaction(async query => {
       for (const row of usageRows) {
@@ -246,6 +358,9 @@ async function flushBatch(db: IDatabase): Promise<void> {
 
 export function resetGitHubApiMeterForTests(): void {
   usage.clear();
+  sites.clear();
+  sitesIntervalStartedAt = Date.now();
+  callSiteLogEnabled = false;
   poolState.clear();
   backoff.clear();
   if (flushTimer) clearTimeout(flushTimer);

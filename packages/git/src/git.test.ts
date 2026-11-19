@@ -1851,6 +1851,66 @@ branch refs/heads/feature/auth
     });
   });
 
+  describe('addSafeDirectory (real git, temp GIT_CONFIG_GLOBAL)', () => {
+    let tmpCfgDir: string;
+    let cfgPath: string;
+    let prevGlobal: string | undefined;
+    let realExec: typeof git.execFileAsync;
+
+    beforeEach(async () => {
+      const { mkdtemp } = await import('fs/promises');
+      tmpCfgDir = await mkdtemp(join(tmpdir(), 'safe-dir-test-'));
+      cfgPath = join(tmpCfgDir, 'gitconfig');
+      prevGlobal = process.env.GIT_CONFIG_GLOBAL;
+      process.env.GIT_CONFIG_GLOBAL = cfgPath;
+      const { execFile } = await import('child_process');
+      const { promisify } = await import('util');
+      const run = promisify(execFile);
+      realExec = async (cmd, args, options) => {
+        const r = await run(cmd, args, options);
+        return { stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+      };
+    });
+
+    afterEach(async () => {
+      if (prevGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = prevGlobal;
+      await rm(tmpCfgDir, { recursive: true, force: true });
+    });
+
+    async function entries(): Promise<string[]> {
+      try {
+        const { stdout } = await realExec('git', [
+          'config',
+          '--file',
+          cfgPath,
+          '--get-all',
+          'safe.directory',
+        ]);
+        return stdout.split(/\r?\n/).filter(Boolean);
+      } catch {
+        return [];
+      }
+    }
+
+    test("appends nothing when '*' is already present", async () => {
+      await writeFile(cfgPath, '[safe]\n\tdirectory = *\n');
+      await git.addSafeDirectory(git.toRepoPath('/workspace/repo'));
+      expect(await entries()).toEqual(['*']);
+    });
+
+    test('does not duplicate an exact path already present', async () => {
+      await writeFile(cfgPath, '[safe]\n\tdirectory = /workspace/repo\n');
+      await git.addSafeDirectory(git.toRepoPath('/workspace/repo'));
+      expect(await entries()).toEqual(['/workspace/repo']);
+    });
+
+    test('appends exactly one entry when neither is present', async () => {
+      await git.addSafeDirectory(git.toRepoPath('/workspace/repo'));
+      expect(await entries()).toEqual(['/workspace/repo']);
+    });
+  });
+
   describe('findRepoRoot', () => {
     let execSpy: Mock<typeof git.execFileAsync>;
 

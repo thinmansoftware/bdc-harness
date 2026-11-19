@@ -62,10 +62,35 @@ export interface RateLimitClassification {
   /** Absolute instant the budget is expected to have refilled (ISO-8601). */
   retryAfter: string;
   /** Stable machine-readable source of the wait: which signal was believed. */
-  source: 'retry_after_header' | 'reset_header' | 'default';
-  /** Which GitHub limit fired, for the receipt. */
-  kind: 'primary' | 'secondary';
+  source: 'retry_after_header' | 'reset_header' | 'default' | 'pool_backoff_gate';
+  /**
+   * Which GitHub limit fired, for the receipt. `pool_gate` means no request
+   * left this process: the local per-pool backoff gate refused it.
+   */
+  kind: 'primary' | 'secondary' | 'pool_gate';
 }
+
+/**
+ * Prefix of the error the local GitHub pool gate throws
+ * (`assertGitHubPoolAvailable` / `assertPersistedGitHubPoolAvailable` in
+ * packages/core/src/github/metering.ts). Shape:
+ * `github_pool_backoff:<poolId>/<resource>:<untilEpochMs>`.
+ *
+ * WHY IT IS CLASSIFIED HERE (WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01): the gate
+ * landed with #1128 (2026-10-17) and throws a plain Error with NO status, so
+ * the 403/429 test below returned null and every caller treated it as a
+ * terminal failure. Live 2026-11-01 17:07-17:09Z, eight run_review items
+ * (bdc-harness #1390 and #1386, bdc-xo #4113 and #4115, shopops #945) were
+ * retired `submission_failed: head_recheck_failed:github_pool_backoff:...`
+ * and nothing re-armed them; #1390 waited 80 minutes for a hand nudge.
+ *
+ * The gate is our own pre-flight refusal, never a GitHub authorization answer,
+ * so deferring on it cannot become the #774 permission spin; the wait is the
+ * gate's own expiry, clamped like every other deferral.
+ */
+export const POOL_BACKOFF_PREFIX = 'github_pool_backoff:';
+
+const POOL_BACKOFF_PATTERN = /github_pool_backoff:[^:\s]+:(\d+)/;
 
 interface HeaderBag {
   get?(name: string): string | null | undefined;
@@ -137,6 +162,9 @@ export function classifyRateLimitError(
   error: unknown,
   now: Date = new Date()
 ): RateLimitClassification | null {
+  const poolBackoff = classifyPoolBackoff(error, now);
+  if (poolBackoff) return poolBackoff;
+
   const status = errorStatus(error);
   if (status !== 403 && status !== 429) return null;
 
@@ -207,6 +235,27 @@ export function classifyRateLimitError(
     retryAfter: new Date(now.getTime() + DEFAULT_RATE_LIMIT_RETRY_MS).toISOString(),
     source: 'default',
     kind,
+  };
+}
+
+/**
+ * The local pool gate's refusal, as a deferral that ends when the gate opens.
+ * Returns null for any error that is not the gate's own message. An
+ * unparseable expiry still defers, on the default interval, because the gate
+ * only ever throws while a backoff is in force.
+ */
+function classifyPoolBackoff(error: unknown, now: Date): RateLimitClassification | null {
+  const message = errorMessageText(error);
+  if (!message.includes(POOL_BACKOFF_PREFIX)) return null;
+  const untilMs = Number(POOL_BACKOFF_PATTERN.exec(message)?.[1]);
+  const retryAfterMs = clampRetryMs(
+    Number.isFinite(untilMs) && untilMs > 0 ? untilMs - now.getTime() : Number.NaN
+  );
+  return {
+    retryAfterMs,
+    retryAfter: new Date(now.getTime() + retryAfterMs).toISOString(),
+    source: 'pool_backoff_gate',
+    kind: 'pool_gate',
   };
 }
 

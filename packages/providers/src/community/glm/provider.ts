@@ -9,6 +9,8 @@ import type {
 } from '../../types';
 
 import { getOpenRouterXaiRefusal } from '../../openrouter-guard';
+import { isNoPrivateEndpointError } from '../../openrouter-review-fence';
+import { buildOpenRouterChatMessages } from '../../openrouter-request';
 import { GLM_CAPABILITIES } from './capabilities';
 import { parseGlmConfig } from './config';
 
@@ -123,32 +125,45 @@ export class GlmProvider implements IAgentProvider {
     // Already-prefixed ids (e.g. "z-ai/glm-4.6") pass through unchanged.
     const resolvedModel = model.includes('/') ? model : 'z-ai/' + model;
 
-    // Build messages array from prompt. systemPrompt is prepended when present.
-    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
-    if (options?.systemPrompt) {
-      messages.push({ role: 'system', content: options.systemPrompt });
-    }
+    // Build messages (system prompt, user prompt, appended outputFormat.schema)
+    // through the shared builder the executor's review fence scans, so the
+    // fence and this request can never diverge.
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = buildOpenRouterChatMessages(
+      prompt,
+      options
+    );
 
-    // structuredOutput: best-effort -- append JSON instruction to prompt
-    let userContent = prompt;
-    if (options?.outputFormat?.type === 'json_schema') {
-      const schema = JSON.stringify(options.outputFormat.schema);
-      userContent =
-        prompt +
-        '\n\nRespond with valid JSON only. The JSON must conform to this schema:\n' +
-        schema;
+    // OpenRouter privacy pin (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01): when
+    // the executor's review-fence gate approved this OpenRouter route on a
+    // customer repo, restrict routing to no-training / zero-retention
+    // providers. The OpenRouter API accepts a top-level `provider` body field
+    // that the OpenAI SDK params type does not model, so it is attached via a
+    // cast; the SDK serializes unknown body fields verbatim.
+    const createBody: OpenAI.Chat.ChatCompletionCreateParamsStreaming & {
+      provider?: { data_collection: 'deny'; zdr: true };
+    } = {
+      model: resolvedModel,
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+    if (options?.openrouterPrivacyPin) {
+      createBody.provider = { data_collection: 'deny', zdr: true };
     }
-    messages.push({ role: 'user', content: userContent });
 
     let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
     try {
-      stream = await client.chat.completions.create({
-        model: resolvedModel,
-        messages,
-        stream: true,
-        stream_options: { include_usage: true },
-      });
+      stream = await client.chat.completions.create(createBody);
     } catch (err) {
+      // Privacy pin set + "no endpoint satisfies the data policy" -> fail
+      // closed. Never retry without the pin and never availability-failback;
+      // the executor reroutes this to a non-OpenRouter seat.
+      if (options?.openrouterPrivacyPin) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isNoPrivateEndpointError(msg)) {
+          throw new Error(`openrouter_no_private_endpoint: ${msg}`);
+        }
+      }
       if (isAvailabilityError(err) && this.failbackProviderFactory) {
         const failback = this.failbackProviderFactory();
         yield {

@@ -308,9 +308,29 @@ export async function syncRepository(
 /**
  * Add a directory to git's global safe.directory config.
  * Uses execFileAsync (no shell interpolation) for safety.
+ *
+ * Skips the write when the global config already trusts everything ('*') or
+ * already lists the exact path. The container image sets safe.directory '*',
+ * and ~/.gitconfig is persisted, so appending per-path entries only bloats it.
  */
 export async function addSafeDirectory(path: RepoPath): Promise<void> {
   try {
+    let existing: string[] = [];
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['config', '--global', '--get-all', 'safe.directory'],
+        {
+          timeout: 10000,
+        }
+      );
+      existing = stdout.split(/\r?\n/).map(line => line.trim());
+    } catch {
+      // exit 1 = no safe.directory entries yet; any other failure surfaces on --add below
+    }
+    if (existing.includes('*') || existing.includes(path)) {
+      return;
+    }
     await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', path], {
       timeout: 10000,
     });

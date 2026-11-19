@@ -10,13 +10,15 @@ type Candidate = {
 };
 
 const calls = { notices: 0, handoffs: 0, list: 0, claim: 0, release: 0 };
+const noticeScopes: Array<string | undefined> = [];
 const releasedClaims: { id: string; leg: string; claimed_at: string }[] = [];
 let candidates: Candidate[] = [];
 let listBarrier: Promise<void> | null = null;
 mock.module('@archon/core/db/dispatch', () => ({
   ...dispatchDb,
-  reconcileDispatchOutcomeNotices: async () => {
+  reconcileDispatchOutcomeNotices: async (_cutoff: string, scope?: string) => {
     calls.notices++;
+    noticeScopes.push(scope);
     return 0;
   },
   ensureXoEscalationHandoffs: async () => {
@@ -69,6 +71,7 @@ describe('dispatch escalation clock', () => {
     candidates = [];
     releasedClaims.length = 0;
     listBarrier = null;
+    noticeScopes.length = 0;
   });
   afterEach(() => {
     delete process.env.DISPATCH_PHASE1_ACTIVATED_AT;
@@ -78,20 +81,20 @@ describe('dispatch escalation clock', () => {
   });
 
   test.each(['off', 'warn'] as const)(
-    'is a complete no-op while sender auth mode is %s',
+    'recovers Chief successes only while sender auth mode is %s',
     async mode => {
       setSenderAuthMode(mode);
       await tickDispatchEscalationClock();
-      expect(calls.notices).toBe(0);
+      expect(noticeScopes).toEqual(['chief-success']);
       expect(calls.handoffs).toBe(0);
       expect(calls.list).toBe(0);
       expect(calls.claim).toBe(0);
     }
   );
 
-  test('is a complete no-op when sender auth mode is unset', async () => {
+  test('recovers only Chief successes when sender auth mode is unset', async () => {
     await tickDispatchEscalationClock();
-    expect(calls.notices).toBe(0);
+    expect(noticeScopes).toEqual(['chief-success']);
     expect(calls.handoffs).toBe(0);
     expect(calls.list).toBe(0);
     expect(calls.claim).toBe(0);
@@ -158,7 +161,7 @@ describe('dispatch escalation clock', () => {
     await tickDispatchEscalationClock({ telegram });
     unblock();
     await first;
-    expect(calls.notices).toBe(1);
+    expect(noticeScopes).toEqual(['chief-success', undefined]);
     expect(calls.list).toBe(1);
   });
   test.each(['telegram', 'sms'] as const)(
@@ -173,6 +176,17 @@ describe('dispatch escalation clock', () => {
         sms: refusedLeg === 'sms' ? async () => false : async () => {},
       });
       expect(releasedClaims).toEqual([{ id: 'refused', leg: refusedLeg, claimed_at: now }]);
+    }
+  );
+  test.each([undefined, '', 'not-a-date'])(
+    'invalid or absent cutoff prevents all recovery: %s',
+    async cutoff => {
+      if (cutoff === undefined) delete process.env.DISPATCH_PHASE1_ACTIVATED_AT;
+      else process.env.DISPATCH_PHASE1_ACTIVATED_AT = cutoff;
+      await tickDispatchEscalationClock();
+      expect(noticeScopes).toEqual([]);
+      expect(calls.handoffs).toBe(0);
+      expect(calls.list).toBe(0);
     }
   );
 });

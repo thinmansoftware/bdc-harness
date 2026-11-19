@@ -30,7 +30,10 @@ function workflowRun(id: string): WorkflowRun {
     workflow_name: 'canonical-provider',
     conversation_id: 'conv',
     parent_conversation_id: null,
-    codebase_id: null,
+    // A registered internal (non-customer) codebase: the OpenRouter review
+    // fence resolves repo identity from this run metadata and stays out of the
+    // way. Without an identity the fence fails closed and reroutes.
+    codebase_id: 'cb-internal',
     status: 'running',
     user_message: 'canonical provider test',
     metadata: {},
@@ -77,7 +80,14 @@ function storeCapturingAttempts(): {
     createWorkflowEvent: mock(() => Promise.resolve()),
     listWorkflowEvents: mock(() => Promise.resolve([])),
     getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
-    getCodebase: mock(() => Promise.resolve(null)),
+    getCodebase: mock(() =>
+      Promise.resolve({
+        id: 'cb-internal',
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/thinmansoftware/bdc-harness',
+        default_cwd: '/tmp/x',
+      })
+    ),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
   } as unknown as IWorkflowStore;
   return { store, attempts };

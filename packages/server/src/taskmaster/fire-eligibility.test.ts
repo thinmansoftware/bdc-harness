@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { checkFireEligibility } from './fire-eligibility';
+import { checkFireEligibility, type PullListingMemo } from './fire-eligibility';
 const TITLE = 'P1: WO-HARNESS-EXAMPLE-01 needs building';
 const SPEC = 'cauldron_compatible: true\ntarget_repo: thinmansoftware/bdc-harness\n';
 const SHA = 'a'.repeat(40);
@@ -111,6 +111,144 @@ describe('checkFireEligibility', () => {
         )
       ).eligible
     ).toBe(true);
+  });
+  // Live 2026-11-09 (bdc-xo#4311): codebase rows registered before the 2026-06-29
+  // owner move still carry repository_url = github.com/bluedevilcollectibles/<repo>,
+  // so the target_repo thinmansoftware/<repo> never matched and every fire was
+  // refused project_not_registered. The owner/repo codebase NAME is current.
+  test('falls back to a unique owner/repo codebase name when repository_url is stale', async () => {
+    const configured = deps();
+    configured.codebases = async () => [
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness.git',
+      },
+    ];
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+    expect(result.evidence?.project).toBe('bdc-harness');
+  });
+  test('the name fallback never matches a bare name and fails closed when ambiguous', async () => {
+    const bare = deps();
+    bare.codebases = async () => [
+      {
+        name: 'bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+    ];
+    expect((await checkFireEligibility(TITLE, bare)).reason).toBe('project_not_registered');
+    const twice = deps();
+    twice.codebases = async () => [
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+      {
+        name: 'THINMANSOFTWARE/bdc-harness',
+        repository_url: 'https://github.com/someone-else/bdc-harness',
+      },
+    ];
+    expect((await checkFireEligibility(TITLE, twice)).reason).toBe('project_not_registered');
+  });
+  test('a repository_url match still wins over a different name match', async () => {
+    const configured = deps();
+    configured.codebases = async () => [
+      {
+        name: 'thinmansoftware/other',
+        repository_url: 'https://github.com/thinmansoftware/bdc-harness',
+      },
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+    ];
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+    expect(result.evidence?.project).toBe('other');
+  });
+  // Live 2026-11-09 (bdc-xo#4311): for a WO that TARGETS bdc-xo, author-wo.sh's own
+  // spec PR ("WO: <id>", touching only docs/work-orders/<id>.md) lives in the target
+  // repo, so the WO was refused pr_exists forever once its spec merged.
+  type FileEntry = string | { filename: string; status: string; previous_filename?: string };
+  function specDeps(files: Record<number, FileEntry[] | 'error'>, prs: unknown[]) {
+    const base = deps(SPEC, prs);
+    const inner = base.fetchImpl;
+    base.fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const m = /\/pulls\/(\d+)\/files/.exec(url);
+      if (m) {
+        const entry = files[Number(m[1])];
+        if (entry === 'error' || entry === undefined) return response({ message: 'boom' }, 500);
+        return response(
+          entry.map(item => (typeof item === 'string' ? { filename: item, status: 'added' } : item))
+        );
+      }
+      return inner(input, init);
+    }) as typeof fetch;
+    return base;
+  }
+  test('a WO whose only matching PR is its own spec PR is eligible', async () => {
+    const configured = specDeps({ 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-01.md'] }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'closed', merged_at: '2026-11-09T10:00:00Z' },
+    ]);
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+  });
+  test('the superpowers spec path also counts as spec-only', async () => {
+    const configured = specDeps({ 1: ['docs/superpowers/specs/WO-HARNESS-EXAMPLE-01.md'] }, [
+      { title: 'spec WO-HARNESS-EXAMPLE-01', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).eligible).toBe(true);
+  });
+  test('a matching PR touching any non-spec path is still pr_exists', async () => {
+    const configured = specDeps(
+      { 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-01.md', 'src/feature.ts'] },
+      [{ title: 'WO-HARNESS-EXAMPLE-01 build', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  test('a spec path for a different WO id (prefix collision) is not this WO spec', async () => {
+    const configured = specDeps({ 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-010.md'] }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01 and -010', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  // Overseer minor on #1541: a rename INTO the spec path must not qualify.
+  test('a rename from a non-spec path into the spec path still counts as pr_exists', async () => {
+    const configured = specDeps(
+      {
+        1: [
+          {
+            filename: 'docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+            status: 'renamed',
+            previous_filename: 'src/feature.ts',
+          },
+        ],
+      },
+      [{ title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  test('a rename between this WO spec paths stays spec-only', async () => {
+    const configured = specDeps(
+      {
+        1: [
+          {
+            filename: 'docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+            status: 'renamed',
+            previous_filename: 'docs/superpowers/specs/WO-HARNESS-EXAMPLE-01.md',
+          },
+        ],
+      },
+      [{ title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).eligible).toBe(true);
+  });
+  test('an unreadable PR file list fails closed as pr_exists', async () => {
+    const configured = specDeps({ 1: 'error' }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
   });
   test('backs off at the shared GitHub rate-limit floor', async () => {
     const configured = deps();
@@ -401,4 +539,92 @@ test('default service path meters paginated core reads while Search is exhausted
     }
     removeTempDirWithRetry(home);
   }
+});
+
+describe('fire eligibility shares one PR listing per repository per tick (WO-HARNESS-TASKMASTER-ELIGIBILITY-LISTING-SHARE-01)', () => {
+  const TITLE_A = 'P1: WO-HARNESS-EXAMPLE-01 needs building';
+  const TITLE_B = 'P1: WO-HARNESS-EXAMPLE-02 needs building';
+  function row(number: number, override: Record<string, unknown> = {}) {
+    return {
+      number,
+      title: 'unrelated',
+      body: null,
+      state: 'closed',
+      merged_at: null,
+      ...override,
+    };
+  }
+  /** `serve(page, call)` answers one listing request; `call` counts the requests made so far. */
+  function counting(serve: (page: number, call: number) => Response) {
+    const configured = deps();
+    const original = configured.fetchImpl;
+    const state = { listing: 0 };
+    configured.fetchImpl = async (input, init) => {
+      const url = String(input);
+      if (url.includes('/pulls?')) {
+        state.listing += 1;
+        return serve(Number(new URL(url).searchParams.get('page')), state.listing);
+      }
+      return original(input, init);
+    };
+    return { configured, state };
+  }
+  const threePages = (page: number): Response =>
+    response(
+      Array.from({ length: page === 3 ? 40 : 100 }, (_, i) => row((page - 1) * 100 + i + 1))
+    );
+
+  test('two checks in one tick read a three page history once (Test 1)', async () => {
+    const f = counting(threePages);
+    const memo: PullListingMemo = new Map();
+    const a = await checkFireEligibility(TITLE_A, { ...f.configured, listingMemo: memo });
+    const b = await checkFireEligibility(TITLE_B, { ...f.configured, listingMemo: memo });
+    expect(a.eligible).toBe(true);
+    expect(b.eligible).toBe(true);
+    expect(f.state.listing).toBe(3);
+    // without a memo each check reads the history itself, as before
+    const g = counting(threePages);
+    await checkFireEligibility(TITLE_A, g.configured);
+    await checkFireEligibility(TITLE_B, g.configured);
+    expect(g.state.listing).toBe(6);
+  });
+
+  test('the shared listing does not change either decision (Test 2)', async () => {
+    const f = counting(() => response([row(1, { title: 'WO-HARNESS-EXAMPLE-01', state: 'open' })]));
+    const memo: PullListingMemo = new Map();
+    const a = await checkFireEligibility(TITLE_A, { ...f.configured, listingMemo: memo });
+    const b = await checkFireEligibility(TITLE_B, { ...f.configured, listingMemo: memo });
+    expect(a.reason).toBe('pr_exists');
+    expect(b.eligible).toBe(true);
+    expect(f.state.listing).toBe(1);
+  });
+
+  test('a failed or incomplete listing is not remembered (Test 3)', async () => {
+    const flaky = counting((page, call) =>
+      call === 2
+        ? response({}, 502)
+        : response(Array.from({ length: page === 1 ? 100 : 5 }, (_, i) => row(page * 1000 + i + 1)))
+    );
+    const memo: PullListingMemo = new Map();
+    await expect(
+      checkFireEligibility(TITLE_A, { ...flaky.configured, listingMemo: memo })
+    ).rejects.toThrow('listing_failed');
+    expect(memo.size).toBe(0);
+    const second = await checkFireEligibility(TITLE_A, { ...flaky.configured, listingMemo: memo });
+    expect(second.eligible).toBe(true);
+    // 2 requests in the failed traversal (page 1, then the 502) plus a fresh traversal of 2 pages
+    expect(flaky.state.listing).toBe(4);
+
+    const ceiling = counting(page =>
+      response(Array.from({ length: 100 }, (_, i) => row((page - 1) * 100 + i + 1)))
+    );
+    const memo2: PullListingMemo = new Map();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(
+        checkFireEligibility(TITLE_A, { ...ceiling.configured, listingMemo: memo2 })
+      ).rejects.toThrow('listing_incomplete');
+    }
+    expect(memo2.size).toBe(0);
+    expect(ceiling.state.listing).toBe(200);
+  });
 });

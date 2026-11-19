@@ -171,13 +171,13 @@ describe('computeNextAction', () => {
     expect(proposal?.idempotencyKey).toBe('tm:deliver_ruling:ruling-42');
   });
 
-  test('unclaimed P0 escalates to operator immediately', () => {
+  test('unclaimed P0 escalates to t3-desktop immediately', () => {
     const proposal = computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
       interventionsLast24h: 0,
       nowMs: NOW_MS,
     });
     expect(proposal?.type).toBe('escalate_p0');
-    expect(proposal?.recipient).toBe('operator');
+    expect(proposal?.recipient).toBe('t3-desktop');
     expect(proposal?.actsImmediately).toBe(true);
   });
 
@@ -652,7 +652,7 @@ describe('M-155 exception push (rules)', () => {
       nowMs: NOW_MS,
     });
     expect(proposal?.type).toBe('escalate_p0');
-    expect(proposal?.recipient).toBe('operator');
+    expect(proposal?.recipient).toBe('t3-desktop');
     expect(proposal?.actsImmediately).toBe(true);
   });
 
@@ -936,5 +936,19 @@ describe('blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () =>
     // Canonical (non-obsolete) issue URL in the body.
     expect(proposal?.body).toContain('https://github.com/thinmansoftware/bdc-harness/issues/1');
     expect(proposal?.body).not.toContain('bluedevilcollectibles');
+  });
+});
+
+describe('composeNudgeBody labelled owner', () => {
+  test('nudge names the labelled owner', () => {
+    const adoption = makeAdoption({
+      title: 'M-144 support rail',
+      owner_login: 'cursor',
+      next_action: 'continue the support rail',
+    });
+    const body = composeNudgeBody(thread(), adoption, NOW_MS);
+    expect(body).not.toBeNull();
+    expect(body).toContain('owner: cursor');
+    expect(body).not.toContain('owner: UNKNOWN');
   });
 });

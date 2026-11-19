@@ -303,6 +303,12 @@ function octokitWithReview(
       }),
       merge: async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }),
       createReview,
+      // Amendment 1 of WO-HARNESS-MERGE-GATES-01: empty review and timeline lists = no draft-era approval.
+      listReviews: async () => ({ data: [] }),
+    },
+    issues: {
+      createComment: async () => ({ data: {} }),
+      listEventsForTimeline: async () => ({ data: [] }),
     },
     search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
     checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
@@ -427,6 +433,8 @@ describe('createRealMergePullRequest expected head SHA', () => {
         state: 'open',
         html_url: 'u',
         head: { sha: reviewed },
+        labels: [],
+        draft: false,
       },
     });
     octokit.pulls.merge = merge;
@@ -472,6 +480,8 @@ describe('createRealMergePullRequest expected head SHA', () => {
         state: 'open',
         html_url: 'u',
         head: { sha: reviewed },
+        labels: [],
+        draft: false,
       },
     });
     octokit.pulls.merge = merge;
@@ -796,6 +806,27 @@ dNull('mergeable:null retry', () => {
 // comment 101 was invisible to the idempotency check, letting a redelivery
 // duplicate the merge receipt on any PR with a busy comment thread.
 describe('createRealGitHubClientDeps listPullRequestComments -- pagination', () => {
+  test('evidence hold labels use the injected GitHub issue API', async () => {
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+    const { octokit } = octokitWithComments([]);
+    const addLabels = mock(async () => ({ data: [] }));
+    if (!octokit.issues) throw new Error('fixture issues API missing');
+    octokit.issues.addLabels = addLabels;
+    const deps = createRealGitHubClientDeps(octokit);
+    await deps.addPullRequestLabels?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      labels: ['merge:held-evidence'],
+    });
+    expect(addLabels).toHaveBeenCalledWith({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      issue_number: 42,
+      labels: ['merge:held-evidence'],
+    });
+  });
+
   function octokitWithComments(bodies: string[]): {
     octokit: RealGitHubOctokitLike;
     pageLog: number[];
@@ -1369,5 +1400,127 @@ describe('WO discovery uses complete REST listing without Search', () => {
     expect(evidence.pr?.number).toBe(42);
     expect(f.calls).toEqual([]);
     expect(f.searchCalls()).toBe(0);
+  });
+});
+
+describe('findPullRequest required-check evidence pages', () => {
+  const headSha = 'd'.repeat(40);
+
+  function run(
+    id: number,
+    name: string,
+    conclusion: string,
+    completedAt: string
+  ): {
+    id: number;
+    name: string;
+    status: string;
+    conclusion: string;
+    completed_at: string;
+  } {
+    return { id, name, status: 'completed', conclusion, completed_at: completedAt };
+  }
+
+  test('reads check runs and commit statuses past the first page', async () => {
+    const checkCalls: { page?: number; filter?: string; per_page?: number; ref?: string }[] = [];
+    const statusCalls: { page?: number; per_page?: number; ref?: string }[] = [];
+    const firstCheckPage = Array.from({ length: 100 }, (_, index) =>
+      run(
+        index + 1,
+        `job-${index}`,
+        index === 2 ? 'failure' : 'success',
+        '2026-11-01T00:00:00.000Z'
+      )
+    );
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.get = async () => ({
+      data: {
+        number: 7,
+        title: 'WO-PAGE-01',
+        state: 'open',
+        merged: false,
+        mergeable: true,
+        mergeable_state: 'clean',
+        html_url: 'https://github.test/pull/7',
+        head: { sha: headSha, ref: 'feature' },
+        base: { ref: 'dev', sha: 'b'.repeat(40) },
+        user: { login: 'builder' },
+        created_at: '2026-11-01T00:00:00.000Z',
+        changed_files: 1,
+        additions: 1,
+        deletions: 0,
+      },
+    });
+    octokit.checks.listForRef = async input => {
+      const page = Number(input.page ?? 1);
+      checkCalls.push({
+        page,
+        filter: typeof input.filter === 'string' ? input.filter : undefined,
+        per_page: typeof input.per_page === 'number' ? input.per_page : undefined,
+        ref: typeof input.ref === 'string' ? input.ref : undefined,
+      });
+      if (page === 1) return { data: { check_runs: firstCheckPage } };
+      if (page === 2) {
+        return {
+          data: {
+            check_runs: [
+              run(201, 'job-2', 'success', '2026-11-03T00:00:00.000Z'),
+              run(202, 'required-later', 'success', '2026-11-03T00:00:00.000Z'),
+            ],
+          },
+        };
+      }
+      return { data: { check_runs: [] } };
+    };
+    octokit.repos = {
+      compareCommits: async () => {
+        throw new Error('compareCommits must not run');
+      },
+      listCommitStatusesForRef: async input => {
+        const page = input.page ?? 1;
+        statusCalls.push({ page, per_page: input.per_page, ref: input.ref });
+        if (page === 1) {
+          return {
+            data: Array.from({ length: 100 }, (_, index) => ({
+              id: index + 1,
+              context: `status-${index}`,
+              state: 'success',
+              created_at: '2026-11-01T00:00:00.000Z',
+            })),
+          };
+        }
+        if (page === 2) {
+          return {
+            data: [
+              {
+                id: 250,
+                context: 'ci/circleci',
+                state: 'success',
+                created_at: '2026-11-03T00:00:00.000Z',
+              },
+            ],
+          };
+        }
+        return { data: [] };
+      },
+    };
+
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 7,
+    });
+
+    expect(checkCalls.map(call => call.page)).toEqual([1, 2]);
+    expect(checkCalls.every(call => call.filter === 'all' && call.per_page === 100)).toBe(true);
+    expect(checkCalls.every(call => call.ref === headSha)).toBe(true);
+    expect(evidence.checkRuns).toHaveLength(101);
+    expect(evidence.checkRuns?.find(check => check.name === 'job-2')?.conclusion).toBe('success');
+    expect(evidence.checkRuns?.some(check => check.name === 'required-later')).toBe(true);
+    expect(evidence.checks).toEqual({ total: 101, passed: 101, failed: 0, pending: 0 });
+    expect(statusCalls.map(call => call.page)).toEqual([1, 2]);
+    expect(statusCalls.every(call => call.per_page === 100 && call.ref === headSha)).toBe(true);
+    expect(evidence.commitStatuses).toHaveLength(101);
+    expect(evidence.commitStatuses?.some(status => status.context === 'ci/circleci')).toBe(true);
   });
 });

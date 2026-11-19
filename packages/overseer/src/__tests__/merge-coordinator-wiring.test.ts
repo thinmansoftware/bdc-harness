@@ -45,6 +45,32 @@ function heartbeatFor(entries: CapturedHeartbeat[]): CapturedHeartbeat | undefin
   return entries.find(entry => entry.msg.includes('merge-coordinator.heartbeat'));
 }
 
+/** Heartbeat shape when watchOnce has no listOpenPullRequests dependency. */
+function heartbeatWithoutListDep(counts: {
+  evaluated: number;
+  total: number;
+  eligible: number;
+  runsEvaluated: number;
+  runsTotal: number;
+}): Record<string, unknown> {
+  return {
+    evaluated: counts.evaluated,
+    total: counts.total,
+    eligible: counts.eligible,
+    exclusionsByReason: {},
+    prCandidates: 0,
+    prDiscoveryUnavailable: true,
+    prDiscoveryUnavailableReason: 'no_list_dep',
+    prsEvaluated: 0,
+    prsClassified: 0,
+    prsFallbackDecision: 0,
+    prsTotalOpen: 0,
+    prsWindowTruncated: false,
+    runsEvaluated: counts.runsEvaluated,
+    runsTotal: counts.runsTotal,
+  };
+}
+
 /**
  * Drive the REAL service dispatch gate (`handleRecord`) over a batch of records,
  * with the v1 classifier path forced: OVERSEER_JUDGE_FIRST and
@@ -125,10 +151,10 @@ const mergeCandidateRecord: WatchedRunRecord = {
   woId: 'WO-COORDINATOR-WIRING-01',
   owner: 'thinmansoftware',
   repo: 'bdc-harness',
-  status: 'failed',
+  // WO-HARNESS-MERGE-GATES-01: a run recorded failed is held at any node; this candidate is a passed run.
+  status: 'completed',
   action: 'merge_ready',
   reason: 'green PR',
-  errorClass: 'tail_node_false_fail',
   workingPath: '/archon/worktrees/run-coordinator-wiring-1',
   prEvidence: {
     exists: true,
@@ -234,16 +260,27 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
         title: 'Ready to merge',
         state: 'open',
         head: { sha: RUN_HEAD_SHA },
+        // A real response always carries these; the merge function refuses one that lacks them.
+        labels: [],
+        draft: false,
       },
     }));
     const pullsMerge = mock(async () => ({ data: { merged: true, sha: RUN_HEAD_SHA } }));
     octokit.pulls.get = pullsGet as unknown as RealGitHubOctokitLike['pulls']['get'];
     octokit.pulls.merge = pullsMerge as unknown as RealGitHubOctokitLike['pulls']['merge'];
+    // WO-HARNESS-MERGE-GATES-01 Amendment 1: the merge function reads every review and the
+    // draft/ready timeline before merging; empty lists here (no network).
+    octokit.pulls.listReviews = (async () => ({
+      data: [],
+    })) as unknown as RealGitHubOctokitLike['pulls']['listReviews'];
+    (octokit as unknown as { issues: Record<string, unknown> }).issues.listEventsForTimeline =
+      async () => ({ data: [] });
 
     const insertOverseerAction = mock(async () => undefined);
     const judge = mock(async input => approveReceipt(input));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -369,7 +406,15 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     // logged OBJECT (not just the message) kills a mutation that always logs zeros.
     const heartbeat = heartbeatFor(entries);
     expect(heartbeat).toBeDefined();
-    expect(heartbeat?.obj).toEqual({ evaluated: 3, total: 3, eligible: 0 });
+    expect(heartbeat?.obj).toEqual(
+      heartbeatWithoutListDep({
+        evaluated: 3,
+        total: 3,
+        eligible: 0,
+        runsEvaluated: 3,
+        runsTotal: 3,
+      })
+    );
 
     // Zero merge calls -- driven through the REAL service dispatch gate
     // (handleRecord), not an inline copy of its `action === 'merge_ready'` check.
@@ -408,7 +453,15 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     expect(heartbeat).toBeDefined();
     // Assert the logged OBJECT, not just the message: an empty cycle reports all
     // zeros. (A hardcoded-zeros mutation is caught by Test 4's non-zero counts.)
-    expect(heartbeat?.obj).toEqual({ evaluated: 0, total: 0, eligible: 0 });
+    expect(heartbeat?.obj).toEqual(
+      heartbeatWithoutListDep({
+        evaluated: 0,
+        total: 0,
+        eligible: 0,
+        runsEvaluated: 0,
+        runsTotal: 0,
+      })
+    );
   });
 
   test('Test 4: heartbeat counts a merge-ready run as eligible and the real gate dispatches it', async () => {
@@ -493,7 +546,15 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     // The observability content is correct, not a fixed shape.
     const heartbeat = heartbeatFor(entries);
     expect(heartbeat).toBeDefined();
-    expect(heartbeat?.obj).toEqual({ evaluated: 2, total: 3, eligible: 1 });
+    expect(heartbeat?.obj).toEqual(
+      heartbeatWithoutListDep({
+        evaluated: 2,
+        total: 3,
+        eligible: 1,
+        runsEvaluated: 2,
+        runsTotal: 3,
+      })
+    );
 
     // Positive control for the dispatch gate: the REAL handleRecord routes the one
     // merge-ready record to the coordinator exactly once (and the skipped one never).

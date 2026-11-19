@@ -154,24 +154,38 @@ describe('SqliteAdapter', () => {
         { principal_id: 'astra', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'board', delivery_mode: 'alias_resolved', active: 1 },
         { principal_id: 'cauldron', delivery_mode: 'notify_only', active: 1 },
+        // WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067): command consumer
+        // mailbox and the t3-bridge sender.
+        { principal_id: 'cauldron-fire', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'claude', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'claude-acp', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'codex', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'codex-mcp', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'cursor', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'do', delivery_mode: 'worker_poll', active: 1 },
+        // WO-HARNESS-COMPANION-MCP-MAILBOX-01: inactive until a config enable.
+        { principal_id: 'dot', delivery_mode: 'drain_on_start', active: 0 },
+        { principal_id: 'duet', delivery_mode: 'drain_on_start', active: 0 },
         { principal_id: 'duty-officer', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'fusion', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok-acp', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'grokbot', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'john', delivery_mode: 'notify_only', active: 0 },
         { principal_id: 'merge-manager', delivery_mode: 'notify_only', active: 0 },
+        { principal_id: 'muse', delivery_mode: 'drain_on_start', active: 0 },
         { principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'overseer', delivery_mode: 'notify_only', active: 1 },
         // WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043): sorted
         // alphabetically by principal_id, same as the query's ORDER BY.
         { principal_id: 'overseer-review-route', delivery_mode: 'notify_only', active: 1 },
         { principal_id: 'overseer-reviewer', delivery_mode: 'worker_poll', active: 1 },
+        // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065): PR review
+        // receipt log and the T3 desktop results queue.
+        { principal_id: 'pr-review-log', delivery_mode: 'drain_on_start', active: 1 },
+        { principal_id: 't3-bridge', delivery_mode: 'drain_on_start', active: 1 },
+        { principal_id: 't3-desk-local', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 't3-desktop', delivery_mode: 'drain_on_start', active: 1 },
         // WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
         // (migration 046): recipient of Overseer's remediation candidates.
         { principal_id: 'taskmaster', delivery_mode: 'worker_poll', active: 1 },
@@ -486,6 +500,87 @@ describe('SqliteAdapter', () => {
         `SELECT grade FROM tm_journal WHERE id = 'legacy-journal-2'`
       );
       expect(graded.rows).toEqual([{ grade: 'unheard' }]);
+    });
+  });
+
+  describe('tm_journal rebuild with tm_fire_admissions rows referencing it (2026-11-09 crash loop)', () => {
+    test('a pre-remediation_nudge tm_journal referenced by tm_fire_admissions rows is rebuilt without a foreign key failure', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      // The production shape before WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: six verbs, no
+      // remediation_nudge, and a child table (migration 063) whose journal_id REFERENCES tm_journal(id).
+      legacy.run(`
+        CREATE TABLE tm_journal (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          thread_ref TEXT NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')),
+          proposal_json TEXT NOT NULL,
+          idempotency_key TEXT,
+          before_hash TEXT,
+          proof_predicate TEXT,
+          proof_deadline_at TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+          graded_at TEXT,
+          grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+        )
+      `);
+      legacy.run(`
+        CREATE TABLE tm_fire_admissions (
+          action_key TEXT PRIMARY KEY,
+          journal_id TEXT NOT NULL UNIQUE REFERENCES tm_journal(id),
+          source TEXT NOT NULL DEFAULT 'taskmaster' CHECK (source = 'taskmaster'),
+          source_thread_ref TEXT NOT NULL,
+          owner_token TEXT NOT NULL,
+          cascade_id TEXT NOT NULL,
+          utc_day TEXT NOT NULL CHECK (length(utc_day) = 10),
+          state TEXT NOT NULL CHECK (state IN ('reserved','admitted','released','unknown')),
+          reserved_at TEXT NOT NULL,
+          admitted_at TEXT,
+          updated_at TEXT NOT NULL,
+          run_ids_json TEXT NOT NULL DEFAULT '[]',
+          CHECK (state <> 'admitted' OR admitted_at IS NOT NULL)
+        )
+      `);
+      legacy.run(`
+        INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+        VALUES ('fire-journal-1', '2026-11-01T00:00:00.000Z', 'gh:thinmansoftware/bdc-xo#1', 'fire_cauldron', '{}', 'sent')
+      `);
+      legacy.run(`
+        INSERT INTO tm_fire_admissions (action_key, journal_id, source_thread_ref, owner_token, cascade_id, utc_day, state, reserved_at, updated_at)
+        VALUES ('fire:1', 'fire-journal-1', 'gh:thinmansoftware/bdc-xo#1', 'tok', 'cascade-1', '2026-11-01', 'reserved', '2026-11-01T00:00:00.000Z', '2026-11-01T00:00:00.000Z')
+      `);
+      legacy.close();
+
+      // Reopening runs the migration. Before the fix this threw
+      // SQLiteError: FOREIGN KEY constraint failed from DROP TABLE tm_journal.
+      db = new SqliteAdapter(currentDbPath);
+
+      const schema = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schema.rows[0]?.sql).toContain('remediation_nudge');
+
+      // the journal row and the child row that references it both survive, and still match
+      const journal = await db.query<{ id: string }>(`SELECT id FROM tm_journal`);
+      expect(journal.rows).toEqual([{ id: 'fire-journal-1' }]);
+      const admission = await db.query<{ journal_id: string }>(
+        `SELECT journal_id FROM tm_fire_admissions`
+      );
+      expect(admission.rows).toEqual([{ journal_id: 'fire-journal-1' }]);
+      const fkViolations = await db.query(`PRAGMA foreign_key_check`);
+      expect(fkViolations.rows).toEqual([]);
+
+      // foreign keys are enforced again after the rebuild, and the new verb is accepted
+      const fk = await db.query<{ foreign_keys: number }>(`PRAGMA foreign_keys`);
+      expect(fk.rows[0]?.foreign_keys).toBe(1);
+      await db.query(
+        `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+         VALUES ('remediation-1', '2026-11-09T00:00:00.000Z', 'gh:thinmansoftware/bdc-harness#1', 'remediation_nudge', '{}', 'sent')`
+      );
     });
   });
 
@@ -1076,6 +1171,260 @@ describe('SqliteAdapter', () => {
       );
       expect(tableSql.rows[0]?.sql ?? '').toContain('sender_principal_id');
       expect(tableSql.rows[0]?.sql ?? '').not.toMatch(/idempotency_key TEXT NOT NULL UNIQUE/i);
+    });
+  });
+
+  describe('SQLite transaction serialization', () => {
+    function deferred(): { promise: Promise<void>; resolve: () => void } {
+      let resolve: () => void = () => {};
+      const promise = new Promise<void>(done => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    }
+
+    function delay(ms: number): Promise<void> {
+      return new Promise(resolve => {
+        setTimeout(resolve, ms);
+      });
+    }
+
+    async function waitUntil(predicate: () => boolean): Promise<void> {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > 1000) {
+          throw new Error('timed out waiting for sqlite transaction state');
+        }
+        await delay(0);
+      }
+    }
+
+    async function createProbe(): Promise<void> {
+      db = createTestDb();
+      await db.query('CREATE TABLE tx_probe (id TEXT PRIMARY KEY)');
+    }
+
+    test('Test 1: outside reader never sees uncommitted rows', async () => {
+      await createProbe();
+      const park = deferred();
+      let parked = false;
+      const txDone = db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r1']);
+        parked = true;
+        await park.promise;
+      });
+
+      await waitUntil(() => parked);
+      let outsideSettled = false;
+      const outside = db
+        .query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe')
+        .then(result => {
+          outsideSettled = true;
+          return result;
+        });
+      await delay(20);
+      expect(outsideSettled).toBe(false);
+
+      park.resolve();
+      await txDone;
+      const result = await outside;
+      expect(result.rows[0]?.count).toBe(1);
+    });
+
+    test('Test 2: outside reader never sees rolled-back rows', async () => {
+      await createProbe();
+      const park = deferred();
+      let parked = false;
+      const txDone = db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r1']);
+        parked = true;
+        await park.promise;
+        throw new Error('tx-rollback');
+      });
+
+      await waitUntil(() => parked);
+      let outsideSettled = false;
+      const outside = db
+        .query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe')
+        .then(result => {
+          outsideSettled = true;
+          return result;
+        });
+      await delay(20);
+      expect(outsideSettled).toBe(false);
+
+      park.resolve();
+      await expect(txDone).rejects.toThrow('tx-rollback');
+      const result = await outside;
+      expect(result.rows[0]?.count).toBe(0);
+    });
+
+    test('Test 3: outside writer is not rolled back with the transaction', async () => {
+      await createProbe();
+      const park = deferred();
+      let parked = false;
+      const txDone = db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r1']);
+        parked = true;
+        await park.promise;
+        throw new Error('tx-rollback');
+      });
+
+      await waitUntil(() => parked);
+      let writerSettled = false;
+      const writer = db.query('INSERT INTO tx_probe (id) VALUES ($1)', ['r2']).then(result => {
+        writerSettled = true;
+        return result;
+      });
+      await delay(20);
+      expect(writerSettled).toBe(false);
+
+      park.resolve();
+      await expect(txDone).rejects.toThrow('tx-rollback');
+      await writer;
+      const rows = await db.query<{ id: string }>('SELECT id FROM tx_probe ORDER BY id');
+      expect(rows.rows.map(row => row.id)).toEqual(['r2']);
+    });
+
+    test('Test 4: concurrent transactions serialize', async () => {
+      await createProbe();
+      const gateA = deferred();
+      const gateB = deferred();
+      const order: string[] = [];
+
+      const txA = db.withTransaction(async tx => {
+        order.push('BEGIN');
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['a']);
+        await gateA.promise;
+        order.push('COMMIT');
+      });
+      const txB = db.withTransaction(async tx => {
+        order.push('BEGIN');
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['b']);
+        await gateB.promise;
+        order.push('COMMIT');
+      });
+
+      await waitUntil(() => order.length >= 1);
+      expect(order).toEqual(['BEGIN']);
+
+      gateA.resolve();
+      await txA;
+      await waitUntil(() => order.length >= 3);
+      expect(order).toEqual(['BEGIN', 'COMMIT', 'BEGIN']);
+
+      gateB.resolve();
+      await txB;
+      expect(order).toEqual(['BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
+
+      const committed = await db.query<{ id: string }>('SELECT id FROM tx_probe ORDER BY id');
+      expect(committed.rows.map(row => row.id)).toEqual(['a', 'b']);
+
+      await expect(
+        db.withTransaction(async tx => {
+          await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['doomed']);
+          await tx('ROLLBACK');
+          throw new Error('rollback-throws');
+        })
+      ).rejects.toThrow('rollback-throws');
+
+      await db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['c']);
+      });
+      const after = await db.query<{ id: string }>('SELECT id FROM tx_probe ORDER BY id');
+      expect(after.rows.map(row => row.id)).toEqual(['a', 'b', 'c']);
+    });
+
+    test('Test 5: helper calling public query inside a transaction does not deadlock', async () => {
+      await createProbe();
+      const startLeaked = deferred();
+      let leakedQueued = false;
+      let leakedSettled = false;
+      let leakedCount: number | undefined;
+
+      await db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r1']);
+        const seen = await db.query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe');
+        expect(seen.rows[0]?.count).toBe(1);
+        // Timer keeps this transaction's AsyncLocalStorage store after commit.
+        // Once released, that store must not bypass the mutex.
+        setTimeout(() => {
+          void startLeaked.promise.then(() => {
+            leakedQueued = true;
+            void db
+              .query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe')
+              .then(result => {
+                leakedSettled = true;
+                leakedCount = result.rows[0]?.count;
+              });
+          });
+        }, 0);
+      });
+
+      const committed = await db.query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe');
+      expect(committed.rows[0]?.count).toBe(1);
+
+      const later = deferred();
+      let secondParked = false;
+      const second = db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r2']);
+        secondParked = true;
+        await later.promise;
+      });
+      await waitUntil(() => secondParked);
+      startLeaked.resolve();
+      await waitUntil(() => leakedQueued);
+      await delay(20);
+      expect(leakedSettled).toBe(false);
+
+      later.resolve();
+      await second;
+      await waitUntil(() => leakedSettled);
+      expect(leakedCount).toBe(2);
+    }, 2000);
+
+    test('Test 6: nested withTransaction fails fast', async () => {
+      await createProbe();
+
+      await db.withTransaction(async tx => {
+        let caught: unknown;
+        try {
+          await db.withTransaction(async () => 'inner');
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Error).message).toContain('nested sqlite transaction');
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['outer']);
+      });
+
+      const committed = await db.query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe');
+      expect(committed.rows[0]?.count).toBe(1);
+
+      await expect(
+        db.withTransaction(async () => {
+          let caught: unknown;
+          try {
+            await db.withTransaction(async () => 'inner');
+          } catch (error) {
+            caught = error;
+          }
+          expect(caught).toBeInstanceOf(Error);
+          expect((caught as Error).message).toContain('nested sqlite transaction');
+          throw new Error('outer-rollback');
+        })
+      ).rejects.toThrow('outer-rollback');
+
+      const afterRollback = await db.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM tx_probe'
+      );
+      expect(afterRollback.rows[0]?.count).toBe(1);
+
+      await db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['later']);
+      });
+      const rows = await db.query<{ id: string }>('SELECT id FROM tx_probe ORDER BY id');
+      expect(rows.rows.map(row => row.id)).toEqual(['later', 'outer']);
     });
   });
 });

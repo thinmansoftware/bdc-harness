@@ -2,6 +2,11 @@
 
 [test]
 # Only discover tests in packages/ - prevents finding duplicates in workspace/worktrees
+# CAUTION: because of this root, a path arg outside packages/ (e.g. scripts/foo.test.ts)
+# is NOT resolved as a path -- it becomes a name filter against this root. Alone it
+# exits 1, but mixed with args that DO match it is silently ignored and bun exits 0
+# with that file never loaded. Always invoke tests outside packages/ with a leading
+# "./" (see the test:* scripts in package.json and .github/workflows/test.yml).
 root = "./packages"
 # Run preload script before tests (now in @archon/core)
 preload = ["./packages/core/src/test/setup.ts"]

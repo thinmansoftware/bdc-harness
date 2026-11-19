@@ -398,6 +398,7 @@ describe('tm_expectations DAL', () => {
     });
   });
 
+  // Windows CI measured this case at 59656 ms against the prior 30000 ms budget.
   test('give-up transition and aggregate counts include every status', async () => {
     const id = await registerExpectation({
       dispatch_ref: 'dispatch-give-up',
@@ -414,7 +415,7 @@ describe('tm_expectations DAL', () => {
     expect(counts.met).toBe(0);
     expect(counts.failed).toBe(0);
     expect(counts.escalated).toBe(0);
-  });
+  }, 120_000);
 
   test('two concurrent claims on the same attempt: exactly one wins', async () => {
     const id = await registerExpectation({
@@ -856,6 +857,76 @@ afterEach(async () => {
 });
 
 describe('tm_journal DAL', () => {
+  test('fresh journal admits all seven verbs and still refuses unknown verbs', async () => {
+    for (const verb of [
+      'deliver_ruling',
+      'nudge',
+      'escalate_p0',
+      'digest',
+      'fire_cauldron',
+      'blocker_report',
+      'remediation_nudge',
+    ] as const) {
+      const row = await recordAction({
+        thread_ref: 'test:seven-verbs',
+        action_type: verb,
+        proposal_json: '{}',
+        outcome: 'deferred',
+      });
+      expect(row.action_type).toBe(verb);
+    }
+    await expect(
+      db.query(
+        "INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,outcome) VALUES ('invalid','test','unknown_verb','{}','deferred')"
+      )
+    ).rejects.toThrow();
+    expect(
+      (await db.query("SELECT id FROM tm_journal WHERE thread_ref='test:seven-verbs'")).rows
+    ).toHaveLength(7);
+  });
+
+  test('legacy six-verb journal upgrades without losing rows or sibling constraints', async () => {
+    const path = join(tmpdir(), `taskmaster-remediation-legacy-${Date.now()}-${Math.random()}.db`);
+    const seed = new Database(path);
+    seed.exec(`CREATE TABLE tm_journal (
+      id TEXT PRIMARY KEY, created_at TEXT NOT NULL, thread_ref TEXT NOT NULL,
+      action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling','nudge','escalate_p0','digest','fire_cauldron','blocker_report')),
+      proposal_json TEXT NOT NULL, idempotency_key TEXT, before_hash TEXT,
+      proof_predicate TEXT, proof_deadline_at TEXT,
+      outcome TEXT NOT NULL CHECK (outcome IN ('pending','sent','parked','deferred','rejected','expired','failed')),
+      graded_at TEXT, grade TEXT CHECK (grade IS NULL OR grade IN ('useful','noise','harmful','unheard','delivered_to_issue'))
+    )`);
+    seed
+      .query(
+        "INSERT INTO tm_journal(id,created_at,thread_ref,action_type,proposal_json,outcome) VALUES ('old','2026-10-18T00:00:00Z','test','blocker_report','{}','sent')"
+      )
+      .run();
+    seed.close();
+    const upgraded = new SqliteAdapter(path);
+    try {
+      expect(
+        (
+          await upgraded.query<{ id: string; action_type: string }>(
+            'SELECT id, action_type FROM tm_journal'
+          )
+        ).rows
+      ).toEqual([{ id: 'old', action_type: 'blocker_report' }]);
+      await upgraded.query(
+        "INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,outcome) VALUES ('new','test','remediation_nudge','{}','deferred')"
+      );
+      await expect(
+        upgraded.query("UPDATE tm_journal SET outcome='invented' WHERE id='old'")
+      ).rejects.toThrow();
+      await expect(
+        upgraded.query("UPDATE tm_journal SET grade='invented' WHERE id='old'")
+      ).rejects.toThrow();
+      expect((await upgraded.query('SELECT id FROM tm_journal')).rows).toHaveLength(2);
+    } finally {
+      await upgraded.close();
+      unlinkSync(path);
+    }
+  });
+
   test('reset winning before notice enqueue rejects the obsolete paused epoch', async () => {
     await db.query(`INSERT INTO dispatch_principals
       (principal_id, display_name, delivery_mode, active)
@@ -1176,6 +1247,57 @@ describe('tm_journal DAL', () => {
       "SELECT COUNT(*) AS cnt FROM tm_journal WHERE thread_ref = 'taskmaster:reset'"
     );
     expect(Number(audits.rows[0]?.cnt)).toBe(2);
+  });
+
+  // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01 Test 8a: the REAL resume expiry
+  // pass (EXPIRE_UNSENT_PROPOSALS) turns parked and pending escalate_p0 rows into
+  // 'expired', which the escalate_p0 dedupe window then ignores (loop Test 8b).
+  test('escalate_p0 dedupe resume expiry: real resetTaskmaster expires parked and pending escalate_p0', async () => {
+    await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'test',
+      pause_actor: 'operator',
+    });
+    const parked = await recordAction({
+      thread_ref: 'gh:test/repo#8',
+      action_type: 'escalate_p0',
+      proposal_json: '{"reason":"paused"}',
+      idempotency_key: 'tm:escalate_p0:gh:test/repo#8:1',
+      outcome: 'parked',
+    });
+    const pending = await recordAction({
+      thread_ref: 'gh:test/repo#9',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: 'tm:escalate_p0:gh:test/repo#9:1',
+      outcome: 'pending',
+    });
+    const fire = await recordAction({
+      thread_ref: 'gh:test/repo#10',
+      action_type: 'fire_cauldron',
+      proposal_json: '{}',
+      idempotency_key: 'tm:fire:gh:test/repo#10:1',
+      outcome: 'pending',
+    });
+    const sent = await recordAction({
+      thread_ref: 'gh:test/repo#11',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: 'tm:escalate_p0:gh:test/repo#11:1',
+      outcome: 'sent',
+    });
+
+    const reset = await resetTaskmaster({ actor: 'operator', reason: 'resume' });
+
+    expect(reset.expiredProposals).toBe(2);
+    const outcomeOf = async (id: string): Promise<string | undefined> =>
+      (await db.query<{ outcome: string }>('SELECT outcome FROM tm_journal WHERE id = $1', [id]))
+        .rows[0]?.outcome;
+    expect(await outcomeOf(parked.id)).toBe('expired');
+    expect(await outcomeOf(pending.id)).toBe('expired');
+    expect(await outcomeOf(fire.id)).toBe('pending');
+    expect(await outcomeOf(sent.id)).toBe('sent');
   });
 
   test('already-running reset preserves the epoch window and accumulated noise grades', async () => {

@@ -1,21 +1,22 @@
 /**
  * Taskmaster loop tests -- Section 11 scenarios 1, 3, 4, 5 plus the
- * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
- * fake dispatch); no mock.module.
+ * auto-circuit. Dependency-injected clocks and effects; most DALs are fake,
+ * while cooldown-history regressions use the production DAL on isolated
+ * SQLite. No mock.module.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { rootLogger } from '@archon/paths';
-import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+import * as githubMetering from '@archon/core/github/metering';
 import {
   setSeatUsageReaderForTests,
   unknownSeatReading,
 } from '@archon/workflows/reliability/seat-usage';
 
 // A synthetic exhausted response belongs to its test, never the next caller.
-beforeEach(resetGitHubApiMeterForTests);
-afterEach(resetGitHubApiMeterForTests);
+beforeEach(githubMetering.resetGitHubApiMeterForTests);
+afterEach(githubMetering.resetGitHubApiMeterForTests);
 import {
   createTaskmasterState,
   defaultFindEffectByIdempotencyKey,
@@ -41,6 +42,7 @@ import {
   type AdoptionRefreshResult,
 } from './loop';
 import { checkEvidence, checkExpectations } from './expectations';
+import { MAX_EFFECTS_ENV, SENT_WINDOW_ENV } from './escalation-dedupe';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -72,6 +74,8 @@ import type {
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import * as taskmasterConnection from '@archon/core/db/connection';
+import * as fireBudgetDb from '@archon/core/db/taskmaster';
 
 describe('Taskmaster reset visibility and canary', () => {
   test('legacy_unverified receipts are never post-cutover evidence', () => {
@@ -282,6 +286,53 @@ function makeWorld(): FakeWorld {
   };
 }
 
+const budgetStores = new WeakMap<FakeWorld, SqliteAdapter>();
+const openedBudgetStores: SqliteAdapter[] = [];
+afterAll(async () => {
+  for (const db of openedBudgetStores) await db.close();
+});
+function fixtureFireBudget(world: FakeWorld): NonNullable<TaskmasterDeps['fireBudget']> {
+  const database = async (): Promise<SqliteAdapter> => {
+    let db = budgetStores.get(world);
+    if (!db) {
+      db = new SqliteAdapter(':memory:');
+      budgetStores.set(world, db);
+      openedBudgetStores.push(db);
+    }
+    await db.query('UPDATE tm_control SET pause_state=$1,epoch=$2 WHERE id=1', [
+      world.control.pause_state,
+      world.control.epoch,
+    ]);
+    for (const row of world.journal)
+      await db.query(
+        `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET outcome=$6,proposal_json=$4`,
+        [
+          row.id,
+          row.thread_ref,
+          row.action_type,
+          row.proposal_json,
+          row.idempotency_key,
+          row.outcome,
+          row.created_at,
+        ]
+      );
+    return db;
+  };
+  return {
+    reserveAutomaticFire: async input => fireBudgetDb.reserveAutomaticFire(input, await database()),
+    authorizeAutomaticFire: async input =>
+      fireBudgetDb.authorizeAutomaticFire(input, await database()),
+    releaseAutomaticFire: async input => fireBudgetDb.releaseAutomaticFire(input, await database()),
+    settleAutomaticFire: async input => fireBudgetDb.settleAutomaticFire(input, await database()),
+    seedAutomaticFireHistory: async input =>
+      fireBudgetDb.seedAutomaticFireHistory(input, await database()),
+    listAutomaticFireAdmissions: async () =>
+      fireBudgetDb.listAutomaticFireAdmissions(await database()),
+    updateAutomaticFireExpectation: async input =>
+      fireBudgetDb.updateAutomaticFireExpectation(input, await database()),
+  };
+}
 function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): TaskmasterDeps {
   let journalSeq = world.journal.length;
   const dal = {
@@ -546,6 +597,28 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
     getGithubIssueEvidence: async () => null,
     ...overrides,
+    fireBudget: overrides.fireBudget ?? fixtureFireBudget(world),
+    readFireCascade: overrides.readFireCascade ?? (async () => null),
+    ...(overrides.runCascade
+      ? {
+          runCascade: (async options => {
+            const provenance = await options.beforeAdmission?.();
+            const normalize = (
+              record: Awaited<ReturnType<NonNullable<TaskmasterDeps['runCascade']>>>
+            ) => ({
+              ...record,
+              cascadeId: options.dispatchId!,
+              automaticFireAdmission: provenance,
+              attempts: record.attempts ?? [{ runId: record.cascadeId }],
+            });
+            const record = await overrides.runCascade!({
+              ...options,
+              onAdmission: (record, created) => options.onAdmission?.(normalize(record), created),
+            });
+            return normalize(record);
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        }
+      : {}),
   };
 }
 
@@ -803,6 +876,71 @@ const EXPECTED_SPEC = {
   specHash: `sha256:${'b'.repeat(64)}`,
 };
 describe('fire_cauldron loop', () => {
+  test.each(['refused', 'planned'] as const)(
+    'definitive pre-permission %s releases only the owned reservation',
+    async status => {
+      const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const deps = makeDeps(world, {
+          listThreads: async () => [
+            makeListedThread({
+              ref: 'gh:thinmansoftware/bdc-harness#709',
+              title: 'WO-HARNESS-EXAMPLE-709',
+              priority: 'P0',
+              isUnclaimed: true,
+              isUnclaimedP0: true,
+            }),
+          ],
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-709',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+            },
+          }),
+        });
+        let calls = 0;
+        // Bypass the fixture's automatic gate wrapper: a real pre-admission
+        // refusal/dry-run returns WITHOUT asking for permission.
+        deps.runCascade = async options => {
+          calls++;
+          return {
+            cascadeId: options.dispatchId,
+            woId: options.woId,
+            project: options.project,
+            status,
+            attempts: [],
+          } as never;
+        };
+        const result = await tick(createTaskmasterState(60_000), deps);
+        expect(calls).toBe(1);
+        expect(result.failed).toBe(0);
+        expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe(
+          'expired'
+        );
+        const rows = (
+          await budgetStores.get(world)!.query<{
+            state: string;
+            admitted_at: string | null;
+          }>('SELECT state,admitted_at FROM tm_fire_admissions')
+        ).rows;
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.state).toBe('released');
+        expect(rows[0]?.admitted_at).toBeNull();
+      } finally {
+        if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+        else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+      }
+    }
+  );
+
   test('beyond_first_page_cannot_fire_by_default', async () => {
     const priorFireVerb = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     const priorBeyondPage = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;
@@ -1099,6 +1237,47 @@ describe('fire_cauldron loop', () => {
     }
   });
 
+  test('eligibility listing: one memo per tick, shared by every check, dropped after (WO-HARNESS-TASKMASTER-ELIGIBILITY-LISTING-SHARE-01)', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const seenMemos: unknown[] = [];
+      const run = async (): Promise<void> => {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const threads = [531, 532, 533].map(number =>
+          makeListedThread({
+            ref: `gh:thinmansoftware/bdc-harness#${number}`,
+            priority: 'P1',
+            isUnclaimed: true,
+            title: `WO-HARNESS-EXAMPLE-${number} build`,
+          })
+        );
+        const deps = makeDeps(world, {
+          listThreads: async () => threads,
+          checkFireEligibility: async (_title, eligibilityDeps) => {
+            seenMemos.push(eligibilityDeps?.listingMemo);
+            return { eligible: false, reason: 'missing_spec' };
+          },
+        });
+        await tick(createTaskmasterState(60_000), deps);
+      };
+      await run();
+      await run();
+      expect(seenMemos).toHaveLength(6);
+      // all three checks of a tick get the same Map, and the next tick gets a different one
+      expect(seenMemos[0]).toBeInstanceOf(Map);
+      expect(seenMemos[1]).toBe(seenMemos[0]);
+      expect(seenMemos[2]).toBe(seenMemos[0]);
+      expect(seenMemos[3]).toBeInstanceOf(Map);
+      expect(seenMemos[3]).not.toBe(seenMemos[0]);
+      expect(seenMemos[4]).toBe(seenMemos[3]);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
   test('mixed immediate proposals keep exceptions ahead of priority-ordered fires', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
@@ -1174,7 +1353,7 @@ describe('fire_cauldron loop', () => {
     }
   });
 
-  test('fire cap dispatches P0 through P2 first and defers overflow for the next tick', async () => {
+  test('daily cap dispatches P0 and P1 first and preserves overflow across ticks and restart', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1223,26 +1402,22 @@ describe('fire_cauldron loop', () => {
       });
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
-      expect(admitted).toEqual([
-        'WO-HARNESS-EXAMPLE-510',
-        'WO-HARNESS-EXAMPLE-511',
-        'WO-HARNESS-EXAMPLE-512',
-      ]);
-      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(2);
+      expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-510', 'WO-HARNESS-EXAMPLE-511']);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(3);
 
       world.nowMs += 60_000;
       await tick(state, deps);
-      expect(admitted.slice(3).sort()).toEqual([
-        'WO-HARNESS-EXAMPLE-513',
-        'WO-HARNESS-EXAMPLE-514',
-      ]);
+      expect(admitted).toHaveLength(2);
+      world.nowMs += 60_000;
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted).toHaveLength(2);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
   });
 
-  test('prior same-day sent fires do not impose a daily fire ceiling', async () => {
+  test('prior same-day unresolved automatic fires close the daily faucet', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1299,7 +1474,7 @@ describe('fire_cauldron loop', () => {
           }) as NonNullable<TaskmasterDeps['runCascade']>,
         })
       );
-      expect(admissions).toBe(1);
+      expect(admissions).toBe(0);
       expect(world.journal.filter(row => row.action_type === 'fire_cauldron')).toHaveLength(3);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
@@ -1750,6 +1925,151 @@ describe('pending fire custody', () => {
     return { deps, fires: () => fires };
   }
 
+  test.each([false, true])(
+    'delayed admission shares its durable deadline with supervision (crash=%s)',
+    async crashAfterRegistration => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const native = new SqliteAdapter(':memory:');
+      await native.query("UPDATE tm_control SET pause_state='RUNNING',epoch=$1 WHERE id=1", [
+        world.control.epoch,
+      ]);
+      const budget: NonNullable<TaskmasterDeps['fireBudget']> = {
+        reserveAutomaticFire: input => fireBudgetDb.reserveAutomaticFire(input, native),
+        authorizeAutomaticFire: input => fireBudgetDb.authorizeAutomaticFire(input, native),
+        releaseAutomaticFire: input => fireBudgetDb.releaseAutomaticFire(input, native),
+        settleAutomaticFire: input => fireBudgetDb.settleAutomaticFire(input, native),
+        seedAutomaticFireHistory: input => fireBudgetDb.seedAutomaticFireHistory(input, native),
+        listAutomaticFireAdmissions: () => fireBudgetDb.listAutomaticFireAdmissions(native),
+        updateAutomaticFireExpectation: input =>
+          fireBudgetDb.updateAutomaticFireExpectation(input, native),
+      };
+      const fixture = setup(world, { fireBudget: budget });
+      const dal = fixture.deps.db!;
+      let interrupted = false;
+      fixture.deps.db = {
+        ...dal,
+        recordAction: async data => {
+          const row = await dal.recordAction(data);
+          await native.query(
+            `INSERT INTO tm_journal
+          (id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at,proof_deadline_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              row.id,
+              row.thread_ref,
+              row.action_type,
+              row.proposal_json,
+              row.idempotency_key,
+              row.outcome,
+              row.created_at,
+              row.proof_deadline_at,
+            ]
+          );
+          return row;
+        },
+        getActionByIdempotencyKey: async key =>
+          (
+            await native.query<TmJournalEntry>(
+              'SELECT * FROM tm_journal WHERE idempotency_key=$1',
+              [key]
+            )
+          ).rows[0] ?? null,
+        listPendingFireActions: async () =>
+          (
+            await native.query<TmJournalEntry>(
+              "SELECT * FROM tm_journal WHERE action_type='fire_cauldron' AND outcome='pending'"
+            )
+          ).rows,
+        registerExpectation: async data => {
+          const key = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+          // Match production idempotency: an existing expectation's deadline is retained.
+          await native.query(
+            `INSERT INTO tm_expectations
+          (id,registration_key,dispatch_ref,recipient,evidence_json,due_at,on_absence,max_retries,
+           retries,status,registered_by,self_supervised,created_at,updated_at)
+          VALUES ($1,$1,$2,$3,$4,$5,$6,$7,0,'pending','taskmaster',0,$8,$8)
+          ON CONFLICT(registration_key) DO NOTHING`,
+            [
+              key,
+              data.dispatch_ref,
+              data.recipient,
+              data.evidence_json,
+              data.due_at,
+              data.on_absence,
+              data.max_retries,
+              new Date(world.nowMs).toISOString(),
+            ]
+          );
+          return key;
+        },
+        getExpectationByRegistrationKey: async key =>
+          (
+            await native.query<TmExpectation>(
+              'SELECT * FROM tm_expectations WHERE registration_key=$1',
+              [key]
+            )
+          ).rows[0] ?? null,
+        transitionPendingFireAction: async (id, expected, outcome, proposal) => {
+          if (crashAfterRegistration && outcome === 'sent' && !interrupted) {
+            interrupted = true;
+            return false; // Crash boundary: supervision persisted, journal still pending.
+          }
+          const result = await native.query(
+            `UPDATE tm_journal SET outcome=$1,proposal_json=$2
+          WHERE id=$3 AND outcome='pending' AND proposal_json=$4`,
+            [outcome, proposal, id, expected]
+          );
+          if (result.rowCount)
+            await dal.transitionPendingFireAction!(id, expected, outcome, proposal);
+          return result.rowCount === 1;
+        },
+      };
+      fixture.deps.runCascade = async options => {
+        world.nowMs += 45 * 60_000; // Async preflight finishes well after journal creation.
+        const permission = await options.beforeAdmission!();
+        const record = {
+          cascadeId: options.dispatchId!,
+          woId: options.woId,
+          project: options.project,
+          automaticFireAdmission: permission,
+          status: 'running',
+          attempts: [{ runId: 'actual-delayed-workflow' }],
+        } as Awaited<ReturnType<NonNullable<TaskmasterDeps['runCascade']>>>;
+        options.onAdmission?.(record, true);
+        return record;
+      };
+      try {
+        await tick(createTaskmasterState(60_000), fixture.deps);
+        const row = (
+          await native.query<TmJournalEntry>(
+            "SELECT * FROM tm_journal WHERE action_type='fire_cauldron'"
+          )
+        ).rows[0]!;
+        const expectation = (await native.query<TmExpectation>('SELECT * FROM tm_expectations'))
+          .rows[0]!;
+        const correctDue = new Date(world.nowMs + 86_400_000).toISOString();
+        expect(row.proof_deadline_at).toBe(correctDue);
+        expect(expectation.due_at).toBe(correctDue);
+        expect(row.outcome).toBe(crashAfterRegistration ? 'pending' : 'sent');
+        if (crashAfterRegistration) {
+          fixture.deps.listThreads = async () => []; // Recover custody without proposing new work.
+          await tick(createTaskmasterState(60_000), fixture.deps);
+          const recovered = (
+            await native.query<TmJournalEntry>('SELECT * FROM tm_journal WHERE id=$1', [row.id])
+          ).rows[0]!;
+          expect(recovered.outcome).toBe('sent');
+          expect((await native.query('SELECT * FROM tm_expectations')).rows).toHaveLength(1);
+          expect(
+            (await native.query<TmExpectation>('SELECT * FROM tm_expectations')).rows[0]!.due_at
+          ).toBe(correctDue);
+        }
+      } finally {
+        await native.close();
+      }
+    }
+  );
+
   test('admission without a proven workflow stays pending across later ticks and buckets', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -1797,26 +2117,53 @@ describe('pending fire custody', () => {
     expect(stored.due_at).toBe(fire.proof_deadline_at);
   });
 
-  test('explicit zero-attempt refusal expires without reporting a sent fire', async () => {
+  test('explicit zero-attempt refusal before permission expires without reporting a sent fire', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world);
+    // Use the real pre-permission boundary, bypassing the admitted-fire wrapper.
+    fixture.deps.runCascade = async options =>
+      ({
+        cascadeId: options.dispatchId,
+        woId: options.woId,
+        project: options.project,
+        status: 'refused',
+        attempts: [],
+      }) as never;
+    const result = await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('expired');
+    expect(result.effects).toBe(0);
+    expect(world.expectations.size).toBe(0);
+  });
+
+  test('zero-attempt refusal after committed permission stays charged and pending', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     const fixture = setup(world, {
-      runCascade: async options => {
-        const record = {
+      runCascade: async options =>
+        ({
           cascadeId: options.dispatchId,
           woId: options.woId,
           project: options.project,
           status: 'refused',
           attempts: [],
-        } as never;
-        options.onAdmission?.(record, true);
-        return record;
+        }) as never,
+      readFireCascadeEvidence: async () => {
+        throw new Error('no workflow proof');
       },
     });
     const result = await tick(createTaskmasterState(60_000), fixture.deps);
-    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('expired');
+    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('pending');
     expect(result.effects).toBe(0);
-    expect(world.expectations.size).toBe(0);
+    const rows = (
+      await budgetStores.get(world)!.query<{
+        state: string;
+        admitted_at: string | null;
+      }>('SELECT state,admitted_at FROM tm_fire_admissions')
+    ).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.state).toBe('admitted');
+    expect(rows[0]!.admitted_at).not.toBeNull();
   });
 
   test('ambiguous dispatch rejection retains pending custody instead of retryable failure', async () => {
@@ -1839,31 +2186,72 @@ describe('pending fire custody', () => {
     expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('pending');
   });
 
-  test('four unconfirmed admissions consume only the existing three fire slots', async () => {
+  test('uncertain release storage preserves pending custody after an ambiguous launch', async () => {
     const world = makeWorld();
     seedDigestSent(world);
+    const budget = fixtureFireBudget(world);
     const fixture = setup(world, {
-      listThreads: async () =>
-        [1, 2, 3, 4].map(n =>
-          makeListedThread({
-            ref: `gh:thinmansoftware/bdc-harness#${700 + n}`,
-            priority: 'P0',
-            isUnclaimedP0: true,
-            title: `WO-HARNESS-CUSTODY-${String(n).padStart(2, '0')}`,
-          })
-        ),
+      fireBudget: {
+        ...budget,
+        releaseAutomaticFire: async () => {
+          throw new Error('synthetic storage uncertainty');
+        },
+      },
+      runCascade: async () => {
+        throw new Error('synthetic lost launch result');
+      },
       readFireCascadeEvidence: async () => {
-        throw new Error('not ready');
+        throw new Error('unknown workflow');
       },
     });
-    const result = await tick(createTaskmasterState(60_000), fixture.deps);
-    expect(fixture.fires()).toBe(3);
-    expect(
-      world.journal.filter(row => row.action_type === 'fire_cauldron' && row.outcome === 'pending')
-    ).toHaveLength(3);
-    expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(1);
-    expect(result.effects).toBe(0);
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('pending');
+    const rows = await budget.listAutomaticFireAdmissions();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.state).toBe('unknown');
+    expect(rows[0]!.admitted_at).not.toBeNull();
   });
+
+  test.each([
+    [2, 2],
+    [5, 3],
+  ])(
+    'unconfirmed admissions obey daily limit %i and per-tick ceiling (%i)',
+    async (limit, expected) => {
+      const previous = process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+      process.env.TASKMASTER_FIRE_MAX_PER_DAY = String(limit);
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const fixture = setup(world, {
+          listThreads: async () =>
+            [1, 2, 3, 4].map(n =>
+              makeListedThread({
+                ref: `gh:thinmansoftware/bdc-harness#${700 + n}`,
+                priority: 'P0',
+                isUnclaimedP0: true,
+                title: `WO-HARNESS-CUSTODY-${String(n).padStart(2, '0')}`,
+              })
+            ),
+          readFireCascadeEvidence: async () => {
+            throw new Error('not ready');
+          },
+        });
+        const result = await tick(createTaskmasterState(60_000), fixture.deps);
+        expect(fixture.fires()).toBe(expected);
+        expect(
+          world.journal.filter(
+            row => row.action_type === 'fire_cauldron' && row.outcome === 'pending'
+          )
+        ).toHaveLength(expected);
+        expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(4 - expected);
+        expect(result.effects).toBe(0);
+      } finally {
+        if (previous === undefined) delete process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+        else process.env.TASKMASTER_FIRE_MAX_PER_DAY = previous;
+      }
+    }
+  );
 
   function seedPending(world: FakeWorld, ageDays = 8): TmJournalEntry {
     const key = 'tm:fire:old-custody';
@@ -3991,15 +4379,158 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
       chunks.push(String(chunk));
       return true;
     };
+    // The 403 is a metered search backoff. Keep it in memory for this test
+    // only -- flushing would publish backoff:search into the shared pool table.
+    const flushSpy = spyOn(githubMetering, 'flushGitHubApiMeter').mockResolvedValue(undefined);
     try {
       const threads = await defaultListThreads(fetchImpl);
+      expect(flushSpy).toHaveBeenCalledTimes(1);
       expect(threads).toHaveLength(1);
       expect(threads[0]?.isUnclaimed).toBe(true);
       expect(threads[0]?.isUnclaimedP0).toBe(true);
       expect(chunks.join('')).toContain('taskmaster.pr_claim_lookup_failed');
     } finally {
+      githubMetering.resetGitHubApiMeterForTests();
+      flushSpy.mockRestore();
       stream.write = originalWrite;
     }
+  });
+
+  test('owner_label_makes_unassigned_issue_claimed', async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes('/search/issues')) {
+        return new Response(JSON.stringify({ items: [{ title: 'WO-HARNESS-OWNER-LABEL-01' }] }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo'
+          ? [ghIssue(1538, ['prio:P0', 'owner:cursor'], { title: 'WO-HARNESS-OWNER-LABEL-01' })]
+          : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.ownerLogin).toBe('cursor');
+    expect(threads[0]?.isUnclaimed).toBe(false);
+    expect(threads[0]?.isUnclaimedP0).toBe(false);
+    expect(threads[0]?.recipient).toBe('xo');
+    expect(urls.some(url => url.includes('/search/issues'))).toBe(false);
+  });
+
+  test('unlabelled_unassigned_issue_stays_unclaimed', async () => {
+    // Search backoff lives in the shared github_api_pool_state table. Ignore it
+    // for this claim lookup so the test does not delete or depend on that row.
+    const originalAssert = githubMetering.assertPersistedGitHubPoolAvailable;
+    const gate = spyOn(githubMetering, 'assertPersistedGitHubPoolAvailable').mockImplementation(
+      async (poolId, resources, db, now) => {
+        const rest = resources.filter(resource => resource !== 'search');
+        if (rest.length === 0) return;
+        await originalAssert(poolId, rest, db, now);
+      }
+    );
+    const urls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes('/search/issues')) {
+        return new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo' ? [ghIssue(1539, ['prio:P0'], { title: 'WO-HARNESS-OWNER-LABEL-02' })] : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    try {
+      const threads = await defaultListThreads(fetchImpl);
+      expect(threads).toHaveLength(1);
+      expect(threads[0]?.ownerLogin).toBeNull();
+      expect(threads[0]?.isUnclaimed).toBe(true);
+      expect(threads[0]?.isUnclaimedP0).toBe(true);
+      expect(urls.filter(url => url.includes('/search/issues'))).toHaveLength(1);
+    } finally {
+      gate.mockRestore();
+    }
+  });
+
+  test('assignee_wins_and_invalid_owner_label_is_ignored', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      wo: [
+        ghIssue(1540, ['prio:P0', 'owner:cursor'], { assignees: [{ login: 'jdoe' }] }),
+        ghIssue(1541, ['prio:P0', 'owner:user @team']),
+        ghIssue(1542, ['prio:P0', 'owner:']),
+      ],
+    });
+
+    const threads = await defaultListThreads(fetchImpl);
+    const byNumber = new Map(threads.map(thread => [Number(thread.ref.split('#')[1]), thread]));
+    expect(byNumber.get(1540)?.ownerLogin).toBe('jdoe');
+    expect(byNumber.get(1541)?.ownerLogin).toBeNull();
+    expect(byNumber.get(1541)?.isUnclaimed).toBe(true);
+    expect(byNumber.get(1542)?.ownerLogin).toBeNull();
+    expect(byNumber.get(1542)?.isUnclaimed).toBe(true);
+  });
+
+  test('evidence_owner_uses_owner_label_fallback', async () => {
+    const bodies = [
+      {
+        number: 1543,
+        state: 'open',
+        updated_at: new Date(T0).toISOString(),
+        labels: [{ name: 'owner:codex' }],
+        assignees: [],
+        title: 'labelled',
+      },
+      [],
+      [],
+    ];
+    let call = 0;
+    const fetchImpl = (async () => {
+      const body = bodies[call] ?? [];
+      call += 1;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const evidence = await defaultGetGithubIssueEvidence(
+      'gh:thinmansoftware/bdc-harness#1543',
+      new Date(T0).toISOString(),
+      fetchImpl
+    );
+    expect(evidence?.ownerLogin).toBe('codex');
   });
 });
 
@@ -4691,7 +5222,7 @@ describe('M-155 exception push (loop)', () => {
     expect(nudges[0]?.body).toContain('Chronic but titled');
   });
 
-  test('push: the six-verb allowlist and the budgets are explicit (regression)', () => {
+  test('push: the seven-verb allowlist and the budgets are explicit (regression)', () => {
     expect(MAX_INTERVENTIONS_PER_ITEM_24H).toBe(3);
     expect(MAX_EFFECTS_PER_TICK).toBe(10);
     expect([...TM_ALLOWED_ACTION_TYPES]).toEqual([
@@ -4701,6 +5232,9 @@ describe('M-155 exception push (loop)', () => {
       'digest',
       'fire_cauldron',
       'blocker_report',
+      // WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: the remediation owner
+      // nudge. TM_ALLOWED_RECIPIENTS below is deliberately UNCHANGED.
+      'remediation_nudge',
     ]);
     expect([...TM_ALLOWED_RECIPIENTS]).toEqual([
       'xo',
@@ -4708,6 +5242,9 @@ describe('M-155 exception push (loop)', () => {
       'captain-ci',
       'operator',
       'duty-officer',
+      't3-desktop',
+      'codex-mcp',
+      't3-desk-local',
     ]);
   });
 
@@ -4767,7 +5304,13 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     });
   }
 
-  test('adopt_fixup_stale_epoch_expired_does_not_suppress', async () => {
+  // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01 (Amendments 3 and 7) replaces the
+  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 rule ("ANY escalate_p0 outcome in the
+  // trailing 24h suppresses"): only a 'sent' row starts the window and a 'failed'
+  // row starts the 6h retry backoff. An expired, pending or claim_held row under
+  // ANOTHER key no longer silences a real P0. The same bucket key is still caught
+  // by the unchanged same-key skip, and GitHub posts by the claim and the marker.
+  test('adopt_fixup_stale_epoch_expired_within_24h_does_not_suppress', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     seedEscalation(world, 'expired', { type: 'escalate_p0' });
@@ -4782,12 +5325,13 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     expect(result.effects).toBe(1);
     expect(gh.posts()).toBe(1);
-    expect(
-      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
-    ).toHaveLength(2);
+    const rows = world.journal.filter(
+      row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+    );
+    expect(rows.map(row => row.outcome).sort()).toEqual(['expired', 'sent']);
   });
 
-  test('adopt_fixup_pending_and_suppressed_dedupe_boundaries', async () => {
+  test('adopt_fixup_pending_and_suppressed_dedupe_boundaries_does_not_suppress', async () => {
     const pendingWorld = makeWorld();
     seedDigestSent(pendingWorld);
     seedEscalation(pendingWorld, 'pending', { type: 'escalate_p0' });
@@ -4801,11 +5345,15 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     await tick(createTaskmasterState(60_000), pendingDeps);
 
     expect(pendingGh.posts()).toBe(1);
+    // The tick's existing reconcile step (taskmaster.reconcile_pending_expired)
+    // expires the stale pending seed before the dedupe check; the real P0 is
+    // still sent, which is what this boundary asserts.
     expect(
-      pendingWorld.journal.filter(
-        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
-      )
-    ).toHaveLength(2);
+      pendingWorld.journal
+        .filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+        .map(row => row.outcome)
+        .sort()
+    ).toEqual(['expired', 'sent']);
 
     const suppressedWorld = makeWorld();
     seedDigestSent(suppressedWorld);
@@ -4822,12 +5370,86 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     await tick(createTaskmasterState(60_000), suppressedDeps);
 
-    expect(suppressedGh.posts()).toBe(0);
+    expect(suppressedGh.posts()).toBe(1);
     expect(
-      suppressedWorld.journal.filter(
-        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
-      )
-    ).toHaveLength(1);
+      suppressedWorld.journal
+        .filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+        .map(row => row.outcome)
+        .sort()
+    ).toEqual(['expired', 'sent']);
+  });
+
+  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01, Tests 5 and 6 (tick level), updated by
+  // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01 Amendment 7: a failed delivery is
+  // still attempted once per stall, and the first suppressed re-proposal inside
+  // the 6h retry backoff is journaled once (one skip row) instead of dropped.
+  const isSkipRow = (row: TmJournalEntry): boolean =>
+    row.proposal_json.includes('"suppressed":"recent_escalation"');
+  function failingDispatchDeps(world: FakeWorld, attempts: string[]): TaskmasterDeps {
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0('dispatch:orphan-p0-1')],
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+    const originalCreate = deps.createTask!;
+    deps.createTask = (async (context, data, fence) => {
+      if (data.idempotency_key.startsWith('tm:escalate_p0:')) {
+        attempts.push(data.recipient);
+        throw new Error('dispatch_send_failed_for_test');
+      }
+      return originalCreate(context, data, fence);
+    }) as typeof deps.createTask;
+    return deps;
+  }
+
+  test('Test 5: one escalate_p0 per stall, even when delivery fails', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const attempts: string[] = [];
+    const deps = failingDispatchDeps(world, attempts);
+    const state = createTaskmasterState(60_000);
+
+    for (let i = 0; i < 4; i += 1) {
+      await tick(state, deps);
+      world.nowMs += 9 * 60_000;
+    }
+
+    const all = world.journal.filter(
+      j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'
+    );
+    const rows = all.filter(row => !isSkipRow(row));
+    expect(all.filter(isSkipRow)).toHaveLength(1);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.outcome).toBe('failed');
+    // The failure reason is now recorded on the row instead of only logged.
+    expect(JSON.parse(rows[0]?.proposal_json ?? '{}')).toMatchObject({
+      recipient: 't3-desktop',
+      failure: 'dispatch_send_failed_for_test',
+    });
+    expect(attempts).toEqual(['t3-desktop']);
+  });
+
+  test('Test 6: a stall unmoved after 24 hours escalates once more', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const attempts: string[] = [];
+    const deps = failingDispatchDeps(world, attempts);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    expect(attempts).toHaveLength(1);
+
+    world.nowMs += 25 * 3_600_000;
+    await tick(state, deps);
+    expect(attempts).toHaveLength(2);
+
+    world.nowMs += 30 * 60_000;
+    await tick(state, deps);
+    expect(attempts).toHaveLength(2);
+    const all = world.journal.filter(
+      j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'
+    );
+    expect(all.filter(row => !isSkipRow(row))).toHaveLength(2);
+    expect(all.filter(isSkipRow)).toHaveLength(1);
   });
 
   test('adopt_fixup_concurrent_ticks_journal_one_escalation', async () => {
@@ -4864,9 +5486,14 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       releaseLookback?.();
     }
 
-    expect(
-      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
-    ).toHaveLength(1);
+    // Amendment 7: still exactly one post and one escalation row. The second
+    // tick reads the first tick's sent row and journals exactly ONE skip row
+    // (the old 24h rule dropped it silently, so a regression fails here).
+    const rows = world.journal.filter(
+      row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+    );
+    expect(rows.filter(row => !isSkipRow(row))).toHaveLength(1);
+    expect(rows.filter(isSkipRow)).toHaveLength(1);
     expect(gh.posts()).toBe(1);
   });
 
@@ -5163,7 +5790,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     ).toHaveLength(0);
   });
 
-  test('a non-gh escalate_p0 thread keeps the operator-mailbox dispatch path', async () => {
+  test('a non-gh escalate_p0 thread uses the t3-desktop dispatch path', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     const gh = makeIssueCommentSink(world);
@@ -5182,7 +5809,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       m.idempotency_key.startsWith('tm:escalate_p0:')
     );
     expect(escalations).toHaveLength(1);
-    expect(escalations[0]?.recipient).toBe('operator');
+    expect(escalations[0]?.recipient).toBe('t3-desktop');
     expect(escalations[0]?.body).toContain('Unclaimed P0');
   });
 
@@ -5207,7 +5834,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
         m.idempotency_key.startsWith('tm:escalate_p0:')
       );
       expect(escalations).toHaveLength(1);
-      expect(escalations[0]?.recipient).toBe('operator');
+      expect(escalations[0]?.recipient).toBe('t3-desktop');
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_ESCALATE_TO_ISSUE;
       else process.env.TASKMASTER_ESCALATE_TO_ISSUE = prior;
@@ -5563,5 +6190,572 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
       if (priorFire === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
     }
+  });
+});
+
+describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01)', () => {
+  const HOUR = 3_600_000;
+  const DAY = 24 * HOUR;
+  const REF = 'gh:thinmansoftware/bdc-xo#4932';
+  const ENV_KEYS = ['TASKMASTER_ESCALATE_TO_ISSUE', SENT_WINDOW_ENV, MAX_EFFECTS_ENV] as const;
+  const priorEnv = new Map<string, string | undefined>();
+
+  // The dispatch path (not the GitHub-issue path) so the dedupe is observed
+  // alone, without the separate 72h issue-marker cooldown.
+  beforeEach(() => {
+    for (const key of ENV_KEYS) priorEnv.set(key, process.env[key]);
+    process.env.TASKMASTER_ESCALATE_TO_ISSUE = 'false';
+    delete process.env[SENT_WINDOW_ENV];
+    delete process.env[MAX_EFFECTS_ENV];
+  });
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      const prior = priorEnv.get(key);
+      if (prior === undefined) delete process.env[key];
+      else process.env[key] = prior;
+    }
+  });
+
+  function p0(ref = REF): ListedThread {
+    return makeListedThread({
+      ref,
+      priority: 'P0',
+      isUnclaimed: true,
+      isUnclaimedP0: true,
+      lastActivityAt: new Date(T0 - 6 * HOUR).toISOString(),
+      title: 'WO-HARNESS-EXAMPLE-4932 stuck P0',
+    });
+  }
+
+  function depsFor(
+    world: FakeWorld,
+    threads: () => ListedThread[],
+    overrides: Partial<TaskmasterDeps> = {}
+  ): TaskmasterDeps {
+    return makeDeps(world, {
+      listThreads: async () => threads(),
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+      ...overrides,
+    });
+  }
+
+  const sendsFor = (world: FakeWorld, ref?: string) =>
+    world.sentMessages.filter(m =>
+      m.idempotency_key.startsWith(ref ? `tm:escalate_p0:${ref}:` : 'tm:escalate_p0:')
+    );
+  const skipRows = (world: FakeWorld, ref = REF) =>
+    world.journal.filter(
+      j =>
+        j.action_type === 'escalate_p0' &&
+        j.thread_ref === ref &&
+        j.outcome === 'expired' &&
+        j.proposal_json.includes('"suppressed":"recent_escalation"')
+    );
+  const bucketKey = (ref: string, atMs: number): string =>
+    `tm:escalate_p0:${ref}:${Math.floor(atMs / DAY)}`;
+
+  function seedRow(world: FakeWorld, outcome: TmActionOutcome, hoursAgo: number): TmJournalEntry {
+    const createdMs = world.nowMs - hoursAgo * HOUR;
+    const row: TmJournalEntry = {
+      id: `journal-dedupe-seed-${world.journal.length}`,
+      created_at: new Date(createdMs).toISOString(),
+      thread_ref: REF,
+      action_type: 'escalate_p0',
+      proposal_json: JSON.stringify({ type: 'escalate_p0', reason: 'unclaimed_p0' }),
+      idempotency_key: bucketKey(REF, world.nowMs),
+      before_hash: null,
+      proof_predicate: null,
+      // Amendment 6, F5: a failed row is retried in place until its proof deadline.
+      proof_deadline_at: new Date(createdMs + DAY).toISOString(),
+      outcome,
+      graded_at: null,
+      grade: null,
+    };
+    world.journal.push(row);
+    return row;
+  }
+
+  /** Run `hours` hourly ticks (hour 0 at the current clock) and report the hours that sent. */
+  async function sendHoursOver(
+    world: FakeWorld,
+    deps: TaskmasterDeps,
+    hours: number
+  ): Promise<number[]> {
+    const state = createTaskmasterState(60_000);
+    const sendHours: number[] = [];
+    let seen = 0;
+    for (let hour = 0; hour < hours; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+      const now = sendsFor(world).length;
+      if (now > seen) sendHours.push(hour);
+      seen = now;
+    }
+    return sendHours;
+  }
+
+  test('escalate_p0 dedupe: skip is journaled once through the tick', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedRow(world, 'sent', 2);
+    const deps = depsFor(world, () => [p0()]);
+    const state = createTaskmasterState(60_000);
+    const rowsAfter: number[] = [];
+
+    for (let i = 0; i < 3; i += 1) {
+      if (i > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+      rowsAfter.push(world.journal.filter(j => j.thread_ref === REF).length);
+    }
+
+    expect(sendsFor(world)).toHaveLength(0);
+    expect(skipRows(world)).toHaveLength(1);
+    // Seed + one skip row after tick 1; ticks 2 and 3 write nothing.
+    expect(rowsAfter).toEqual([2, 2, 2]);
+    // The silent skip of the old 24h any-outcome set is gone from the loop.
+    const source = readFileSync(join(import.meta.dir, 'loop.ts'), 'utf8');
+    // A duplicate proposal for the same thread in the SAME tick is journaled
+    // once as well (validator finding 1): one send, one skip row.
+    const sameTick = makeWorld();
+    seedDigestSent(sameTick);
+    await tick(
+      createTaskmasterState(60_000),
+      depsFor(sameTick, () => [p0(), p0()])
+    );
+    expect(sendsFor(sameTick)).toHaveLength(1);
+    expect(skipRows(sameTick)).toHaveLength(1);
+    // No thread-only set can drop a duplicate without a row any more.
+    expect(source).not.toContain('recentEscalateP0ByThread');
+  });
+
+  test('escalate_p0 dedupe: real P0 fires after the window over 25 hourly ticks', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const sendHours = await sendHoursOver(
+      world,
+      depsFor(world, () => [p0()]),
+      25
+    );
+
+    expect(sendHours).toEqual([0, 24]);
+    const skips = skipRows(world);
+    expect(skips).toHaveLength(1);
+    expect(skips[0]?.created_at).toBe(new Date(T0 + HOUR).toISOString());
+  });
+
+  test('escalate_p0 dedupe: quiet day under 10 sends and an injected P0 is sent', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const refs = [1, 2, 3, 4, 5].map(n => `gh:thinmansoftware/bdc-xo#${9000 + n}`);
+    const injected = 'gh:thinmansoftware/bdc-xo#9100';
+    let injectNow = false;
+    const deps = depsFor(world, () => [
+      ...refs.map(ref => p0(ref)),
+      ...(injectNow ? [p0(injected)] : []),
+    ]);
+    const state = createTaskmasterState(60_000);
+
+    for (let hour = 0; hour < 24; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      if (hour === 12) injectNow = true;
+      await tick(state, deps);
+    }
+
+    expect(sendsFor(world).length).toBeLessThan(10);
+    expect(sendsFor(world)).toHaveLength(6);
+    expect(sendsFor(world, injected)).toHaveLength(1);
+  });
+
+  test('escalate_p0 dedupe: effect cap is settable and lowers only', async () => {
+    const refs = [1, 2, 3, 4, 5].map(n => `gh:thinmansoftware/bdc-xo#${9200 + n}`);
+    // 11 proposals for the fallback cases, so a cap of 10 is told apart from any smaller one.
+    const refs11 = Array.from({ length: 11 }, (_, n) => `gh:thinmansoftware/bdc-xo#${9300 + n}`);
+
+    process.env[MAX_EFFECTS_ENV] = '3';
+    const capped = makeWorld();
+    seedDigestSent(capped);
+    await tick(
+      createTaskmasterState(60_000),
+      depsFor(capped, () => refs.map(ref => p0(ref)))
+    );
+    expect(sendsFor(capped)).toHaveLength(3);
+    const deferred = capped.journal.filter(
+      j => j.action_type === 'escalate_p0' && j.outcome === 'deferred'
+    );
+    expect(deferred).toHaveLength(2);
+
+    for (const raw of ['0', '11', 'abc']) {
+      process.env[MAX_EFFECTS_ENV] = raw;
+      const world = makeWorld();
+      seedDigestSent(world);
+      const warnings: Array<{ variable: string; raw: string; fallback: number }> = [];
+      const deps = depsFor(world, () => refs11.map(ref => p0(ref)), {
+        onConfigWarning: (variable, value, fallback) =>
+          warnings.push({ variable, raw: value, fallback }),
+      });
+      await tick(createTaskmasterState(60_000), deps);
+      expect(sendsFor(world)).toHaveLength(10);
+      expect(warnings).toEqual([{ variable: MAX_EFFECTS_ENV, raw, fallback: 10 }]);
+    }
+
+    delete process.env[MAX_EFFECTS_ENV];
+    const unset = makeWorld();
+    seedDigestSent(unset);
+    const unsetWarnings: string[] = [];
+    await tick(
+      createTaskmasterState(60_000),
+      depsFor(unset, () => refs11.map(ref => p0(ref)), {
+        onConfigWarning: variable => unsetWarnings.push(variable),
+      })
+    );
+    expect(sendsFor(unset)).toHaveLength(10);
+    expect(unsetWarnings).toEqual([]);
+  });
+
+  test('escalate_p0 dedupe: parked rows do not start the window after resume expiry', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.control.pause_actor = 'john';
+    const deps = depsFor(world, () => [p0()]);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    expect(world.journal.filter(j => j.thread_ref === REF && j.outcome === 'parked')).toHaveLength(
+      1
+    );
+    const parkedBucket = Math.floor(world.nowMs / DAY);
+
+    // Resume by the SAME rule as EXPIRE_UNSENT_PROPOSALS in
+    // packages/core/src/db/taskmaster.ts (parked, and pending that is not
+    // fire_cauldron, become expired); Test 8a runs the real query.
+    for (const row of world.journal) {
+      if (
+        row.outcome === 'parked' ||
+        (row.outcome === 'pending' && row.action_type !== 'fire_cauldron')
+      ) {
+        row.outcome = 'expired';
+      }
+    }
+    world.control = {
+      ...world.control,
+      pause_state: 'RUNNING',
+      pause_scope: null,
+      epoch: world.control.epoch + 1,
+    };
+
+    // Hourly ticks until the first tick in bucket B+1 (T0 is 12:00Z, so 12 ticks).
+    let sendsAtFirstNextBucketTick = -1;
+    for (let hour = 1; hour <= 12; hour += 1) {
+      world.nowMs += HOUR;
+      await tick(state, deps);
+      const inNextBucket = Math.floor(world.nowMs / DAY) === parkedBucket + 1;
+      if (!inNextBucket) expect(sendsFor(world)).toHaveLength(0);
+      else if (sendsAtFirstNextBucketTick < 0) sendsAtFirstNextBucketTick = sendsFor(world).length;
+    }
+
+    expect(skipRows(world)).toHaveLength(0);
+    expect(sendsAtFirstNextBucketTick).toBe(1);
+    expect(sendsFor(world)[0]?.idempotency_key).toBe(`tm:escalate_p0:${REF}:${parkedBucket + 1}`);
+  });
+
+  test('escalate_p0 dedupe: failed delivery retries after the backoff', async () => {
+    const early = makeWorld();
+    seedDigestSent(early);
+    seedRow(early, 'failed', 3);
+    const earlyHours = await sendHoursOver(
+      early,
+      depsFor(early, () => [p0()]),
+      2
+    );
+    expect(earlyHours).toEqual([]);
+    expect(skipRows(early)).toHaveLength(1);
+    expect(JSON.parse(skipRows(early)[0]!.proposal_json)).toMatchObject({
+      window_basis: 'failed_backoff',
+    });
+
+    const late = makeWorld();
+    seedDigestSent(late);
+    const failed = seedRow(late, 'failed', 7);
+    await tick(
+      createTaskmasterState(60_000),
+      depsFor(late, () => [p0()])
+    );
+    expect(sendsFor(late)).toHaveLength(1);
+    expect(failed.outcome).toBe('sent');
+    expect(skipRows(late)).toHaveLength(0);
+  });
+
+  test('escalate_p0 retry backoff: consecutive failed retries each restart the 6 h backoff', async () => {
+    // Overseer review of PR 1598: an in-place retry keeps the row's created_at.
+    // Under the old rule a retry that failed again found the backoff already
+    // over and retried EVERY tick; now each failure restarts it.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const failed = seedRow(world, 'failed', 7);
+    const base = depsFor(world, () => [p0()]);
+    const attemptHours: number[] = [];
+    let hour = 0;
+    const deps: TaskmasterDeps = {
+      ...base,
+      pageOperator: async () => {},
+      createTask: (async (
+        context: unknown,
+        data: { idempotency_key: string },
+        ...rest: unknown[]
+      ) => {
+        if (data.idempotency_key.startsWith(`tm:escalate_p0:${REF}:`)) {
+          attemptHours.push(hour);
+          throw new Error('test_delivery_down');
+        }
+        return (base.createTask as (...args: unknown[]) => unknown)(context, data, ...rest);
+      }) as unknown as TaskmasterDeps['createTask'],
+    };
+    const state = createTaskmasterState(60_000);
+    // T0 is 12:00Z: twelve hourly ticks stay inside one 24 h bucket (one key).
+    for (hour = 0; hour < 12; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+    }
+
+    expect(attemptHours).toEqual([0, 6]);
+    expect(sendsFor(world)).toHaveLength(0);
+    expect(failed.outcome).toBe('failed');
+    expect(JSON.parse(failed.proposal_json)).toMatchObject({
+      last_attempt_at: new Date(T0 + 6 * HOUR).toISOString(),
+    });
+    // One skip row per backoff window: the one from hour 0 and the one from hour 6.
+    expect(skipRows(world)).toHaveLength(2);
+    expect(skipRows(world).map(r => JSON.parse(r.proposal_json).window_basis)).toEqual([
+      'failed_backoff',
+      'failed_backoff',
+    ]);
+  });
+
+  test('escalate_p0 retry backoff: a send on an in-place retry starts the sent window at the send', async () => {
+    // Board desk read of PR 1598 at 38ac23a29: the row is created at 05:00Z,
+    // delivery fails at 12:00Z (hour 0) and succeeds at the 18:00Z retry
+    // (hour 6). The 24 h sent window must count from 18:00Z, not from 05:00Z
+    // (which let the next escalation out at 05:00Z the next day, hour 17).
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedRow(world, 'failed', 7);
+    const base = depsFor(world, () => [p0()]);
+    const attemptHours: number[] = [];
+    let hour = 0;
+    const deps: TaskmasterDeps = {
+      ...base,
+      pageOperator: async () => {},
+      createTask: (async (
+        context: unknown,
+        data: { idempotency_key: string },
+        ...rest: unknown[]
+      ) => {
+        if (data.idempotency_key.startsWith(`tm:escalate_p0:${REF}:`)) {
+          attemptHours.push(hour);
+          if (hour === 0) throw new Error('test_delivery_down');
+        }
+        return (base.createTask as (...args: unknown[]) => unknown)(context, data, ...rest);
+      }) as unknown as TaskmasterDeps['createTask'],
+    };
+    const state = createTaskmasterState(60_000);
+    for (hour = 0; hour < 30; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+    }
+
+    expect(attemptHours).toEqual([0, 6]);
+    expect(sendsFor(world)).toHaveLength(1);
+
+    // Hour 30 (18:00Z the next day) is 24 h after the real send: it may go.
+    world.nowMs += HOUR;
+    hour = 30;
+    await tick(state, deps);
+    expect(attemptHours).toEqual([0, 6, 30]);
+  });
+
+  test('escalate_p0 retry backoff: a pending row reconciled to sent starts the sent window at the real send', async () => {
+    // Board desk read of PR 1598 at 1bbda058a: restart reconciliation marked a
+    // pending in-place retry 'sent' with no proposal_json, so it kept the
+    // last_attempt_at of its last FAILURE (8 h ago) and the next escalation
+    // went out at hour 16. The found dispatch row (sent at hour 0) is the send.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const row = seedRow(world, 'pending', 20);
+    row.proposal_json = JSON.stringify({
+      type: 'escalate_p0',
+      reason: 'unclaimed_p0',
+      failure: 'test_delivery_down',
+      last_attempt_at: new Date(world.nowMs - 8 * HOUR).toISOString(),
+    });
+    world.sentMessages.push({
+      idempotency_key: row.idempotency_key!,
+      recipient: 'operator',
+      body: 'escalation sent just before the restart',
+      createdAt: new Date(world.nowMs).toISOString(),
+    });
+    const deps = depsFor(world, () => [p0()]);
+    const state = createTaskmasterState(60_000);
+    const sendHours: number[] = [];
+    let seen = sendsFor(world).length;
+    for (let hour = 0; hour <= 24; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+      const now = sendsFor(world).length;
+      if (now > seen) sendHours.push(hour);
+      seen = now;
+    }
+
+    // No further escalation before hour 24 (24 h after the real send); hour 24 may go.
+    expect(sendHours).toEqual([24]);
+    expect(row.outcome).toBe('sent');
+    expect(JSON.parse(row.proposal_json)).toMatchObject({
+      last_attempt_at: new Date(T0).toISOString(),
+    });
+  });
+
+  async function withSqliteJournalHistory(
+    world: FakeWorld,
+    deps: TaskmasterDeps,
+    check: () => Promise<void>
+  ): Promise<void> {
+    const native = new SqliteAdapter(':memory:');
+    const connection = spyOn(taskmasterConnection, 'getDatabase').mockReturnValue(native);
+    deps.db = {
+      ...deps.db!,
+      getActionsSince: async sinceIso => {
+        // Writes remain in the existing fake world, but every history read
+        // executes the production DAL and its created_at SQL on real SQLite.
+        for (const row of world.journal) {
+          await native.query(
+            `INSERT INTO tm_journal
+             (id,created_at,thread_ref,action_type,proposal_json,idempotency_key,
+              before_hash,proof_predicate,proof_deadline_at,outcome,graded_at,grade)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             ON CONFLICT(id) DO UPDATE SET proposal_json=$5,outcome=$10,graded_at=$11,grade=$12`,
+            [
+              row.id,
+              row.created_at,
+              row.thread_ref,
+              row.action_type,
+              row.proposal_json,
+              row.idempotency_key,
+              row.before_hash,
+              row.proof_predicate,
+              row.proof_deadline_at,
+              row.outcome,
+              row.graded_at,
+              row.grade,
+            ]
+          );
+        }
+        return fireBudgetDb.getActionsSince(sinceIso);
+      },
+    };
+    try {
+      await check();
+    } finally {
+      connection.mockRestore();
+      await native.close();
+    }
+  }
+
+  for (const outcome of ['sent', 'failed'] as const) {
+    test(`escalate_p0 cooldown history: an old ${outcome} row keeps its 168 h latest-attempt window`, async () => {
+      process.env[SENT_WINDOW_ENV] = '168';
+      const priorBackoff = process.env.TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS;
+      process.env.TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS = '168';
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        // The row was created 169 h ago and retried 6 h after creation. Its
+        // 168 h window still has 5 h left, despite leaving the 7-day history.
+        const row = seedRow(world, outcome, 169);
+        row.idempotency_key = bucketKey(REF, world.nowMs - 169 * HOUR);
+        row.proposal_json = JSON.stringify({
+          type: 'escalate_p0',
+          reason: 'unclaimed_p0',
+          last_attempt_at: new Date(world.nowMs - 163 * HOUR).toISOString(),
+        });
+        const deps = depsFor(world, () => [p0()]);
+        await withSqliteJournalHistory(world, deps, async () => {
+          expect(await sendHoursOver(world, deps, 6)).toEqual([5]);
+        });
+      } finally {
+        if (priorBackoff === undefined)
+          delete process.env.TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS;
+        else process.env.TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS = priorBackoff;
+      }
+    });
+  }
+
+  test('escalate_p0 cooldown history: late reconciliation fallback keeps the full sent window', async () => {
+    process.env[SENT_WINDOW_ENV] = '168';
+    const world = makeWorld();
+    seedDigestSent(world);
+    // Pending reconciliation can find a row almost 7 days after creation.
+    // An invalid effect timestamp conservatively stamps reconciliation time.
+    const row = seedRow(world, 'pending', 167);
+    row.idempotency_key = bucketKey(REF, world.nowMs - 167 * HOUR);
+    world.sentMessages.push({
+      idempotency_key: row.idempotency_key!,
+      recipient: 'operator',
+      body: 'existing escalation before restart',
+      createdAt: 'invalid-time',
+    });
+    const start = world.nowMs;
+    const deps = depsFor(world, () => [p0()]);
+    const state = createTaskmasterState(60_000);
+    await withSqliteJournalHistory(world, deps, async () => {
+      await tick(state, deps);
+      expect(row.outcome).toBe('sent');
+      expect(JSON.parse(row.proposal_json).last_attempt_at).toBe(new Date(start).toISOString());
+      expect(sendsFor(world)).toHaveLength(1);
+      world.nowMs = start + 167 * HOUR;
+      await tick(state, deps);
+      expect(sendsFor(world)).toHaveLength(1);
+      world.nowMs = start + 168 * HOUR;
+      await tick(state, deps);
+      expect(sendsFor(world)).toHaveLength(2);
+    });
+  });
+
+  test('escalate_p0 dedupe: a 36 h sent window holds across a 24 h bucket boundary', async () => {
+    process.env[SENT_WINDOW_ENV] = '36';
+    const world = makeWorld();
+    seedDigestSent(world);
+    // First tick 10 minutes before a 24 h bucket boundary.
+    world.nowMs = (Math.floor(T0 / DAY) + 1) * DAY - 10 * 60_000;
+    const start = world.nowMs;
+
+    const sendHours = await sendHoursOver(
+      world,
+      depsFor(world, () => [p0()]),
+      37
+    );
+
+    expect(sendHours).toEqual([0, 36]);
+    const keys = sendsFor(world).map(m => m.idempotency_key);
+    expect(keys[0]).toBe(bucketKey(REF, start));
+    // The key bucket changed at 10 minutes past hour 0, yet hours 1 to 35 did not send.
+    expect(bucketKey(REF, start + HOUR)).not.toBe(keys[0]);
+    expect(skipRows(world)).toHaveLength(1);
+  });
+
+  test('escalate_p0 dedupe: a sent window below 24 h falls back to 24 h', async () => {
+    process.env[SENT_WINDOW_ENV] = '6';
+    const world = makeWorld();
+    seedDigestSent(world);
+    const warnings: string[] = [];
+    const deps = depsFor(world, () => [p0()], {
+      onConfigWarning: variable => warnings.push(variable),
+    });
+
+    const sendHours = await sendHoursOver(world, deps, 25);
+
+    expect(sendHours).toEqual([0, 24]);
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(new Set(warnings)).toEqual(new Set([SENT_WINDOW_ENV]));
   });
 });

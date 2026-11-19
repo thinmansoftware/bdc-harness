@@ -1,6 +1,6 @@
 ---
 name: astra-validator
-model: claude-fable-5
+model: claude-fable-5-2
 tools: [Read, Grep, Glob, Bash]
 description: Manifest-against-reality validator. Verifies files exist, tests pass, manifest is complete.
 ---

@@ -9,7 +9,7 @@ loop limits, except accurate model attribution. Existing lane files are unchange
 | Seats | Provider | Model |
 | --- | --- | --- |
 | Planning, build, repair and push-target decision | codex-native-strict | gpt-6-astra |
-| Plan review, validator, diff reviews and findings consolidation | claude | claude-fable-5 |
+| Plan review, validator, diff reviews and findings consolidation | claude | claude-fable-5-2 |
 
 The original Sonnet/Opus persona files are unchanged. Four role-identical Fable
 variants prevent those existing persona pins from overriding the new review model.

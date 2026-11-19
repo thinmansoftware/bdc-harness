@@ -1,0 +1,66 @@
+### run-stop-tests: npm test
+TAP version 13
+# Subtest: /work/tests/file1.test.ts
+    # Subtest: works
+    ok 1 - works
+    1..1
+ok 1 - /work/tests/file1.test.ts
+# Subtest: /work/tests/file2.test.ts
+    # Subtest: works
+    ok 1 - works
+    1..1
+ok 2 - /work/tests/file2.test.ts
+# Subtest: /work/tests/file3.test.ts
+    # Subtest: works
+    ok 1 - works
+    1..1
+ok 3 - /work/tests/file3.test.ts
+# Subtest: /work/tests/file4.test.ts
+    # Subtest: works
+    ok 1 - works
+    1..1
+ok 4 - /work/tests/file4.test.ts
+# Subtest: /work/tests/file5.test.ts
+    # Subtest: works
+    ok 1 - works
+    1..1
+ok 5 - /work/tests/file5.test.ts
+# Subtest: /work/tests/worker-skeleton.test.ts
+# node:internal/modules/esm/resolve:1 throw
+# Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:sqlite
+# Node.js v20.19.2
+not ok 6 - /work/tests/worker-skeleton.test.ts
+  ---
+  duration_ms: 41.2
+  failureType: 'testCodeFailure'
+  exitCode: 1
+  ...
+# Subtest: /work/tests/worker-concurrency.test.ts
+# node:internal/modules/esm/resolve:1 throw
+# Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:sqlite
+# Node.js v20.19.2
+not ok 7 - /work/tests/worker-concurrency.test.ts
+  ---
+  duration_ms: 41.2
+  failureType: 'testCodeFailure'
+  exitCode: 1
+  ...
+# Subtest: /work/tests/worker-lease-reclaim.test.ts
+# node:internal/modules/esm/resolve:1 throw
+# Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:sqlite
+# Node.js v20.19.2
+not ok 8 - /work/tests/worker-lease-reclaim.test.ts
+  ---
+  duration_ms: 41.2
+  failureType: 'testCodeFailure'
+  exitCode: 1
+  ...
+1..8
+# tests 68
+# suites 0
+# pass 65
+# fail 3
+# cancelled 0
+# skipped 0
+# todo 0
+### exit 1

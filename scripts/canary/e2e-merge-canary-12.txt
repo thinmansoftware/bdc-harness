@@ -1,0 +1,5 @@
+E2E merge canary 12
+
+E2E_MERGE_CANARY_OK
+
+Canary run 2026-11-04 (WO-HARNESS-E2E-MERGE-CANARY-12, lane cursor) proves Test 1 (file present), Test 2 (the PR diff is exactly this file), and Test 3 (this dated marker) for the cursor lane on live harness 8a5deb19.

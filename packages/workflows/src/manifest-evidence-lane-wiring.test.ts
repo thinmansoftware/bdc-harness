@@ -135,25 +135,36 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         expect(n.bash).toContain(
           'inline-flag rejection: -c -e --eval -p --print -r --require -i -m'
         );
-        expect(n.bash).toContain('timeout 1500 "$@"');
+        expect(n.bash).toContain('timeout "$(rst_timeout)" "$@"');
         expect(n.bash).toContain('[ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]');
       });
 
       it('run-stop-greps tokenizes argv pipelines and rejects find -execdir', () => {
         const n = node(nodes, 'run-stop-greps', file);
-        expect(n.depends_on).toEqual(['format-autofix']);
+        // implement-block-gate (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01): the
+        // stop greps do not run after a declared implement BLOCKED, so the node waits on the gate.
+        expect(n.depends_on).toEqual([
+          'format-autofix',
+          'run-stop-tests-final',
+          'implement-block-gate',
+        ]);
         expect(n.timeout).toBe(600000);
-        expect(n.bash).toContain('rsg_tokens_safe');
+        // WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01: the whitespace split and the
+        // per-token charset check were replaced by the shared quote-aware tokenizer
+        // scripts/lane/rsg-argv.sh (rsg_parse_pipeline); the charset now lives there.
+        expect(n.bash).toContain('rsg_parse_pipeline');
+        expect(n.bash).toContain('BDC_RSGARGV_SCRIPT');
+        expect(n.bash).not.toContain('rsg_tokens_safe');
+        expect(n.bash).not.toContain('rsg_strip_arg');
         expect(n.bash).toContain('rsg_exec_pipeline');
         expect(n.bash).toContain('-execdir');
-        expect(n.bash).toContain('^[A-Za-z0-9@%+=:,./_*?-]+$');
         expect(n.bash).not.toContain('bash -c "$1"');
       });
 
       it('war-council-validator depends on both evidence nodes and carries the executed-command contract', () => {
         const n = node(nodes, 'war-council-validator', file);
-        expect(n.depends_on).toEqual(['ascii-gate', 'run-stop-tests', 'run-stop-greps']);
-        expect(n.prompt).toContain('$run-stop-tests.output');
+        expect(n.depends_on).toEqual(['ascii-gate', 'run-stop-tests-final', 'run-stop-greps']);
+        expect(n.prompt).toContain('$run-stop-tests-final.output');
         expect(n.prompt).toContain('$run-stop-greps.output');
         expect(n.prompt).toContain('TESTS_OBSERVED: <passed>/<total> (<command you executed>)');
         expect(n.prompt).toContain('TESTS_OBSERVED: not_run (<reason>)');
@@ -163,9 +174,9 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('stamp-manifest-evidence rewrites the raw engine manifest from both evidence nodes', () => {
         const n = node(nodes, 'stamp-manifest-evidence', file);
-        expect(n.depends_on).toEqual(['build-manifest', 'run-stop-tests', 'run-stop-greps']);
+        expect(n.depends_on).toEqual(['build-manifest', 'run-stop-tests-final', 'run-stop-greps']);
         expect(n.bash).toContain('$build-manifest.output');
-        expect(n.bash).toContain('$run-stop-tests.output');
+        expect(n.bash).toContain('$run-stop-tests-final.output');
         expect(n.bash).toContain('$run-stop-greps.output');
       });
 
@@ -206,6 +217,25 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
     }
   });
 
+  // WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01, Test 10.
+  it('lane_parity_not_gated: the pbb core is byte-identical, mec says NOT_GATED, patch-pr-body accepts it', () => {
+    const canonical = laneNodes('bdc-feature-development-codex.yaml');
+    const expectedPbb = coreOf(node(canonical, 'patch-pr-body', 'canonical').bash ?? '', 'pbb');
+    expect(expectedPbb).toContain('pbb_mark_blocked()');
+    expect(expectedPbb).toContain('RUN BLOCKED -- not lane-verified');
+    expect(expectedPbb).toContain('run:blocked');
+    for (const file of EXPECTED_LANES) {
+      const nodes = laneNodes(file);
+      const patch = node(nodes, 'patch-pr-body', file);
+      expect(coreOf(patch.bash ?? '', 'pbb')).toBe(expectedPbb);
+      expect(patch.bash ?? '').toContain('pbb_mark_blocked "$STATUS" "$NP_URL" "$NP_REPO"');
+      expect(patch.when).toContain("$manifest-evidence-check.output == 'OK'");
+      expect(patch.when).toContain("$manifest-evidence-check.output == 'NOT_GATED:BLOCKED'");
+      const mec = coreOf(node(nodes, 'manifest-evidence-check', file).bash ?? '', 'mec');
+      expect(mec).toContain('NOT_GATED:');
+    }
+  });
+
   it('the placeholder Tests text is still what the engine renders (so the stamp is load-bearing)', () => {
     const collector = readFileSync(
       join(REPO_ROOT, 'packages/workflows/src/reliability/evidence-collector.ts'),
@@ -242,6 +272,7 @@ function runStopTestsNode(opts: {
   const artifacts = join(cwd, 'artifacts');
   mkdirSync(artifacts);
   try {
+    // Initial evidence must not require a Git repair snapshot.
     writeFileSync(
       join(cwd, 'package.json'),
       `${JSON.stringify({ name: 'x', scripts: { test: 'bash ./repo-pass.sh' } })}\n`
@@ -291,9 +322,9 @@ function runStopTestsNode(opts: {
   }
 }
 
-// The behavioral cases spawn the node's bash; on win32 `bash` resolves to WSL and
-// produces nothing, so they run on POSIX CI only (ubuntu-latest).
-describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral)', () => {
+// Use the same real bash as the project-map and workspace cases below, including
+// Git Bash on Windows. These regressions must exercise the initial runner too.
+describe('run-stop-tests ladder (behavioral)', () => {
   it('a spec-declared command that exits nonzero with no counts stays failed; repo_test_script is not run', () => {
     const { stdout, log } = runStopTestsNode({
       spec: rstSpec('bash ./exit3.sh'),
@@ -543,7 +574,10 @@ function runStopGrepsNode(opts: {
     );
     const proc = Bun.spawnSync(['bash', '-c', rendered], {
       cwd,
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        BDC_RSGARGV_SCRIPT: join(import.meta.dir, '..', '..', '..', 'scripts/lane/rsg-argv.sh'),
+      },
       stdout: 'pipe',
       stderr: 'pipe',
     });

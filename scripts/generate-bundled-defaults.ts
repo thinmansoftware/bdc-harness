@@ -35,6 +35,11 @@ const WORKFLOWS_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 // WO-HARNESS-POLICYFILE-NOT-ENFORCED-01).
 const POLICIES_DIR = join(REPO_ROOT, 'harness/policies');
 const POLICIES_KEY_PREFIX = 'harness/policies';
+// Shared shell cores SOURCED by lane workflow bash nodes (e.g. dprep.sh). Keyed by
+// filename. The engine materializes them per bash node and exports
+// ARCHON_LANE_SCRIPTS_DIR, so standalone CLI / source runs (no /app) source the
+// same single source of truth as the Docker image (scripts/lane/*.sh).
+const LANE_SCRIPTS_DIR = join(REPO_ROOT, 'scripts/lane');
 const OUTPUT_PATH = join(
   REPO_ROOT,
   'packages/workflows/src/defaults/bundled-defaults.generated.ts'
@@ -167,6 +172,32 @@ async function collectPoliciesWithPath(dir: string, keyPrefix: string): Promise<
   return files;
 }
 
+/**
+ * Lane shell scripts: keys are the filename with extension (`dprep.sh`). Only
+ * `<kebab>.sh` files are bundled; tests and anything else in the dir are ignored.
+ */
+async function collectLaneScripts(dir: string): Promise<BundledFile[]> {
+  const entries = await readdir(dir);
+  const matched = entries.filter(entry => entry.endsWith('.sh')).sort(compareAscii);
+  const files: BundledFile[] = [];
+  for (const entry of matched) {
+    const stem = entry.slice(0, -'.sh'.length);
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(stem)) {
+      throw new Error(
+        `Bundled lane script has invalid filename "${entry}" in ${dir}. ` +
+          'Names must be kebab-case (lowercase letters, digits, hyphens) and end in .sh.'
+      );
+    }
+    const raw = await readFile(join(dir, entry), 'utf-8');
+    const content = normalizeBundledText(raw);
+    if (!content.trim()) {
+      throw new Error(`Bundled lane script "${entry}" in ${dir} is empty.`);
+    }
+    files.push({ name: entry, content });
+  }
+  return files;
+}
+
 function renderRecord(comment: string, exportName: string, files: BundledFile[]): string {
   const entries = files
     .map(f => `  ${JSON.stringify(f.name)}: ${JSON.stringify(f.content)},`)
@@ -182,7 +213,8 @@ function renderRecord(comment: string, exportName: string, files: BundledFile[])
 function renderFile(
   commands: BundledFile[],
   workflows: BundledFile[],
-  policies: BundledFile[]
+  policies: BundledFile[],
+  laneScripts: BundledFile[]
 ): string {
   const header = [
     '/**',
@@ -195,6 +227,7 @@ function renderFile(
     ' *   .archon/commands/defaults/*.md',
     ' *   .archon/workflows/defaults/*.{yaml,yml}',
     ' *   harness/policies/*.md',
+    ' *   scripts/lane/*.sh',
     ' *',
     ' * Contents are inlined as plain string literals (JSON-escaped) so this',
     ' * module loads in both Bun and Node. Previous versions used',
@@ -215,6 +248,12 @@ function renderFile(
       policies
     ),
     '',
+    renderRecord(
+      'Bundled lane shell scripts (keyed by filename; materialized into ARCHON_LANE_SCRIPTS_DIR)',
+      'BUNDLED_LANE_SCRIPTS',
+      laneScripts
+    ),
+    '',
   ].join('\n');
 }
 
@@ -223,15 +262,17 @@ async function main(): Promise<void> {
     ensureDir(COMMANDS_DIR, 'Commands defaults'),
     ensureDir(WORKFLOWS_DIR, 'Workflows defaults'),
     ensureDir(POLICIES_DIR, 'Agent-behavior policies'),
+    ensureDir(LANE_SCRIPTS_DIR, 'Lane scripts'),
   ]);
 
-  const [commands, workflows, policies] = await Promise.all([
+  const [commands, workflows, policies, laneScripts] = await Promise.all([
     collectFiles(COMMANDS_DIR, ['.md']),
     collectFiles(WORKFLOWS_DIR, ['.yaml', '.yml']),
     collectPoliciesWithPath(POLICIES_DIR, POLICIES_KEY_PREFIX),
+    collectLaneScripts(LANE_SCRIPTS_DIR),
   ]);
 
-  const contents = renderFile(commands, workflows, policies);
+  const contents = renderFile(commands, workflows, policies, laneScripts);
 
   if (CHECK_ONLY) {
     let existing = '';
@@ -249,14 +290,14 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     console.log(
-      `bundled-defaults.generated.ts is up to date (${commands.length} commands, ${workflows.length} workflows, ${policies.length} policies).`
+      `bundled-defaults.generated.ts is up to date (${commands.length} commands, ${workflows.length} workflows, ${policies.length} policies, ${laneScripts.length} lane scripts).`
     );
     return;
   }
 
   await writeFile(OUTPUT_PATH, contents, 'utf-8');
   console.log(
-    `Wrote ${OUTPUT_PATH}\n  ${commands.length} commands, ${workflows.length} workflows, ${policies.length} policies.`
+    `Wrote ${OUTPUT_PATH}\n  ${commands.length} commands, ${workflows.length} workflows, ${policies.length} policies, ${laneScripts.length} lane scripts.`
   );
 }
 

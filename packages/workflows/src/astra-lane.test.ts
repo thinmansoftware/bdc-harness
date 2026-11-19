@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { parseWorkflow } from './loader';
 import { registerBuiltinProviders } from '@archon/providers';
+import { registerGrokAgentProvider } from '@archon/providers/community/grok';
 
 const root = join(import.meta.dir, '../../..');
 const read = (path: string): string => readFileSync(join(root, path), 'utf8');
@@ -59,13 +60,15 @@ const attributionChanges = [
   ['Diff review (Codex,', 'Diff review (Fable,'],
   [
     'diff-review provider used (codex cross-model, OR claude-fallback with\n  CROSS_MODEL_REVIEW=false disclosed)',
-    'diff-review provider/model used (claude/claude-fable-5, independent of Astra;\n  any substitution or unverified served identity must be disclosed)',
+    'diff-review provider/model used (claude/claude-fable-5-2, independent of Astra;\n  any substitution or unverified served identity must be disclosed)',
   ],
 ];
 
 describe('Astra build / Fable review lane', () => {
   it('loads the real workflow without changing any DAG behavior or gates', () => {
     registerBuiltinProviders();
+    // openrouter: the D0 Kimi review failover target (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    registerGrokAgentProvider();
     const parsed = parseWorkflow(astraText, 'bdc-feature-development-astra.yaml');
     expect(parsed.error).toBeNull();
     expect(parsed.workflow).toBeDefined();
@@ -84,18 +87,21 @@ describe('Astra build / Fable review lane', () => {
 
   it('binds every prompt and loop seat, preserving different-family review', () => {
     const seats = astra.nodes.filter(node => node.prompt || node.loop);
-    expect(seats).toHaveLength(14);
+    expect(seats).toHaveLength(15);
     expect(seats.filter(node => reviewIds.includes(node.id))).toHaveLength(7);
     for (const seat of seats) {
       const review = reviewIds.includes(seat.id);
       expect(seat.provider, seat.id).toBe(review ? 'claude' : 'codex-native-strict');
-      expect(seat.model, seat.id).toBe(review ? 'claude-fable-5' : 'gpt-6-astra');
+      expect(seat.model, seat.id).toBe(review ? 'claude-fable-5-2' : 'gpt-6-astra');
       expect(seat.fallbackModel).toBeUndefined();
-      expect(seat.failover_provider).toBeUndefined();
+      // D0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01, acting XO fence 282): review seats
+      // fail over to Kimi K3.1 Pro on openrouter, never Claude; build seats declare none.
+      expect(seat.failover_provider, seat.id).toBe(review ? 'openrouter' : undefined);
+      expect(seat.failover_model, seat.id).toBe(review ? 'moonshotai/kimi-k3.1-pro' : undefined);
       const personaName = seat.persona ?? seat.agent;
       if (personaName) {
         const header = parseYaml(read(`.archon/agents/${personaName}.md`).split(/^---\s*$/m)[1]);
-        expect(header.model, personaName).toBe(review ? 'claude-fable-5' : undefined);
+        expect(header.model, personaName).toBe(review ? 'claude-fable-5-2' : undefined);
       }
     }
   });

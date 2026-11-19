@@ -75,9 +75,11 @@ describe('resolvePiThinkingLevel', () => {
 describe('resolvePiTools', () => {
   const cwd = '/tmp/test-cwd';
 
-  test('returns undefined tools when neither allowed_tools nor denied_tools set', () => {
-    expect(resolvePiTools(cwd, undefined)).toEqual({ tools: undefined, unknownTools: [] });
-    expect(resolvePiTools(cwd, {})).toEqual({ tools: undefined, unknownTools: [] });
+  test('with neither allowed_tools nor denied_tools set, returns Pi default tools built with the env-stripping bash hook (bdc-xo#5464)', () => {
+    for (const result of [resolvePiTools(cwd, undefined), resolvePiTools(cwd, {})]) {
+      expect(result.unknownTools).toEqual([]);
+      expect(result.tools).toHaveLength(4);
+    }
   });
 
   test('allowed_tools: [] returns empty tools array (no-tools idiom)', () => {
@@ -140,9 +142,9 @@ describe('resolvePiTools', () => {
     expect(result.unknownTools).toEqual([]);
   });
 
-  test('no allow/deny with empty env -> still returns undefined (Pi defaults)', () => {
-    expect(resolvePiTools(cwd, undefined, {})).toEqual({ tools: undefined, unknownTools: [] });
-    expect(resolvePiTools(cwd, {}, {})).toEqual({ tools: undefined, unknownTools: [] });
+  test('no allow/deny with empty env -> still Pi default tools, with the env-stripping bash hook', () => {
+    expect(resolvePiTools(cwd, undefined, {}).tools).toHaveLength(4);
+    expect(resolvePiTools(cwd, {}, {}).tools).toHaveLength(4);
   });
 
   test('env passthrough does not affect unknown tool reporting', () => {

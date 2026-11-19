@@ -1,0 +1,1712 @@
+name: bdc-evidence-replay
+description: Detached, local-only test evidence replay for an existing PR.
+worktree:
+  enabled: true
+inputs:
+  PR_NUMBER:
+    default: ""
+  WO_ID:
+    default: ""
+nodes:
+  - id: checkout-replay
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      PR="${PR_NUMBER:-${INPUT_PR_NUMBER:-}}"
+      [ -n "$PR" ] || PR="$(printf '%s\n' "${USER_MESSAGE:-}" | sed -nE 's/.*PR_NUMBER=([0-9]+).*/\1/p')"
+      [[ "$PR" =~ ^[0-9]+$ ]] || { echo 'PR_NUMBER must be a positive integer' >&2; exit 1; }
+      # The engine checkout may be a linked worktree with shared git config.
+      # Clone the origin into this run's artifacts; mutate only our own config.
+      SOURCE_URL="$(git remote get-url origin)"
+      mkdir -p "$ARTIFACTS_DIR/evidence"
+      REPLAY_DIR="$ARTIFACTS_DIR/replay-checkout"
+      git clone --quiet --no-checkout -- "$SOURCE_URL" "$REPLAY_DIR"
+      cd "$REPLAY_DIR"
+      git remote set-url --push origin DISABLED-evidence-replay
+      git fetch origin "refs/pull/$PR/head"
+      git checkout --detach FETCH_HEAD
+      pwd > "$ARTIFACTS_DIR/evidence/replay-checkout"
+      printf '%s\n' "$PR" > "$ARTIFACTS_DIR/evidence/replay.pr"
+      git rev-parse HEAD > "$ARTIFACTS_DIR/run-start-sha.txt"
+      gh pr view "$PR" --repo thinmansoftware/bdc-harness --json body,headRefOid > "$ARTIFACTS_DIR/evidence/replay-pr.json"
+
+  - id: read-spec
+    depends_on: [checkout-replay]
+    bash: |
+      set -uo pipefail
+      WO_ID="${WO_ID:-${INPUT_WO_ID:-}}"
+      if [ -z "$WO_ID" ]; then
+        WO_ID="$(python3 -c 'import json,re,sys; body=json.load(open(sys.argv[1]))["body"]; m=re.search(r"^WO:\s*(WO-[A-Z0-9-]+)",body,re.M); print(m[1] if m else "")' "$ARTIFACTS_DIR/evidence/replay-pr.json")"
+      fi
+      SPEC_CONTENT=""
+      SPEC_PATH=""
+      if [ -n "$WO_ID" ]; then
+      # Specs live in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api.
+      # Per YAML Recipe v1 Section 4 / Rule 5: try docs/work-orders/ then docs/superpowers/specs/ glob.
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 1: docs/superpowers/specs/${WO_ID}.md direct
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 2: date-prefix glob in docs/superpowers/specs/
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      fi
+      printf '%s\n' "$WO_ID" > "$ARTIFACTS_DIR/evidence/replay.wo"
+      printf '%s' "$SPEC_CONTENT" > "$ARTIFACTS_DIR/spec.md"
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\n\n%s\n' "$WO_ID" "$SPEC_PATH" "$SPEC_CONTENT"
+
+  - id: format-autofix
+    depends_on: [read-spec]
+    bash: |
+      # Dependency anchor only: replay must not rewrite the PR before observing it.
+      echo 'replay: no formatting mutation'
+
+  - id: resolve-test-command
+    persona: major-build
+    load_bearing: true
+    depends_on: [format-autofix]
+    task_class: clerical
+    timeout: 60000
+    bash: |
+      set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
+      ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
+      if ! MAP_RESPONSE="$(timeout 30 gh api 'repos/thinmansoftware/bdc-xo/contents/scripts/cauldron/cauldron-projects.json?ref=main' 2>/dev/null)"; then
+        printf 'TEST_COMMAND_SOURCE=wo-spec\nTEST_COMMAND_FALLBACK=unavailable\nTEST_COMMAND_MAP_SHA=\nTEST_COMMAND_B64=\nTEST_TIMEOUT_SECONDS=1500\n'
+        exit 0
+      fi
+      # Structured data only: no shell evaluation or command execution here.
+      python3 -c '
+      import base64, json, re, sys
+      def normalize(value, allow_slug=False):
+          if not isinstance(value, str):
+              return None
+          # Cauldron clones embed a token in origin (https://<token>@github.com/o/r.git or
+          # https://x-access-token:<token>@github.com/o/r.git); drop the userinfo first.
+          value = re.sub(r"^(https?://)[^/@\s]+@", r"\1", value.strip(), flags=re.I)
+          prefix = r"(?:https?://github[.]com/|ssh://git@github[.]com/|git@github[.]com:)"
+          if allow_slug:
+              prefix += "?"
+          match = re.fullmatch(prefix + r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:[.]git)?/?", value, re.I)
+          return match.group(1).lower() if match else None
+      reason = "malformed"
+      sha = ""
+      command = ""
+      timeout_seconds = 1500
+      try:
+          envelope = json.load(sys.stdin)
+          revision = envelope.get("sha", "")
+          if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+              raise ValueError("invalid map revision")
+          sha = revision.lower()
+          content = base64.b64decode("".join(envelope["content"].split()), validate=True)
+          projects = json.loads(content)
+          if not isinstance(projects, dict):
+              raise ValueError("invalid project map")
+          slug = normalize(sys.argv[1])
+          matches = [value for value in projects.values() if isinstance(value, dict) and slug is not None and normalize(value.get("repo"), True) == slug]
+          reason = "invalid-origin" if slug is None else "missing" if not matches else "ambiguous" if len(matches) != 1 else "invalid-command"
+          if len(matches) == 1:
+              value = matches[0].get("test_timeout_seconds")
+              if type(value) is int:
+                  timeout_seconds = max(60, min(1700, value))
+              candidate = matches[0].get("test_command")
+              if isinstance(candidate, str) and candidate.strip() and len(candidate) <= 4096 and "\n" not in candidate and "\r" not in candidate and "\x00" not in candidate:
+                  command = candidate
+                  reason = ""
+      except (ValueError, TypeError, KeyError, AttributeError):
+          reason = "malformed"
+      print("TEST_TIMEOUT_SECONDS=" + str(timeout_seconds))
+      print("TEST_COMMAND_SOURCE=" + ("project-map" if command else "wo-spec"))
+      print("TEST_COMMAND_FALLBACK=" + reason)
+      print("TEST_COMMAND_MAP_SHA=" + sha)
+      print("TEST_COMMAND_B64=" + base64.b64encode(command.encode()).decode())
+      ' "$ORIGIN" <<< "$MAP_RESPONSE"
+
+
+  - id: run-stop-tests
+    persona: major-build
+    load_bearing: true
+    depends_on: [format-autofix, resolve-test-command]
+    task_class: clerical
+    timeout: 1800000
+    bash: |
+      set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN rst core (byte-identical across lanes; extracted by unit test) ----
+      # POSIX awk only (the container ships mawk, not gawk): no IGNORECASE, no gensub.
+      # rst_class   (spec on stdin -> CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR; default CODE)
+      #   Reads the first "WO Class:" / "Class:" line. Doctrine default is CODE (Rule 14).
+      rst_class() {
+        local c
+        c="$(grep -m1 -E '^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*(CODE|INFRA|MIXED|DOCUMENTATION|DOCS|OPERATOR)' | sed -E 's/^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*//' | grep -oE '^[A-Z]+' | head -1 || true)"
+        case "$c" in
+          CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR) printf '%s' "$c" ;;
+          DOCS) printf 'DOCUMENTATION' ;;
+          *) printf 'CODE' ;;
+        esac
+      }
+      # inline-flag rejection: -c -e --eval -p --print -r --require -i -m
+      rst_has_inline_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            -c|-e|--eval|-p|--print|-r|--require|-i|-m|-c=*|-e=*|--eval=*|-p=*|--print=*|-r=*|--require=*|-i=*|-m=*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      # The command check and the execution consume the words of ONE shared quote-aware
+      # tokenizer, scripts/lane/rsg-argv.sh (rsg_parse_chain, WO-HARNESS-GREP-STOP-EXTRACTION-
+      # SILENT-WAIVE-01), the same file the run-stop-greps node sources. Resolution order:
+      # $BDC_RSGARGV_SCRIPT (tests), then the engine per-node copy
+      # $ARCHON_LANE_SCRIPTS_DIR/rsg-argv.sh, then the image copy /app/scripts/lane/rsg-argv.sh.
+      # When none exists a command that contains a quote character is refused (fail closed) and
+      # a command with no quote character is split on whitespace exactly as before.
+      RSGARGV_SCRIPT=""
+      for rsgargv_candidate in "${BDC_RSGARGV_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/rsg-argv.sh}" /app/scripts/lane/rsg-argv.sh; do
+        if [ -n "$rsgargv_candidate" ] && [ -f "$rsgargv_candidate" ]; then RSGARGV_SCRIPT="$rsgargv_candidate"; break; fi
+      done
+      if [ -n "$RSGARGV_SCRIPT" ]; then
+        . "$RSGARGV_SCRIPT"
+      else
+        printf 'run-stop-tests: rsg-argv.sh missing (tried BDC_RSGARGV_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/rsg-argv.sh); a command containing a quote character will be refused (fail closed)\n' "${BDC_RSGARGV_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+        RSG_PARSED=()
+        rsg_parse_chain() { RSG_PARSED=(); return 1; }
+      fi
+      # Segment separator element in RST_WORDS (the one-character string ASCII 0x1E; the same value
+      # as RSG_RS in rsg-argv.sh, defined here so the helper-missing path needs no helper).
+      RST_RS=$'\036'
+      RST_WORDS=()
+      # rst_parse_cmd <cmd>   (rc 0 and RST_WORDS filled: one argv word per element, && segments
+      #   separated by the single element RST_RS; rc 1 rejects the command). With the helper this
+      #   is rsg_parse_chain: single-quoted words are one literal argv word each, double quotes,
+      #   backslashes, ; | & ` $ ( ) > < and {{ outside quotes are refused. The chain scanner also
+      #   accepts glob characters outside quotes; the rst charset never did, so they are refused
+      #   here (checked on the command with its quoted spans removed). Without the helper: any
+      #   quote character is refused, otherwise the legacy whitespace split with the legacy
+      #   charset ^[A-Za-z0-9@%+=:,./_-]+$ per word.
+      rst_parse_cmd() {
+        local LC_ALL=C
+        local cmd="${1-}" rest seg w more
+        local -a out=()
+        RST_WORDS=()
+        if [ -n "$RSGARGV_SCRIPT" ]; then
+          rsg_parse_chain "$cmd" || return 1
+          case "$(printf '%s' "$cmd" | sed "s/'[^']*'//g")" in *'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
+          RST_WORDS=("${RSG_PARSED[@]}")
+          return 0
+        fi
+        case "$cmd" in *"'"*|*'"'*|*'\'*) return 1 ;; esac
+        case "$cmd" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1 ;; esac
+        case "${cmd//&&/}" in *'&'*) return 1 ;; esac
+        rest="$cmd"
+        while :; do
+          case "$rest" in
+            *'&&'*) seg="${rest%%&&*}"; rest="${rest#*&&}"; more=1 ;;
+            *) seg="$rest"; rest=""; more=0 ;;
+          esac
+          set -f
+          set -- $seg
+          set +f
+          [ $# -gt 0 ] || return 1
+          for w in "$@"; do
+            [[ "$w" =~ ^[A-Za-z0-9@%+=:,./_-]+$ ]] || return 1
+            out+=("$w")
+          done
+          [ "$more" -eq 1 ] || break
+          out+=("$RST_RS")
+        done
+        RST_WORDS=("${out[@]}")
+        return 0
+      }
+      # rst_has_install_step <word...>   (rc 0 when one parsed segment holds a dependency-install
+      #   step: npm|npm.cmd|pnpm|yarn|bun followed by ci|install|i|add)
+      rst_has_install_step() {
+        local -a a=("$@")
+        local i
+        for ((i = 0; i + 1 < ${#a[@]}; i++)); do
+          case "${a[i]}" in
+            npm|npm.cmd|pnpm|yarn|bun)
+              case "${a[i+1]}" in ci|install|i|add) return 0 ;; esac
+              ;;
+          esac
+        done
+        return 1
+      }
+      rst_is_repo_script() {
+        local p="$1" oldifs seg
+        case "$p" in /*|-*) return 1 ;; esac
+        case "$p" in *.js|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.sh) ;; *) return 1 ;; esac
+        oldifs="$IFS"; IFS=/; set -f; set -- $p; set +f; IFS="$oldifs"
+        for seg in "$@"; do
+          [ "$seg" = ".." ] && return 1
+        done
+        return 0
+      }
+      # rst_argv_looks_runnable <word...>   (rc 0 when the already-parsed argv words of ONE && segment
+      #   name an allowlisted runner with its safe arguments; there is no tokenizing here)
+      rst_argv_looks_runnable() {
+        local runner
+        [ $# -ge 2 ] || return 1
+        runner="$1"
+        shift
+        case "$runner" in
+          node|npm|npx|bun|bunx|pytest|python|python3|go|cargo|bash|sh|make) ;;
+          *) return 1 ;;
+        esac
+        case "$runner" in
+          python|python3)
+            if [ "$1" = "-m" ] && { [ "${2:-}" = "pytest" ] || [ "${2:-}" = "unittest" ]; }; then
+              shift 2
+              rst_has_inline_flag "$@" && return 1
+              return 0
+            fi
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          node|bash|sh)
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          bun)
+            if [ "$1" = "test" ] || [ "$1" = "run" ]; then
+              if [ "$1" = "run" ]; then
+                [ -n "${2:-}" ] || return 1
+                printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
+              fi
+              rst_has_inline_flag "$@" && return 1
+              return 0
+            fi
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          npm)
+            [ "$1" = "test" ] || [ "$1" = "run" ] || return 1
+            if [ "$1" = "run" ]; then
+              [ -n "${2:-}" ] || return 1
+              printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
+            fi
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          npx|bunx)
+            printf '%s' "$1" | grep -qE '^[A-Za-z0-9@/._-]+$' || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          pytest|go|cargo|make)
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+        esac
+        return 1
+      }
+      # rst_command_looks_runnable <cmd>   (rc 0 when the line parses -- through the shared
+      #   quote-aware tokenizer, no shell -- to an allowlisted runner FOLLOWED BY AN ARGUMENT -- a
+      #   bare "node" or "bun" mentioned in prose is not a command (live false positive, run
+      #   f4dabd76) -- with no inline interpreter modes, and is not a dependency-install step).
+      #   Interpreters (node|bun|python|python3|bash|sh) must take a relative repo script path (.js
+      #   .mjs .cjs .ts .tsx .py .sh), not -c/-e/--eval, and a quoted "-e" is refused like a bare
+      #   one because the checks run on the parsed words. python -m pytest|unittest is the only -m
+      #   exception. A single-quoted multi-word argument is one argv word. Round-4 metacharacter
+      #   rejection still applies (see rst_parse_cmd).
+      rst_command_looks_runnable() {
+        local cmd="$1" k=0 total
+        local -a words=() seg=()
+        rst_parse_cmd "$cmd" || return 1
+        words=("${RST_WORDS[@]}")
+        total=${#words[@]}
+        [ "$total" -gt 0 ] || return 1
+        # Preserve an optional "cd safe/subdir &&" prefix and declared chains of test runners.
+        # Every remaining && segment must itself be argv-runnable.
+        if [ "${words[0]}" = "cd" ]; then
+          [ "$total" -ge 4 ] && [ "${words[2]}" = "$RST_RS" ] || return 1
+          printf '%s' "${words[1]}" | grep -qE '^[A-Za-z0-9_./-]+$' || return 1
+          k=3
+        fi
+        while [ "$k" -lt "$total" ]; do
+          seg=()
+          while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RST_RS" ]; do
+            seg+=("${words[k]}")
+            k=$((k + 1))
+          done
+          [ "${#seg[@]}" -gt 0 ] || return 1
+          if rst_has_install_step "${seg[@]}"; then
+            return 1
+          fi
+          rst_argv_looks_runnable "${seg[@]}" || return 1
+          k=$((k + 1))
+        done
+        return 0
+      }
+      # rst_extract_commands   (spec on stdin -> one declared test command per line, deduped,
+      #   first 8). Ladder, in document order:
+      #     A. the template "Stop N (test suite|tests|unit tests|suite ...)" block(s): the
+      #        command line(s) up to "Expected:" (backslash joins continuation lines)
+      #     B. any backticked runner command inside a "Stop conditions" / "Stop Point" /
+      #        "Test scenarios" / "Verification" section, or on any "When:" line
+      #     C. the Section 9 "Tests: <n>/<n> (<command>)" parenthesised group(s)
+      #   Callers filter with rst_command_looks_runnable (drops prose, placeholders,
+      #   install steps).
+      rst_extract_commands() {
+        awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
+          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+          function emit(c) { c = clean(c); if (c != "" && !(c in seen)) { seen[c] = 1; print c } }
+          tstate == 1 {
+            if ($0 ~ /^[ \t]*```/) next
+            line = clean($0)
+            if (line == "") next
+            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0; next }
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
+            else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
+          }
+          tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Tt]est|[Uu]nit|[Ss]uite)/ { tstate = 1; tcmd = ""; next }
+          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition|[Ss]top [Pp]oint|[Tt]est [Ss]cenario|[Tt]est [Pp]lan|[Vv]erification/) ? 1 : 0 }
+          insec || $0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/ {
+            s = $0
+            while (match(s, /`[^`]+`/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          /^[ \t]*Tests:[ \t]/ {
+            s = $0
+            while (match(s, /\([^)]*\)/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          END { if (tstate == 1 && tcmd != "") emit(tcmd) }
+        ' | head -n 8
+      }
+      # rst_rescue_subdir <cmd>   (-> cmd, or "cd <dir> && <cmd>" when the command's first
+      #   relative path does not exist at the worktree root but exists in exactly one
+      #   depth-1 directory -- shopops specs write "node tests/x.js" meaning shopops-api/).
+      #   Works on the parsed argv words, so a quoted multi-word argument is never split
+      #   or mistaken for a path.
+      rst_rescue_subdir() {
+        local cmd="$1" tok p="" d hit="" n=0
+        case "$cmd" in cd\ *|*'&& cd '*) printf '%s' "$cmd"; return 0 ;; esac
+        rst_parse_cmd "$cmd" || { printf '%s' "$cmd"; return 0; }
+        for tok in "${RST_WORDS[@]}"; do
+          case "$tok" in
+            "$RST_RS"|-*|*://*|*'='*|*' '*|*$'\t'*) continue ;;
+            */*) p="${tok#./}"; break ;;
+          esac
+        done
+        if [ -z "$p" ] || [ -e "$p" ]; then printf '%s' "$cmd"; return 0; fi
+        for d in */; do
+          d="${d%/}"
+          case "$d" in node_modules|.git|dist|build) continue ;; esac
+          if [ -e "$d/$p" ]; then hit="$d"; n=$((n + 1)); fi
+        done
+        if [ "$n" -eq 1 ]; then printf 'cd %s && %s' "$hit" "$cmd"; else printf '%s' "$cmd"; fi
+      }
+      # rst_tests_in_diff <base-sha>   (-> one test command per line derived from the test
+      #   files this run created or modified since <base-sha>, plus untracked test files;
+      #   empty when the diff touched no test files). Runner choice: *.test.* / *.spec.* /
+      #   __tests__/ -> vitest if the root package.json declares vitest, jest if jest, else
+      #   bun test; <dir>/tests/test_*.js -> "cd <dir> && node tests/<file>"; *.py -> pytest.
+      #   Fixtures, helpers, run_all.js, snapshots and data files are excluded.
+      rst_tests_in_diff() {
+        local base="$1" files f js_runner="" bun_files="" py_files=""
+        files="$( { git diff --name-only "$base" -- 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u \
+          | grep -E '(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]*\.(js|mjs|cjs|py|sh)$' \
+          | grep -vE '(^|/)(fixtures?|helpers?|__snapshots__|__mocks__|setup)/|(^|/)(run_all|_[^/]*|setup[^/]*|conftest)\.[a-z]+$|\.(json|md|txt|csv|snap|sql|yaml|yml|html)$' || true)"
+        [ -n "$files" ] || return 0
+        if [ -f package.json ]; then
+          if grep -q '"vitest"' package.json; then js_runner="npx vitest run"
+          elif grep -q '"jest"' package.json; then js_runner="npx jest"
+          fi
+        fi
+        [ -n "$js_runner" ] || js_runner="bun test"
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          [ -e "$f" ] || continue
+          case "$f" in
+            *.py) py_files="${py_files:+$py_files }$f" ;;
+            *.test.*|*.spec.*|*__tests__/*) bun_files="${bun_files:+$bun_files }$f" ;;
+            */tests/test_*.js|*/tests/test_*.mjs|*/tests/test_*.cjs) printf 'cd %s && node tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.js|tests/test_*.mjs|tests/test_*.cjs) printf 'node %s\n' "$f" ;;
+            */tests/test_*.sh) printf 'cd %s && bash tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.sh|tests/*.test.sh|tests/*_test.sh) printf 'bash %s\n' "$f" ;;
+            *) ;;
+          esac
+        done <<<"$files"
+        [ -n "$bun_files" ] && printf '%s %s\n' "$js_runner" "$bun_files"
+        [ -n "$py_files" ] && printf 'pytest %s\n' "$py_files"
+        return 0
+      }
+      # rst_repo_test_script   (-> the repo's own canonical test command when the root
+      #   package.json declares a "test" script: "bun run test" when a bun lockfile is
+      #   present, else "npm test"; empty otherwise). Last rung of the ladder: a CODE WO
+      #   whose spec names no command and whose diff touched no test file still gets
+      #   real numbers from the repo's suite instead of N/A.
+      rst_repo_test_script() {
+        [ -f package.json ] || return 0
+        python3 -c 'import json,sys; d=json.load(open("package.json")); s=d.get("scripts",{}); sys.exit(0 if isinstance(s,dict) and s.get("test") else 1)' 2>/dev/null || return 0
+        if [ -f bun.lock ] || [ -f bun.lockb ]; then printf 'bun run test\n'; else printf 'npm test\n'; fi
+      }
+      # rst_parse_counts   (test-runner output on stdin -> "<passed> <total>", or empty)
+      #   Sums every recognised summary line (a chained "a && b && c" command prints
+      #   several). Recognised: shopops run_all "Passed: N  Failed: M  Total: T" and
+      #   per-file "Tests: P/T"; jest "Tests: N failed, M passed, T total"; vitest
+      #   "Tests  N failed | M passed (T)"; bun "N pass" / "M fail"; TAP and node:test
+      #   "# pass N" / "pass N"; mocha "N passing" / "M failing"; pytest "N passed, M
+      #   failed in Xs". Fallback: count "PASS:"/"ok" vs "FAIL:"/"not ok" lines. ANSI
+      #   colour codes are stripped first (vitest).
+      rst_parse_counts() {
+        local esc raw counts
+        esc="$(printf '\033')"
+        # Bun --filter prefixes each workspace test line; normalize parser input only.
+        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g" | sed -E 's/^(@[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)?[A-Za-z0-9_-][A-Za-z0-9_.-]*:test[[:blank:]]+\|[[:blank:]]*//')"
+        counts="$(printf '%s\n' "$raw" | awk '
+          /^[ \t]*Passed: [0-9]+[ \t]+Failed: [0-9]+[ \t]+Total: [0-9]+/ { p += $2; t += $6; hit = 1; next }
+          /^[ \t]*Tests: [0-9]+\/[0-9]+[ \t]*$/ { split($2, a, "/"); p += a[1]; t += a[2]; hit = 1; next }
+          /^[ \t]*Tests:.*[0-9]+ total/ { for (i = 1; i < NF; i++) { if ($(i+1) == "passed," || $(i+1) == "passed") p += $i; if ($(i+1) == "total") t += $i }; hit = 1; next }
+          /^[ \t]*Tests[ \t]+.*[0-9]+ passed.*\([0-9]+\)[ \t]*$/ { for (i = 1; i < NF; i++) { if ($(i+1) == "passed") p += $i }; m = $NF; gsub(/[()]/, "", m); t += m; hit = 1; next }
+          /^[ \t]*[0-9]+ pass[ \t]*$/ { p += $1; t += $1; hit = 1; next }
+          /^[ \t]*[0-9]+ fail[ \t]*$/ { t += $1; hit = 1; next }
+          /(^|[^A-Za-z0-9])pass [0-9]+[ \t]*$/ { p += $NF; t += $NF; hit = 1; next }
+          /(^|[^A-Za-z0-9])fail [0-9]+[ \t]*$/ { t += $NF; hit = 1; next }
+          /^[ \t]*[0-9]+ passing/ { p += $1; t += $1; hit = 1; next }
+          /^[ \t]*[0-9]+ failing/ { t += $1; hit = 1; next }
+          /^=+ .*[0-9]+ (passed|failed).* in [0-9.]+s/ { for (i = 1; i < NF; i++) { w = $(i+1); gsub(/,/, "", w); if (w == "passed") { p += $i; t += $i } else if (w == "failed" || w == "error" || w == "errors") t += $i }; hit = 1; next }
+          END { if (hit) print p, t }
+        ')"
+        if [ -z "$counts" ]; then
+          local pass fail
+          pass="$(printf '%s\n' "$raw" | grep -cE '^(PASS|ok)([: ]|$)' || true)"
+          fail="$(printf '%s\n' "$raw" | grep -cE '^(FAIL|not ok)([: ]|$)' || true)"
+          pass="${pass:-0}"; fail="${fail:-0}"
+          if [ "$pass" -gt 0 ] || [ "$fail" -gt 0 ]; then
+            counts="$pass $((pass + fail))"
+          fi
+        fi
+        printf '%s' "$counts"
+      }
+      # Remove production credentials and switches before any test command is spawned.
+      # Preserve _TEST_ names: CI supplies disposable fixtures; production never uses them.
+      rst_scrub_env() {
+        local name
+        for name in $(env | sed -n 's/=.*//p'); do
+          case "$name" in
+            *_TEST_*) continue ;;
+            OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL|TELEGRAM_*)
+              unset "$name"
+              ;;
+          esac
+        done
+      }
+      # Split declared semicolon segments outside literal single-quoted arguments.
+      # Each resulting segment still passes the existing argv allowlist (no shell eval).
+      rst_split_segments() {
+        local line c part="" quoted=0 i
+        while IFS= read -r line; do
+          part=""; quoted=0
+          for ((i=0; i<${#line}; i++)); do
+            c="${line:i:1}"
+            if [ "$c" = "'" ]; then quoted=$((1 - quoted)); fi
+            if [ "$c" = ";" ] && [ "$quoted" -eq 0 ]; then
+              printf '%s\n' "$part"; part=""
+            else part+="$c"; fi
+          done
+          printf '%s\n' "$part"
+        done
+      }
+      # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
+      #   1500 s budget as the parsed argv words of the shared tokenizer -- no bash -c -- appends
+      #   every command's output to <log> under a "### run-stop-tests:" header, and prints
+      #   "<exit> <passed> <total>" -- exit is the first nonzero exit, counts are summed across
+      #   commands; "<exit>  " (empty counts) when nothing parsed). Optional "cd <dir> &&" is
+      #   performed in-process; remaining && segments run sequentially. pipefail is
+      #   unused (pipes are already rejected).
+      rst_run_commands() {
+        local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
+        local saved_pwd d k total piece piece_counts piece_cmd env_reason="" word needs_postgres
+        local -a words=() segw=()
+        rst_scrub_env
+        saved_pwd="$(pwd)"
+        seg="$(mktemp)"
+        while IFS= read -r cmd; do
+          [ -z "$cmd" ] && continue
+          printf '### run-stop-tests: %s\n' "$cmd" >> "$log"
+          cd "$saved_pwd" || continue
+          : > "$seg"
+          rc=0
+          if ! rst_command_looks_runnable "$cmd"; then
+            printf 'rst_run_commands: refusing non-runnable command\n' > "$seg"
+            rc=1
+          else
+            rst_parse_cmd "$cmd" || true
+            words=("${RST_WORDS[@]}")
+            needs_postgres=0
+            for word in "${words[@]}"; do
+              case "$word" in --postgres|--postgres=*) needs_postgres=1 ;; esac
+            done
+            if [ "$needs_postgres" -eq 1 ] && [ "${BDC_BUILDER_POSTGRES:-}" != "1" ]; then
+              env_reason="postgres capability absent in this lane"
+              printf '### skipped: %s\n' "$env_reason" >> "$log"
+              continue
+            fi
+            total=${#words[@]}
+            k=0
+            if [ "$total" -gt 0 ] && [ "${words[0]}" = "cd" ]; then
+              d="${words[1]}"
+              k=3
+              if ! cd "$d"; then
+                printf 'rst_run_commands: cd %s failed\n' "$d" > "$seg"
+                rc=1
+              fi
+            fi
+            if [ "$rc" -eq 0 ]; then
+              while :; do
+                segw=()
+                while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RST_RS" ]; do
+                  segw+=("${words[k]}")
+                  k=$((k + 1))
+                done
+                set -- "${segw[@]}"
+                if [ $# -eq 0 ]; then rc=1; break; fi
+                # Rewrite npx/npm to bun only after the original argv passed the allowlist.
+                # When the real binary is on PATH, leave the command unchanged.
+                if [ "$1" = "npx" ] && ! command -v "${RST_NPX_BIN:-npx}" >/dev/null 2>&1; then
+                  if command -v bunx >/dev/null 2>&1; then
+                    shift
+                    set -- bunx "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  elif command -v bun >/dev/null 2>&1; then
+                    shift
+                    set -- bun x "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                elif [ "$1" = "npm" ] && ! command -v "${RST_NPM_BIN:-npm}" >/dev/null 2>&1 && command -v bun >/dev/null 2>&1; then
+                  if [ "${2:-}" = "test" ]; then
+                    shift 2
+                    set -- bun run test "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  elif [ "${2:-}" = "run" ] && [ -n "${3:-}" ]; then
+                    shift 2
+                    set -- bun run "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                fi
+                piece="$(mktemp)"
+                piece_cmd="${segw[*]}"
+                timeout "$(rst_timeout)" "$@" > "$piece" 2>&1 < /dev/null
+                rc=$?
+                piece_counts="$(rst_parse_counts < "$piece")"
+                cat "$piece" >> "$seg"
+                printf 'TESTS_COMMAND_RESULT=%s => exit %s, %s/%s\n' "$piece_cmd" "$rc" "${piece_counts%% *}" "${piece_counts##* }" >> "$log"
+                rm -f "$piece"
+                [ "$rc" -ne 0 ] && break
+                k=$((k + 1))
+                [ "$k" -ge "$total" ] && break
+              done
+            fi
+          fi
+          cat "$seg" >> "$log"
+          printf '### exit %s\n' "$rc" >> "$log"
+          [ "$rc" -ne 0 ] && [ "$exit_code" -eq 0 ] && exit_code="$rc"
+          c="$(rst_parse_counts < "$seg")"
+          if [ -n "$c" ]; then p=$((p + ${c%% *})); t=$((t + ${c##* })); hit=1; fi
+        done < "$cmds"
+        cd "$saved_pwd" || true
+        rm -f "$seg"
+        if [ "$hit" -eq 1 ]; then printf '%s %s %s' "$exit_code" "$p" "$t"; else printf '%s  ' "$exit_code"; fi
+        [ -z "$env_reason" ] || printf '\t%s' "$env_reason"
+        return 0
+      }
+      # rst_report <class> <cmd> <exit> <counts> [env_reason] [log_path]
+      #   A declared environment probe wins over blocked reasons; absent capability is
+      #   not repairable, even if another declared command failed or timed out.
+      #   Status law: passed only when the command exited 0 AND passed == total > 0.
+      #   Any nonzero exit, any failing test, or 0 tests ran is "failed". A
+      #   spec-declared command that exited nonzero with no parseable counts is
+      #   also "failed" (the required command failed; do not treat it as an
+      #   unparseable rung). Other unparseable output is "counts_unparsed"
+      #   (fail-closed downstream on CODE/MIXED). A CODE or MIXED spec with no
+      #   runnable test command AND no test files in the diff is
+      #   "no_command_declared" (spec + build defect).
+      rst_report() {
+        local class="$1" cmd="$2" exit_code="$3" counts="$4" env_reason="${5:-}" status line p t reason
+        if [ -n "$env_reason" ]; then
+          line="${counts:-0 0}"
+          line="${line/ /\/} ($cmd) -- ENVIRONMENT UNAVAILABLE: $env_reason"
+          printf 'TESTS_ENV_REASON=%s\nTESTS_STATUS=env_unavailable\nTESTS_LINE=%s\n' "$env_reason" "$line"
+          return 0
+        fi
+        reason="$(rst_failure_reason "$exit_code" "${6:-/dev/null}" "$cmd")"
+        if [ -n "$reason" ]; then
+          printf 'TESTS_STATUS=blocked\nTESTS_LINE=BLOCKED (%s)\nTESTS_BLOCKED_REASON=%s\n' "$reason" "$reason"
+          return 0
+        fi
+        if [ -z "$cmd" ]; then
+          case "$class" in
+            CODE|MIXED) status="no_command_declared"; line="N/A ($class spec declares no executable test command and the diff touched no test files -- Rule 10 defect)" ;;
+            *) status="not_required"; line="N/A ($class class, no test command declared)" ;;
+          esac
+        elif [ -z "$counts" ]; then
+          if [ "$exit_code" -ne 0 ] && [ "${SOURCE:-}" = "spec_declared" ]; then
+            status="failed"
+            line="N/A (spec-declared test command exited $exit_code with no parseable counts: $cmd) -- FAILED"
+          else
+            status="counts_unparsed"
+            line="N/A (test command exited $exit_code but pass/total could not be parsed from its output: $cmd)"
+          fi
+        else
+          p="${counts%% *}"; t="${counts##* }"
+          if [ "$exit_code" -ne 0 ] || [ "$t" -eq 0 ] || [ "$p" -lt "$t" ]; then
+            status="failed"
+            line="$p/$t ($cmd) -- FAILED, exit $exit_code"
+          else
+            status="passed"
+            line="$p/$t ($cmd)"
+          fi
+        fi
+        printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
+      }
+
+      # Project-map values are clamped separately; direct fixture overrides may be <60.
+      rst_timeout() {
+        local value="${RST_TIMEOUT_SECONDS:-1500}"
+        if ! [[ "$value" =~ ^[0-9]+$ ]]; then value=1500; fi
+        value="$(printf '%s' "$value" | sed 's/^0*//')"
+        if [ -z "$value" ]; then value=1500
+        elif [ "${#value}" -gt 4 ] || [ "$value" -gt 1700 ]; then value=1700; fi
+        printf '%s' "$value"
+      }
+      rst_failure_reason() {
+        local rc="$1" log="${2:-/dev/null}" cmd="${3:-}" tool
+        if [ "$rc" -eq 124 ]; then printf 'timeout:%ss' "$(rst_timeout)"; return; fi
+        if grep -q 'outside of the test runner' "$log" && [[ "$(command -v node)" == *bun-node-fallback-bin/* || "$(command -v node)" == */bun ]]; then
+          printf 'runner_mismatch:node-is-bun'; return
+        fi
+        if [ "$rc" -eq 127 ] || grep -q 'failed to run command' "$log"; then
+          tool="$(sed -nE 's/.*failed to run command [^A-Za-z0-9_/.-]*([A-Za-z0-9_/.-]+).*/\1/p' "$log" | head -1)"
+          [ -n "$tool" ] || tool="${cmd%% *}"
+          printf 'missing_tool:%s' "${tool:-unknown}"
+        fi
+      }
+      # Same canonical-block selection and required stage keys as parse-stages.
+      # An absent plan is empty; an ambiguous or invalid declared plan fails closed.
+      rst_stage_plan() {
+        python3 -c '
+      import re, sys
+      spec = sys.stdin.read()
+      candidates = [(m.start(), m.group(1)) for m in re.finditer(r"```ya?ml\s*\n(.*?)\n```", spec, re.S) if re.search(r"^stages:", m.group(1), re.M)]
+      if not candidates:
+          m = re.search(r"^stages:[^\n]*(?:\n(?:[ \t-][^\n]*|))*(?:\n|$)", spec, re.M)
+          if m: candidates = [(0, m.group())]
+      if not candidates: sys.exit(0)
+      markers = [r"^\s*##+\s+Canonical\s+stages\b", r"^\s*##+\s+Stages\b", r"<!--\s*canonical-stages\s*-->", r"<!--\s*stages:\s*canonical\s*-->"]
+      chosen = next((body for marker in markers for offset, body in candidates if re.search(marker, spec[max(0, offset-600):offset], re.I|re.M)), None)
+      if chosen is None:
+          if len(candidates) != 1: sys.exit("stage_plan_invalid: ambiguous canonical stages")
+          chosen = candidates[0][1]
+      import yaml
+      data = yaml.safe_load(chosen)
+      stages = data.get("stages") if isinstance(data, dict) else None
+      if not isinstance(stages, list) or not stages: sys.exit("stage_plan_invalid: empty stages")
+      seen = set()
+      lines = []
+      for st in stages:
+          if not isinstance(st, dict) or any(k not in st for k in ["id","repo","target_branch","in_scope_files","verify_commands","readiness_bar"]): sys.exit("stage_plan_invalid: required key missing")
+          sid, repo, commands = st["id"], st["repo"], st["verify_commands"]
+          if not isinstance(sid,str) or not re.fullmatch(r"[A-Za-z0-9_.-]+",sid) or sid in seen: sys.exit("stage_plan_invalid: invalid or duplicate id")
+          seen.add(sid)
+          if not isinstance(repo,str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",repo): sys.exit("stage_plan_invalid: invalid repo")
+          if not isinstance(commands,list) or not commands: sys.exit("stage_plan_invalid: empty verify_commands")
+          for cmd in commands:
+              if not isinstance(cmd,str) or not cmd.strip() or any(c in cmd for c in "\t\r\n\x00"): sys.exit("stage_plan_invalid: invalid command")
+              lines.append("\t".join([sid,repo,cmd,str(st["target_branch"])]))
+      print("\n".join(lines))' | sed 's/\r$//'
+      }
+      # Shared directory resolution for execution and assertion-guard coverage.
+      rst_stage_dir() {
+        local sid="$1" repo="$2" dir origin
+        dir="$(printf '%s\n' "${RST_STAGE_WORKTREES:-}" | tr ';' '\n' | sed -n "s/^${sid}=//p" | head -1)"
+        origin="$(git remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]##; s/[.]git$//')"
+        if [ -z "$dir" ] && [ "$repo" = "$origin" ]; then dir="$(pwd)"; fi
+        printf '%s\n' "$dir"
+      }
+      # Replays only the persisted plan; no spec extraction occurs in a repair or final run.
+      rst_execute_saved() {
+        local evidence="$1" class="$2" cmds log result rc counts joined report reason="" env_reason="" overall_env_reason="" overall=passed p=0 t=0
+        local sid repo cmd dir stage_status stage_line lines="" blocked="" stage_cmds
+        cmds="$evidence/stop-tests.commands"; log="$evidence/stop-tests.log"
+        if [ -s "$evidence/stop-tests.stages" ]; then
+          stage_cmds="$(mktemp)"
+          while IFS= read -r sid; do
+            repo="$(awk -F '\t' -v id="$sid" '$1==id {print $2; exit}' "$evidence/stop-tests.stages")"
+            awk -F '\t' -v id="$sid" '$1==id {print $3}' "$evidence/stop-tests.stages" > "$stage_cmds"
+            dir="$(rst_stage_dir "$sid" "$repo")"
+            if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+              stage_status=blocked; reason="stage_repo_absent:$repo"; stage_line="$sid: BLOCKED ($reason)"
+            else
+              joined="$(paste -sd ';' "$stage_cmds" | sed 's/;/; /g')"
+              local stage_log
+              stage_log="$(mktemp)"
+              result="$(cd "$dir" && rst_run_commands "$stage_cmds" "$stage_log")"
+              cat "$stage_log" >> "$log"
+              env_reason=""
+              case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
+              rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
+              report="$(SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$stage_log")"
+              stage_status="$(echo "$report" | sed -n 's/^TESTS_STATUS=//p')"
+              reason="$(echo "$report" | sed -n 's/^TESTS_BLOCKED_REASON=//p')"
+              stage_line="$sid: $(echo "$report" | sed -n 's/^TESTS_LINE=//p')"
+              if [ -n "$counts" ]; then p=$((p+${counts%% *})); t=$((t+${counts##* })); fi
+              rm -f "$stage_log"
+            fi
+            if [ "$stage_status" = env_unavailable ]; then
+              overall=env_unavailable
+              [ -n "$overall_env_reason" ] || overall_env_reason="$(echo "$report" | sed -n 's/^TESTS_ENV_REASON=//p')"
+            elif [ "$stage_status" = blocked ]; then
+              [ "$overall" = env_unavailable ] || overall=blocked
+              [ -n "$blocked" ] || blocked="$reason"
+            elif [ "$stage_status" != passed ] && [ "$overall" != blocked ] && [ "$overall" != env_unavailable ]; then overall=failed; fi
+            printf 'TESTS_STAGE_LINE=%s\n' "$stage_line"
+            lines="${lines:+$lines | }$stage_line"
+          done < <(cut -f1 "$evidence/stop-tests.stages" | awk '!seen[$0]++')
+          rm -f "$stage_cmds"
+          [ -z "$overall_env_reason" ] || printf 'TESTS_ENV_REASON=%s\n' "$overall_env_reason"
+          printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\nTESTS_BLOCKED_REASON=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\nTESTS_EXIT=%s\n' "$overall" "$lines" "$blocked" "$p" "$t" "$([ "$overall" = passed ] && echo 0 || echo 1)"
+        else
+          joined="$(paste -sd ';' "$cmds" | sed 's/;/; /g')"
+          local command_log
+          command_log="$(mktemp)"
+          result="$(rst_run_commands "$cmds" "$command_log")"
+          cat "$command_log" >> "$log"
+          env_reason=""
+          case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
+          rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
+          SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$command_log"
+          printf 'TESTS_EXIT=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\n' "$rc" "${counts%% *}" "${counts##* }"
+          rm -f "$command_log"
+        fi
+        printf 'TESTS_CLASS=%s\n' "$class"
+        grep '^TESTS_COMMAND_RESULT=' "$log" || true
+      }
+      # Persist executable functions before the agent runs. Both consumers source this
+      # snapshot, so the embedded rst/trg cores have one byte-identical copy per lane.
+      rst_save_core() {
+        { declare -f $(compgen -A function | grep -E '^(rst_|trg_|_?rsg_)'); declare -p RSGARGV_SCRIPT RST_RS RST_WORDS RSG_US RSG_RS RSG_PARSED; } > "$1/stop-tests.core.sh"
+      }
+      # ---- END rst core ----
+
+      # ---- BEGIN trg core (byte-identical across lanes; extracted by unit test) ----
+      # Allow only build-changed product source and new product helpers.
+      # One infrastructure classifier governs the freeze, new files and listing.
+      trg_guard() {
+        local mode="$1" root="$2" snapshot="$3" sid repo command target dir
+        local -a roots=("$root" "${BASE_BRANCH:-master}")
+        local -a declared=()
+        if [ ! -s "$(dirname "$snapshot")/stop-tests.stages" ] && [ -f "$(dirname "$snapshot")/stop-tests.commands" ]; then
+          while IFS= read -r command; do
+            declared+=("$root" "$command")
+          done < "$(dirname "$snapshot")/stop-tests.commands"
+        fi
+        if [ -s "$(dirname "$snapshot")/stop-tests.stages" ]; then
+          while IFS=$'\t' read -r sid repo command target; do
+            dir="$(cd "$root" && rst_stage_dir "$sid" "$repo")" || return 1
+            # Remember present roots; checks revisit saved roots if mappings vanish.
+            if [ -n "$dir" ]; then
+              dir="$(cd "$root" && cd "$dir" 2>/dev/null && pwd)" || continue
+              roots+=("$dir" "$target")
+              declared+=("$dir" "$command")
+            fi
+          done < "$(dirname "$snapshot")/stop-tests.stages"
+        fi
+        python3 - "$mode" "$snapshot" "${SPEC:-}" "${ARTIFACTS_DIR:-}" "${#roots[@]}" "${roots[@]}" "${declared[@]}" <<'TRG_PY'
+      import collections, fnmatch, hashlib, json, os, pathlib, re, shlex, subprocess, sys
+      mode, snapshot, spec, artifacts = sys.argv[1:5]
+      count = int(sys.argv[5])
+      pairs = sys.argv[6:6+count]
+      run_root, run_base = str(pathlib.Path(pairs[0]).resolve()), pairs[1]
+      # Match resolve-review-base's declared-header priority, without network access.
+      for pattern in [r"^Base branch:\s*([A-Za-z0-9_./-]+)",r"\*\*Base branch:\*\*\s*`([A-Za-z0-9_./-]+)`",r"^base_branch:\s*([A-Za-z0-9_./-]+)"]:
+          match = re.search(pattern,spec,re.M)
+          if match:
+              run_base = match[1]
+              break
+      roots = {}
+      for directory, base in zip(pairs[2::2],pairs[3::2]):
+          roots.setdefault(str(pathlib.Path(directory).resolve()),set()).add(base)
+      # A stage executing in the run directory uses its own persisted target branch.
+      roots.setdefault(run_root,{run_base})
+      declared = sys.argv[6+count:]
+      markers = [r"\.skip\s*\(",r"\.only\s*\(",r"\bxit\s*\(",r"\bxdescribe\s*\(",r"\bit\.todo\b",r"\btest\.todo\b",r"@pytest\.mark\.skip",r"unittest\.skip"]
+      before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
+      touched = set()
+      violations = []
+      command_files = {}
+      entry_cwds = {}
+      absolute_references = {}
+      def live_absolute_reference(token):
+          path = pathlib.Path(token)
+          if not path.is_absolute(): return None
+          path = pathlib.Path(os.path.abspath(path))
+          # Harness output retains its existing exclusion from project capture.
+          if any(path.is_relative_to(directory) for directory in artifact_roots): return None
+          if any(path.is_relative_to(pathlib.Path(directory)) or path.resolve().is_relative_to(pathlib.Path(directory)) for directory in roots):
+              return path
+          return None
+      def absolute_reference_message(name,path):
+          return "test guard: absolute reference into the live worktree cannot be verified from the trusted copy: "+name+" -> "+path.as_posix()
+      # Lane evidence is harness output, including when it lives in a project.
+      artifact_roots = {pathlib.Path(snapshot).resolve().parent}
+      if artifacts: artifact_roots.add(pathlib.Path(artifacts).resolve())
+      def excluded(root,name):
+          return (any(part in {"node_modules",".git",".venv","venv","__pycache__",".bun",".pnpm-store"} for part in pathlib.PurePosixPath(name).parts)
+                  or any((root/name).is_relative_to(path) for path in artifact_roots))
+      def directory_in_tree(root,name):
+          path = root/name
+          return path.is_dir() and path.resolve().is_relative_to(root)
+      def package_script(root, cwd, name, stack, lifecycle=False):
+          if excluded(root,cwd.relative_to(root).as_posix()): return
+          key = (str(cwd),name)
+          try:
+              if key in stack or len(stack) >= 5: raise ValueError("package script cycle or depth limit")
+              package = cwd/"package.json"
+              if not package.resolve(strict=True).is_relative_to(root): raise ValueError("package outside worktree")
+              scripts = json.loads(package.read_text())["scripts"]
+              command = scripts[name]
+              names = (["pre"+name] if lifecycle and "pre"+name in scripts else []) + [name] + (["post"+name] if lifecycle and "post"+name in scripts else [])
+              commands = [scripts[entry] for entry in names]
+              if any(not isinstance(value,str) or not value.strip() for value in commands): raise ValueError("missing package script")
+          except (OSError,RuntimeError,ValueError,KeyError,TypeError) as error:
+              print("test guard: cannot resolve package script: "+str(cwd)+"/"+name+": "+str(error),file=sys.stderr)
+              sys.exit(42)
+          command_files.setdefault(str(root),set()).add(package.relative_to(root).as_posix())
+          for command in commands: declared_paths(root,command,cwd,stack+(key,),entry=package.relative_to(root).as_posix())
+      def declared_paths(root, command, cwd=None, stack=(), expand=True, entry="stop-tests.commands"):
+          cwd = root if cwd is None else cwd
+          try:
+              lexer = shlex.shlex(command,posix=True,punctuation_chars="&|;")
+              lexer.whitespace_split = True
+              lexer.commenters = ""
+              tokens = list(lexer)
+          except ValueError:
+              if expand: sys.exit(42)
+              return
+          # Resolve each chained segment in its own command cwd.
+          segments = []
+          segment = []
+          for token in tokens:
+              if token in {"&&","||",";","|"}:
+                  segments.append(segment); segment = []
+              else: segment.append(token)
+          segments.append(segment)
+          for segment in segments:
+              if not segment: continue
+              if segment[0] == "cd" and len(segment) == 2:
+                  cwd = (cwd/segment[1]).resolve()
+                  if not cwd.is_relative_to(root): return
+                  continue
+              manager = pathlib.Path(segment[0]).name
+              args = segment[1:]
+              name = None
+              if manager == "npm":
+                  if args and args[0] == "test": name = "test"
+                  elif len(args) >= 2 and args[0] == "run": name = args[1]
+              elif manager in {"bun","yarn","pnpm"} and args:
+                  if len(args) >= 2 and args[0] == "run": name = args[1]
+                  elif manager != "bun" and not args[0].startswith("-"): name = args[0]
+                  # Bun prefers package scripts over same-named files. Only
+                  # treat bun run x.ts as a file when no such script is declared.
+                  if manager == "bun" and name and (cwd/name).is_file():
+                      try:
+                          scripts = json.loads((cwd/"package.json").read_text()).get("scripts",{})
+                          if not isinstance(scripts,dict): scripts = {}
+                      except (OSError,ValueError,AttributeError): scripts = {}
+                      if name not in scripts: name = None
+              if mode == "snapshot" and expand and name is not None:
+                  package_script(root,cwd,name,stack,lifecycle=manager == "npm")
+              for token in segment:
+                  if mode == "snapshot" and expand:
+                      absolute = live_absolute_reference(token)
+                      if absolute is not None:
+                          absolute_references.setdefault(str(root),set()).add(absolute_reference_message(entry,absolute))
+                  if token.startswith("-"): continue
+                  if re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bunx?|npm|npx|pnpm|yarn|pytest",pathlib.Path(token).name): continue
+                  path = pathlib.Path(os.path.abspath(cwd/token))
+                  if (path.is_file() or path.is_symlink()) and path.is_relative_to(root):
+                      name = path.relative_to(root).as_posix()
+                      if not excluded(root,name) and not directory_in_tree(root,name):
+                          command_files.setdefault(str(root),set()).add(name)
+                          if expand: entry_cwds.setdefault((str(root),name),set()).add(str(cwd))
+      for directory, command in zip(declared[::2],declared[1::2]):
+          declared_paths(pathlib.Path(directory).resolve(),command)
+      def named_helpers(root,body,cwd,name,entry):
+          found = set()
+          parent = (root/name).resolve().parent
+          def blocked(reason):
+              if trusted_boundary(root,name):
+                  raise ValueError("test guard: cannot resolve trusted helper: "+entry+" ("+name+": "+reason+")")
+          def resolve(token,base,required=False,module=False):
+              if any(c in token for c in "$`{}*?[]"):
+                  if required: blocked("dynamic script reference")
+                  return
+              absolute = live_absolute_reference(token)
+              if absolute is not None and trusted_boundary(root,name):
+                  raise ValueError(absolute_reference_message(name,absolute))
+              candidates = [base/token]
+              if not module and base == cwd and parent != base: candidates.append(parent/token)
+              if module:
+                  extensions = [".py"] if module == "python" else [".js",".cjs",".mjs",".ts"]
+                  leaves = ["__init__.py"] if module == "python" else ["index.js","index.ts"]
+                  candidates += [base/(token+ext) for ext in extensions]
+                  candidates += [base/token/leaf for leaf in leaves]
+              resolved = False
+              for path in candidates:
+                  path = pathlib.Path(os.path.abspath(path))
+                  if excluded(root,path):
+                      resolved = True
+                      continue
+                  if not path.is_relative_to(root): continue
+                  relative = path.relative_to(root).as_posix()
+                  if path.is_file():
+                      if not path.resolve().is_relative_to(root):
+                          blocked("script outside worktree")
+                          continue
+                      found.add((relative,str(cwd)))
+                      resolved = True
+                      if module == "python":
+                          package = path.parent
+                          while package.is_relative_to(root) and package != root:
+                              init = package/"__init__.py"
+                              if init.is_file(): found.add((init.relative_to(root).as_posix(),str(cwd)))
+                              package = package.parent
+              if required and not resolved: blocked("missing script: "+token)
+          # Imports resolve against the importing file, unlike shell commands.
+          for match in re.finditer(r"\b(?:require|import)\s*\(([^)\n]*)\)",body):
+              literal = re.fullmatch(r"\s*(['\"])([^'\"]+)\1\s*",match[1])
+              if not literal:
+                  blocked("computed import")
+                  continue
+              if literal[2].startswith(".") or live_absolute_reference(literal[2]) is not None: resolve(literal[2],parent,True,True)
+          body = re.sub(r"\b(?:require|import)\s*\([^\n)]*\)","",body)
+          for match in re.finditer(r"\b(?:from\s*|import\s*)(['\"])([^'\"]+)\1",body):
+              if match[2].startswith(".") or live_absolute_reference(match[2]) is not None: resolve(match[2],parent,True,True)
+          if pathlib.Path(name).suffix == ".py":
+              for match in re.finditer(r"^\s*(?:from\s+([.\w]+)\s+import\s+([^\n]+)|import\s+([^\n]+))",body,re.M):
+                  modules = [match[1]] if match[1] else [part.strip().split()[0] for part in match[3].split(",") if part.strip()]
+                  for module in modules:
+                      dots = len(module)-len(module.lstrip("."))
+                      base = parent
+                      for _ in range(max(0,dots-1)): base = base.parent
+                      token = module.lstrip(".").replace(".","/")
+                      resolve(token,base,module="python")
+                      if match[1]:
+                          for part in match[2].split(","):
+                              child = part.strip().split()[0]
+                              if child.isidentifier(): resolve((token+"/" if token else "")+child,base,module="python")
+          # Follow literal command/source positions, not data arguments such as
+          # `grep good a.js`. Product inputs must retain their repaired bytes.
+          lexer = shlex.shlex(body,posix=True,punctuation_chars="&|;()\n")
+          lexer.whitespace = " \t\r"
+          lexer.whitespace_split = True
+          lexer.commenters = "#"
+          try: tokens = list(lexer)
+          except ValueError:
+              if re.search(r"(?:^|[;\n])\s*(?:source|\.|bash|sh|node|bun|python)\s",body): blocked("unparseable script reference")
+              return found
+          segments, segment = [], []
+          for token in tokens+["\n"]:
+              if token and all(c in "&|;()\n" for c in token):
+                  segments.append(segment); segment = []
+              else: segment.append(token)
+          for segment in segments:
+              while segment and (segment[0] in {"if","then","else","elif","do","!","exec","command","env"} or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=",segment[0])):
+                  segment = segment[1:]
+              if not segment: continue
+              if segment[0] == "cd" and len(segment) == 2:
+                  cwd = pathlib.Path(os.path.abspath(cwd/segment[1]))
+                  if not cwd.is_relative_to(root): return found
+                  continue
+              head = segment[0] if segment[0] == "." else pathlib.Path(segment[0]).name
+              runner = head in {".","source"} or re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bun",head)
+              if runner:
+                  args = segment[1:]
+                  # Inline programs are not filenames. Inspect their references too.
+                  if args and args[0] in {"-c","-e","--eval","-m"}:
+                      if len(args) < 2:
+                          blocked("missing inline program")
+                          continue
+                      if args[0] == "-m": resolve(args[1].replace(".","/"),cwd,module="python")
+                      else: found.update(named_helpers(root,args[1],cwd,name,entry))
+                      continue
+                  args = [token for token in args if not token.startswith("-")]
+                  if head == "bun" and args[:1] == ["run"]: args = args[1:]
+                  if args: resolve(args[0],cwd,True)
+              else:
+                  token = segment[0]
+                  resolve(token,cwd,token.startswith(("./","../")))
+                  # Literal relative tokens can carry helper arguments to a
+                  # custom runner. Ordinary data-reader arguments are not code.
+                  if head not in {"grep","cat","echo","printf","test","[","read","sed","awk"}:
+                      for token in segment[1:]:
+                          if not token.startswith("-"): resolve(token.rstrip(","),cwd)
+          return found
+      def git_paths(root,*args):
+          return {os.fsdecode(name) for name in subprocess.check_output(["git",*args],cwd=root).split(b"\x00") if name}
+      def test_file(name):
+          return bool(re.search(r"(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.|(^|/)test_[^/]+|(^|/)[^/]+_test[.]",name))
+      def allowed_paths(root,bases):
+          allowed = None
+          for base in bases:
+              changed = set()
+              if base:
+                  for ref in ["origin/"+base,base]:
+                      if subprocess.run(["git","rev-parse","--verify","--quiet",ref+"^{commit}"],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode: continue
+                      try:
+                          changed = git_paths(root,"diff","--no-renames","--name-only","-z",ref+"...HEAD","--")
+                      except subprocess.CalledProcessError:
+                          pass
+                      break
+              allowed = changed if allowed is None else allowed & changed
+          return {name for name in allowed or set() if not excluded(root,name) and not directory_in_tree(root,name) and not infrastructure(root,name)}
+      def content(path):
+          # Hash symlink bytes without following targets outside the worktree.
+          if path.is_symlink(): return os.fsencode(os.readlink(path))
+          return path.read_bytes() if path.is_file() else None
+      def digest(path):
+          raw = content(path)
+          return hashlib.sha256(raw).hexdigest() if raw is not None else None
+      def executable(path):
+          # Git's index preserves executable mode on hosts without POSIX chmod.
+          return path.is_file() and (path.relative_to(root).as_posix() in executable_index or bool(path.stat().st_mode & 0o111))
+      def infrastructure(root,name):
+          if excluded(root,name) or directory_in_tree(root,name): return False
+          parts = pathlib.PurePosixPath(name).parts
+          patterns = ["package.json","bun.lock","bun.lockb","package-lock.json","pnpm-lock.yaml","yarn.lock","bunfig.toml","jest.config.*","vitest.config.*","vitest.workspace.*","playwright.config.*","pytest.ini","conftest.py","pyproject.toml","setup.cfg","tox.ini","Makefile","tsconfig*",".github"]
+          return (test_file(name) or any(fnmatch.fnmatchcase(part,pattern) for part in parts for pattern in patterns)
+                  or name in command_files.get(str(root),set())
+                  or pathlib.PurePosixPath(name).suffix.lower() in {".sh",".bash",".ps1"}
+                  or any(part in {"scripts","test","tests","__tests__","spec","specs",".circleci",".buildkite"} for part in parts)
+                  or any(fnmatch.fnmatchcase(parts[-1],pattern) for pattern in [".gitlab-ci.*",".travis.yml","Jenkinsfile","azure-pipelines.*",".mocharc*",".nycrc*",".taprc*",".coveragerc","karma.conf.*","cypress.config.*","ava.config.*","test.config.*","runner.config.*","phpunit.xml*"])
+                  or executable(root/name))
+      def trusted_boundary(root,name):
+          path = pathlib.PurePosixPath(name)
+          return (infrastructure(root,name)
+                  or any(part in {"test","tests","spec","specs","fixtures","__tests__","mocks"} for part in path.parts)
+                  or any(marker in path.name.lower() for marker in {"test","spec","fixture","mock","helper","setup","conftest"}))
+      def fingerprint(path):
+          return [digest(path),executable(path)] if path.exists() or path.is_symlink() else None
+      now = {}
+      for directory in sorted(roots.keys() | before.keys()):
+          root = pathlib.Path(directory)
+          if mode == "report" and not root.is_dir():
+              touched.update(before.get(directory,{}).get("infrastructure",{}))
+              continue
+          if not root.is_dir(): sys.exit("test guard: missing stage directory: "+directory)
+          index = git_paths(root,"ls-files","--stage","-z")
+          tracked = {entry.split("\t",1)[1] for entry in index}
+          tracked = {name for name in tracked if not excluded(root,name) and not directory_in_tree(root,name)}
+          executable_index = {entry.split("\t",1)[1] for entry in index if entry.startswith("100755 ")}
+          files = {name for name in tracked | git_paths(root,"ls-files","-z","--others") | command_files.get(directory,set()) if not excluded(root,name) and not directory_in_tree(root,name)}
+          if mode == "snapshot":
+              links = {}
+              def freeze_link(name):
+                  path = root/name
+                  # Resolve file tokens through directory links as well as leaf links.
+                  if not path.is_symlink() and path.resolve() == path: return
+                  try:
+                      target = path.resolve(strict=True)
+                      if not target.is_relative_to(root) and not infrastructure(root,name): return
+                      if not target.is_relative_to(root) or not target.is_file(): raise ValueError("outside worktree or not a file")
+                  except (OSError,RuntimeError,ValueError) as error:
+                      print("test guard: unresolved or outside symlink: "+str(path)+": "+str(error),file=sys.stderr)
+                      sys.exit(42)
+                  target_name = target.relative_to(root).as_posix()
+                  if not excluded(root,target_name): links[name] = target_name
+              build_allowed = allowed_paths(root,roots[directory])
+              fixed_paths = tracked - build_allowed
+              for name in files:
+                  if name in fixed_paths or infrastructure(root,name): freeze_link(name)
+              declared_set = set(command_files.get(directory,set()))
+              # Preserve the round-8 freeze of symlinked test entries in other
+              # packages, without requiring or expanding their undeclared scripts.
+              for name in files:
+                  if pathlib.PurePosixPath(name).name != "package.json": continue
+                  try:
+                      command = json.loads((root/name).read_text()).get("scripts",{}).get("test","")
+                      if isinstance(command,str): declared_paths(root,command,(root/name).parent,expand=False)
+                  except (OSError,ValueError,AttributeError): pass
+              for name in command_files.get(directory,set()) - declared_set:
+                  if (root/name).is_symlink() or (root/name).resolve() != root/name:
+                      freeze_link(name)
+                      declared_set.add(name)
+              command_files[directory] = declared_set
+              targets = set(links.values())
+              allowed = build_allowed - declared_set - targets
+              frozen = (tracked - allowed) | {name for name in files if infrastructure(root,name)} | declared_set | targets
+              now[directory] = dict(allowed=sorted(allowed),known=sorted(files),links=links,frozen={name:digest(root/name) for name in sorted(frozen)},infrastructure={name:fingerprint(root/name) for name in sorted(files | targets) if infrastructure(root,name)})
+              # Walk through product imports, but save only the named test-support
+              # boundary. Keep the guard's frozen set and product allowlist intact.
+              try:
+                  if absolute_references.get(directory):
+                      raise ValueError(sorted(absolute_references[directory])[0])
+                  trusted = {name for name in files | targets if infrastructure(root,name)} | declared_set
+                  pending = collections.deque((name,cwd,0,name) for name in sorted(trusted) for cwd in entry_cwds.get((directory,name),{directory}))
+                  visited = set()
+                  while pending:
+                      name, cwd, depth, entry = pending.popleft()
+                      if (name,cwd) in visited: continue
+                      if depth > 8:
+                          raise ValueError("test guard: cannot resolve trusted helper: "+entry+" (depth limit 8: "+name+")")
+                      visited.add((name,cwd))
+                      if trusted_boundary(root,name): trusted.add(name)
+                      if pathlib.PurePosixPath(name).name == "package.json": continue
+                      try: body = (root/name).read_text()
+                      except (OSError,UnicodeError): continue
+                      if "\x00" in body: continue
+                      for helper, helper_cwd in sorted(named_helpers(root,body,pathlib.Path(cwd),name,entry)):
+                          pending.append((helper,helper_cwd,depth+1,entry))
+                  for name in list(trusted):
+                      path = root/name
+                      if path.is_symlink() or path.resolve() != path:
+                          target = path.resolve(strict=True)
+                          if not target.is_relative_to(root) or not target.is_file():
+                              raise ValueError("test guard: trusted file outside worktree: "+str(path))
+                          target_name = target.relative_to(root).as_posix()
+                          if trusted_boundary(root,target_name): trusted.add(target_name)
+                  store = pathlib.Path(snapshot).parent/"trusted-infra"/hashlib.sha256(os.fsencode(directory)).hexdigest()
+                  saved = {}
+                  for name in sorted(trusted):
+                      path = root/name
+                      raw = content(path)
+                      if raw is None: continue
+                      dest = store/name
+                      dest.parent.mkdir(parents=True,exist_ok=True)
+                      dest.write_bytes(raw)
+                      saved[name] = dict(sha=hashlib.sha256(raw).hexdigest(),executable=executable(path),link=os.readlink(path) if path.is_symlink() else None)
+                  now[directory]["trusted"] = saved
+              except (OSError,ValueError,RuntimeError) as error:
+                  # Keep the frozen snapshot usable when trusted capture fails.
+                  now[directory]["trusted_error"] = str(error)
+                  violations.append(str(error))
+              continue
+          if directory not in before: sys.exit("test guard: unsnapshotted stage directory: "+directory)
+          saved = before[directory]
+          previous = saved.get("infrastructure",{})
+          candidates = set(previous) | {name for name in files if infrastructure(root,name)}
+          touched.update(name for name in candidates if fingerprint(root/name) != previous.get(name))
+          if mode == "report": continue
+          for name, target in saved.get("links",{}).items():
+              try:
+                  if (root/name).resolve(strict=True) != root/target: raise ValueError("repointed")
+              except (OSError,RuntimeError,ValueError):
+                  violations.append("test guard: changed or deleted symlink target: "+directory+"/"+name)
+          for name, sha in saved["frozen"].items():
+              if digest(root/name) != sha: violations.append("test guard: changed or deleted frozen file: "+directory+"/"+name)
+          for name in files - set(saved["known"]):
+              if infrastructure(root,name):
+                  violations.append("test guard: new frozen file: "+directory+"/"+name)
+              raw = content(root/name)
+              if raw is not None and any(re.search(t,raw.decode(errors="replace")) for t in markers):
+                  violations.append("test guard: skip/only/todo in new file: "+directory+"/"+name)
+      if mode == "snapshot":
+          pathlib.Path(snapshot).write_text(json.dumps(now,sort_keys=True),encoding="ascii")
+      if mode == "report":
+          sys.stdout.reconfigure(newline="\n")
+          print("Repair touched test infrastructure" if touched else "Repair touched test infrastructure: none")
+          for name in sorted(touched): print(name)
+      for name in sorted(touched):
+          print("test guard: repair changed test infrastructure: "+name+" (frozen; a human must change it)",file=sys.stdout if mode == "report" else sys.stderr)
+      for message in violations: print(message,file=sys.stderr)
+      if touched or violations: sys.exit(1)
+      TRG_PY
+      }
+      trg_snapshot() { trg_guard snapshot "$1" "$2"; }
+      trg_check() { trg_guard check "$1" "$2"; }
+      trg_infrastructure() { trg_guard report "$1" "$2"; }
+      # Run only final verification in disposable copies. Git metadata is private;
+      # object alternates are read-only inputs, and dependencies are copied too.
+      trg_execute_trusted() (
+        local e="$1" class="$2" scratch sid repo command target dir prepared
+        local -a stages=()
+        e="$(cd "$e" && pwd)" || return 1
+        scratch="$(mktemp -d)" || return 1
+        trap 'rm -rf "$scratch"' EXIT
+        if [ -s "$e/stop-tests.stages" ]; then
+          while IFS=$'\t' read -r sid repo command target; do
+            dir="$(rst_stage_dir "$sid" "$repo")"
+            stages+=("$sid" "$dir")
+          done < "$e/stop-tests.stages"
+        fi
+        python3 - "$e/test-guard.json" "$scratch" "$(pwd)" "${ARTIFACTS_DIR:-}" "${stages[@]}" <<'TRUSTED_PY'
+      import hashlib, json, os, pathlib, shutil, subprocess, sys
+      snapshot, scratch, current, artifacts = map(pathlib.Path,sys.argv[1:5])
+      scratch, current = scratch.resolve(), current.resolve()
+      saved = json.loads(snapshot.read_text())
+      copies = {}
+      def remove(path):
+          if path.is_symlink() or path.is_file(): path.unlink()
+          elif path.exists(): shutil.rmtree(path)
+      def ignore(directory,names):
+          return [name for name in names if name == ".git" or (artifacts and (pathlib.Path(directory)/name).resolve() == artifacts.resolve())]
+      try:
+          for directory, state in saved.items():
+              root = pathlib.Path(directory)
+              key = hashlib.sha256(os.fsencode(directory)).hexdigest()
+              dest = scratch/key
+              if "trusted_error" in state: sys.exit(state["trusted_error"])
+              trusted = state["trusted"]
+              store = snapshot.parent/"trusted-infra"/key
+              # Verify all trusted bytes before allowing any command to execute.
+              for name, entry in trusted.items():
+                  path = pathlib.PurePosixPath(name)
+                  if path.is_absolute() or ".." in path.parts: raise ValueError("unsafe trusted path")
+                  if hashlib.sha256((store/name).read_bytes()).hexdigest() != entry["sha"]:
+                      raise ValueError("damaged trusted file: "+name)
+              subprocess.run(["git","clone","--shared","--no-checkout","--quiet",str(root),str(dest)],check=True)
+              # Clone metadata is private. Preserve the live tracked set (also
+              # for linked/split indexes), without refreshing the source index.
+              def git_path(base,name):
+                  value = subprocess.check_output(["git","rev-parse","--git-path",name],cwd=base,text=True).strip()
+                  return base/value
+              source_index = git_path(root,"index")
+              if source_index.is_file():
+                  shutil.copy2(source_index,git_path(dest,"index"))
+                  shared = subprocess.check_output(["git","rev-parse","--shared-index-path"],cwd=root,text=True).strip()
+                  if shared:
+                      shutil.copy2(root/shared,git_path(dest,pathlib.Path(shared).name))
+                  tree = subprocess.check_output(["git","write-tree"],cwd=dest,text=True).strip()
+                  # Staged repairs belong to working-file verification, not a
+                  # phantom cached diff. Anchor only the private HEAD to its index.
+                  head_tree = subprocess.run(["git","rev-parse","HEAD^{tree}"],cwd=dest,text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+                  if head_tree.returncode or head_tree.stdout.strip() != tree:
+                      parents = [] if head_tree.returncode else ["-p","HEAD"]
+                      commit = subprocess.check_output(["git","commit-tree",tree,*parents,"-m","Trusted verification index"],cwd=dest,text=True,env={**os.environ,"GIT_AUTHOR_NAME":os.environ.get("CAULDRON_GIT_AUTHOR_NAME","Thinman Cauldron"),"GIT_AUTHOR_EMAIL":os.environ.get("CAULDRON_GIT_AUTHOR_EMAIL","admin@bluedevilcollectibles.com"),"GIT_COMMITTER_NAME":os.environ.get("CAULDRON_GIT_AUTHOR_NAME","Thinman Cauldron"),"GIT_COMMITTER_EMAIL":os.environ.get("CAULDRON_GIT_AUTHOR_EMAIL","admin@bluedevilcollectibles.com")}).strip()
+                      subprocess.run(["git","update-ref","HEAD",commit],cwd=dest,check=True)
+              origin = subprocess.check_output(["git","remote","get-url","origin"],cwd=root,text=True).strip()
+              subprocess.run(["git","remote","set-url","origin",origin],cwd=dest,check=True)
+              shutil.copytree(root,dest,symlinks=True,dirs_exist_ok=True,ignore=ignore)
+              # Internal links stay internal; materialize external links so a
+              # command cannot write through a copied link into the live checkout.
+              for base, dirs, files in os.walk(dest):
+                  dirs[:] = [name for name in dirs if name != ".git"]
+                  for name in dirs + files:
+                      path = pathlib.Path(base)/name
+                      if not path.is_symlink(): continue
+                      original = root/path.relative_to(dest)
+                      resolved = original.resolve(strict=True)
+                      path.unlink()
+                      if resolved.is_relative_to(root):
+                          path.symlink_to(os.path.relpath(dest/resolved.relative_to(root),path.parent),target_is_directory=resolved.is_dir())
+                      elif resolved.is_dir(): shutil.copytree(resolved,path,symlinks=False,ignore=ignore)
+                      else: shutil.copy2(resolved,path)
+              for name, entry in trusted.items():
+                  path = dest/name
+                  parent = dest
+                  for part in pathlib.PurePosixPath(name).parts[:-1]:
+                      parent = parent/part
+                      if parent.is_symlink() or (parent.exists() and not parent.is_dir()): remove(parent)
+                      parent.mkdir(exist_ok=True)
+                  remove(path)
+                  if entry["link"] is not None:
+                      target = pathlib.Path(os.path.abspath(root/pathlib.Path(name).parent/entry["link"]))
+                      if not target.is_relative_to(root): raise ValueError("external trusted link")
+                      path.symlink_to(os.path.relpath(dest/target.relative_to(root),path.parent))
+                  else:
+                      shutil.copyfile(store/name,path)
+                      path.chmod(0o755 if entry["executable"] else 0o644)
+              copies[str(root.resolve())] = str(dest)
+          (scratch/"current").write_text(copies[str(current)],encoding="utf-8")
+          stages = []
+          for sid, directory in zip(sys.argv[5::2],sys.argv[6::2]):
+              mapped = copies[str(pathlib.Path(directory).resolve())] if directory else ""
+              stages.append(sid+"="+mapped)
+          (scratch/"stages").write_text("\n".join(stages),encoding="utf-8")
+      except (OSError,ValueError,KeyError,RuntimeError,subprocess.CalledProcessError) as error:
+          sys.exit("test guard: cannot prepare trusted final run: "+str(error))
+      TRUSTED_PY
+        prepared=$?
+        if [ "$prepared" -ne 0 ]; then
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:trusted_infra\nTESTS_LINE=BLOCKED (trusted infrastructure unavailable)\nTESTS_CLASS=%s\n' "$class"
+          return 0
+        fi
+        export RST_STAGE_WORKTREES="$(cat "$scratch/stages")"
+        cd "$(cat "$scratch/current")" || return 1
+        rst_execute_saved "$e" "$class"
+      )
+      # Explicit snapshot boundaries (42) block before repair, as in round 8.
+      # Trusted-capture failures defer to final evidence after a repair attempt.
+      trg_snapshot_report() {
+        local previous result
+        if trg_snapshot "$1" "$2/test-guard.json"; then return 0; else result=$?; fi
+        : > "$2/test-repair.guard"
+        [ "$result" -eq 42 ] || return 0
+        previous="$(cat "$2/stop-tests.initial")"
+        {
+          printf '%s\n' "$previous" | grep -vE '^TESTS_(STATUS|BLOCKED_REASON|LINE)=' || true
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:guard\nTESTS_LINE=BLOCKED (tests_failed_after_repair:guard)\n'
+        } > "$2/stop-tests.initial"
+      }
+      # A guard violation returns success to END the loop; final evidence stays BLOCKED.
+      trg_attempt() {
+        local e="$1" class="$2" n
+        n="$(cat "$e/test-repair.attempts" 2>/dev/null || echo 0)"
+        n=$((n+1)); printf '%s\n' "$n" > "$e/test-repair.attempts"
+        rst_execute_saved "$e" "$class" > "$e/test-repair.report"
+        if ! trg_check "$(pwd)" "$e/test-guard.json"; then
+          : > "$e/test-repair.guard"
+          return 0
+        fi
+        grep -q '^TESTS_STATUS=passed$' "$e/test-repair.report"
+      }
+      # ---- END trg core ----
+
+
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one source of truth). It installs
+      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent, retries
+      # once without the frozen lockfile, prints the real install output, and returns nonzero
+      # when the install failed (callers continue; the base compare treats it as base_unrunnable).
+      # Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
+      # per-node copy of the bundled script ($ARCHON_LANE_SCRIPTS_DIR/dprep.sh; works for
+      # standalone CLI and source runs), then the image copy /app/scripts/lane/dprep.sh.
+      # Only when none exists is it logged and the run continues like a failed install.
+      DPREP_SCRIPT=""
+      for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do
+        if [ -n "$dprep_candidate" ] && [ -f "$dprep_candidate" ]; then DPREP_SCRIPT="$dprep_candidate"; break; fi
+      done
+      if [ -n "$DPREP_SCRIPT" ]; then
+        . "$DPREP_SCRIPT"
+      else
+        dprep_ensure_js_deps() {
+          printf 'dprep: dprep.sh missing (tried BDC_DPREP_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/dprep.sh), cannot install JS dependencies (continuing; run-stop-tests reports the real result)\n' "${BDC_DPREP_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}"
+          return 0
+        }
+      fi
+      # ---- END dprep core ----
+
+      # ---- BEGIN stbase core (byte-identical across lanes; extracted by unit test) ----
+      # rst_base_compare and stb_stamp_base_red live in scripts/lane/stop-tests-base.sh (one
+      # source of truth, WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01). A failed head run is re-run
+      # on the run's base commit; failures that are already red there report base_red, any
+      # newly broken test stays failed. Resolution order: $BDC_STBASE_SCRIPT (tests), then the
+      # engine's per-node copy ($ARCHON_LANE_SCRIPTS_DIR/stop-tests-base.sh), then the image
+      # copy /app/scripts/lane/stop-tests-base.sh. When none exists the result is unchanged
+      # (a failed head stays failed) and no Base-red tests: line is stamped.
+      STBASE_SCRIPT=""
+      for stbase_candidate in "${BDC_STBASE_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/stop-tests-base.sh}" /app/scripts/lane/stop-tests-base.sh; do
+        if [ -n "$stbase_candidate" ] && [ -f "$stbase_candidate" ]; then STBASE_SCRIPT="$stbase_candidate"; break; fi
+      done
+      if [ -n "$STBASE_SCRIPT" ]; then
+        . "$STBASE_SCRIPT"
+      else
+        rst_base_compare() {
+          printf 'stop-tests-base: stop-tests-base.sh missing (tried BDC_STBASE_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/stop-tests-base.sh), result unchanged\n' "${BDC_STBASE_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+          cat "$1"
+          printf 'TESTS_BASE_COMPARE=script_missing\n'
+        }
+        stb_stamp_base_red() { cat; }
+        stb_report_compare() { rst_base_compare "$@"; }
+      fi
+      # ---- END stbase core ----
+
+      SPEC=$read-spec.output
+      CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
+      EVIDENCE_DIR="${ARTIFACTS_DIR:-.}/evidence"
+      mkdir -p "$EVIDENCE_DIR" 2>/dev/null || true
+      LOG="$EVIDENCE_DIR/stop-tests.log"
+      CMDS="$EVIDENCE_DIR/stop-tests.commands"
+      : > "$LOG"; : > "$CMDS"
+      SOURCE="none"
+      while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        if rst_command_looks_runnable "$c"; then
+          rst_rescue_subdir "$c" >> "$CMDS"; printf '\n' >> "$CMDS"
+        else
+          echo "run-stop-tests: declared line is not a runnable test command, ignoring: $c" >&2
+        fi
+      done <<EOF_CMDS
+      $(printf '%s\n' "$SPEC" | rst_extract_commands | rst_split_segments)
+      EOF_CMDS
+      [ -s "$CMDS" ] && SOURCE="spec_declared"
+      RESOLUTION="$(cat <<'BDC_TEST_COMMAND_RESOLUTION' | capture_node_output
+      $resolve-test-command.output
+      BDC_TEST_COMMAND_RESOLUTION
+      )"
+      MAP_SOURCE="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_SOURCE=//p' | head -1)"
+      MAP_SHA="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_MAP_SHA=//p' | head -1)"
+      MAP_FALLBACK="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_FALLBACK=//p' | head -1)"
+      MAP_COMMAND="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_B64=//p' | head -1 | base64 --decode 2>/dev/null || true)"
+      export RST_TIMEOUT_SECONDS="${RST_TIMEOUT_SECONDS:-$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_TIMEOUT_SECONDS=//p' | head -1)}"
+      printf '%s\n' "$CLASS" > "$EVIDENCE_DIR/stop-tests.class"
+      printf '%s\n' "${RST_TIMEOUT_SECONDS:-1500}" > "$EVIDENCE_DIR/stop-tests.timeout"
+      rst_save_core "$EVIDENCE_DIR"
+      if ! printf '%s\n' "$SPEC" | rst_stage_plan > "$EVIDENCE_DIR/stop-tests.stages"; then
+        printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=stage_plan_invalid\nTESTS_LINE=BLOCKED (stage_plan_invalid)\n' | tee "$EVIDENCE_DIR/stop-tests.initial"
+        exit 0
+      fi
+      if [ -s "$EVIDENCE_DIR/stop-tests.stages" ]; then
+        printf 'canonical stages: Stop test-suite blocks and project-map command superseded\n' | tee -a "$LOG"
+        cut -f3 "$EVIDENCE_DIR/stop-tests.stages" > "$CMDS"
+        rst_execute_saved "$EVIDENCE_DIR" "$CLASS" > "$EVIDENCE_DIR/stop-tests.initial"
+        trg_snapshot_report "$(pwd)" "$EVIDENCE_DIR"
+        cat "$EVIDENCE_DIR/stop-tests.initial"
+        exit 0
+      fi
+      SELECTED_SOURCE="spec_declared"
+      if [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ]; then
+        if rst_command_looks_runnable "$MAP_COMMAND"; then
+          printf '%s\n' "$MAP_COMMAND" > "$CMDS"
+          SELECTED_SOURCE="project-map"
+        else
+          MAP_FALLBACK="unsafe-command"
+        fi
+      fi
+      echo "TESTS_MAP_SHA=$MAP_SHA"
+      echo "TESTS_MAP_FALLBACK=$MAP_FALLBACK"
+      EXIT_CODE=0
+      COUNTS=""
+      TESTS_ENV_REASON=""
+      CMD_JOINED=""
+      # rst_try <source-label>: run whatever is in $CMDS; rc 0 when counts were parsed.
+      rst_try() {
+        [ -s "$CMDS" ] || return 1
+        CMD_JOINED="$(grep -v '^$' "$CMDS" | paste -sd ';' - | sed 's/;/; /g')"
+        RESULT="$(rst_run_commands "$CMDS" "$LOG")"
+        TESTS_ENV_REASON=""
+        case "$RESULT" in *$'\t'*) TESTS_ENV_REASON="${RESULT#*$'\t'}"; RESULT="${RESULT%%$'\t'*}" ;; esac
+        EXIT_CODE="${RESULT%% *}"
+        COUNTS="${RESULT#* }"
+        COUNTS="$(printf '%s' "$COUNTS" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        SOURCE="$1"
+        [ -n "$COUNTS" ] || [ -n "$TESTS_ENV_REASON" ]
+      }
+      if [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
+        # Ladder: spec-declared -> test files in this run's diff -> the repo's own test
+        # script. A spec-declared command that ran and exited nonzero is failed even
+        # with no parseable counts -- do not replace it with fallback evidence. A rung
+        # that exited 0 with no parseable counts (or no command at all) falls through;
+        # the earlier attempt stays in the log and in TESTS_SOURCE.
+        TRIED=""
+        (
+          cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && dprep_ensure_js_deps
+        ) >&2
+        if ! rst_try "$SELECTED_SOURCE" && [ "$SELECTED_SOURCE" != "project-map" ]; then
+          if [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]; then
+            TRIED="spec_declared command(s) exited $EXIT_CODE with no parseable counts: $CMD_JOINED"
+          else
+            [ -s "$CMDS" ] && TRIED="spec_declared command(s) gave no parseable counts: $CMD_JOINED"
+            : > "$CMDS"
+            RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
+            if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
+              rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
+            fi
+            if ! rst_try "tests_in_diff"; then
+              [ -s "$CMDS" ] && TRIED="${TRIED:+$TRIED; }tests_in_diff command(s) gave no parseable counts: $CMD_JOINED"
+              : > "$CMDS"
+              rst_repo_test_script > "$CMDS"
+              rst_try "repo_test_script" || true
+            fi
+          fi
+        fi
+        if [ -z "$COUNTS" ] && [ -z "$CMD_JOINED" ] && [ -n "$TRIED" ]; then
+          # every rung was empty after the first; keep the first attempt's command so
+          # the N/A line names what was actually run
+          CMD_JOINED="${TRIED##*: }"
+        fi
+        if [ -n "$TRIED" ]; then
+          if [ "$SOURCE" != "spec_declared" ] || [ "$EXIT_CODE" -eq 0 ]; then
+            SOURCE="$SOURCE (after: $TRIED)"
+          fi
+        fi
+      fi
+      echo "TESTS_CLASS=$CLASS"
+      echo "TESTS_SOURCE=$SOURCE"
+      echo "TESTS_COMMAND=${CMD_JOINED:-(none)}"
+      echo "TESTS_EXIT=$EXIT_CODE"
+      echo "TESTS_PASSED=${COUNTS%% *}"
+      echo "TESTS_TOTAL=${COUNTS##* }"
+      if [ "$SOURCE" = "project-map" ]; then
+        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" "$LOG" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
+      else
+        REPORT_SOURCE="${SOURCE%% *}"
+        if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
+        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" "$LOG" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
+      fi > "$EVIDENCE_DIR/stop-tests.report"
+      stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS" > "$EVIDENCE_DIR/stop-tests.initial"
+      trg_snapshot_report "$(pwd)" "$EVIDENCE_DIR"
+      cat "$EVIDENCE_DIR/stop-tests.initial"
+      grep '^TESTS_COMMAND_RESULT=' "$LOG" || true
+      echo "TESTS_LOG=$LOG"
+      if [ -s "$LOG" ]; then
+        echo "--- last 80 lines of test output ---"
+        tail -n 80 "$LOG"
+      fi
+      exit 0
+
+
+  - id: classify-test-result
+    persona: overseer
+    depends_on: [run-stop-tests]
+    task_class: clerical
+    bash: |
+      set -uo pipefail
+      INITIAL=$run-stop-tests.output
+      printf '%s\n' "$INITIAL" | python3 -c '
+      import json,sys
+      fields=dict(line.split("=",1) for line in sys.stdin.read().splitlines() if line.startswith("TESTS_") and "=" in line)
+      status=fields.get("TESTS_STATUS", "missing")
+      reason=fields.get("TESTS_BLOCKED_REASON", "")
+      print(json.dumps(dict(status=status,repairable="true" if status=="failed" and not reason else "false",reason=reason),separators=(",",":")))'
+
+
+  - id: test-repair
+    depends_on: [classify-test-result]
+    when: "$classify-test-result.output.repairable == 'true'"
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      until: __NEVER_EMIT_USE_UNTIL_BASH__
+      max_iterations: 2
+      until_bash: |
+        set -uo pipefail
+        # Replay consumers run in the owned clone; feature lanes keep their cwd.
+        if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+          cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+        fi
+        EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
+        . "$EVIDENCE_DIR/stop-tests.core.sh"
+        export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
+        trg_attempt "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")"
+      prompt: |
+        Repair the real test failure only within the snapshot's allowed product
+        paths (test-guard.json), or add new non-test, non-infrastructure helpers.
+        Every other tracked file and all test infrastructure are frozen, even
+        in the build diff: tests, shell scripts, scripts/ and test directories,
+        declared commands and reachable package scripts (including npm pre/post
+        hooks), executable files, package.json, lockfiles, runner configs,
+        Makefile, tsconfig* and .github paths.
+        Resolved in-worktree symlink targets of test entrypoints are frozen too.
+        Final verification restores named infrastructure helpers from the snapshot.
+        Any repair-touched infrastructure blocks and is listed for a human.
+        Never add test files or skip/only/todo markers. Never emit
+        __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and allowlist guard
+        are the only completion authority, with at most two attempts.
+
+        Read the failing commands verbatim from
+        $ARTIFACTS_DIR/evidence/stop-tests.commands and the stage mapping from
+        $ARTIFACTS_DIR/evidence/stop-tests.stages. Read the last 80 lines of
+        $ARTIFACTS_DIR/evidence/stop-tests.log before editing. Reuse exactly this
+        persisted plan. Do not modify artifacts, commands, snapshots or maps.
+        Do not commit, push, open a PR, label or comment. This path also runs in
+        the read-only evidence replay lane; product repairs remain local.
+
+        If $ARTIFACTS_DIR/evidence/replay-checkout exists, read its absolute
+        path and edit only that isolated clone, not the engine worktree.
+
+        Original failure:
+        $run-stop-tests.output
+
+  - id: run-stop-tests-final
+    persona: overseer
+    depends_on: [run-stop-tests, test-repair]
+    trigger_rule: all_done
+    task_class: clerical
+    timeout: 1800000
+    bash: |
+      set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
+      EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
+      INITIAL=$run-stop-tests.output
+      ATTEMPTS="$(cat "$EVIDENCE_DIR/test-repair.attempts" 2>/dev/null || echo 0)"
+      printf 'Repair touched test infrastructure: none\n' > "$EVIDENCE_DIR/test-repair.infrastructure"
+      if [ "$ATTEMPTS" = 0 ]; then
+        { printf '%s\nTESTS_REPAIR_ATTEMPTS=0\n' "$INITIAL"; cat "$EVIDENCE_DIR/test-repair.infrastructure"; } | tee "$EVIDENCE_DIR/stop-tests.final"
+        exit 0
+      fi
+      . "$EVIDENCE_DIR/stop-tests.core.sh"
+      export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
+      trg_execute_trusted "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
+      INFRA_FAILURE=0
+      trg_infrastructure "$(pwd)" "$EVIDENCE_DIR/test-guard.json" > "$EVIDENCE_DIR/test-repair.infrastructure" || INFRA_FAILURE=1
+      RESULT=repaired
+      REASON=""
+      if [ "$INFRA_FAILURE" = 1 ] || [ "$(cat "$EVIDENCE_DIR/test-repair.infrastructure")" != 'Repair touched test infrastructure: none' ] || [ -f "$EVIDENCE_DIR/test-repair.guard" ] || ! trg_check "$(pwd)" "$EVIDENCE_DIR/test-guard.json"; then
+        RESULT=guard_violation; REASON=tests_failed_after_repair:guard
+      elif grep -q '^TESTS_STATUS=env_unavailable$' "$EVIDENCE_DIR/stop-tests.final-raw"; then
+        RESULT=env_unavailable
+      elif ! grep -q '^TESTS_STATUS=passed$' "$EVIDENCE_DIR/stop-tests.final-raw"; then
+        RESULT=exhausted; REASON=tests_failed_after_repair:exhausted
+      fi
+      {
+        if [ -n "$REASON" ]; then
+          grep -vE '^TESTS_(STATUS|BLOCKED_REASON)=' "$EVIDENCE_DIR/stop-tests.final-raw"
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=%s\n' "$REASON"
+        else cat "$EVIDENCE_DIR/stop-tests.final-raw"; fi
+        printf 'TESTS_FINAL_INFRA=trusted\nTESTS_REPAIR_ATTEMPTS=%s\nTESTS_REPAIR_RESULT=%s\n' "$ATTEMPTS" "$RESULT"
+        cat "$EVIDENCE_DIR/test-repair.infrastructure"
+      } | tee "$EVIDENCE_DIR/stop-tests.final"
+
+  - id: replay-report
+    depends_on: [run-stop-tests-final]
+    trigger_rule: all_done
+    bash: |
+      set -euo pipefail
+      cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")"
+      EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
+      git diff --binary HEAD > "$EVIDENCE_DIR/replay-repair.patch"
+      # Preserve newly created product/setup files for independent replay too.
+      while IFS= read -r -d '' path; do
+        git diff --binary --no-index -- /dev/null "$path" >> "$EVIDENCE_DIR/replay-repair.patch" || [ "$?" -eq 1 ]
+      done < <(git ls-files --others --exclude-standard -z)
+      python3 - "$EVIDENCE_DIR" <<'PY'
+      import json, pathlib, sys
+      e=pathlib.Path(sys.argv[1])
+      fields={}
+      stages=[]
+      for line in (e/"stop-tests.final").read_text().splitlines():
+          if line.startswith("TESTS_STAGE_LINE="): stages.append(line.split("=",1)[1])
+          if line.startswith("TESTS_") and "=" in line:
+              key,value=line.split("=",1); fields.setdefault(key,value)
+      report=dict(pr=int((e/"replay.pr").read_text()),wo_id=(e/"replay.wo").read_text().strip(),stage_lines=stages,status=fields.get("TESTS_STATUS","missing"),blocked_reason=fields.get("TESTS_BLOCKED_REASON",""),repair_attempts=int(fields.get("TESTS_REPAIR_ATTEMPTS",0)),repair_result=fields.get("TESTS_REPAIR_RESULT",""),tests_line=fields.get("TESTS_LINE",""),wo_class=(e/"stop-tests.class").read_text().strip())
+      (e/"replay-report.json").write_text(json.dumps(report,sort_keys=True),encoding="ascii")
+      print("REPLAY_REPORT_PATH="+str(e/"replay-report.json"))
+      PY

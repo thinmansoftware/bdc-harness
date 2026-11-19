@@ -1,3 +1,4 @@
+import { ingestBeforePromotion, processPromotionWebhook } from '@archon/overseer';
 /**
  * Remote Coding Agent - Main Entry Point
  * Multi-platform AI coding assistant (Telegram, Discord, Slack, GitHub, Gitea)
@@ -64,16 +65,26 @@ import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
+import { createInProcessApiFetch } from './routes/in-process-authority';
 import {
   startDispatchEscalationClock,
   stopDispatchEscalationClock,
 } from './dispatch/escalation-clock';
 import { startReviewWorkerClock, stopReviewWorkerClock } from './dispatch/review-worker-clock';
 import { startDutyOfficerClock, stopDutyOfficerClock } from './dispatch/duty-officer-clock';
+import { startOutcomeReportClock, stopOutcomeReportClock } from './dispatch/outcome-report-clock';
+import {
+  startCauldronFireConsumer,
+  stopCauldronFireConsumer,
+} from './dispatch/cauldron-fire-consumer';
 import {
   startWorkerHeartbeatAlarmTimer,
   stopWorkerHeartbeatAlarmTimer,
 } from './dispatch/worker-heartbeat-alarm';
+import {
+  startWorkroomDrainerStallTimer,
+  stopWorkroomDrainerStallTimer,
+} from './dispatch/workroom-drainer-stall';
 import {
   observeStartupRecovery,
   reconcilePendingRunsAtBoot,
@@ -83,11 +94,18 @@ import {
   loadPersistedSeatCutoff,
   restoreSeatCutoffOverride,
 } from '@archon/workflows/reliability/seat-usage';
-import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
-import { createMergeManager } from '@archon/overseer/merge-manager';
+import {
+  createRuntimeMergeManager,
+  startOverseerRuntime,
+  stopOverseerRuntime,
+} from './overseer-runtime';
 import { resolveDefaultDeps } from '@archon/overseer/service';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
+import {
+  startUnreviewedHeadReconcileClock,
+  stopUnreviewedHeadReconcileClock,
+} from '@archon/overseer/unreviewed-head-reconcile';
 import { ingestCheckCompletionEvent } from '@archon/overseer/pr-review-check-ingest';
 import { createRealRecheckIngestDeps } from '@archon/overseer/pr-review-check-wiring';
 import {
@@ -109,6 +127,7 @@ import {
   validateAppDefaultsPaths,
   shutdownTelemetry,
 } from '@archon/paths';
+import { enableGitHubCallSiteLog } from '@archon/core/github/metering';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -202,7 +221,7 @@ function startOverseerRuntimeWithRealMergeManager(): void {
     return;
   }
   const deps = resolveDefaultDeps();
-  const mergeManager = createMergeManager(deps);
+  const mergeManager = createRuntimeMergeManager(deps);
   startOverseerRuntime({
     serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
   });
@@ -210,6 +229,8 @@ function startOverseerRuntimeWithRealMergeManager(): void {
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
   getLog().info('server_starting');
+  // Name the endpoints that spend the GitHub quota in the log (bdc-xo#5449). Server only: see metering.ts.
+  enableGitHubCallSiteLog();
 
   // Database auto-detected: SQLite (default) or PostgreSQL (if DATABASE_URL set)
   // No required environment variables - SQLite works out of the box
@@ -644,25 +665,39 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // over the raw body, so neither trusts the other's dispatch decision.
         const isCheckCompletion =
           eventType === 'check_run' || eventType === 'check_suite' || eventType === 'workflow_run';
-        const result = isCheckCompletion
-          ? await ingestCheckCompletionEvent(
-              {
-                rawBody,
-                signature: c.req.header('x-hub-signature-256'),
-                eventType,
-                deliveryId,
-              },
-              recheckDeps
-            )
-          : await ingestPullRequestEvent(
-              {
-                rawBody,
-                signature: c.req.header('x-hub-signature-256'),
-                eventType,
-                deliveryId,
-              },
-              ingestDeps
-            );
+        const intake = async (): Promise<
+          | Awaited<ReturnType<typeof ingestPullRequestEvent>>
+          | Awaited<ReturnType<typeof ingestCheckCompletionEvent>>
+        > =>
+          isCheckCompletion
+            ? await ingestCheckCompletionEvent(
+                {
+                  rawBody,
+                  signature: c.req.header('x-hub-signature-256'),
+                  eventType,
+                  deliveryId,
+                },
+                recheckDeps
+              )
+            : await ingestPullRequestEvent(
+                {
+                  rawBody,
+                  signature: c.req.header('x-hub-signature-256'),
+                  eventType,
+                  deliveryId,
+                },
+                ingestDeps
+              );
+        const result = await ingestBeforePromotion(intake, () =>
+          processPromotionWebhook(
+            {
+              rawBody,
+              signature: c.req.header('x-hub-signature-256'),
+              eventType,
+            },
+            reviewRouteConfig.webhookSecret
+          )
+        );
         getLog().info(
           {
             eventType,
@@ -688,15 +723,27 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
     getLog().info('overseer_review_route_registered');
     startReviewWorkerClock(reviewRouteConfig);
+    // Unreviewed-head reconcile (WO-HARNESS-OVERSEER-UNREVIEWED-HEAD-RECONCILE-01):
+    // a push lost while the app was down (e.g. mid-rebuild) never reaches the
+    // route above. One pass now, then every OVERSEER_UNREVIEWED_HEAD_RECONCILE_MINUTES.
+    void startUnreviewedHeadReconcileClock(reviewRouteConfig);
   } else {
     getLog().info(
       'overseer_review_route_not_configured: set OVERSEER_REVIEW_WEBHOOK_SECRET and OVERSEER_REVIEW_IDENTITY to enable'
     );
   }
   startDutyOfficerClock();
+  // Daily outcome report (WO-HARNESS-DAILY-OUTCOME-REPORT-01): 11:00 UTC GitHub comment.
+  startOutcomeReportClock();
+  // T3 command consumer (WO-HARNESS-T3-COMMAND-CONSUMER-01): drains the
+  // cauldron-fire mailbox. No-op unless T3_COMMAND_CONSUMER_ENABLED=1 (default
+  // off): no reads, no writes until an operator enables it and mints the
+  // t3-bridge principal.
+  startCauldronFireConsumer(undefined, { apiFetch: createInProcessApiFetch(app) });
   // Dedicated fast timer (default 60s) that pages John for a dead/restarted
   // Dispatch worker, independent of the 15-minute Duty Officer tick.
   startWorkerHeartbeatAlarmTimer();
+  startWorkroomDrainerStallTimer();
 
   // Gitea webhook endpoint
   if (gitea) {
@@ -853,8 +900,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopProviderWaitScheduler();
     stopDispatchEscalationClock();
     stopReviewWorkerClock();
+    stopUnreviewedHeadReconcileClock();
     stopDutyOfficerClock();
+    stopOutcomeReportClock();
+    stopCauldronFireConsumer();
     stopWorkerHeartbeatAlarmTimer();
+    stopWorkroomDrainerStallTimer();
     persistence.stopPeriodicFlush();
 
     // Await overseer watcher abort before flushing; bounded by the watcher's own

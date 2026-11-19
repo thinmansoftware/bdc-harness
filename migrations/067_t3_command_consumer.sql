@@ -1,0 +1,107 @@
+-- WO-HARNESS-T3-COMMAND-CONSUMER-01: durable admission ledger + principals for
+-- the cauldron-fire T3 command consumer.
+--
+-- A typed command (fire / cancel-own / approve) sent by an authorized Dispatch
+-- principal to recipient `cauldron-fire` is decided once, server-side. This
+-- table is the durable record of that decision: retries return the original
+-- outcome, a WO with a live run is never fired twice, and request + run
+-- identity are retained after completion (rows are never deleted).
+--
+-- Modeled on migration 063 (tm_fire_admissions) but keyed by request_id, not
+-- action_key, and NOT reusing tm_fire_admissions (its CHECK pins
+-- source='taskmaster'). State vocabulary mirrors 063's reserved/admitted/
+-- (released -> here refused)/unknown rule: an `unknown` fire never refires.
+
+CREATE TABLE IF NOT EXISTS t3_command_admissions (
+  request_id TEXT PRIMARY KEY,
+  actor_principal_id TEXT NOT NULL,
+  verb TEXT NOT NULL CHECK (verb IN ('fire', 'cancel-own', 'approve')),
+  payload_sha256 TEXT NOT NULL,
+  wo_id TEXT,
+  project TEXT,
+  target_run_id TEXT,
+  pr_ref TEXT,
+  head_sha TEXT,
+  thread_id TEXT,
+  source_message_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('reserved', 'admitted', 'refused', 'unknown')),
+  status_code INTEGER,
+  code TEXT,
+  cascade_id TEXT,
+  run_id TEXT,
+  reply_message_id TEXT,
+  -- Set in its own committed write immediately BEFORE the verb's side effect
+  -- (Amendment 2 A2.2): null = failed before effects, set = effect possible.
+  effect_started_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- WO fire lock: at most one UNRESOLVED fire per wo_id. `reserved` is
+-- mid-admission; `unknown` is a fire whose effect could not be proven (crash or
+-- uncertain cascade) and holds the lock until an operator adjudicates it
+-- (adjudicateUnknownFire -> admitted or refused). A second fire reservation for
+-- the same WO violates this index and is refused 409 live_run.
+DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
+  ON t3_command_admissions (wo_id)
+  WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+
+-- Amendment 5 A5.0: ONE shared WO claim for every in-process cascade caller
+-- (Taskmaster and the T3 consumer), held through every tier until terminal.
+CREATE TABLE IF NOT EXISTS cascade_wo_claims (
+  wo_id TEXT NOT NULL,
+  project TEXT NOT NULL,
+  cascade_id TEXT NOT NULL,
+  holder TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+  claimed_at TEXT NOT NULL,
+  released_at TEXT,
+  -- Set when the cascade exited without a proven-terminal outcome (frontier
+  -- pause, uncertain exception): the claim is RETAINED with its run ids.
+  retained_reason TEXT,
+  run_ids_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cascade_wo_claims_active
+  ON cascade_wo_claims (wo_id)
+  WHERE state = 'active';
+
+-- Amendment 5 A5.7: the consumer ticks only while holding this lease.
+CREATE TABLE IF NOT EXISTS t3_consumer_lease (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  holder TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+-- Amendment 5 A5.12: failed processing attempts per command row.
+CREATE TABLE IF NOT EXISTS t3_command_attempts (
+  message_id TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+
+-- Run custody (Amendment 3 A3.1): an admission owns EVERY run its cascade
+-- creates, on every tier. Append-only; one row per run.
+CREATE TABLE IF NOT EXISTS t3_command_run_custody (
+  admission_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  tier TEXT,
+  discovered_at TEXT NOT NULL,
+  UNIQUE (run_id)
+);
+
+-- Run lock (Amendment 2 A2.2 rule 2): at most one unresolved cancel-own /
+-- approve per target run. An `unknown` cancel/approve holds it until an
+-- operator adjudicates.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
+  ON t3_command_admissions (target_run_id)
+  WHERE verb IN ('cancel-own', 'approve') AND state IN ('reserved', 'unknown');
+
+-- Recipient principal for the consumer (drains the command mailbox and sends
+-- replies) and the T3 VPS bridge sender. Shape copied from migration 065.
+INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+VALUES
+  ('cauldron-fire', 'T3 command consumer', 'drain_on_start', TRUE),
+  ('t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', TRUE)
+ON CONFLICT (principal_id) DO NOTHING;

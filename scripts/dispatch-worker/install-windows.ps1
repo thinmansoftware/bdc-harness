@@ -14,7 +14,13 @@ if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw "Launcher is missing: $launcher"
 }
 
+# Both tasks run through conhost.exe --headless so NO console window ever appears on the interactive
+# desktop, not even a flash (powershell.exe -WindowStyle Hidden still flashes). Task Scheduler runs an
+# Interactive-logon task in the user's session, and a plain powershell.exe action holds a visible
+# console open for the life of the worker (2026-11-10, John: "this windows kept popping up").
 $arguments = @(
+    '--headless',
+    'powershell.exe',
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', ('"' + $launcher + '"'),
@@ -24,17 +30,19 @@ $arguments = @(
 ) -join ' '
 
 if ($PSCmdlet.ShouldProcess($TaskName, 'Register logon dispatch worker task')) {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+    $action = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument $arguments
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     # Bounded watchdog restart (M-51 AMEND-9 gap 2): Task Scheduler restarts the
     # task up to RestartCount times, spaced RestartInterval apart, on ANY
     # trigger type including AtLogOn -- this is not limited to scheduled-time
     # triggers. RestartCount=5 / RestartInterval=1 minute bounds it to at most
     # 5 restarts total rather than an infinite tight crash-restart loop.
-    # ExecutionTimeLimit bounds a hung/wedged instance to a finite lifetime
-    # (1 day) so Task Scheduler will terminate and restart it instead of
-    # letting a stuck process sit forever consuming the single-instance slot.
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 1)
+    # No arbitrary worker lifetime cap (M-186, WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01):
+    # ExecutionTimeLimit is zero, meaning unlimited. A time cap killed a healthy worker on a
+    # schedule and was already out of step with the live task (PT72H vs this file's 1 day).
+    # Hung-worker recovery is a separate concern; the launcher supervises the tunnel and the
+    # worker, and the watchdog task below restarts a dead worker.
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
     Write-Output "DISPATCH_WINDOWS_TASK_REGISTERED=$TaskName"
@@ -51,6 +59,8 @@ if (-not (Test-Path -LiteralPath $watchdogWrapper -PathType Leaf)) {
 }
 
 $watchdogArguments = @(
+    '--headless',
+    'powershell.exe',
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', ('"' + $watchdogWrapper + '"'),
@@ -59,7 +69,7 @@ $watchdogArguments = @(
 ) -join ' '
 
 if ($PSCmdlet.ShouldProcess($WatchdogTaskName, 'Register repeating dispatch worker watchdog task')) {
-    $watchdogAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $watchdogArguments
+    $watchdogAction = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument $watchdogArguments
     # -Once anchored to now, repeating every 5 minutes indefinitely. The cmdlet
     # requires a duration alongside an interval, and the TimeSpan max duration is
     # rejected by modern Task Scheduler. Build with a finite duration, then clear

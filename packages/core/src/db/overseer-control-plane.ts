@@ -222,7 +222,7 @@ export interface ReleaseFusionBudgetReservationInput extends FusionBudgetIdentit
   readonly release_reason: FusionBudgetReleaseReason;
 }
 
-type TxQuery = OverseerControlPlaneQuery;
+export type TxQuery = OverseerControlPlaneQuery;
 export type OverseerControlResourceKind =
   | 'PARENT'
   | 'CHILD'
@@ -261,7 +261,7 @@ export interface ListOverseerControlEventsFilter {
   readonly resource_key?: string;
 }
 
-interface DatabaseClock {
+export interface DatabaseClock {
   readonly db_now: string;
   readonly lease_expires_at: string;
 }
@@ -406,7 +406,7 @@ export function computeVerifierRegistryDigest(
   return sha256Domain('overseer-verifier-registry-v1\n', content);
 }
 
-async function databaseClock(
+export async function databaseClock(
   query: TxQuery,
   dialect: IDatabase['dialect']
 ): Promise<DatabaseClock> {
@@ -424,7 +424,7 @@ async function databaseClock(
   return row;
 }
 
-async function withSerializedTransaction<T>(
+export async function withSerializedTransaction<T>(
   database: IDatabase,
   lockKey: string,
   fn: (query: TxQuery) => Promise<T>

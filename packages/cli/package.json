@@ -4,11 +4,12 @@
   "type": "module",
   "main": "./src/cli.ts",
   "bin": {
-    "archon": "./src/cli.ts"
+    "archon": "./src/cli.ts",
+    "thinman": "./src/cli.ts"
   },
   "scripts": {
     "cli": "bun src/cli.ts",
-    "test": "bun test --timeout 30000 src/commands/version.test.ts src/commands/setup.test.ts src/commands/skill.test.ts src/commands/doctor.test.ts && bun test --timeout 30000 src/commands/workflow.test.ts && bun test --timeout 30000 src/commands/isolation.test.ts && bun test --timeout 30000 src/commands/chat.test.ts && bun test --timeout 30000 src/commands/serve.test.ts",
+    "test": "bun test --timeout 30000 src/commands/project.test.ts src/commands/version.test.ts src/commands/setup.test.ts src/commands/skill.test.ts src/commands/doctor.test.ts && bun test --timeout 30000 src/commands/workflow.test.ts && bun test --timeout 30000 src/commands/isolation.test.ts && bun test --timeout 30000 src/commands/chat.test.ts && bun test --timeout 30000 src/commands/serve.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
@@ -21,7 +22,8 @@
     "@archon/server": "workspace:*",
     "@archon/workflows": "workspace:*",
     "@clack/prompts": "^1.0.0",
-    "dotenv": "^17.2.3"
+    "dotenv": "^17.2.3",
+    "@archon/overseer": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"

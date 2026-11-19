@@ -19,6 +19,7 @@ import type {
   SupervisorRepairLeaseRecord,
   TerminalWorkflowPersistence,
 } from './reliability/types';
+import type { TerminalRunLeaseRecord } from './run-teardown';
 
 export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
@@ -71,6 +72,16 @@ export const WORKFLOW_EVENT_TYPES = [
   // for its cooldown window, and again when the mark auto-expires. See
   // engine-availability.ts for the full detection/cooldown contract.
   'engine_availability_changed',
+  // OpenRouter review-fence decision (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01).
+  // One event per gate decision on a customer-repo OpenRouter review route:
+  // verdict clean (sent with the privacy pin), hit or scan_unavailable
+  // (rerouted to a Claude/Codex seat). data carries locations as file:line
+  // only -- never the matched customer value.
+  'openrouter_diff_scan',
+  'duplicate_pr_suppressed',
+  // WO-HARNESS-RUN-LEASE-LOST-SAYS-SO-01: written when the executor stops a run because its lease was lost;
+  // data carries where, reason, last_renewed_at, expires_at, detected_at and gap_seconds.
+  'run_lease_lost',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
@@ -166,6 +177,14 @@ export interface IWorkflowStore {
     releasedAt: string;
   }): Promise<boolean>;
   listExpiredRunLeases(expiredAt: string): Promise<ExpiredRunLeaseRecord[]>;
+  /** Unreleased leases whose run is terminal (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01, N5). */
+  listUnreleasedTerminalRunLeases?(): Promise<TerminalRunLeaseRecord[]>;
+  /** Release a terminal run's lease; re-checks the run is still terminal. */
+  releaseTerminalRunLease?(data: { runId: string; releasedAt: string }): Promise<boolean>;
+  /** Run rows recorded for a working path (repair not_before lookup, N6). */
+  listWorkflowRunsByWorkingPath?(
+    workingPath: string
+  ): Promise<{ id: string; status: string; completed_at: string | Date | null }[]>;
   interruptExpiredRunLease(data: {
     runId: string;
     leaseToken: string;

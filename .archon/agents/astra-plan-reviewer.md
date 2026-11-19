@@ -1,6 +1,6 @@
 ---
 name: astra-plan-reviewer
-model: claude-fable-5
+model: claude-fable-5-2
 tools: [Read, Grep, Glob, WebFetch]
 description: Plans implementation from spec + prior art. Suggests, does not execute.
 ---

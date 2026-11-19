@@ -164,7 +164,13 @@ function runtimeRunner(options: {
       case 'remote':
         return { stdout: `${options.originRemote}\n` };
       case 'merge-base':
-        if (args[3] !== options.baseSha) {
+        if (args[3] === '--is-ancestor') {
+          return { stdout: '' };
+        }
+        if (
+          args[3] !== options.baseSha &&
+          !String(args[3] ?? '').startsWith('refs/remotes/origin/')
+        ) {
           throw new Error(`unexpected merge-base operand ${String(args[3])}`);
         }
         return { stdout: `${options.baseSha}\n` };

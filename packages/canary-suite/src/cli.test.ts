@@ -248,3 +248,125 @@ test('probe-binding uses default deps when probeBinding is omitted', async () =>
   expect(stdout).not.toHaveBeenCalled();
   expect(stderr).toHaveBeenCalledWith('probe_binding_missing_required_argument');
 });
+
+// WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01 Test 7: the dispatch-worker subcommand.
+const dispatchEvidence = (
+  verdict: 'passed' | 'failed' | 'blocked'
+): import('./dispatch-worker-canary').DispatchWorkerCanaryResult => ({
+  verdict,
+  reasonCodes: verdict === 'passed' ? [] : ['fixture_reason'],
+  evidenceRefs: ['worker_id=dispatch-worker-X'],
+  evidence: {
+    worker_id: 'dispatch-worker-X',
+    last_heartbeat_at: '2026-11-09T12:00:00.000Z',
+    age_ms: 1000,
+    threshold_ms: 600_000,
+    source_ref: 'fixture.db',
+    assessment_scope: 'selected_source_heartbeat_freshness',
+    runtime_health: 'not_assessed',
+  },
+});
+
+test('dispatch-worker needs --db-path and --worker-id and fails before any check runs', async () => {
+  const runner = mock(async () => dispatchEvidence('passed'));
+  const stderr: string[] = [];
+  for (const argv of [
+    ['dispatch-worker'],
+    ['dispatch-worker', '--db-path', 'x.db'],
+    ['dispatch-worker', '--worker-id', 'dispatch-worker-X'],
+  ]) {
+    const exit = await runCanaryCli(
+      argv,
+      {},
+      {
+        runner: mock(async () => ({}) as RunCanaryResult),
+        stdout: () => {},
+        stderr: value => stderr.push(value),
+        dispatchWorkerRunner: runner,
+      }
+    );
+    expect(exit).toBe(3);
+  }
+  expect(runner).not.toHaveBeenCalled();
+  expect(stderr.every(line => line.includes('dispatch_worker_canary_missing'))).toBe(true);
+});
+
+test.each([
+  ['passed', 0],
+  ['failed', 2],
+  ['blocked', 3],
+] as const)(
+  'dispatch-worker maps %s to exit %d, prints bounded evidence and never prints a secret',
+  async (verdict, expectedExit) => {
+    const secret = 'fixture-operator-token';
+    const out: string[] = [];
+    const exit = await runCanaryCli(
+      ['dispatch-worker', '--db-path', 'fixture.db', '--worker-id', 'dispatch-worker-X'],
+      { ARCHON_OPERATOR_TOKEN: secret },
+      {
+        runner: mock(async () => ({}) as RunCanaryResult),
+        stdout: value => out.push(value),
+        stderr: () => {},
+        dispatchWorkerRunner: async () => dispatchEvidence(verdict),
+      }
+    );
+    expect(exit).toBe(expectedExit);
+    const printed = out.join('\n');
+    expect(printed).not.toContain(secret);
+    const parsed = JSON.parse(printed) as {
+      evidence: { assessment_scope: string; runtime_health: string };
+    };
+    expect(parsed.evidence.assessment_scope).toBe('selected_source_heartbeat_freshness');
+    expect(parsed.evidence.runtime_health).toBe('not_assessed');
+  }
+);
+
+test('dispatch-worker with the real check: a fresh row exits 0, a stale row 2, a missing database 3, and nothing is written', async () => {
+  const { Database } = await import('bun:sqlite');
+  const { mkdtemp, rm } = await import('fs/promises');
+  const { existsSync } = await import('fs');
+  const { tmpdir } = await import('os');
+  const { join } = await import('path');
+  const dir = await mkdtemp(join(tmpdir(), 'dispatch-cli-'));
+  try {
+    const dbPath = join(dir, 'archon.db');
+    const db = new Database(dbPath, { create: true });
+    db.run('CREATE TABLE agent_dispatch_workers (worker_id TEXT PRIMARY KEY, last_heartbeat_at)');
+    const insert = db.prepare('INSERT INTO agent_dispatch_workers VALUES (?, ?)');
+    insert.run('fresh-worker', new Date(Date.now() - 1_000).toISOString());
+    insert.run('stale-worker', new Date(Date.now() - 3_600_000).toISOString());
+    insert.finalize();
+    db.close();
+    const run = async (worker: string, path: string): Promise<{ exit: number; out: string }> => {
+      const out: string[] = [];
+      const exit = await runCanaryCli(
+        ['dispatch-worker', '--db-path', path, '--worker-id', worker],
+        {},
+        {
+          runner: mock(async () => ({}) as RunCanaryResult),
+          stdout: v => out.push(v),
+          stderr: () => {},
+        }
+      );
+      return { exit, out: out.join('\n') };
+    };
+    const fresh = await run('fresh-worker', dbPath);
+    expect(fresh.exit).toBe(0);
+    expect(JSON.parse(fresh.out).evidence.runtime_health).toBe('not_assessed');
+    expect((await run('stale-worker', dbPath)).exit).toBe(2);
+    expect((await run('no-such-worker', dbPath)).exit).toBe(2);
+    const missing = join(dir, 'absent.db');
+    expect((await run('fresh-worker', missing)).exit).toBe(3);
+    expect(existsSync(missing)).toBe(false);
+  } finally {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await rm(dir, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (attempt >= 20) throw error;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+  }
+});

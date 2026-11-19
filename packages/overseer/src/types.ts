@@ -1,5 +1,7 @@
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
+import type { ResolveRequiredContextsInput } from './adapters/required-contexts.ts';
+import type { RecheckCheckRun } from './pr-review-check-ingest.ts';
 
 export type WatchedRunStatus = string;
 
@@ -29,6 +31,9 @@ export interface OverseerWorkflowEvent {
   created_at?: string;
 }
 
+/** Reason a reviewed head must not merge yet (see reviewConflictAtHead). */
+export type ReviewConflictAtHead = 'changes_requested' | 'review_in_flight' | 'lookup_failed';
+
 export interface PullRequestRef {
   owner: string;
   repo: string;
@@ -46,6 +51,18 @@ export interface PullRequestCheckSummary {
   failed: number;
   pending: number;
   conclusion?: string;
+}
+
+/**
+ * One GitHub commit status on the PR head. Distinct from a check run: a
+ * required context can be satisfied by a status alone.
+ */
+export interface PullRequestCommitStatus {
+  id?: number;
+  context: string;
+  state: string;
+  createdAt?: string | null;
+  updatedAt?: string | null;
 }
 
 export interface PullRequestEvidence {
@@ -84,6 +101,33 @@ export interface PullRequestEvidence {
    * not loaded.
    */
   otherOpenPrsForWoLookupFailed?: boolean;
+  /**
+   * GitHub label names on this pull request. Absent on older evidence
+   * fixtures. `merge-hold`, `run:blocked` and `owner:reworking` (matched case-insensitively) hold the
+   * merge on EVERY merge path through mergeHoldReason in merge-holds.ts; owner:reworking is set and
+   * cleared only by the owner and is not HOLD.
+   */
+  labels?: readonly string[];
+  /**
+   * True when the pull request is a draft. Absent on older evidence fixtures. A draft is never merged
+   * and never approved by the merge paths (WO-HARNESS-MERGE-GATES-01).
+   */
+  draft?: boolean;
+  /**
+   * Latest check run per name and app, when the evidence source loaded them.
+   * Absent on older fixtures. An empty array means the lookup returned no runs.
+   * The merge gate matches required contexts against these runs and against
+   * `commitStatuses`. When both exist for one context, both must pass.
+   */
+  checkRuns?: readonly RecheckCheckRun[];
+  /**
+   * Commit statuses for the head. Absent when the evidence source did not load
+   * them. An empty array means the lookup returned none. The merge gate treats
+   * the latest status for a context as passing only when its state is success.
+   * A passing check run with the same name does not override a non-success
+   * status.
+   */
+  commitStatuses?: readonly PullRequestCommitStatus[];
 }
 
 export interface GrokJudgeEvidence {
@@ -114,7 +158,11 @@ export interface GrokDispositionReceipt {
     | 'judge_output_invalid'
     | 'judge_timeout'
     | 'judge_exit_nonzero'
-    | 'judge_error';
+    | 'judge_error'
+    | 'originating_run_failed_evidence_gate'
+    | 'originating_run_failed'
+    | 'originating_run_unreadable'
+    | 'originating_run_in_progress';
   woId: string;
   prNumber: number;
   headSha: string;
@@ -140,6 +188,14 @@ export interface WatchedRunRecord {
   prEvidence: PullRequestEvidence;
   decision?: DecisionResult;
   lastEvent?: OverseerWorkflowEvent;
+}
+
+/**
+ * Replay handoff into the merge-execution bridge. A method object, not a
+ * MergeReadyCoordinator function, so the two cannot be substituted.
+ */
+export interface DeterministicMergeHandoff {
+  handoff(record: WatchedRunRecord): Promise<unknown>;
 }
 
 export interface OverseerRunStoreDeps {
@@ -212,6 +268,8 @@ export interface DiscoveredPullRequest {
    * from individual reviews here -- an absent decision stays absent.
    */
   reviewDecision: string | null;
+  /** Label names on the PR as listed. Absent means not read; the run:blocked label excludes a PR. */
+  labels?: readonly string[];
   /** WO id when one is recoverable from the PR, used to sharpen evidence lookup. */
   woId?: string;
   /**
@@ -253,10 +311,52 @@ export interface MergeCandidateDiscoveryDeps {
   listOpenPullRequests?(
     input: GitHubOpenPullRequestListInput
   ): Promise<readonly DiscoveredPullRequest[]>;
+  /** Durable sandbox-review qualification. Production wiring must provide it. */
+  hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
+  /**
+   * Branch-protection lookups, the same seam the merge bridge uses. When the
+   * base's required contexts are known and non-empty, only those contexts can
+   * exclude a candidate for checks_failing or checks_pending. When absent,
+   * discovery resolves with an empty env and keeps the all-checks rule.
+   */
+  requiredContextsLookups?: GitHubClientDeps['requiredContextsLookups'];
+}
+
+/** What the merge gate's sibling check reads about one pull request and its repository. */
+export interface SiblingMergeContextData {
+  headRefName: string;
+  createdAt: string;
+  recentMerged: readonly {
+    number: number;
+    url: string;
+    mergedAt: string;
+    body: string;
+    /** The branch the merged PR targeted ('' when unknown). */
+    baseRef: string;
+  }[];
 }
 
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
+  /**
+   * Branch-protection lookups for the merge check gate. Optional so existing
+   * fakes keep compiling. When absent, the bridge resolves required contexts
+   * with an empty env and falls back to the aggregate check summary.
+   */
+  requiredContextsLookups?: Pick<
+    ResolveRequiredContextsInput,
+    'fetchWithAppClient' | 'fetchWithPatClient' | 'fetchBranchRules' | 'fetchBranch'
+  >;
+  /** Receipt-backed exact-head sandbox-review qualification. */
+  hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
+  /**
+   * Why the exact head must not merge even though one review approved it:
+   * another review of the same head requested changes, or is still running.
+   * Null when every review of the head has finished and none requested changes.
+   */
+  reviewConflictAtHead?(
+    input: PullRequestRef & { headSha: string }
+  ): Promise<ReviewConflictAtHead | null>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
   ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }>;
@@ -274,6 +374,13 @@ export interface GitHubClientDeps {
   ): Promise<{ commented: boolean; url?: string }>;
   /** Login expected to own comments created through `commentOnPullRequest`. */
   commentAuthorLogin?: string;
+  /** Apply merge hold labels through the same GitHub identity as PR comments. */
+  addPullRequestLabels?(input: PullRequestRef & { labels: string[] }): Promise<void>;
+  /**
+   * Remove one label (the `merge-queued` label once the merge happened). Optional so existing fakes keep
+   * compiling; a label that is not on the PR is not an error.
+   */
+  removePullRequestLabel?(input: PullRequestRef & { label: string }): Promise<void>;
   /**
    * Existing PR issue comments, used to keep the merge-manager receipt
    * idempotent. Optional so existing fakes and compositions keep compiling.
@@ -302,6 +409,14 @@ export interface GitHubClientDeps {
   listOpenPullRequests?(
     input: GitHubOpenPullRequestListInput
   ): Promise<readonly DiscoveredPullRequest[]>;
+  /**
+   * The merge gate's sibling check (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01): the pull
+   * request's head branch and creation time, and the repository's most recently merged pull
+   * requests. Optional so existing fakes keep compiling; absent disables the check.
+   */
+  readSiblingMergeContext?(input: PullRequestRef): Promise<SiblingMergeContextData>;
+  /** File paths of one merged pull request; null when the list is truncated. */
+  listMergedPullRequestFiles?(input: PullRequestRef): Promise<readonly string[] | null>;
 }
 
 /**
@@ -333,4 +448,23 @@ export interface OverseerVerdictStoreDeps {
     evidenceDigest?: string;
     evidence?: string;
   }): Promise<unknown>;
+  getVerdictByRunHead(input: { runId: string; headSha: string }): Promise<{
+    id: string;
+    verdict: string | null;
+    proposedAction: string | null;
+    actionedAt: string | null;
+  } | null>;
+  promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean>;
+  /**
+   * Promote an unactioned observe or healthy verdict and insert its
+   * flag_merge_ready receipt in one transaction. Returns true only when both
+   * writes committed. A failed insert must leave the prior action in place.
+   */
+  promoteObserveOrHealthyVerdictWithReceipt(input: {
+    verdictId: string;
+    runId: string;
+    woId: string;
+    class: string;
+    result: string;
+  }): Promise<boolean>;
 }

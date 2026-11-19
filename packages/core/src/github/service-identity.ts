@@ -192,7 +192,12 @@ export function buildAppJwt(identity: GitHubAppIdentity, now: number = Date.now(
 
 export async function getServiceGitHubToken(
   identity: ServiceGitHubAuth,
-  options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
+  options: {
+    fetch?: typeof fetch;
+    apiBaseUrl?: string;
+    now?: () => number;
+    signal?: AbortSignal;
+  } = {}
 ): Promise<string> {
   if (identity.kind === 'pat') return identity.token;
   if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
@@ -205,6 +210,7 @@ export async function getServiceGitHubToken(
     `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
     {
       method: 'POST',
+      signal: options.signal,
       headers: {
         accept: 'application/vnd.github+json',
         authorization: `Bearer ${jwt}`,

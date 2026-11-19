@@ -24,6 +24,7 @@ interface RawLadderConfig {
   tiers: RawTier[];
   refusedTiers?: string[];
   premiumTiers?: string[];
+  maxClimbsByEntry?: Record<string, number>;
 }
 
 /**
@@ -140,4 +141,33 @@ export function loadPremiumTiers(configPath?: string): string[] {
   return config.premiumTiers.filter(
     (name): name is string => typeof name === 'string' && name.length > 0
   );
+}
+
+/**
+ * Load the per-entry-tier climb-count limit map from the canonical ladder SOR
+ * (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01, fence 3: "one climb, then stop").
+ *
+ * The map keys are entry-tier names; the value is the maximum number of climbs
+ * a cascade that ENTERED at that tier may perform before it stops blocked
+ * (reason `climb_limit_reached`) instead of firing another rung. A tier absent
+ * from the map (or a missing/malformed field) has NO limit -- current behavior
+ * for every entry tier except those explicitly listed. Only positive integers
+ * are honored; any other value is ignored (treated as no limit for that key).
+ *
+ * @param configPath Optional path override; defaults to config/ladder.config.json
+ *                   relative to this file's directory.
+ */
+export function loadMaxClimbsByEntry(configPath?: string): Record<string, number> {
+  const config = readLadderConfig(configPath);
+  const raw = config.maxClimbsByEntry;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const out: Record<string, number> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (typeof name === 'string' && name.length > 0 && Number.isInteger(value) && value > 0) {
+      out[name] = value;
+    }
+  }
+  return out;
 }

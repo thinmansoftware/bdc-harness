@@ -26,15 +26,29 @@
  * mechanism that ensures no Cauldron failure ever exits silently again.
  */
 
-import { appendOperatorCard, type OperatorCardRecord } from '@archon/core/db/overseer-briefing';
+import {
+  appendOperatorCard,
+  getOperatorCard,
+  type OperatorCardRecord,
+} from '@archon/core/db/overseer-briefing';
+import { UNOWNED_RESPONSIBLE_ACTOR } from '@archon/core/db/dispatch-routing';
+import { createLogger } from '@archon/paths';
 import {
   buildOperatorCard,
   OPERATOR_CARD_IDENTITY_VERSION,
   type ActionableEventIdentity,
   type OperatorCardPayload,
 } from './operator-card';
+import {
+  readOwnerRoutingMode,
+  resolveWorkOwner,
+  type WorkOwnerLookupInput,
+  type WorkOwnerResolution,
+} from './owner-resolution';
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
+
+const log = createLogger('overseer/escalate');
 
 /**
  * Structured payload accepted by runEscalation. Mirrors the loose shape of
@@ -58,6 +72,35 @@ export interface EscalationSourceEvent {
   eventCreatedAt: string;
 }
 
+/** Injected dependencies; tests replace the GitHub-backed owner resolver. */
+export interface EscalationDeps {
+  resolveOwner?: (input: WorkOwnerLookupInput) => Promise<WorkOwnerResolution>;
+}
+
+/**
+ * WO-HARNESS-OVERSEER-OWNER-ROUTING-01 (mode on): the card fields an owner
+ * resolution implies when the caller did not pass its own. Never an XO
+ * principal unless the recorded owner IS xo (M-93 clause 3).
+ */
+function ownerCardFields(
+  assignment: WorkOwnerResolution,
+  woId: string
+): { responsible_actor: string; next_permitted_action: string } {
+  if (assignment.kind === 'owned') {
+    return {
+      responsible_actor: assignment.owner,
+      next_permitted_action: `owner ${assignment.owner} acts on this card`,
+    };
+  }
+  const issueNumber = assignment.source_issue?.split('#')[1];
+  return {
+    responsible_actor: UNOWNED_RESPONSIBLE_ACTOR,
+    next_permitted_action: issueNumber
+      ? `John assigns an owner on bdc-xo#${issueNumber}`
+      : `John assigns an owner (no WO issue found for ${woId})`,
+  };
+}
+
 /**
  * Run an escalation for a non-recoverable workflow failure.
  *
@@ -71,9 +114,26 @@ export async function runEscalation(
   runId: string,
   decision: DecisionResult,
   context: EscalationContext,
-  source: EscalationSourceEvent
+  source: EscalationSourceEvent,
+  deps: EscalationDeps = {}
 ): Promise<OperatorCardRecord> {
   if (!context.woId) throw new Error('operator_card_identity_invalid:wo_id');
+  // WO-HARNESS-OVERSEER-OWNER-ROUTING-01: off (default) never calls the
+  // resolver and leaves the payload byte-identical; shadow records the
+  // resolution only; on also derives the actor and next action from it.
+  const ownerRoutingMode = readOwnerRoutingMode();
+  const ownerAssignment =
+    ownerRoutingMode === 'off'
+      ? null
+      : await (deps.resolveOwner ?? resolveWorkOwner)({
+          woId: context.woId,
+          repository: textValue(context.repository),
+          prNumber: numberValue(context.prNumber),
+        });
+  const routedFields =
+    ownerRoutingMode === 'on' && ownerAssignment
+      ? ownerCardFields(ownerAssignment, context.woId)
+      : null;
   const identity: ActionableEventIdentity = {
     identity_version: OPERATOR_CARD_IDENTITY_VERSION,
     source_event_id: source.sourceEventId,
@@ -101,26 +161,56 @@ export async function runEscalation(
     },
     recovery_attempted: objectValue(context.recoveryAttempted),
     proposed_remediation: { steps: context.remediation ?? [] },
-    next_permitted_action: textValue(context.nextPermittedAction) ?? 'await operator ruling',
-    responsible_actor: textValue(context.responsibleActor) ?? 'acting-xo',
+    next_permitted_action:
+      textValue(context.nextPermittedAction) ??
+      routedFields?.next_permitted_action ??
+      'await operator ruling',
+    responsible_actor:
+      textValue(context.responsibleActor) ?? routedFields?.responsible_actor ?? 'acting-xo',
     actionable_event_at: source.eventCreatedAt,
     required_ruling: textValue(context.requiredRuling),
     evidence_links: objectValue(context.evidenceLinks),
     lifecycle_classification: textValue(context.lifecycleClassification) ?? 'recovery',
     governance_classification: textValue(context.governanceClassification) ?? 'information-only',
+    ...(ownerAssignment ? { owner_assignment: ownerAssignment } : {}),
   };
   const built = buildOperatorCard(identity, payload);
-  const persisted = await appendOperatorCard({
-    card_id: built.card_id,
-    identity_version: built.identity_version,
-    canonical_event_identity: { ...built.canonical_event_identity },
-    payload_digest: built.payload_digest,
-    payload: { ...built.payload },
-    ...built.payload,
-    run_id: runId,
-    wo_id: context.woId,
-  });
-  return persisted.card;
+  try {
+    const persisted = await appendOperatorCard({
+      card_id: built.card_id,
+      identity_version: built.identity_version,
+      canonical_event_identity: { ...built.canonical_event_identity },
+      payload_digest: built.payload_digest,
+      payload: { ...built.payload },
+      ...built.payload,
+      run_id: runId,
+      wo_id: context.woId,
+    });
+    return persisted.card;
+  } catch (error) {
+    // Retry safety with owner routing active: the same source event can
+    // resolve a different owner on a retry (a label changed in between).
+    // The card id is the event identity, so the first resolution wins and
+    // the existing card is returned instead of throwing.
+    if (
+      ownerRoutingMode === 'off' ||
+      (error as Error).message !== 'operator_card_digest_conflict'
+    ) {
+      throw error;
+    }
+    const view = await getOperatorCard(built.card_id);
+    if (!view) throw new Error('operator_card_not_found_after_conflict');
+    log.warn(
+      {
+        cardId: built.card_id,
+        woId: context.woId,
+        existingDigest: view.card.payload_digest,
+        retryDigest: built.payload_digest,
+      },
+      'overseer.owner_routing.digest_conflict_first_resolution_kept'
+    );
+    return view.card;
+  }
 }
 
 function textValue(value: unknown): string | null {

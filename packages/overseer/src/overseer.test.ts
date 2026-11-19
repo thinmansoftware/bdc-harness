@@ -170,6 +170,17 @@ describe('classifyError -- failure classes E-J (BDC 2026-07-17)', () => {
     ).toBe('commit_blocked_no_authorization');
   });
 
+  test('build_blocked: the terminal gate reason is named, not unknown', () => {
+    expect(
+      classifyError({
+        message:
+          "DAG workflow 'bdc-feature-development-codex' completed with failures: 'blocked-terminal-gate': Bash node 'blocked-terminal-gate' failed [exit 1]: build_blocked: BLOCKED opus-made-changes-rereview-failed",
+        nodeId: 'blocked-terminal-gate',
+        exitCode: 1,
+      })
+    ).toBe('build_blocked');
+  });
+
   test('plan_review_source_unreachable: escalated plan-review source phrases', () => {
     const phrases = [
       'could not be retrieved from the source repository',
@@ -390,6 +401,7 @@ describe('decide -- failure classes E-J', () => {
     const newClasses: ErrorClass[] = [
       'scope_dirty_at_capture',
       'commit_blocked_no_authorization',
+      'build_blocked',
       'plan_review_source_unreachable',
       'read_spec_scope_authority_missing',
       'read_spec_command_not_found',

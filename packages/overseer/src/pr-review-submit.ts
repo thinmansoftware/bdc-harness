@@ -21,6 +21,8 @@ import type {
   SubmitPullRequestReviewInput,
   SubmitPullRequestReviewResult,
 } from './adapters/github-real-deps.ts';
+import { readFile } from 'node:fs/promises';
+import { createLogger } from '@archon/paths';
 import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
 import { classifyRateLimitError } from './github-rate-limit';
 import { resolveMergeManagerMode } from './merge-manager';
@@ -32,8 +34,11 @@ import {
   type RemediationRefusalReason,
 } from './remediation-candidate';
 
+const credentialLog = createLogger('overseer/pr-review-submit');
+
 /** What the governed reviewer returns. */
 export interface ReviewerVerdict {
+  coverage?: BundleCoverage;
   /** true -> APPROVE; false -> REQUEST_CHANGES. */
   approved: boolean;
   /** Evidence. REQUIRED (non-empty) when approved === false. */
@@ -95,6 +100,52 @@ export interface ReviewerVerdict {
   reasonCode?: string;
   /** Milliseconds to wait before the item becomes claimable again. */
   retryAfterMs?: number;
+  /** Supervisor-observed native execution evidence. Model output cannot populate this. */
+  executionProof?: ReviewExecutionProof;
+}
+
+export interface ReviewExecutionContext {
+  readonly requestId: string;
+  readonly workerId: string;
+  readonly fencingToken: number;
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly headSha: string;
+  readonly checkoutPath: string;
+  readonly reviewerIdentity: string;
+  readonly rung: string;
+  readonly checkPlanStatus: 'absent' | 'present' | 'unsafe';
+  readonly checkPlan: readonly (readonly string[])[];
+  /**
+   * Set by the trusted worker when the exact-head checkout could not be
+   * prepared or verified (for example review_checkout_identity_failure). The
+   * review is then incomplete before any broker or model call.
+   */
+  readonly checkoutFailure?: string;
+}
+
+export interface ReviewExecutionProof {
+  readonly requestId: string;
+  readonly headSha: string;
+  readonly treeSha: string;
+  readonly cwd: string;
+  readonly nativePolicy: 'codex_bubblewrap';
+  readonly nativeVersion: string;
+  readonly runtimeUid: number;
+  readonly inspectionObserved: boolean;
+  /** Durable receipt marker required when the exact-head repository declares no plan. */
+  readonly check_plan: 'absent' | 'present';
+  readonly checks: readonly {
+    readonly argv: readonly string[];
+    readonly cwd: string;
+    readonly exitCode: number;
+    readonly outputDigest: string;
+    readonly startedAt: string;
+    readonly endedAt: string;
+  }[];
+  readonly startedAt: string;
+  readonly endedAt: string;
 }
 
 export interface ReviewWorkItem {
@@ -106,6 +157,8 @@ export interface ReviewWorkItem {
   /** The exact head this work item is bound to. */
   headSha: string;
   author: string;
+  /** Present on dispatch-worker work only; constructed from the live claim, never its body. */
+  executionContext?: ReviewExecutionContext;
 }
 
 export type SubmitDisposition =
@@ -162,12 +215,22 @@ export type SubmitDisposition =
    * transport failure only has a fixed backoff, and the two are worth telling
    * apart in the receipt when diagnosing why a review did not land.
    */
-  | 'rate_limited';
+  | 'rate_limited'
+  | 'review_incomplete'
+  /**
+   * NON-TERMINAL (WO-HARNESS-MERGE-GATES-01 Amendment 1). The PR is a draft at submit time (or its
+   * draft state could not be read), so NO review is submitted: a review queued before the PR was
+   * drafted must not land on the draft (comicstoreos-provisioner PR 112, 2026-11-13). Deferred like
+   * `checks_pending`; nothing is retired, and ready_for_review queues a fresh review.
+   */
+  | 'pr_is_draft';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
   reason?: string;
   event?: OverseerReviewEvent;
+  executionProof?: ReviewExecutionProof;
+  githubReview?: SubmitPullRequestReviewResult['review'];
   /**
    * Present only on a changes_requested disposition. Reports whether the
    * verdict was handed back to Taskmaster and, when it was not, why it stopped
@@ -210,6 +273,11 @@ export interface SubmitOutcome {
 }
 
 export interface SubmitDeps {
+  currentReviewRefs?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<{ headSha: string; baseSha: string }>;
   reviewerIdentity: string;
   /** Runs the governed reviewer against an exact head. */
   runReviewer(work: ReviewWorkItem): Promise<ReviewerVerdict>;
@@ -220,6 +288,12 @@ export interface SubmitDeps {
    * must never land on a head the reviewer did not examine.
    */
   currentHeadSha(input: { owner: string; repo: string; prNumber: number }): Promise<string>;
+  /**
+   * Whether the PR is a draft, re-read immediately before any review is submitted
+   * (WO-HARNESS-MERGE-GATES-01 Amendment 1). The real wiring always provides it and throws when the
+   * draft field is missing; a throw is a non-terminal deferral and nothing is submitted.
+   */
+  isDraft?(input: { owner: string; repo: string; prNumber: number }): Promise<boolean>;
   recordReceipt(input: {
     correlationId: string;
     messageId: string;
@@ -236,6 +310,17 @@ export interface SubmitDeps {
      * blocking finding needs your judgment".
      */
     remediation?: RemediationOutcome;
+    executionProof?: ReviewExecutionProof;
+    githubReview?: SubmitPullRequestReviewResult['review'];
+  }): Promise<void>;
+
+  /** Revalidates the dispatch fence. Required for execution-context work. */
+  hasCustody?(context: ReviewExecutionContext): Promise<boolean>;
+
+  /** Durable pre-publication write. Approval is refused if this write fails. */
+  recordExecutionProof?(input: {
+    work: ReviewWorkItem;
+    proof: ReviewExecutionProof;
   }): Promise<void>;
 
   /**
@@ -294,8 +379,10 @@ const MAX_EVIDENCE_BODY = 60_000;
  */
 export function buildReviewBody(work: ReviewWorkItem, verdict: ReviewerVerdict): string {
   const header = `Independent review by the Overseer App at head \`${work.headSha}\`.`;
+  const coverage = verdict.coverage ? `\n\n${verdict.coverage.notice}` : '';
   const summary = verdict.summary.trim();
-  const body = summary.length > 0 ? `${header}\n\n${summary}` : header;
+  // Reserve coverage ahead of model findings so the body limit cannot erase it.
+  const body = summary.length > 0 ? `${header}${coverage}\n\n${summary}` : header + coverage;
   return body.length > MAX_EVIDENCE_BODY ? body.slice(0, MAX_EVIDENCE_BODY) : body;
 }
 
@@ -442,6 +529,14 @@ export async function runAndSubmitReview(
       prNumber: work.prNumber,
     });
   } catch (error) {
+    // A rate limit or the local pool gate on the head re-read is a deferral,
+    // not a failure (WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01). The re-read never
+    // reached a head, so nothing was submitted and the verdict is not lost:
+    // the worker re-queues this item for when the budget refills, and the next
+    // attempt re-evaluates the same bound head. Terminating here retired five
+    // PRs' reviews on 2026-11-01 with nothing to re-arm them.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimitedOutcome(deps, work, 'head_recheck', rateLimit);
     return finish(deps, work, work.headSha, {
       disposition: 'submission_failed',
       reason: `head_recheck_failed:${errorCode(error)}`,
@@ -464,6 +559,53 @@ export async function runAndSubmitReview(
       disposition: 'stale_head',
       reason: 'head_advanced_during_review',
     });
+  }
+
+  // NO REVIEW ON A DRAFT (WO-HARNESS-MERGE-GATES-01 Amendment 1). The draft check at ingest
+  // (pr-review-ingest.ts) reads the webhook payload when the review is QUEUED; a PR drafted while the
+  // review waited would otherwise receive it. Re-read here, after both head gates and before EVERY
+  // submit below. A draft, or a draft state that cannot be read, submits nothing and defers.
+  if (deps.isDraft) {
+    let draft: boolean;
+    try {
+      draft = await deps.isDraft({ owner: work.owner, repo: work.repo, prNumber: work.prNumber });
+    } catch (error) {
+      const rateLimit = classifyRateLimitError(error);
+      if (rateLimit) return rateLimitedOutcome(deps, work, 'draft_recheck', rateLimit);
+      return finish(deps, work, work.headSha, {
+        disposition: 'pr_is_draft',
+        reason: `draft_recheck_failed:${errorCode(error)}`,
+      });
+    }
+    if (draft) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'pr_is_draft',
+        reason: 'pr_is_draft_at_submit',
+      });
+    }
+  }
+
+  // Execution qualification runs AFTER both head gates: an incomplete review
+  // of a head the PR has already moved past is stale, not incomplete, and a
+  // rate-limited or pool-gated head re-read stays a deferral (#1400). Nothing
+  // is published before this point, so the ordering never lets an
+  // unqualified verdict reach GitHub.
+  if (work.executionContext && !qualifiesExecution(work.executionContext, verdict.executionProof)) {
+    return submitIncomplete(
+      work,
+      deps,
+      verdict.reasonCode ?? 'sandbox_execution_proof_missing_or_invalid'
+    );
+  }
+
+  if (work.executionContext) {
+    const ownsFence = deps.hasCustody ? await deps.hasCustody(work.executionContext) : false;
+    if (!ownsFence) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'custody_conflict',
+        reason: 'dispatch_fence_lost_before_publication',
+      });
+    }
   }
 
   // REQUIRED CONTEXTS UNAVAILABLE (#775): bounded deferral has been exhausted,
@@ -502,6 +644,36 @@ export async function runAndSubmitReview(
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
   const body = buildReviewBody(work, verdict);
 
+  if (work.executionContext) {
+    const leak = await findCredentialInReviewBody(body);
+    if (leak) {
+      // Name the matched kind and field, never the value (bdc-xo#5550).
+      credentialLog.warn(
+        { prNumber: work.prNumber, repo: work.repo, kind: leak.kind, field: leak.field },
+        'review_body_credential_leak'
+      );
+      return submitIncomplete(work, deps, 'review_body_credential_leak');
+    }
+  }
+
+  if (work.executionContext && verdict.approved) {
+    if (!deps.recordExecutionProof || !verdict.executionProof) {
+      return submitIncomplete(work, deps, 'execution_proof_store_unavailable');
+    }
+    try {
+      await deps.recordExecutionProof({ work, proof: verdict.executionProof });
+    } catch (error) {
+      return submitIncomplete(work, deps, `execution_proof_store_failed:${errorCode(error)}`);
+    }
+    const ownsFence = deps.hasCustody ? await deps.hasCustody(work.executionContext) : false;
+    if (!ownsFence) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'custody_conflict',
+        reason: 'dispatch_fence_lost_immediately_before_post',
+      });
+    }
+  }
+
   // A rejection with no evidence is not actionable; refuse before the call.
   if (!verdict.approved && verdict.summary.trim().length === 0) {
     return finish(deps, work, work.headSha, {
@@ -512,6 +684,23 @@ export async function runAndSubmitReview(
   }
 
   let submission: SubmitPullRequestReviewResult;
+  if (verdict.coverage) {
+    try {
+      if (!deps.currentReviewRefs) throw new Error('freshness_unavailable');
+      const refs = await deps.currentReviewRefs({
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+      });
+      if (refs.headSha !== work.headSha || refs.baseSha !== verdict.coverage.baseSha)
+        throw new Error('refs_changed');
+    } catch {
+      return finish(deps, work, work.headSha, {
+        disposition: 'stale_head',
+        reason: 'bundle_coverage_refs_unavailable_or_changed',
+      });
+    }
+  }
   try {
     submission = await deps.submitReview({
       owner: work.owner,
@@ -526,6 +715,11 @@ export async function runAndSubmitReview(
       commitId: work.headSha,
     });
   } catch (error) {
+    // A rate-limit answer (or the local pool gate) means GitHub did not create
+    // the review, so retrying later cannot double-post. Any other throw stays
+    // terminal: its outcome on GitHub is unknown.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimitedOutcome(deps, work, 'submit', rateLimit);
     return finish(deps, work, work.headSha, {
       disposition: 'submission_failed',
       reason: `submit_threw:${errorCode(error)}`,
@@ -541,6 +735,19 @@ export async function runAndSubmitReview(
     });
   }
 
+  if (
+    work.executionContext &&
+    verdict.approved &&
+    (submission.review?.state !== 'APPROVED' || submission.review.commitSha !== work.headSha)
+  ) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'review_incomplete',
+      reason: 'github_approval_response_unqualified',
+      event: 'APPROVE',
+      executionProof: verdict.executionProof,
+    });
+  }
+
   if (verdict.approved) {
     // summaryField is REQUIRED here, not optional polish. Splitting the
     // approved branch out of the shared terminal return dropped it (PR #740
@@ -550,6 +757,8 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'approved',
       event,
+      executionProof: verdict.executionProof,
+      githubReview: submission.review,
       ...summaryField(verdict),
     });
   }
@@ -569,6 +778,162 @@ export async function runAndSubmitReview(
     ...(!verdict.approved && verdict.reasonCode
       ? { reason: `indeterminate:${verdict.reasonCode}` }
       : {}),
+  });
+}
+
+/**
+ * Credential shapes that must never appear in a review body (bdc-xo#5550 narrowed the guard).
+ *
+ * The earlier pattern, `sk-[A-Za-z0-9_-]{20,}` with the case-insensitive flag and no left
+ * boundary, matched inside ordinary names: any work-order id or branch name containing the
+ * letters "sk" followed by a hyphen and 20 more name characters (for example a desk or task id
+ * with a long kebab-case tail), so the Overseer refused its own review of any pull request that
+ * named that work order (five heads of bdc-xo PR 5518). A real token is matched by its prefix, a
+ * left boundary, a realistic minimum length and, where the prefix is ambiguous, its character mix:
+ *
+ * - `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` (36 characters in reality) and `github_pat_` (82):
+ *   distinctive prefixes, at least 30 characters after them;
+ * - `sk-` (OpenAI and Anthropic keys are 40 characters or more): at least 32 characters after the
+ *   prefix, a digit and a letter, and Shannon entropy of at least 4.1 bits per character (random
+ *   base62 is 4.4 and up; kebab-case words and work-order ids are below 4.0);
+ * - `Bearer <value>`: at least 24 characters, a digit and a letter, entropy of at least 3.3 (a
+ *   hex secret is about 3.9).
+ */
+const PREFIXED_TOKEN_SHAPE =
+  /(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{30,})/;
+const SK_KEY_CANDIDATE = /(?<![A-Za-z0-9])sk-([A-Za-z0-9_-]{32,})/g;
+const BEARER_CANDIDATE = /(?<![A-Za-z0-9])Bearer\s+([A-Za-z0-9._~+/-]{24,})/gi;
+
+function shannonEntropy(value: string): number {
+  const counts = new Map<string, number>();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / value.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function hasDigitAndLetter(value: string): boolean {
+  return /[0-9]/.test(value) && /[A-Za-z]/.test(value);
+}
+
+/** True when `body` holds a string shaped like a real credential. Exported for tests. */
+export function bodyHasCredentialShape(body: string): boolean {
+  if (PREFIXED_TOKEN_SHAPE.test(body)) return true;
+  for (const match of body.matchAll(SK_KEY_CANDIDATE)) {
+    const candidate = match[1] ?? '';
+    if (hasDigitAndLetter(candidate) && shannonEntropy(candidate) >= 4.1) return true;
+  }
+  for (const match of body.matchAll(BEARER_CANDIDATE)) {
+    const candidate = match[1] ?? '';
+    if (hasDigitAndLetter(candidate) && shannonEntropy(candidate) >= 3.3) return true;
+  }
+  return false;
+}
+
+/** A login-file field whose NAME says it holds a secret (tokens, keys, passwords), or a JWT. */
+const SECRET_FIELD_NAME = /(?:token|secret|key|password|credential)/i;
+const JWT_SHAPE = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+/**
+ * Collect the secret-valued strings of the login file with their field paths. Identifiers that are
+ * not secrets (issuer URL, client id, account id, refresh timestamp) are skipped: before bdc-xo#5550
+ * every string of 20 characters or more counted, so ordinary repeated text could trip the guard.
+ */
+function collectSecretStrings(
+  value: unknown,
+  path: string,
+  into: { field: string; value: string }[]
+): void {
+  if (typeof value === 'string') {
+    const leaf = path.split('.').pop() ?? '';
+    if (value.length >= 20 && (SECRET_FIELD_NAME.test(leaf) || JWT_SHAPE.test(value)))
+      into.push({ field: path, value });
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      collectSecretStrings(item, `${path}[${index}]`, into);
+    });
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value as Record<string, unknown>))
+      collectSecretStrings(item, path ? `${path}.${key}` : key, into);
+  }
+}
+
+export interface CredentialMatch {
+  kind: 'generic_shape' | 'login_field';
+  /** The login-file field NAME that matched; never the value. */
+  field?: string;
+}
+
+/** Parent-only final egress guard for the reviewer's accepted residual-risk login. */
+export async function findCredentialInReviewBody(
+  body: string,
+  loginPath = '/home/appuser/.codex/auth.json'
+): Promise<CredentialMatch | null> {
+  if (bodyHasCredentialShape(body)) return { kind: 'generic_shape' };
+  try {
+    const login = JSON.parse(await readFile(loginPath, 'utf8')) as unknown;
+    const secrets: { field: string; value: string }[] = [];
+    collectSecretStrings(login, '', secrets);
+    const hit = secrets.find(secret => body.includes(secret.value));
+    return hit ? { kind: 'login_field', field: hit.field } : null;
+  } catch {
+    // Missing reviewer auth is handled by the broker. The generic shape guard
+    // remains active for test and bootstrap environments without this file.
+    return null;
+  }
+}
+
+function qualifiesExecution(
+  context: ReviewExecutionContext,
+  proof: ReviewExecutionProof | undefined
+): proof is ReviewExecutionProof {
+  if (proof?.requestId !== context.requestId || proof.headSha !== context.headSha) return false;
+  if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_bubblewrap') return false;
+  if (!Number.isInteger(proof.runtimeUid) || proof.runtimeUid === 0 || !proof.treeSha || !proof.cwd)
+    return false;
+  if (context.checkPlanStatus === 'unsafe') return false;
+  if (proof.check_plan !== context.checkPlanStatus) return false;
+  if (proof.checks.length !== context.checkPlan.length) return false;
+  return proof.checks.every(
+    (check, index) =>
+      check.exitCode === 0 &&
+      check.outputDigest.length > 0 &&
+      JSON.stringify(check.argv) === JSON.stringify(context.checkPlan[index])
+  );
+}
+
+export async function submitIncomplete(
+  work: ReviewWorkItem,
+  deps: SubmitDeps,
+  reason: string
+): Promise<SubmitOutcome> {
+  const body = `Review incomplete: ${reason}. No approval was recorded.`;
+  let suffix = '';
+  try {
+    const result = await deps.submitReview({
+      owner: work.owner,
+      repo: work.repo,
+      number: work.prNumber,
+      event: 'COMMENT',
+      body,
+      commitId: work.headSha,
+    });
+    if (!result.submitted) suffix = `:comment_failed:${result.message ?? 'unknown'}`;
+  } catch (error) {
+    suffix = `:comment_failed:${errorCode(error)}`;
+  }
+  return finish(deps, work, work.headSha, {
+    disposition: 'review_incomplete',
+    reason: `${reason}${suffix}`,
+    event: 'COMMENT',
+    summary: body,
   });
 }
 
@@ -649,6 +1014,25 @@ function summaryField(verdict: ReviewerVerdict): { summary?: string } {
   return summary.length > 0 ? { summary } : {};
 }
 
+/**
+ * The non-terminal `rate_limited` outcome for a GitHub call made AFTER the
+ * reviewer ran (head re-read or review submission). The worker defers the
+ * item to `retryAfter`; the reason names which call was refused.
+ */
+function rateLimitedOutcome(
+  deps: SubmitDeps,
+  work: ReviewWorkItem,
+  stage: 'head_recheck' | 'draft_recheck' | 'submit',
+  rateLimit: NonNullable<ReturnType<typeof classifyRateLimitError>>
+): Promise<SubmitOutcome> {
+  return finish(deps, work, work.headSha, {
+    disposition: 'rate_limited',
+    reason: `rate_limited:${stage}:${rateLimit.kind}:${rateLimit.source}`,
+    retryAfter: rateLimit.retryAfter,
+    retryAfterMs: rateLimit.retryAfterMs,
+  });
+}
+
 function errorCode(error: unknown): string {
   if (error instanceof Error && error.message) return error.message.slice(0, 120);
   return 'unknown_error';
@@ -672,11 +1056,22 @@ async function finish(
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
       ...(outcome.remediation ? { remediation: outcome.remediation } : {}),
+      ...(outcome.executionProof ? { executionProof: outcome.executionProof } : {}),
+      ...(outcome.githubReview ? { githubReview: outcome.githubReview } : {}),
     });
   } catch {
-    // Receipt failure never converts a classified outcome into a throw.
+    // A posted approval whose actual response cannot be made durable is
+    // unknown and must never be presented to downstream code as qualified.
+    if (outcome.disposition === 'approved') {
+      return {
+        ...outcome,
+        disposition: 'review_incomplete',
+        reason: 'github_approval_response_receipt_failed',
+      };
+    }
   }
   // The retry instant is part of the outcome, not the receipt: the worker reads
   // it off the return value to schedule the deferral.
   return outcome;
 }
+import type { BundleCoverage } from './bundle-review-proof';

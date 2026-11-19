@@ -7,7 +7,7 @@
  * Gate conditions:
  *   1. Terminal status: "completed" passes; "failed" or "cancelled" fails.
  *   2. Validator verdict: "satisfied" passes; "needs_revision" fails; "unknown" abstains.
- *   3. PR opened: if completed but no PR URL, fails (work didn't land).
+ *   3. PR opened: if completed but no PR URL and no matching pushed-head SHA, fails.
  *   4. PR mergeable: if prMergeable === false, fails.
  *
  * Integrity separation: infra-errors (auth/transport) are classified separately
@@ -18,6 +18,24 @@
 import { classifyError } from '@archon/overseer/classify';
 import type { GateVerdict, PollResult, FireResult, TierOutcome } from './types.js';
 
+const SHA40 = /^[0-9a-f]{40}$/i;
+
+/** The one gate reason that a conflict-only verdict consists of (condition 4 below). */
+const NOT_MERGEABLE_REASON = 'PR is not mergeable';
+
+/**
+ * A completed run counts as having opened a PR when its pushed head SHA equals
+ * the head of exactly one open WO PR. Both values must be 40 hex digits.
+ * Equality does not override any other gate condition.
+ */
+function runPushedShaMatchesOpenPr(poll: PollResult): boolean {
+  const pushed = poll.runPushedHeadSha;
+  const open = poll.openWoPrHeadSha;
+  if (typeof pushed !== 'string' || typeof open !== 'string') return false;
+  if (!SHA40.test(pushed) || !SHA40.test(open)) return false;
+  return pushed.toLowerCase() === open.toLowerCase();
+}
+
 /**
  * Judge whether a run passed the gate.
  *
@@ -27,7 +45,7 @@ import type { GateVerdict, PollResult, FireResult, TierOutcome } from './types.j
 export function judgeGate(poll: PollResult): GateVerdict {
   const { terminalStatus, validatorVerdict, prUrl, prMergeable } = poll;
 
-  const prOpened = prUrl !== null;
+  const prOpened = prUrl !== null || runPushedShaMatchesOpenPr(poll);
 
   // Cancelled is NOT a climb signal (Motion M-86). A human deliberately stopped
   // this run -- climbing to a more expensive tier is the opposite of intent.
@@ -71,11 +89,18 @@ export function judgeGate(poll: PollResult): GateVerdict {
 
   // Condition 4: PR mergeable
   if (prMergeable === false) {
-    failingReasons.push('PR is not mergeable');
+    failingReasons.push(NOT_MERGEABLE_REASON);
   }
 
   const pass = failingReasons.length === 0;
   const reason = pass ? 'all gate conditions passed' : failingReasons.join('; ');
+  const conflictOnly =
+    !pass &&
+    terminalStatus === 'completed' &&
+    prOpened &&
+    validatorVerdict !== 'needs_revision' &&
+    failingReasons.length === 1 &&
+    failingReasons[0] === NOT_MERGEABLE_REASON;
 
   return {
     pass,
@@ -85,6 +110,7 @@ export function judgeGate(poll: PollResult): GateVerdict {
     prOpened,
     prMergeable: prMergeable ?? null,
     terminalStatus,
+    ...(conflictOnly ? { conflictOnly: true } : {}),
   };
 }
 
@@ -100,7 +126,8 @@ export function judgeGate(poll: PollResult): GateVerdict {
  */
 export function classifyAttemptOutcome(
   fireResult: FireResult,
-  gateVerdict: GateVerdict | null
+  gateVerdict: GateVerdict | null,
+  pollResult?: PollResult
 ): TierOutcome {
   // Check for infra-error first (fire failed to produce a run)
   if (!fireResult.ok && fireResult.infraError !== null) {
@@ -139,6 +166,16 @@ export function classifyAttemptOutcome(
   // guarantees pass:false for a cancelled verdict.
   if (gateVerdict.cancelled) {
     return 'cancelled';
+  }
+
+  // Only the evidence gate emits ENVIRONMENT_UNAVAILABLE: after checking a
+  // declared capability. Never infer missing services from test output text.
+  if (
+    pollResult?.terminalStatus === 'failed' &&
+    typeof pollResult.rawMetadata.error === 'string' &&
+    pollResult.rawMetadata.error.includes('ENVIRONMENT_UNAVAILABLE:')
+  ) {
+    return 'environment-unavailable';
   }
 
   return gateVerdict.pass ? 'won' : 'gate-failed';

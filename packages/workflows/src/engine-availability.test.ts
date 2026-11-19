@@ -200,6 +200,11 @@ describe('T6: resolveRouterEngine -- provider+model to router.yaml engine bridge
     expect(resolveRouterEngine('claude', 'claude-fable-5')).toBe('fable-session');
   });
 
+  it('maps the pinned Fable 5.1 and 5.2 ids to fable-session', () => {
+    expect(resolveRouterEngine('claude', 'claude-fable-5-1')).toBe('fable-session');
+    expect(resolveRouterEngine('claude', 'claude-fable-5-2')).toBe('fable-session');
+  });
+
   it('maps sonnet variants to sonnet-subscription', () => {
     expect(resolveRouterEngine('claude', 'claude-sonnet-5')).toBe('sonnet-subscription');
     expect(resolveRouterEngine('claude', 'sonnet')).toBe('sonnet-subscription');

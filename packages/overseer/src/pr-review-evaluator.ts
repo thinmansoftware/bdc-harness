@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import type { BundleCoverage } from './bundle-review-proof';
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
@@ -6,6 +8,8 @@ import { conclusionIsPassing, latestAttemptPerCheck } from './pr-review-check-in
 import { createLogger } from '@archon/paths';
 import {
   buildJudgeTransport,
+  buildPrReviewTransport,
+  describeJudgeModel,
   defaultJudgeChildSpawn,
   deliverStdin,
   destroyStdin,
@@ -13,7 +17,17 @@ import {
   type JudgeChild,
   type JudgeChildSpawn,
   type JudgeTransport,
+  type PrReviewTransportContext,
+  supportedPrReviewLadder,
 } from './judge-transport';
+import {
+  submitReviewerBrokerJob,
+  diagnosticForError,
+  terminationDiagnostic,
+  isTrustedTermination,
+  isTrustedProcessTermination,
+  type SanitizedTermination,
+} from './reviewer-broker-client';
 
 /**
  * Observability gap found 2026-09-17: this ladder loop classifies a per-rung
@@ -28,6 +42,8 @@ import {
  * classification that already exists observable.
  */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
+/** Fully composed UTF-8 prompt limit; oversize is terminal, never a transport retry. */
+export const MAX_REVIEW_PROMPT_BYTES = 1_048_576;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('overseer.pr-review-evaluator');
   return cachedLog;
@@ -95,6 +111,8 @@ export interface PrReviewCheck {
   started_at?: string | null;
   completed_at?: string | null;
   app?: { slug?: string; name?: string };
+  check_suite?: { id?: number } | null;
+  workflow_attempt?: { run_id: number; run_attempt: number } | null;
 }
 
 export interface PrReviewCheckPartition {
@@ -103,6 +121,9 @@ export interface PrReviewCheckPartition {
 }
 
 export interface PrReviewResult {
+  bundleProofUnavailable?: boolean;
+  coverage?: BundleCoverage;
+  diagnostics?: readonly SanitizedTermination[];
   verdict: PrReviewVerdict;
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
@@ -130,6 +151,7 @@ export interface PrReviewResult {
 }
 
 export interface PrReviewModelResult {
+  diagnostic?: SanitizedTermination;
   exitCode: number;
   stdout: string;
   timedOut: boolean;
@@ -166,11 +188,21 @@ export interface PrReviewDeps {
    * to the reported-checks heuristic. The real GitHub adapter always sets it
    * explicitly to `string[] | null`.
    */
-  fetchEvidence(
-    input: PrReviewInput
-  ): Promise<{ diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null }>;
+  fetchEvidence(input: PrReviewInput): Promise<{
+    diff: string;
+    checks: PrReviewCheck[];
+    requiredContexts?: string[] | null;
+    coverage?: BundleCoverage;
+    bundleProofUnavailable?: boolean;
+  }>;
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
-  invokeModel(binary: string, prompt: string): Promise<PrReviewModelResult>;
+  invokeModel(
+    binary: string,
+    prompt: string,
+    context?: PrReviewTransportContext
+  ): Promise<PrReviewModelResult>;
+  /** Server-created context only. Its absence preserves legacy/test callers. */
+  executionContext?: PrReviewTransportContext;
   ladder?: readonly string[];
   /**
    * Per-rung outage seam (#847). Called with the classified quota / credit /
@@ -246,6 +278,8 @@ export function buildReviewPrompt(input: {
   diff: string;
   checkPartition: PrReviewCheckPartition;
   acceptanceCriteria: string | null;
+  coverageNotice?: string;
+  bundleProofUnavailable?: boolean;
 }): string {
   return [
     'You are an independent pull-request code reviewer.',
@@ -263,6 +297,10 @@ export function buildReviewPrompt(input: {
     `Required checks (these gate the verdict): ${JSON.stringify(input.checkPartition.gating)}`,
     `Non-required checks (informational only; report a failure as severity note, never blocker or major): ${JSON.stringify(input.checkPartition.nonRequired)}`,
     'Diff:',
+    ...(input.coverageNotice ? [input.coverageNotice] : []),
+    ...(input.bundleProofUnavailable
+      ? ['Bundle exclusion unavailable: producer proof missing or untrusted; full diff retained.']
+      : []),
     input.diff,
   ].join('\n');
 }
@@ -463,6 +501,22 @@ export function reviewErrorCode(error: string | undefined): string | null {
   return /^[a-z0-9_]{1,40}$/.test(code) ? code : null;
 }
 
+function trustedProcessOutage(result: PrReviewModelResult): JudgeOutage | null {
+  const diagnostic = result.diagnostic;
+  if (!isTrustedProcessTermination(diagnostic) || diagnostic.exitCode !== result.exitCode)
+    return null;
+  switch (diagnostic.terminationClass) {
+    case 'auth_expired':
+    case 'usage_limit':
+    case 'usage_limit_until':
+    case 'provider_credits_exhausted':
+      // The public projection has no raw provider date. Use the existing bounded TTL.
+      return { kind: diagnostic.terminationClass, code: diagnostic.terminationClass };
+    default:
+      return null;
+  }
+}
+
 /**
  * Terminality of a PR's check suite for review purposes.
  *
@@ -576,6 +630,8 @@ export async function evaluatePullRequest(
   }
 
   let evidence: {
+    bundleProofUnavailable?: boolean;
+    coverage?: BundleCoverage;
     diff: string;
     checks: PrReviewCheck[];
     requiredContexts?: string[] | null;
@@ -584,6 +640,9 @@ export async function evaluatePullRequest(
   try {
     evidence = await deps.fetchEvidence(input);
   } catch (error) {
+    if (error instanceof Error && error.message === 'pr_review_diff_evidence_unavailable') {
+      return transportError(input, deps, false, 'pr_review_diff_evidence_unavailable');
+    }
     // RATE LIMIT IS A DEFERRAL, NOT A VERDICT (#782 part 2). Checked BEFORE the
     // generic evidence-error branch: a 403/429 carrying rate-limit headers used
     // to fall through to INDETERMINATE, which is TERMINAL -- the review was
@@ -642,8 +701,34 @@ export async function evaluatePullRequest(
     diff: evidence.diff,
     checkPartition,
     acceptanceCriteria,
+    coverageNotice: evidence.coverage?.notice,
+    bundleProofUnavailable: evidence.bundleProofUnavailable,
   });
+  const promptBytes = Buffer.byteLength(prompt, 'utf8');
+  if (promptBytes > MAX_REVIEW_PROMPT_BYTES) {
+    getLog().warn(
+      {
+        promptBytes,
+        cap: MAX_REVIEW_PROMPT_BYTES,
+        prNumber: input.pr_number,
+        headSha: input.head_sha,
+      },
+      'prompt_too_large'
+    );
+    return {
+      ...indeterminate(
+        input,
+        deps,
+        acceptanceCriteriaAvailable,
+        `prompt_too_large:bytes=${promptBytes}:cap=${MAX_REVIEW_PROMPT_BYTES}`
+      ),
+      ...(evidence.coverage ? { coverage: evidence.coverage } : {}),
+      ...(evidence.bundleProofUnavailable ? { bundleProofUnavailable: true } : {}),
+    };
+  }
   const ladder = deps.ladder ?? defaultReviewLadder();
+  const supported = deps.executionContext ? supportedPrReviewLadder(ladder) : ladder;
+  const diagnostics: SanitizedTermination[] = [];
   let lastError = 'model_unavailable';
   // TRANSPORT vs JUDGMENT across the whole ladder.
   //
@@ -672,15 +757,41 @@ export async function evaluatePullRequest(
   let transportFailure: string | null = null;
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
+    if (!supported.includes(binary)) {
+      diagnostics.push(terminationDiagnostic('unsupported_binary', null));
+      if (lastError === 'model_unavailable') lastError = 'unsupported_binary';
+      continue;
+    }
     const rungStartedAt = Date.now();
+    const invocationId = randomUUID();
     getLog().info(
-      { binary, promptBytes: prompt.length, prNumber: input.pr_number, headSha: input.head_sha },
+      { binary, promptBytes, prNumber: input.pr_number, headSha: input.head_sha },
       'judge_rung_started'
     );
     try {
-      const result = await deps.invokeModel(binary, prompt);
+      const result = await deps.invokeModel(binary, prompt, deps.executionContext);
       const rungMs = Date.now() - rungStartedAt;
+      const diagnostic = (
+        kind: SanitizedTermination['terminationClass'],
+        exit: number | null
+      ): SanitizedTermination =>
+        isTrustedTermination(result.diagnostic)
+          ? result.diagnostic
+          : terminationDiagnostic(kind, exit, invocationId);
+      // A native success must be an observed, consistent process result. Never
+      // clear the breaker or parse a verdict merely because exitCode is zero.
+      if (
+        deps.executionContext &&
+        (result.diagnostic?.terminationClass === 'invalid_broker_result' ||
+          (result.exitCode === 0 && !isTrustedProcessTermination(result.diagnostic)))
+      ) {
+        diagnostics.push(diagnostic('invalid_broker_result', null));
+        lastError = 'invalid_broker_result';
+        nonTransportFailure = true;
+        continue;
+      }
       if (result.timedOut) {
+        diagnostics.push(diagnostic('timeout', null));
         // A timeout is transport, not judgment: the process started but never
         // delivered anything to judge, so this rung was not reached.
         lastError = `model_timeout:${binary}`;
@@ -691,13 +802,22 @@ export async function evaluatePullRequest(
       // The process ran and returned. Whatever happens below is judgment.
       reachedAnyRung = true;
       if (result.exitCode !== 0) {
+        diagnostics.push(
+          diagnostic(
+            classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`)?.kind ??
+              'unknown_nonzero',
+            Number.isSafeInteger(result.exitCode) ? result.exitCode : null
+          )
+        );
         // QUOTA / CREDIT / AUTH REFUSALS ARE NAMED, NOT HIDDEN (#847). The
         // process ran, so this is still a JUDGMENT failure and still terminal
         // exactly as before -- but `model_exit_nonzero` told nobody that codex
         // had hit its usage limit and grok had no credits (2026-09-14, every
         // review from ~20:45Z). The code now says which, and the rung's outage
         // is reported so the ladder breaker can stop spawning dead rungs.
-        const outage = classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`);
+        const outage = deps.executionContext
+          ? trustedProcessOutage(result)
+          : classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`);
         if (outage) deps.recordRungOutage?.(binary, outage);
         lastError = outage ? outage.code : `model_exit_nonzero:${binary}`;
         getLog().warn(
@@ -717,6 +837,7 @@ export async function evaluatePullRequest(
       getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_clean_exit');
       const parsed = parseReviewVerdict(result.stdout);
       if (!parsed) {
+        diagnostics.push(diagnostic('invalid_model_output', 0));
         lastError = `model_output_invalid:${binary}`;
         getLog().warn({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_output_invalid');
         continue;
@@ -724,16 +845,38 @@ export async function evaluatePullRequest(
       try {
         assertCandidateIsCurrentHead(input.head_sha, parsed.reviewed_head_sha);
       } catch {
-        return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
+        return {
+          ...indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch'),
+          ...(evidence.coverage ? { coverage: evidence.coverage } : {}),
+          ...(evidence.bundleProofUnavailable ? { bundleProofUnavailable: true } : {}),
+          ...(diagnostics.length > 0 ? { diagnostics } : {}),
+        };
       }
-      getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_verdict_produced');
+      getLog().info(
+        { binary, model: describeJudgeModel(binary), rungMs, prNumber: input.pr_number },
+        'judge_rung_verdict_produced'
+      );
       return {
         ...applyRequiredCheckGate(parsed, checkPartition),
-        reviewer: { provider: deps.reviewer.provider, model: binary },
+        reviewer: { provider: deps.reviewer.provider, model: describeJudgeModel(binary) },
         acceptance_criteria_available: acceptanceCriteriaAvailable,
+        ...(evidence.coverage ? { coverage: evidence.coverage } : {}),
+        ...(evidence.bundleProofUnavailable ? { bundleProofUnavailable: true } : {}),
       };
     } catch (error) {
       const rungMs = Date.now() - rungStartedAt;
+      const known = diagnosticForError(error);
+      const message = error instanceof Error ? error.message : '';
+      const kind =
+        message === 'pr_review_native_sandbox_unsupported_binary'
+          ? 'unsupported_binary'
+          : ((deps.executionContext ? undefined : classifyJudgeOutage(message)?.kind) ??
+            (isTransportError(error) ? 'transport_error' : 'unknown_error'));
+      diagnostics.push(known ?? terminationDiagnostic(kind, null, invocationId));
+      if (kind === 'unsupported_binary') {
+        if (lastError === 'model_unavailable') lastError = 'unsupported_binary';
+        continue;
+      }
       // A rate limit raised by the model seam (the judge CLIs read GitHub too)
       // is the same deferral, and must abandon the ladder immediately: walking
       // to the next binary would spend more of a budget that is already
@@ -748,9 +891,11 @@ export async function evaluatePullRequest(
       // error will recur, so it is terminal and named. Classified on the FULL
       // message -- the Codex retry date sits past the 120-char slice that
       // `errorMessage` keeps for the detail half.
-      const outage = classifyJudgeOutage(
-        error instanceof Error ? error.message : typeof error === 'string' ? error : ''
-      );
+      const outage = deps.executionContext
+        ? null
+        : classifyJudgeOutage(
+            error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+          );
       if (outage) {
         deps.recordRungOutage?.(binary, outage);
         lastError = outage.code;
@@ -761,7 +906,7 @@ export async function evaluatePullRequest(
         );
         continue;
       }
-      lastError = `model_error:${errorMessage(error)}`;
+      lastError = deps.executionContext ? 'model_error' : `model_error:${errorMessage(error)}`;
       if (isTransportError(error)) {
         // E2BIG and friends: the process never ran, so this rung was not reached.
         transportFailure ??= lastError;
@@ -775,7 +920,11 @@ export async function evaluatePullRequest(
         {
           binary,
           rungMs,
-          errorMessage: error instanceof Error ? error.message : String(error),
+          errorMessage: deps.executionContext
+            ? 'private_native_error'
+            : error instanceof Error
+              ? error.message
+              : String(error),
           isTransport: isTransportError(error),
           prNumber: input.pr_number,
         },
@@ -793,7 +942,12 @@ export async function evaluatePullRequest(
   if (transportFailure && !reachedAnyRung && !nonTransportFailure) {
     return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
   }
-  return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
+  return {
+    ...indeterminate(input, deps, acceptanceCriteriaAvailable, lastError),
+    diagnostics,
+    ...(evidence.coverage ? { coverage: evidence.coverage } : {}),
+    ...(evidence.bundleProofUnavailable ? { bundleProofUnavailable: true } : {}),
+  };
 }
 
 /** The configured judge ladder, cheapest first. Exported for the breaker (#847). */
@@ -802,6 +956,11 @@ export function defaultReviewLadder(): string[] {
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
+}
+
+/** Shared native policy for the evaluator, ingest breaker and parked-head recovery. */
+export function supportedReviewLadder(): string[] {
+  return supportedPrReviewLadder(defaultReviewLadder());
 }
 
 /** Existing judge CLI convention, exposed for the real dependency composition. */
@@ -832,18 +991,62 @@ export { DEFAULT_CURSOR_JUDGE_MODEL, resolveCursorJudgeModel } from './judge-tra
 /** Exported for the permission test; not part of the review API surface. */
 export async function buildReviewModelTransport(
   binary: string,
-  prompt: string
+  prompt: string,
+  context?: PrReviewTransportContext
 ): Promise<JudgeTransport> {
-  return buildJudgeTransport(binary, prompt);
+  return context
+    ? buildPrReviewTransport(binary, prompt, context)
+    : buildJudgeTransport(binary, prompt);
 }
 
 export async function invokeConfiguredReviewModel(
   binary: string,
   prompt: string,
-  timeoutMs = resolveReviewModelTimeoutMs()
+  context?: PrReviewTransportContext,
+  timeoutMs = resolveReviewModelTimeoutMs(),
+  brokerSubmit: typeof submitReviewerBrokerJob = submitReviewerBrokerJob
 ): Promise<PrReviewModelResult> {
-  const transport = await buildReviewModelTransport(binary, prompt);
+  const correlationId = randomUUID();
+  const transport = await buildReviewModelTransport(binary, prompt, context);
   try {
+    if (context) {
+      if (!transport.brokerJob) throw new Error('reviewer_broker_unavailable');
+      const result = await brokerSubmit(
+        {
+          ...transport.brokerJob,
+          // The broker accepts 1 ms to 30 min; it starts from env -i, so the
+          // parent supplies its configured model wall clock per job.
+          timeoutMs: Math.max(1, Math.min(Math.floor(timeoutMs), 30 * 60_000)),
+        },
+        { id: correlationId }
+      );
+      // Refuse the envelope BEFORE consuming even well-formed APPROVE text.
+      // Failure diagnostics retain Phase A's shape; only qualified exit-zero
+      // process results may supply a candidate verdict or clear an outage.
+      if (
+        !isTrustedTermination(result.diagnostic) ||
+        result.diagnostic.terminationClass === 'invalid_broker_result' ||
+        (result.exitCode === 0 && !isTrustedProcessTermination(result.diagnostic))
+      ) {
+        return {
+          exitCode: 1,
+          stdout: '',
+          timedOut: false,
+          diagnostic:
+            isTrustedTermination(result.diagnostic) &&
+            result.diagnostic.terminationClass === 'invalid_broker_result'
+              ? result.diagnostic
+              : terminationDiagnostic('invalid_broker_result', null, correlationId),
+        };
+      }
+      const payload = result.stdout.trim().length > 0 ? result.stdout : result.stderr;
+      return {
+        exitCode: result.exitCode,
+        stdout: codexExecJsonlVerdictText(payload),
+        timedOut: result.timedOut === true,
+        diagnostic: result.diagnostic,
+      };
+    }
     return await runReviewModelProcess(transport, binary, timeoutMs);
   } finally {
     // Always in a finally: the prompt holds the private diff, so it must not
@@ -928,6 +1131,33 @@ export async function runReviewModelProcess(
   // parked if the child exited without draining stdin.
   destroyStdin(subprocess.stdin);
   return result;
+}
+
+/**
+ * Text of the last completed agent message in a `codex exec --json` stream.
+ * A stream with no such message returns '' so parseReviewVerdict fails closed.
+ */
+export function codexExecJsonlVerdictText(stdout: string): string {
+  let verdict = '';
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line.trim().length === 0) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+    const record = event as Record<string, unknown>;
+    if (record.type !== 'item.completed') continue;
+    const item = record.item;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const message = item as Record<string, unknown>;
+    if (message.type !== 'agent_message') continue;
+    if (typeof message.text !== 'string' || message.text.trim().length === 0) continue;
+    verdict = message.text;
+  }
+  return verdict;
 }
 
 function normalizeModelOutput(binary: string, stdout: string): string {

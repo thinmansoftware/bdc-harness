@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { createHash } from 'crypto';
 
 import type { RunAuthorityPolicy } from '@archon/workflows/schemas/workflow';
+import { parseRepairTarget } from '@archon/workflows/reliability/run-branch-identity';
 import { freezeWorkOrderSource } from './work-order-source';
 
 const policy: RunAuthorityPolicy = {
@@ -167,5 +168,34 @@ describe('freezeWorkOrderSource', () => {
     await expect(
       freezeWorkOrderSource({ ...policy, allow_issue_fallback: true }, 'build something')
     ).rejects.toThrow('scope_authority_missing: woId or issue');
+  });
+
+  it('frozen_spec_carries_climb_repair_target', async () => {
+    const line = 'Repair target: PR #4422 (branch archon/task-web-worker-1-abc)';
+    const message = `${boundMessage(identity)}\n\n## Prior attempt context\n${line}`;
+    const result = await freezeWorkOrderSource(policy, message, { fetcher: canonicalFetch });
+    const text = Buffer.from(result.specBytes).toString('utf8');
+    expect(text.split('\n').filter(entry => entry === line)).toEqual([line]);
+    expect(parseRepairTarget(result.specBytes)).toEqual({
+      prNumber: 4422,
+      branch: 'archon/task-web-worker-1-abc',
+    });
+    expect(`sha256:${createHash('sha256').update(bytes).digest('hex')}`).toBe(identity.specHash);
+  });
+
+  it('spec_declaration_wins', async () => {
+    const canonical = 'Repair target: PR #10 (branch a/b)\n# spec\n';
+    const specHash = `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+    const binding = { ...identity, specHash };
+    const fetcher: typeof fetch = async input =>
+      String(input).includes('/git/ref/')
+        ? response(200, { object: { sha: 'a'.repeat(40) } })
+        : response(200, { type: 'file', content: Buffer.from(canonical).toString('base64') });
+    const message = `${boundMessage(binding)}\nRepair target: PR #20 (branch c/d)`;
+    const result = await freezeWorkOrderSource(policy, message, { fetcher });
+    const text = Buffer.from(result.specBytes).toString('utf8');
+    expect(text).toBe(canonical);
+    expect(text).not.toContain('PR #20');
+    expect(parseRepairTarget(result.specBytes)?.prNumber).toBe(10);
   });
 });

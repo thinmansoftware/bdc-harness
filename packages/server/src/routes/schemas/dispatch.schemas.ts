@@ -99,13 +99,60 @@ export const dispatchMailboxPrincipalBodySchema = z
   .strict()
   .openapi('DispatchMailboxPrincipalBody');
 
-export const listDispatchMessagesQuerySchema = z.object({
-  recipient: z.string().optional(),
-  status: dispatchMessageStatusSchema.optional(),
-  limit: z.string().optional(),
-  subject_key: z.string().optional(),
-  route_disposition: dispatchRouteDispositionSchema.optional(),
-});
+// Duplicate query keys arrive as arrays. Accept them here so the route parser
+// can reject a selected request by name instead of a generic type error.
+const dispatchQueryString = z.union([z.string(), z.array(z.string()).min(1)]);
+
+// No-selector lists still use the historical OpenAPI hook text. Selected
+// requests keep arrays so the route parser can name the selector error.
+const legacyDuplicateQueryMessage = {
+  recipient: 'Expected string, received array',
+  status: "Expected 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled', received array",
+  limit: 'Expected string, received array',
+  subject_key: 'Expected string, received array',
+  route_disposition:
+    "Expected 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced', received array",
+} as const;
+
+const legacyDuplicateQueryFields = [
+  'recipient',
+  'status',
+  'limit',
+  'subject_key',
+  'route_disposition',
+] as const;
+
+export const listDispatchMessagesQuerySchema = z
+  .object({
+    recipient: dispatchQueryString.optional(),
+    status: z.union([dispatchMessageStatusSchema, z.array(z.string()).min(1)]).optional(),
+    limit: dispatchQueryString.optional(),
+    subject_key: dispatchQueryString.optional(),
+    route_disposition: z
+      .union([dispatchRouteDispositionSchema, z.array(z.string()).min(1)])
+      .optional(),
+    message_id: dispatchQueryString.optional(),
+    correlation_id: dispatchQueryString.optional(),
+    after_seq: dispatchQueryString.optional(),
+  })
+  .superRefine((query, ctx) => {
+    if (
+      query.message_id !== undefined ||
+      query.correlation_id !== undefined ||
+      query.after_seq !== undefined
+    ) {
+      return;
+    }
+    for (const field of legacyDuplicateQueryFields) {
+      if (Array.isArray(query[field])) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: legacyDuplicateQueryMessage[field],
+        });
+      }
+    }
+  });
 
 export const claimDispatchMessageBodySchema = z
   .object({
@@ -177,6 +224,18 @@ export const dispatchMessageListResponseSchema = z
   .array(dispatchMessageSchema)
   .openapi('DispatchMessageListResponse');
 
+export const dispatchMessageCursorPageSchema = z
+  .object({
+    messages: z.array(dispatchMessageSchema),
+    next_after_seq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    page_full: z.boolean(),
+  })
+  .openapi('DispatchMessageCursorPage');
+
+export const dispatchMessageListOrCursorResponseSchema = z
+  .union([dispatchMessageListResponseSchema, dispatchMessageCursorPageSchema])
+  .openapi('DispatchMessageListOrCursorResponse');
+
 export const dispatchStatusQuerySchema = z.object({
   worker_stale_after_ms: z.coerce.number().int().positive().max(86_400_000).optional(),
 });
@@ -190,6 +249,40 @@ const dispatchStatusItemSchema = z.object({
   body_preview: z.string(),
   result_preview: z.string().nullable(),
 });
+
+export const dispatchPrincipalDeliveryModeSchema = z.enum([
+  'worker_poll',
+  'drain_on_start',
+  'alias_resolved',
+  'notify_only',
+]);
+
+export const dispatchPrincipalAckPathSchema = z.enum([
+  'xo_lease',
+  'operator_token',
+  'principal_credential',
+  'worker_claim',
+  'none',
+]);
+
+export const dispatchPrincipalListingEntrySchema = z
+  .object({
+    principal_id: z.string(),
+    display_name: z.string(),
+    delivery_mode: dispatchPrincipalDeliveryModeSchema,
+    active: z.boolean(),
+    credential_configured: z.boolean(),
+    ack_path: dispatchPrincipalAckPathSchema,
+  })
+  .strict()
+  .openapi('DispatchPrincipalListingEntry');
+
+export const dispatchPrincipalsResponseSchema = z
+  .object({
+    principals: z.array(dispatchPrincipalListingEntrySchema),
+  })
+  .strict()
+  .openapi('DispatchPrincipalsResponse');
 
 export const dispatchStatusResponseSchema = z
   .object({

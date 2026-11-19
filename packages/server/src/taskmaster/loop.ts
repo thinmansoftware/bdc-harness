@@ -1,3 +1,4 @@
+import { checkApprovalStalls } from './approval-stalls-runtime';
 /**
  * Taskmaster Slice 1 loop (WO-HARNESS-TASKMASTER-SLICE1-01, M-133 CARRIED 3-0).
  *
@@ -13,29 +14,40 @@
  * Budgets (ratified Q1): max 10 effects/tick, 1 effect/item/tick, max 3
  * automated interventions per item per 24h.
  */
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { getDatabase } from '@archon/core';
-import { runCascade } from '@archon/smart-cauldron/cascade';
+import { readCascadeRecord, runCascade } from '@archon/smart-cauldron/cascade';
 import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
   assessDispatchRecipient,
   createAuthenticatedMessage,
+  disposeMessageByMachine,
   getMessage,
   listMessages,
+  listMessagesBySeqCursor,
+  normalizeDispatchSubjectKey,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
   type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
+  parseRemediationCandidateBody,
+  REMEDIATION_RECIPIENT,
+  type RemediationCandidateBody,
+} from '@archon/overseer/remediation-candidate';
+import {
   adoptionContentHash,
   classifyThread,
   computeBlockerReport,
   computeNextAction,
+  computeRemediationNudge,
   isSuppressedByNoise,
+  MAX_INTERVENTIONS_PER_ITEM_24H,
   type ActionProposal,
+  type RemediationEvidence,
   type ThreadSnapshot,
   type ThreadPriority,
   type TmActionType,
@@ -53,7 +65,12 @@ import {
   resolveEscalateToIssueEnabled,
   type EscalationDeliveryDeps,
 } from './escalation-delivery';
-import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
+import {
+  checkFireEligibility,
+  type FireEligibilityDeps,
+  type FireEligibilityResult,
+  type PullListingMemo,
+} from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
 import { refreshLaneHealth } from './lane-health';
@@ -65,6 +82,18 @@ import {
   type CascadeEvidenceDeps,
 } from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
+import {
+  decideEscalation,
+  DEFAULT_MAX_EFFECTS_PER_TICK,
+  escalationSkipKey,
+  reasonForThreadRef,
+  resolveEscalationCooldowns,
+  resolveMaxEffectsPerTick,
+  type CooldownConfigWarn,
+} from './escalation-dedupe';
+import { pageOnce } from '../dispatch/worker-heartbeat-alarm';
+import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
+import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -78,8 +107,9 @@ const log = createLogger('taskmaster/loop');
 
 /**
  * One process-wide real escalation-delivery deps object, so its cached
- * poster-login lookup (GET /user, used to trust only Taskmaster's own marker
- * comments) runs once per token rather than once per escalation.
+ * poster-login lookup (GET /app for an App identity, GET /user for a PAT; used
+ * to trust only Taskmaster's own marker comments) runs once per identity
+ * rather than once per escalation.
  */
 let realEscalationDelivery: EscalationDeliveryDeps | null = null;
 function defaultEscalationDelivery(): EscalationDeliveryDeps {
@@ -87,10 +117,33 @@ function defaultEscalationDelivery(): EscalationDeliveryDeps {
   return realEscalationDelivery;
 }
 
-/** Ratified Q1 budgets. */
-export const MAX_EFFECTS_PER_TICK = 10;
+/**
+ * Ratified Q1 budgets. MAX_EFFECTS_PER_TICK is the default AND the ceiling:
+ * TASKMASTER_MAX_EFFECTS_PER_TICK (read each tick by resolveMaxEffectsPerTick in
+ * escalation-dedupe.ts) can only lower it (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01).
+ */
+export const MAX_EFFECTS_PER_TICK = DEFAULT_MAX_EFFECTS_PER_TICK;
+
+/** One log line per distinct invalid setting value, not one per tick. */
+const warnedConfigValues = new Set<string>();
+function defaultConfigWarn(variable: string, raw: string, fallback: number): void {
+  const key = `${variable}=${raw}`;
+  if (warnedConfigValues.has(key)) return;
+  warnedConfigValues.add(key);
+  log.warn({ variable, fallback }, 'taskmaster.config_value_invalid_using_default');
+}
 /** Conservative faucet bound for newly eligible work, within the shared cap. */
 export const MAX_FIRES_PER_TICK = 3;
+
+/** Ratified M-155 daily bound; invalid input closes the automatic faucet. */
+export function resolveTaskmasterFireDailyLimit(
+  value: string | undefined = process.env.TASKMASTER_FIRE_MAX_PER_DAY
+): number {
+  if (value === undefined) return 2;
+  if (!/^\d+$/.test(value)) return 0;
+  const limit = Number(value);
+  return Number.isSafeInteger(limit) ? limit : 0;
+}
 
 /**
  * Per-tick cap on blocker_report sends (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01).
@@ -190,7 +243,7 @@ export interface GithubIssueEvidence {
   assignedAt: string | null;
   activeStatusAt: string | null;
   progressRecordedAt: string | null;
-  /** First assignee login; null when unassigned (UNKNOWN -- never guessed). */
+  /** First assignee login, else a valid owner label, else null. */
   ownerLogin: string | null;
   latestMarkerKind: 'PROGRESS' | 'BLOCKED' | null;
   /** Marker comment body, trimmed, capped at 500 chars. */
@@ -200,11 +253,55 @@ export interface GithubIssueEvidence {
   lastMovementKind: 'closed' | 'assigned' | 'status_label' | 'progress_comment' | null;
 }
 
+/**
+ * Read-only state of one pull request, the evidence for grading a
+ * remediation_nudge. `headSha` is the PR's current head; `headCommittedAt` is the
+ * committer date of that head when it differs from the rejected head (null when
+ * unknown); `closedAt` is the close or merge time (null while the PR is open).
+ */
+export interface PullRequestState {
+  state: 'open' | 'closed';
+  headSha: string;
+  headCommittedAt: string | null;
+  closedAt: string | null;
+  merged: boolean;
+}
+
 export interface TaskmasterDeps {
+  /** Test seam; injected journal DALs never fall through into the live budget DB. */
+  fireBudget?: Pick<
+    typeof taskmasterDb,
+    | 'reserveAutomaticFire'
+    | 'authorizeAutomaticFire'
+    | 'releaseAutomaticFire'
+    | 'settleAutomaticFire'
+    | 'listAutomaticFireAdmissions'
+    | 'seedAutomaticFireHistory'
+    | 'updateAutomaticFireExpectation'
+  >;
+  readFireCascade?: typeof readCascadeRecord;
+  /** Test seam: release retained shared WO claims whose runs are all terminal. */
+  reconcileWoClaims?: () => Promise<string[]>;
   now?: () => Date;
   db?: TaskmasterDal;
   createTask?: typeof createAuthenticatedMessage;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
+  /**
+   * Overseer remediation candidates queued for Taskmaster
+   * (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01): queued, not-yet-consumed
+   * `run_review` dispatch rows addressed to 'taskmaster' whose body parses as an
+   * `overseer_remediation_candidate`. Defaults to defaultListRemediationCandidates.
+   */
+  listRemediationCandidates?: () => Promise<RemediationCandidate[]>;
+  /**
+   * Mark a consumed candidate row so the reader stops returning it. Defaults to
+   * disposing the queued row by machine (route_disposition='expired'): the
+   * 'taskmaster' principal is worker_poll, so the drain_on_start/notify_only
+   * mailbox lifecycle (acknowledgeMessage/addressMessage) does not apply to it;
+   * machine disposal is the correct system-actor consumption signal and still
+   * leaves the row counted by the producer's attempt cap.
+   */
+  consumeRemediationCandidate?: (id: string) => Promise<void>;
   listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
   headroom?: () => Promise<HeadroomReading>;
   /** External-SOR check: does a dispatch row exist for this key, and when was it sent? */
@@ -219,11 +316,31 @@ export interface TaskmasterDeps {
    */
   assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
   getDispatchReceiptCutoverAt?: () => Promise<string | null>;
+  /**
+   * Test seam: receives each invalid cooldown or effect-cap setting read this
+   * tick (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01). Default: one log line per
+   * distinct invalid value.
+   */
+  onConfigWarning?: CooldownConfigWarn;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
   ) => Promise<GithubIssueEvidence | null>;
-  checkFireEligibility?: (issueTitle: string) => Promise<FireEligibilityResult>;
+  /**
+   * Read the candidate PR a remediation_nudge was about (grading only).
+   * `rejectedHeadSha` is the head recorded at nudge time; the committer date is
+   * looked up only when the current head differs from it.
+   */
+  getPullRequestState?: (
+    owner: string,
+    repo: string,
+    prNumber: number,
+    rejectedHeadSha: string
+  ) => Promise<PullRequestState | null>;
+  checkFireEligibility?: (
+    issueTitle: string,
+    eligibilityDeps?: FireEligibilityDeps
+  ) => Promise<FireEligibilityResult>;
   runCascade?: typeof runCascade;
   readFireCascadeEvidence?: typeof readCascadeWorkflowEvidence;
   getFireRunEvidence?: (
@@ -246,6 +363,102 @@ export interface TaskmasterDeps {
    * claim when the real DAL is in use (no deps.db), else none.
    */
   escalationDelivery?: EscalationDeliveryDeps;
+  /**
+   * Operator page transport for a REJECTED Dispatch send (fence 281). Defaults
+   * to the same Telegram page the worker-heartbeat alarm uses; tests capture it.
+   */
+  pageOperator?: (text: string) => Promise<void>;
+}
+
+/** One operator page per thread per clock hour for rejected Dispatch sends. */
+export const SEND_REJECTED_PAGE_BUCKET_MS = 60 * 60 * 1000;
+
+/**
+ * Map a Taskmaster thread ref to a Dispatch subject_key the core validator
+ * (normalizeDispatchSubjectKey: wo:, digest:YYYY-MM-DD, gh:) accepts.
+ *
+ * gh:, wo: and digest: refs pass through unchanged (canonicalized). Remediation
+ * refs keep their synthetic journal identity but group Dispatch rows by PR.
+ * Any other ref -- dispatch:<message-id> from undelivered rulings, or a future non-GitHub
+ * source -- maps deterministically to the documented Taskmaster day thread
+ * digest:<UTC date of the send>. The original ref is not lost: it stays on the
+ * tm_journal row's thread_ref and inside the message body. The validator is
+ * NOT widened: wo:/digest:/gh: is the contract its other readers also enforce
+ * (duty-officer-clock escalationSubjectKey), and subject_key here only groups
+ * same-subject rows for the repeat_reason check, which every Taskmaster verb
+ * already satisfies unconditionally (TM_REPEAT_REASON_BY_TYPE).
+ */
+export function dispatchSubjectKeyForThreadRef(threadRef: string, nowMs: number): string {
+  const canonical = canonicalizeThreadRef(threadRef);
+  try {
+    return normalizeDispatchSubjectKey(canonical.replace(/^remediation:/, 'gh:'));
+  } catch {
+    return `digest:${new Date(nowMs).toISOString().slice(0, 10)}`;
+  }
+}
+
+/**
+ * Fail a Dispatch-refused Taskmaster send LOUD (fence 281): one error log line,
+ * then an operator page through the worker-heartbeat alarm's journal-first
+ * pageOnce, keyed per thread per clock hour so a retrying rejection pages once
+ * an hour, never once a tick. The page row lands in tm_journal with the
+ * failure, so a send that has no journal row of its own (the self-pause notice)
+ * is still visible there. A failed page leaves its row 'failed' and the next
+ * rejection in the hour retries it; it never throws into the tick.
+ */
+async function reportRejectedSend(
+  deps: TaskmasterDeps,
+  dal: TaskmasterDal,
+  nowMs: number,
+  args: {
+    actionType: string;
+    threadRef: string;
+    subjectKey: string | null;
+    idempotencyKey: string;
+    journalId: string | null;
+    failure: string;
+  }
+): Promise<void> {
+  log.error(
+    {
+      actionType: args.actionType,
+      threadRef: args.threadRef,
+      subjectKey: args.subjectKey,
+      idempotencyKey: args.idempotencyKey,
+      failure: args.failure,
+    },
+    'taskmaster.dispatch_send_rejected'
+  );
+  const hourBucket = Math.floor(nowMs / SEND_REJECTED_PAGE_BUCKET_MS);
+  const journalNote = args.journalId ? ` Journal row ${args.journalId} is failed.` : '';
+  try {
+    await pageOnce(
+      {
+        pageOperator: deps.pageOperator ?? ((text): Promise<void> => sendCanaryTelegramAlert(text)),
+        journal: dal,
+      },
+      {
+        idempotencyKey: `tm:send-rejected-page:${args.threadRef}:${hourBucket}`,
+        threadRef: `dispatch-send-rejected:${args.threadRef}`,
+        text:
+          `[TASKMASTER SEND REJECTED] ${args.actionType} for ${args.threadRef} ` +
+          `was refused by Dispatch: ${args.failure}.${journalNote}`,
+        proposal: {
+          kind: 'dispatch_send_rejected',
+          action_type: args.actionType,
+          thread_ref: args.threadRef,
+          subject_key: args.subjectKey,
+          journal_id: args.journalId,
+          failure: args.failure,
+        },
+      }
+    );
+  } catch (pageError) {
+    log.error(
+      { err: pageError as Error, threadRef: args.threadRef },
+      'taskmaster.dispatch_send_rejected_page_failed'
+    );
+  }
 }
 
 export interface TickResult {
@@ -315,6 +528,143 @@ async function defaultListUndeliveredRulings(): Promise<ThreadSnapshot[]> {
       undeliveredRulingId: m.id,
       recipient: m.resolved_recipient ?? m.recipient,
     }));
+}
+
+/** One Overseer remediation candidate: the dispatch row id plus its parsed body. */
+export interface RemediationCandidate {
+  id: string;
+  body: RemediationCandidateBody;
+}
+
+/**
+ * Queued Overseer remediation candidates for Taskmaster
+ * (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
+ *
+ * Lists queued `run_review` rows addressed to the remediation recipient
+ * ('taskmaster') and keeps only authenticated `system:overseer` rows whose body parses as an
+ * `overseer_remediation_candidate` via the producer's own parser. A row that
+ * does not parse, or carries another kind, is ignored with one log line and
+ * NEVER throws the tick. The open-only queued read excludes machine-ADDRESSED
+ * (disposed) rows via `route_disposition IS NULL`, so a candidate whose
+ * two-phase lifecycle has reached the address phase is not returned again. The
+ * `acknowledged_at IS NULL` filter below matches the spec's "queued, UNACKNOWLEDGED
+ * rows" wording and mirrors defaultListUndeliveredRulings; taskmaster is worker_poll
+ * and never sets acknowledged_at on its own rows, so it is a no-op in practice that
+ * keeps the reader honest if that ever changes.
+ */
+function isQueuedRemediationEnvelope(message: DispatchMessage | null): message is DispatchMessage {
+  return (
+    message !== null &&
+    message.sender_principal_id === 'system:overseer' &&
+    message.recipient === REMEDIATION_RECIPIENT &&
+    message.status === 'queued' &&
+    message.task_type === 'run_review' &&
+    message.acknowledged_at === null &&
+    message.addressed_at === null &&
+    message.route_disposition === null
+  );
+}
+
+export async function defaultListRemediationCandidates(
+  listFn: typeof listMessagesBySeqCursor = listMessagesBySeqCursor
+): Promise<RemediationCandidate[]> {
+  const candidates: RemediationCandidate[] = [];
+  let afterSeq: number | undefined;
+  // First attempts intentionally remain queued. Walk by insertion sequence so
+  // retained rows cannot hide a later candidate, even while rows are disposed.
+  for (;;) {
+    const queued = await listFn({
+      recipient: REMEDIATION_RECIPIENT,
+      task_type: 'run_review',
+      status: 'queued',
+      openOnly: true,
+      afterSeq,
+      limit: 200,
+    });
+    for (const message of queued) {
+      if (!isQueuedRemediationEnvelope(message)) continue;
+      const body = parseRemediationCandidateBody(message.body);
+      if (!body) {
+        log.warn({ messageId: message.id }, 'taskmaster.remediation_candidate_ignored');
+        continue;
+      }
+      candidates.push({ id: message.id, body });
+    }
+    if (queued.length < 200) break;
+    afterSeq = queued[queued.length - 1].cursor_seq;
+  }
+  return candidates;
+}
+
+export interface RemediationConsumptionDeps {
+  getMessage?: typeof getMessage;
+  listMessagesBySeqCursor?: typeof listMessagesBySeqCursor;
+  disposeMessageByMachine?: typeof disposeMessageByMachine;
+}
+
+/** Existing two-phase lifecycle, injectable without changing dispatch authority. */
+export async function defaultConsumeRemediationCandidate(
+  id: string,
+  deps: RemediationConsumptionDeps = {}
+): Promise<void> {
+  const read = deps.getMessage ?? getMessage;
+  const list = deps.listMessagesBySeqCursor ?? listMessagesBySeqCursor;
+  const dispose = deps.disposeMessageByMachine ?? disposeMessageByMachine;
+  // Two-phase candidate lifecycle (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
+  //
+  // taskmaster is a worker_poll principal, so the drain_on_start/notify_only
+  // acknowledge/address mailbox calls (acknowledgeMessage / addressMessage)
+  // reject its OWN rows. The take-up ACKNOWLEDGEMENT is therefore the nudge's
+  // tm_journal 'sent' row under this proposal's idempotency key: that row -- not
+  // a dispatch-row mutation -- is what stops the candidate re-sending every tick
+  // (the same mechanism the deliver_ruling reminder relies on; it never re-fires
+  // once journaled). The dispatch row itself is only ADDRESSED -- terminally
+  // disposed -- once it can no longer yield a fresh nudge: the attempt cap is
+  // reached, or a newer candidate for the same PR (the owner's new reviewed
+  // head) has superseded it. Until one of those holds the row is deliberately
+  // left live and unaddressed so a new head can still arrive, exactly as the
+  // spec requires. Disposing on the first successful send (the prior behavior)
+  // was a terminal one-phase disposal that both mislabeled a just-delivered
+  // candidate 'expired' and killed a still-usable attempt slot before its head
+  // could change.
+  const row = await read(id);
+  if (!isQueuedRemediationEnvelope(row)) return;
+  const body = parseRemediationCandidateBody(row.body);
+  if (!body) return;
+  const capReached = body.attempt >= body.maxAttempts;
+  let superseded = false;
+  if (!capReached) {
+    const siblings = await defaultListRemediationCandidates(list);
+    superseded = siblings.some(sibling => {
+      if (sibling.id === id) return false;
+      const other = sibling.body;
+      return (
+        other.owner.toLowerCase() === body.owner.toLowerCase() &&
+        other.repo.toLowerCase() === body.repo.toLowerCase() &&
+        other.prNumber === body.prNumber &&
+        other.attempt > body.attempt
+      );
+    });
+  }
+  // ACKNOWLEDGE phase only: the nudge is sent and journaled, but a fresh head
+  // could still arrive, so leave the row live (unaddressed).
+  if (!capReached && !superseded) return;
+  // ADDRESS phase: no further nudge can come from this row. Dispose it. A row a
+  // racing tick already disposed is a success here, not a warning.
+  const current = await read(id);
+  if (!isQueuedRemediationEnvelope(current) || current.body !== row.body) return;
+  const result = await dispose({
+    id,
+    actor: 'system:taskmaster-remediation',
+    disposition: 'expired',
+    requireNoReceipt: true,
+  });
+  if (!result.ok && result.reason !== 'already_disposed') {
+    log.warn(
+      { messageId: id, reason: result.reason },
+      'taskmaster.remediation_candidate_dispose_failed'
+    );
+  }
 }
 
 export function priorityFromLabels(labels: string[]): ThreadPriority | null {
@@ -418,6 +768,7 @@ export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
   digest: 'tm:digest:repeated',
   fire_cauldron: 'tm:fire_cauldron:repeated',
   blocker_report: 'tm:blocker_report:repeated',
+  remediation_nudge: 'tm:remediation_nudge:repeated',
 };
 
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
@@ -516,8 +867,10 @@ export async function defaultListThreads(
         const hasClaimStatus = normalizedLabels.some(label =>
           ['status:building', 'status:review'].includes(label)
         );
-        const ownerLogin = issue.assignees?.[0]?.login ?? null;
-        let isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
+        const ownerFromLabel = parseOwnerLabel(JSON.stringify(labels));
+        const ownerLogin = issue.assignees?.[0]?.login ?? ownerFromLabel;
+        let isUnclaimed =
+          (issue.assignees ?? []).length === 0 && !hasClaimStatus && ownerFromLabel === null;
         const woId = issue.title?.match(WO_ID_RE)?.[0];
         if (isUnclaimed && woId !== undefined && prClaimLookups < PR_CLAIM_LOOKUP_CAP) {
           prClaimLookups += 1;
@@ -764,16 +1117,19 @@ export async function defaultGetGithubIssueEvidence(
     adoptionActiveStatusAt,
     adoptionProgressAt
   );
+  const labels = issue.labels.map(label =>
+    typeof label === 'string' ? label : (label.name ?? '')
+  );
   return {
     state: issue.state,
     updatedAt: issue.updated_at,
-    labels: issue.labels.map(label => (typeof label === 'string' ? label : (label.name ?? ''))),
+    labels,
     assigneeCount: issue.assignees?.length ?? 0,
     closedAt,
     assignedAt,
     activeStatusAt,
     progressRecordedAt,
-    ownerLogin: issue.assignees?.[0]?.login ?? null,
+    ownerLogin: issue.assignees?.[0]?.login ?? parseOwnerLabel(JSON.stringify(labels)),
     latestMarkerKind: latestMarker ? markerKindFromBody(latestMarker.body) : null,
     latestMarkerText: latestMarker ? truncateMarkerText(latestMarker.body) : null,
     latestMarkerAt: latestMarker?.created_at ?? null,
@@ -782,11 +1138,77 @@ export async function defaultGetGithubIssueEvidence(
   };
 }
 
+const GH_SLUG_RE = /^[A-Za-z0-9_.-]+$/;
+
+interface GithubPullDetail {
+  state: 'open' | 'closed';
+  merged?: boolean;
+  merged_at?: string | null;
+  closed_at?: string | null;
+  head?: { sha?: string };
+}
+
+/**
+ * Default PR read for remediation grading: GET the pull request, and only when
+ * its head differs from the rejected head, GET that commit for its committer
+ * date. Read-only; uses the same service GitHub path as the issue evidence.
+ */
+export async function defaultGetPullRequestState(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  rejectedHeadSha: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<PullRequestState | null> {
+  if (!GH_SLUG_RE.test(owner) || !GH_SLUG_RE.test(repo) || !Number.isInteger(prNumber)) {
+    return null;
+  }
+  const pullResponse = await serviceGitHubFetchWithPermissionFallback({
+    service: 'taskmaster',
+    fetch: fetchImpl,
+    url: `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+  });
+  assertGithubRateLimit(pullResponse, `evidence:pull:${owner}/${repo}#${prNumber}`);
+  if (!pullResponse.ok) {
+    throw new Error(`taskmaster_github_pull_evidence_read_failed:${pullResponse.status}`);
+  }
+  const pull = (await pullResponse.json()) as GithubPullDetail;
+  const headSha = pull.head?.sha;
+  if (typeof headSha !== 'string' || !headSha) return null;
+  let headCommittedAt: string | null = null;
+  if (headSha !== rejectedHeadSha && /^[0-9a-f]{7,64}$/i.test(headSha)) {
+    const commitResponse = await serviceGitHubFetchWithPermissionFallback({
+      service: 'taskmaster',
+      fetch: fetchImpl,
+      url: `https://api.github.com/repos/${owner}/${repo}/commits/${headSha}`,
+    });
+    assertGithubRateLimit(commitResponse, `evidence:commit:${owner}/${repo}#${prNumber}`);
+    if (commitResponse.ok) {
+      const commit = (await commitResponse.json()) as {
+        commit?: { committer?: { date?: string } };
+      };
+      headCommittedAt = commit.commit?.committer?.date ?? null;
+    }
+  }
+  const merged = pull.merged === true || Boolean(pull.merged_at);
+  return {
+    state: pull.state,
+    headSha,
+    headCommittedAt,
+    closedAt: pull.state === 'closed' ? (pull.merged_at ?? pull.closed_at ?? null) : null,
+    merged,
+  };
+}
+
 const RESET_COMMAND = "bash scripts/taskmaster/reset.sh --confirm --reason '<why>'";
+
+/** Taskmaster thread of the self-pause notice; mapped to a valid subject key at send. */
+export const SELF_PAUSE_THREAD_REF = 'taskmaster:self-pause';
 
 export function buildSelfPauseNotice(
   reason: string,
-  epoch: number
+  epoch: number,
+  nowMs: number = Date.now()
 ): CreateAuthenticatedMessageData {
   return {
     correlation_id: `tm-self-pause-${epoch}`,
@@ -794,7 +1216,10 @@ export function buildSelfPauseNotice(
     task_type: 'agent_message',
     recipient: 'duty-officer',
     body: `Taskmaster self-paused: ${reason} Reset with: ${RESET_COMMAND}`,
-    subject_key: 'taskmaster:self-pause',
+    // 'taskmaster:self-pause' is refused by the Dispatch validator (fence 282).
+    // The Duty Officer still recognises the notice by its tm:self-pause:
+    // idempotency key and tm-self-pause- correlation id (isTaskmasterSelfPause).
+    subject_key: dispatchSubjectKeyForThreadRef(SELF_PAUSE_THREAD_REF, nowMs),
     repeat_reason: 'A new Taskmaster epoch self-paused and requires Duty Officer attention.',
   };
 }
@@ -810,9 +1235,11 @@ export interface GitHubDigestData {
   servicesByPool: Map<string, string[]>;
 }
 
-export async function loadGitHubDigestData(nowMs: number): Promise<GitHubDigestData> {
+export async function loadGitHubDigestData(
+  nowMs: number,
+  db: Pick<ReturnType<typeof getDatabase>, 'query'> = getDatabase()
+): Promise<GitHubDigestData> {
   const since = new Date(nowMs - 24 * 60 * 60 * 1000).toISOString();
-  const db = getDatabase();
   const usage = await db.query<{
     service: string;
     pool_id: string;
@@ -829,7 +1256,7 @@ export async function loadGitHubDigestData(nowMs: number): Promise<GitHubDigestD
     remaining: number | string;
     limit: number | string;
   }>(
-    `SELECT pool_id, resource, remaining, "limit" AS limit FROM github_api_pool_state
+    `SELECT pool_id, resource, remaining, "limit" AS "limit" FROM github_api_pool_state
      WHERE resource IN ('core', 'search', 'graphql') ORDER BY pool_id, resource`
   );
   const servicesByPool = new Map<string, string[]>();
@@ -1035,6 +1462,33 @@ async function reconcilePendingFire(
 }
 
 /**
+ * proposal_json for an escalate_p0 row that restart reconciliation marks
+ * 'sent', with last_attempt_at set to the real send: the found dispatch row's
+ * createdAt, or the reconciliation time when that is not a valid time. An
+ * in-place retry would otherwise keep the last_attempt_at of its last FAILURE
+ * and start the sent window there (escalation-dedupe.ts latestAttemptIso;
+ * Board desk read of PR 1598 at 1bbda058a). Undefined (the row's JSON is left
+ * as it is) when its JSON cannot be read; the window then counts from
+ * created_at, since latestAttemptIso cannot read it either.
+ */
+function reconciledEscalationSentJson(
+  proposalJson: string,
+  effectCreatedAt: string,
+  nowMs: number
+): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(proposalJson);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const sentMs = Date.parse(effectCreatedAt);
+  const sentAt = new Date(Number.isFinite(sentMs) ? sentMs : nowMs).toISOString();
+  return JSON.stringify({ ...(parsed as Record<string, unknown>), last_attempt_at: sentAt });
+}
+
+/**
  * Restart reconciliation (Section 11 test 4): a journal row left 'pending'
  * (in-flight marker) is resolved against the external SOR. If the dispatch
  * row exists, the effect happened -- mark 'sent' WITHOUT a second
@@ -1052,12 +1506,19 @@ async function reconcilePendingActions(
     if (
       action.outcome !== 'pending' ||
       !action.idempotency_key ||
-      action.action_type === 'fire_cauldron'
+      action.action_type === 'fire_cauldron' ||
+      action.idempotency_key.startsWith('tm:pending_approval:')
     )
       continue;
     const effect = await findEffect(action.idempotency_key);
     if (effect) {
-      await dal.updateActionOutcome(action.id, 'sent');
+      await dal.updateActionOutcome(
+        action.id,
+        'sent',
+        action.action_type === 'escalate_p0'
+          ? reconciledEscalationSentJson(action.proposal_json, effect.createdAt, nowMs)
+          : undefined
+      );
       log.info(
         { journalId: action.id, idempotencyKey: action.idempotency_key },
         'taskmaster.reconcile_pending_marked_sent'
@@ -1069,6 +1530,134 @@ async function reconcilePendingActions(
         'taskmaster.reconcile_pending_expired'
       );
     }
+  }
+}
+
+async function reconcileAutomaticFires(
+  dal: TaskmasterDal,
+  budget: NonNullable<TaskmasterDeps['fireBudget']>,
+  read: typeof readCascadeRecord,
+  now: Date
+): Promise<void> {
+  // The seven-day message lookback cannot drop unresolved automatic effects.
+  const history = await dal.getActionsSince('1970-01-01T00:00:00.000Z');
+  const dayStart = `${now.toISOString().slice(0, 10)}T00:00:00.000Z`;
+  for (const action of history) {
+    if (
+      action.action_type !== 'fire_cauldron' ||
+      !action.idempotency_key ||
+      ['parked', 'deferred', 'rejected'].includes(action.outcome)
+    )
+      continue;
+    // Resolved legacy days do not become a permanent new global hold. Old
+    // pending effects and every unresolved NEW ledger identity still reconcile.
+    if (action.outcome !== 'pending' && action.created_at < dayStart) continue;
+    const proposal = JSON.parse(action.proposal_json) as { cascadeId?: string; reason?: string };
+    if (proposal.reason === 'stale_epoch_before_effect') continue;
+    await budget.seedAutomaticFireHistory({
+      actionKey: action.idempotency_key,
+      journalId: action.id,
+      sourceThreadRef: action.thread_ref,
+      ownerToken: 'legacy-reconciliation',
+      cascadeId: proposal.cascadeId ?? action.idempotency_key,
+      now: action.created_at,
+    });
+  }
+  for (const row of await budget.listAutomaticFireAdmissions()) {
+    const record = await read(row.cascade_id);
+    if (!record) continue; // Absence is never proof that a permission was unused.
+    const runIds = record.attempts.flatMap(attempt => (attempt.runId ? [attempt.runId] : []));
+    // A zero-attempt file can predate this permission (manual/dry-run collision).
+    // It is not an owned non-admission witness. Check provenance even for such
+    // records; absent/conflicting evidence stays held. The active owner releases
+    // definitive pre-permission refusals through releaseAutomaticFire below.
+    const source = record.automaticFireAdmission;
+    if (!source) {
+      // A terminal journal label alone is not admission proof. Only an exact,
+      // completed legacy cascade can establish the historical accounting day;
+      // missing evidence and real post-permission unknowns remain held.
+      const action = history.find(action => action.id === row.journal_id);
+      const proposal = action
+        ? (JSON.parse(action.proposal_json) as ActionProposal & {
+            cascadeId?: string;
+          })
+        : null;
+      const admittedAt = Date.parse(record.createdAt);
+      const legacyDryRun: unknown = record.request?.dryRun;
+      if (
+        row.owner_token !== 'legacy-reconciliation' ||
+        action?.action_type !== 'fire_cauldron' ||
+        action.idempotency_key !== row.action_key ||
+        action.thread_ref !== row.source_thread_ref ||
+        proposal?.cascadeId !== row.cascade_id ||
+        record.cascadeId !== row.cascade_id ||
+        typeof proposal.fireEvidence?.woId !== 'string' ||
+        !proposal.fireEvidence.woId.trim() ||
+        typeof proposal.fireEvidence.project !== 'string' ||
+        !proposal.fireEvidence.project.trim() ||
+        proposal.fireEvidence?.woId !== record.woId ||
+        proposal.fireEvidence?.project !== record.project ||
+        legacyDryRun !== false ||
+        !['won', 'blocked', 'spec-repair', 'cancelled', 'frontier-rejected'].includes(
+          record.status
+        ) ||
+        !runIds.length ||
+        !runIds.every(id => typeof id === 'string' && id.trim().length > 0) ||
+        !Number.isFinite(admittedAt) ||
+        !Number.isFinite(Date.parse(action.created_at)) ||
+        admittedAt < Date.parse(action.created_at) ||
+        admittedAt > now.getTime() ||
+        !record.attempts.every(
+          attempt =>
+            Number.isFinite(Date.parse(attempt.startedAt)) &&
+            Date.parse(attempt.startedAt) >= admittedAt &&
+            attempt.completedAt !== null &&
+            Number.isFinite(Date.parse(attempt.completedAt)) &&
+            Date.parse(attempt.completedAt) >= Date.parse(attempt.startedAt) &&
+            Date.parse(attempt.completedAt) <= now.getTime()
+        ) ||
+        // Record creation precedes admission. Crossing midnight before the first
+        // attempt leaves the historical admission day ambiguous, so keep it held.
+        new Date(Date.parse(record.attempts[0].startedAt)).toISOString().slice(0, 10) !==
+          new Date(admittedAt).toISOString().slice(0, 10)
+      )
+        continue;
+      await budget.settleAutomaticFire({
+        actionKey: row.action_key,
+        cascadeId: row.cascade_id,
+        state: 'admitted',
+        admittedAt: new Date(admittedAt).toISOString(),
+        runIds,
+      });
+      // Keep the legacy owner marker and original journal/record provenance.
+      continue;
+    }
+    const recordDryRun: unknown = record.request?.dryRun;
+    if (
+      source.source !== 'taskmaster' ||
+      source.actionKey !== row.action_key ||
+      source.journalId !== row.journal_id ||
+      source.sourceThreadRef !== row.source_thread_ref ||
+      source.cascadeId !== row.cascade_id ||
+      record.cascadeId !== row.cascade_id ||
+      recordDryRun !== false ||
+      !Number.isFinite(Date.parse(source.admittedAt)) ||
+      Date.parse(source.admittedAt) > now.getTime() ||
+      source.utcDay !== source.admittedAt.slice(0, 10) ||
+      (row.admitted_at !== null &&
+        (Date.parse(source.admittedAt) !== Date.parse(row.admitted_at) ||
+          source.utcDay !== row.utc_day))
+    )
+      throw new Error('automatic_fire_provenance_conflict');
+    await budget.settleAutomaticFire({
+      actionKey: row.action_key,
+      cascadeId: row.cascade_id,
+      state: 'admitted',
+      admittedAt: source.admittedAt,
+      runIds,
+    });
+    // Admission accounting does not prove a workflow launch. The existing
+    // pending-fire custody reconciler owns journal confirmation and supervision.
   }
 }
 
@@ -1116,7 +1705,8 @@ async function gradeSentActions(
   nowMs: number,
   getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>,
   assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>,
-  cutoverAt: string | null
+  cutoverAt: string | null,
+  getPullRequestState: NonNullable<TaskmasterDeps['getPullRequestState']>
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
@@ -1229,6 +1819,44 @@ async function gradeSentActions(
         ) {
           usefulAtMs = addressedAtMs;
         }
+      } else if (action.action_type === 'remediation_nudge') {
+        // Candidate-specific evidence ONLY: the PR the nudge was about. Activity
+        // on the owner's work-item thread (comments, labels, assignment, issue
+        // close) is never proof that the rejected PR was fixed.
+        const evidence = (JSON.parse(action.proposal_json) as ActionProposal).remediationEvidence;
+        if (evidence && isRemediationEvidence(evidence)) {
+          let pr: PullRequestState | null = null;
+          try {
+            pr = await getPullRequestState(
+              evidence.owner,
+              evidence.repo,
+              evidence.prNumber,
+              evidence.headSha
+            );
+          } catch (error) {
+            // Rate-limit backoff aborts the whole grading pass (outer catch). Any
+            // other read failure is "not yet proven": never useful, and noise only
+            // once the deadline passes (the shared tail below).
+            if (error instanceof GithubRateLimitBackoffError) throw error;
+            failures += 1;
+            log.warn(
+              { err: error as Error, journalId: action.id },
+              'taskmaster.remediation_pr_evidence_read_failed'
+            );
+          }
+          if (pr) {
+            const closedAtMs = pr.closedAt ? Date.parse(pr.closedAt) : NaN;
+            const committedAtMs = pr.headCommittedAt ? Date.parse(pr.headCommittedAt) : NaN;
+            if (pr.state === 'closed' && Number.isFinite(closedAtMs) && closedAtMs >= sentAtMs) {
+              usefulAtMs = closedAtMs;
+            } else if (pr.headSha !== evidence.headSha) {
+              // A new head: dated by its commit when that falls after the send,
+              // else by this observation (an old commit pushed after the nudge).
+              usefulAtMs =
+                Number.isFinite(committedAtMs) && committedAtMs >= sentAtMs ? committedAtMs : nowMs;
+            }
+          }
+        }
       } else {
         const issue = await getIssueEvidence(action.thread_ref, effect.createdAt);
         if (issue) {
@@ -1276,6 +1904,16 @@ async function gradeSentActions(
   return failures;
 }
 
+function isRemediationEvidence(value: RemediationEvidence): boolean {
+  return (
+    typeof value.owner === 'string' &&
+    typeof value.repo === 'string' &&
+    Number.isInteger(value.prNumber) &&
+    typeof value.headSha === 'string' &&
+    value.headSha.length > 0
+  );
+}
+
 function proofPredicate(proposal: ActionProposal): string {
   if (proposal.type === 'deliver_ruling') {
     return 'original ruling row is addressed by its resolved recipient after the reminder dispatch send';
@@ -1291,6 +1929,9 @@ function proofPredicate(proposal: ActionProposal): string {
   }
   if (proposal.type === 'blocker_report') {
     return 'blocker report delivery only; relayed to xo by the Duty Officer clock; never qualifies as an SC7 useful action';
+  }
+  if (proposal.type === 'remediation_nudge') {
+    return 'owner pushes a new head to the rejected PR, or the PR is closed, before the proof deadline';
   }
   return 'digest delivery only; never qualifies as an SC7 useful action';
 }
@@ -1473,21 +2114,6 @@ export async function refreshAdoption(
   }
 }
 
-function isDeliverySuppressedExpiry(action: taskmasterDb.TmJournalEntry): boolean {
-  if (action.outcome !== 'expired') return false;
-  try {
-    const proposal: unknown = JSON.parse(action.proposal_json);
-    return (
-      typeof proposal === 'object' &&
-      proposal !== null &&
-      !Array.isArray(proposal) &&
-      Boolean((proposal as Record<string, unknown>).suppressed)
-    );
-  } catch {
-    return false;
-  }
-}
-
 let tickQueue: Promise<void> = Promise.resolve();
 
 export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
@@ -1502,12 +2128,32 @@ export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise
 async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<TickResult> {
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
+  const fireBudget = deps.fireBudget ?? (!deps.db ? taskmasterDb : undefined);
+  const readFire = deps.readFireCascade ?? readCascadeRecord;
+  let fireHistoryReady = false;
+  if (fireBudget && resolveFireVerbEnabled()) {
+    try {
+      await reconcileAutomaticFires(dal, fireBudget, readFire, now());
+      fireHistoryReady = true;
+    } catch (error) {
+      log.error({ err: error as Error }, 'taskmaster.fire_history_unknown');
+    }
+  }
   const createTask = deps.createTask ?? createAuthenticatedMessage;
+  const listRemediationCandidates =
+    deps.listRemediationCandidates ?? defaultListRemediationCandidates;
+  const consumeRemediationCandidate =
+    deps.consumeRemediationCandidate ?? defaultConsumeRemediationCandidate;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
   const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
-  const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
+  const getPullRequestState = deps.getPullRequestState ?? defaultGetPullRequestState;
+  // One all-state pull request listing per repository per tick: every eligibility check of this tick
+  // shares it, and it is dropped when the tick ends (WO-HARNESS-TASKMASTER-ELIGIBILITY-LISTING-SHARE-01).
+  const listingMemo: PullListingMemo = new Map();
+  const eligibilityCheck = (issueTitle: string): Promise<FireEligibilityResult> =>
+    (deps.checkFireEligibility ?? checkFireEligibility)(issueTitle, { listingMemo });
   const executeCascade = deps.runCascade ?? runCascade;
   const readFireEvidence = deps.readFireCascadeEvidence ?? readCascadeWorkflowEvidence;
   const getFireRunEvidence = deps.getFireRunEvidence ?? defaultGetFireRunEvidence;
@@ -1525,6 +2171,13 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   state.tickIndex += 1;
   recordTickAttempt(state.deadman, nowMs);
   let tickFailures = 0;
+
+  try {
+    if (!deps.db) await checkApprovalStalls(new Date(nowMs));
+  } catch (error) {
+    tickFailures += 1;
+    log.warn({ err: error as Error }, 'taskmaster.approval_ingestion_failed');
+  }
 
   try {
     if (deps.checkExpectations) await deps.checkExpectations(new Date(nowMs));
@@ -1625,15 +2278,34 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
-  const recentEscalateP0ByThread = new Set(
-    actions24h
-      .filter(
-        action =>
-          action.action_type === 'escalate_p0' &&
-          (action.outcome === 'sent' || isDeliverySuppressedExpiry(action))
-      )
-      .map(action => canonicalizeThreadRef(action.thread_ref))
+  // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01: escalate_p0 is deduped per
+  // (thread, reason) by escalation-dedupe.ts. Its sent window starts only from a
+  // 'sent' row, and a 'failed' row starts the retry backoff instead. This
+  // replaces the 24h any-outcome thread set of WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01,
+  // which silently skipped and let a parked or expired row silence a real P0.
+  // A window starts at the latest attempt, which may follow row creation.
+  const configWarn = deps.onConfigWarning ?? defaultConfigWarn;
+  const escalationCooldowns = resolveEscalationCooldowns(process.env, configWarn);
+  const maxEffectsPerTick = resolveMaxEffectsPerTick(
+    process.env.TASKMASTER_MAX_EFFECTS_PER_TICK,
+    configWarn
   );
+  // escalate_p0 rows the dedupe reads. A row written earlier in THIS tick is
+  // appended once its outcome is known, so a same-tick duplicate is journaled
+  // once like any other, never dropped silently.
+  // Retries keep created_at. They run within the 24 h proof deadline, while
+  // restart reconciliation can stamp a pending row up to JOURNAL_LOOKBACK_MS
+  // after creation (including its conservative invalid-timestamp fallback).
+  // Retain that entire lifetime PLUS the current maximum cooldown. This is
+  // bounded at 14 days and leaves every other action's 7-day history unchanged.
+  const escalationHistory = await dal.getActionsSince(
+    new Date(
+      nowMs -
+        JOURNAL_LOOKBACK_MS -
+        Math.max(escalationCooldowns.sentWindowMs, escalationCooldowns.failedBackoffMs)
+    ).toISOString()
+  );
+  const escalateP0Rows = escalationHistory.filter(action => action.action_type === 'escalate_p0');
   try {
     if (deps.refreshLaneHealth) await deps.refreshLaneHealth();
     else if (!deps.db) await refreshLaneHealth();
@@ -1687,7 +2359,8 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     nowMs,
     getFireRunEvidence,
     assessRecipient,
-    cutoverAt
+    cutoverAt,
+    getPullRequestState
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER
@@ -1722,6 +2395,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           pause_reason: pauseReason,
           pause_actor: 'taskmaster:useful-rate-floor',
         });
+        let notice: CreateAuthenticatedMessageData | null = null;
         try {
           // Apply the monitoring exemption; Dispatch atomically fences enqueue
           // against reset using the expected paused epoch, not this snapshot.
@@ -1731,21 +2405,29 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             noticeControl.epoch === control.epoch &&
             isPauseEffectsExempt('self_pause_notice', noticeControl.pause_scope)
           ) {
-            await createTask(
-              { kind: 'system', sender: 'taskmaster' },
-              buildSelfPauseNotice(pauseReason, control.epoch),
-              {
-                taskmasterPausedEpoch: control.epoch,
-                // Carry the exact state the exemption was decided against so
-                // Dispatch can re-assert it inside its locked transaction.
-                taskmasterPausedState: 'PAUSED',
-                taskmasterPausedScope: noticeControl.pause_scope,
-              }
-            );
+            notice = buildSelfPauseNotice(pauseReason, control.epoch, nowMs);
+            await createTask({ kind: 'system', sender: 'taskmaster' }, notice, {
+              taskmasterPausedEpoch: control.epoch,
+              // Carry the exact state the exemption was decided against so
+              // Dispatch can re-assert it inside its locked transaction.
+              taskmasterPausedState: 'PAUSED',
+              taskmasterPausedScope: noticeControl.pause_scope,
+            });
           }
         } catch (error) {
           tickFailures += 1;
           log.error({ err: error as Error }, 'taskmaster.self_pause_notice_failed');
+          // Only the send itself can throw once the notice is built.
+          if (notice) {
+            await reportRejectedSend(deps, dal, nowMs, {
+              actionType: 'self_pause_notice',
+              threadRef: SELF_PAUSE_THREAD_REF,
+              subjectKey: notice.subject_key ?? null,
+              idempotencyKey: notice.idempotency_key,
+              journalId: null,
+              failure: (error instanceof Error ? error.message : String(error)).slice(0, 200),
+            });
+          }
         }
         log.warn({ usefulCount, noiseCount }, 'taskmaster.useful_rate_floor_auto_paused');
       }
@@ -1773,6 +2455,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   let rulings: ThreadSnapshot[] = [];
   let threads: ThreadSnapshot[] = [];
+  let remediationCandidates: RemediationCandidate[] = [];
   let unlabelledPriorityTriage: string[] = [];
   let threadsReadSucceeded = false;
   try {
@@ -1780,6 +2463,12 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.rulings_read_failed');
+  }
+  try {
+    remediationCandidates = await listRemediationCandidates();
+  } catch (error) {
+    tickFailures += 1;
+    log.warn({ err: error as Error }, 'taskmaster.remediation_candidates_read_failed');
   }
   try {
     const listed = await (deps.listThreads ?? defaultListThreads)();
@@ -1943,6 +2632,26 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
   }
 
+  // Overseer remediation candidates (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
+  // Each candidate becomes ONE proposal pushed into the SAME proposals array, so
+  // it is subject to the existing pause / per-item cap / guard / journal / send
+  // pipeline. The owner thread is resolved by matching the candidate's woId
+  // against the already-fetched open threads (the same WO_ID_RE match the nudge
+  // and PR-claim lookups use); no woId or no match becomes an operator escalation.
+  // Taskmaster nudges the owner -- it never fires a builder or creates work.
+  for (const candidate of remediationCandidates) {
+    const matched =
+      candidate.body.woId !== null
+        ? threads.find(thread => {
+            const title = (thread as ListedThread).title;
+            return typeof title === 'string' && title.match(WO_ID_RE)?.[0] === candidate.body.woId;
+          })
+        : undefined;
+    const proposal = computeRemediationNudge(candidate.body, { thread: matched });
+    proposal.remediationCandidateId = candidate.id;
+    proposals.push(proposal);
+  }
+
   if (
     laneDecision.holding &&
     (state.lastHoldMonitorTick === null || state.tickIndex - state.lastHoldMonitorTick >= 96)
@@ -1990,6 +2699,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const proposalRank = (proposal: ActionProposal): number => {
     if (proposal.type === 'deliver_ruling') return 0;
     if (proposal.type === 'escalate_p0') return 1;
+    // A remediation nudge chases a rejected PR; it acts immediately, like
+    // deliver_ruling / escalate_p0, so it ranks with the exception classes.
+    if (proposal.type === 'remediation_nudge') return 1;
     if (proposal.type === 'fire_cauldron') {
       return 2 + priorityRank[priorityByRef.get(proposal.threadRef) ?? 'P3'];
     }
@@ -2011,9 +2723,6 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   for (const proposal of proposals) {
     const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
-    if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
-      continue;
-    }
     let existingAction =
       actionsByKey.get(proposal.idempotencyKey) ??
       (await dal.getActionByIdempotencyKey(proposal.idempotencyKey));
@@ -2030,10 +2739,83 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       continue;
     }
 
+    // escalate_p0 dedupe per (thread, reason), BEFORE the same-key skip below so
+    // a duplicate inside the window is journaled once instead of dropped
+    // silently (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01). A remediation
+    // candidate whose OWN row already exists (any outcome) keeps its existing
+    // lifecycle under its stable per-attempt key: an in-place retry of a
+    // failed/deferred row under its proof deadline (Amendment 5, C2), or, for a
+    // 'sent' row, the reconcile-and-dispose step of the same-key skip below
+    // (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01). The dedupe window only
+    // gates a candidate proposal that has no row yet.
+    if (proposal.type === 'escalate_p0') {
+      const candidateOwnRow = Boolean(proposal.remediationCandidateId && existingAction);
+      if (!candidateOwnRow) {
+        const reason = proposal.reason ?? reasonForThreadRef(canonicalProposalRef);
+        if (reason) {
+          const decision = decideEscalation({
+            threadRef: canonicalProposalRef,
+            reason,
+            nowMs,
+            rows: escalateP0Rows,
+            settings: escalationCooldowns,
+            canonicalize: canonicalizeThreadRef,
+          });
+          if (decision.action === 'skip') {
+            const skipKey = escalationSkipKey(
+              canonicalProposalRef,
+              reason,
+              decision.windowStartIso
+            );
+            const existingSkip =
+              actionsByKey.get(skipKey) ?? (await dal.getActionByIdempotencyKey(skipKey));
+            if (!existingSkip) {
+              const skipRow = await dal.recordAction({
+                thread_ref: proposal.threadRef,
+                action_type: proposal.type,
+                proposal_json: JSON.stringify({
+                  ...proposal,
+                  reason,
+                  suppressed: 'recent_escalation',
+                  window_basis: decision.basis,
+                  window_start: decision.windowStartIso,
+                }),
+                idempotency_key: skipKey,
+                before_hash: sha256(proposal.body),
+                outcome: 'expired',
+              });
+              actionsByKey.set(skipKey, skipRow);
+              result.expired += 1;
+            }
+            continue;
+          }
+        }
+      }
+    }
+
     if (
       existingAction &&
       ['sent', 'pending', 'rejected', 'expired', 'parked'].includes(existingAction.outcome)
     ) {
+      // Reconcile the remediation candidate lifecycle BEFORE this terminal dedupe
+      // skip (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01). A prior tick may have
+      // sent the nudge (journal 'sent') yet failed to dispose the candidate row;
+      // without this, the 'sent' dedupe would `continue` every subsequent tick and
+      // the consume path at the send site would never run again, leaving the
+      // dispatch row queued forever. Re-run the idempotent consume so the candidate
+      // is still addressed once the cap is reached or a new head supersedes it.
+      // Best-effort: a consume failure is logged and never turns a dedupe-skip into
+      // a tick failure.
+      if (existingAction.outcome === 'sent' && proposal.remediationCandidateId) {
+        try {
+          await consumeRemediationCandidate(proposal.remediationCandidateId);
+        } catch (reconcileError) {
+          log.warn(
+            { err: reconcileError as Error, messageId: proposal.remediationCandidateId },
+            'taskmaster.remediation_candidate_reconcile_failed'
+          );
+        }
+      }
       continue;
     }
     if (existingAction && ['failed', 'deferred'].includes(existingAction.outcome)) {
@@ -2093,11 +2875,36 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     // digest alive so watching never goes dark.
     if (
       control.pause_state !== 'RUNNING' &&
-      !isPauseEffectsExempt(
-        proposal.type === 'digest' ? 'canary' : proposal.type,
-        control.pause_scope
-      )
+      (Boolean(proposal.remediationCandidateId) ||
+        !isPauseEffectsExempt(
+          proposal.type === 'digest' ? 'canary' : proposal.type,
+          control.pause_scope
+        ))
     ) {
+      // Every candidate-bearing proposal's idempotency key has no time bucket (one key per
+      // PR/attempt/head), so a sticky 'parked' row under that key would make the
+      // first-skip branch drop it forever and no post-resume tick could ever
+      // deliver it. Record it as a retryable 'deferred' (with a proof deadline)
+      // instead, which the second-skip retry path reuses when the loop resumes.
+      // The candidate dispatch row is left unconsumed, so a later tick re-reads
+      // it. Noncandidate proposals keep their existing pause behavior.
+      if (proposal.remediationCandidateId) {
+        result.deferred += 1;
+        if (!existingAction) {
+          existingAction = await dal.recordAction({
+            thread_ref: proposal.threadRef,
+            action_type: proposal.type,
+            proposal_json: JSON.stringify({ ...proposal, deferred: true, reason: 'paused' }),
+            idempotency_key: proposal.idempotencyKey,
+            before_hash: sha256(proposal.body),
+            proof_predicate: proofPredicate(proposal),
+            proof_deadline_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+            outcome: 'deferred',
+          });
+          actionsByKey.set(proposal.idempotencyKey, existingAction);
+        }
+        continue;
+      }
       result.parked += 1;
       await dal.recordAction({
         thread_ref: proposal.threadRef,
@@ -2113,10 +2920,21 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     // Budgets: max 10 effects/tick, 1 effect/item/tick. Overflow is
     // journaled as deferred, not dropped.
     if (
-      result.effects + unconfirmedFireReservations >= MAX_EFFECTS_PER_TICK ||
+      result.effects + unconfirmedFireReservations >= maxEffectsPerTick ||
       (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
       (proposal.type === 'blocker_report' &&
         blockerReportsThisTick >= MAX_BLOCKER_REPORTS_PER_TICK) ||
+      // Lane/budget and per-item gates for a remediation nudge. Per the spec the
+      // existing gates apply unchanged: when the fire lanes are holding
+      // (laneDecision.holding -- all lanes degraded/unavailable or over threshold)
+      // or the owner thread already carries MAX_INTERVENTIONS_PER_ITEM_24H sends in
+      // the last 24h, nothing is sent. The refusal is recorded 'deferred' (retryable)
+      // and the candidate dispatch row is left unconsumed, so a later tick with lanes
+      // available and headroom under the cap can still deliver it.
+      (proposal.type === 'remediation_nudge' &&
+        (laneDecision.holding ||
+          (interventions24hByThread.get(proposal.threadRef) ?? 0) >=
+            MAX_INTERVENTIONS_PER_ITEM_24H)) ||
       touchedThisTick.has(proposal.threadRef)
     ) {
       result.deferred += 1;
@@ -2166,11 +2984,28 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     const fresh = await dal.getPauseState();
     const freshPauseWithhold =
       fresh.pause_state !== 'RUNNING' &&
-      !isPauseEffectsExempt(
-        proposal.type === 'digest' ? 'canary' : proposal.type,
-        fresh.pause_scope
-      );
+      (Boolean(proposal.remediationCandidateId) ||
+        !isPauseEffectsExempt(
+          proposal.type === 'digest' ? 'canary' : proposal.type,
+          fresh.pause_scope
+        ));
     if (fresh.epoch !== epoch || freshPauseWithhold) {
+      // No outbound effect started: retain this stable candidate key for a
+      // fresh gated tick, under its original proof deadline.
+      if (proposal.remediationCandidateId) {
+        result.deferred += 1;
+        await dal.updateActionOutcome(
+          journalRow.id,
+          'deferred',
+          JSON.stringify({
+            ...JSON.parse(journalRow.proposal_json),
+            deferred: true,
+            reason: freshPauseWithhold ? 'paused' : 'epoch-changed',
+          })
+        );
+        journalRow.outcome = 'deferred';
+        continue;
+      }
       // A pause that landed mid-tick (fresh scope withholds this effect) is a
       // pause-park, not an ordinary stale-epoch/resume expiry: re-tag the
       // ROW-FIRST row as parked with reason='paused' so it is indistinguishable
@@ -2185,11 +3020,24 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         );
       } else {
         result.expired += 1;
-        await dal.updateActionOutcome(journalRow.id, 'expired');
+        await dal.updateActionOutcome(
+          journalRow.id,
+          'expired',
+          JSON.stringify({ ...proposal, reason: 'stale_epoch_before_effect' })
+        );
       }
       continue;
     }
 
+    let dispatchSendRejected = false;
+    let dispatchSubjectKey: string | null = null;
+    // An escalate_p0 send records WHEN it was attempted, as a failure does: an
+    // in-place retry keeps the row's created_at, and the sent window must
+    // start at the real send (escalation-dedupe.ts latestAttemptIso).
+    const escalationSentJson =
+      proposal.type === 'escalate_p0'
+        ? JSON.stringify({ ...proposal, last_attempt_at: new Date(nowMs).toISOString() })
+        : undefined;
     try {
       const escalationIssue =
         proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
@@ -2248,7 +3096,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             JSON.stringify({ ...proposal, suppressed })
           );
           journalRow.outcome = 'expired';
-          recentEscalateP0ByThread.add(canonicalProposalRef);
+          escalateP0Rows.push(journalRow);
           result.expired += 1;
           log.info(
             {
@@ -2261,9 +3109,41 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           );
           continue;
         }
-        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.updateActionOutcome(journalRow.id, 'sent', escalationSentJson);
         await dal.gradeAction(journalRow.id, 'delivered_to_issue');
       } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
+        if (!fireBudget || !fireHistoryReady) {
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'deferred',
+            JSON.stringify({ ...proposal, reason: 'daily_cap_history_or_store_unavailable' })
+          );
+          result.deferred += 1;
+          continue;
+        }
+        const reservation: taskmasterDb.AutomaticFireRequest = {
+          actionKey: proposal.idempotencyKey,
+          journalId: journalRow.id,
+          sourceThreadRef: proposal.threadRef,
+          ownerToken: randomUUID(),
+          cascadeId: proposal.idempotencyKey,
+          epoch,
+          limit: resolveTaskmasterFireDailyLimit(),
+          now: now().toISOString(),
+          clock: () => now().toISOString(),
+        };
+        const reserved = await fireBudget.reserveAutomaticFire(reservation);
+        if (!reserved.allowed) {
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'deferred',
+            JSON.stringify({ ...proposal, reason: reserved.reason })
+          );
+          result.deferred += 1;
+          continue;
+        }
+        let guardAttempted = false;
+        let permission: taskmasterDb.AutomaticFireProvenance | undefined;
         // Reserve launch budget before admission; pending is not a confirmed send.
         firesThisTick += 1;
         unconfirmedFireReservations += 1;
@@ -2300,7 +3180,22 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             project: custody.identity.project,
             dispatchId: custody.identity.cascadeId,
             token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
-            deps: { seatUsage: conductorSeatUsage },
+            // Amendment 5 A5.0 (WO-HARNESS-T3-COMMAND-CONSUMER-01): the shared
+            // database WO claim, so a Taskmaster cascade and a T3 consumer
+            // cascade can never run the same WO at once.
+            deps: { seatUsage: conductorSeatUsage, ...cascadeWoClaimDeps('taskmaster') },
+            beforeAdmission: async () => {
+              guardAttempted = true;
+              const decision = await fireBudget.authorizeAutomaticFire({
+                ...reservation,
+                now: now().toISOString(),
+                limit: resolveTaskmasterFireDailyLimit(),
+              });
+              if (!decision.allowed || !decision.admission)
+                throw new Error(decision.reason ?? 'automatic_fire_permission_missing');
+              permission = decision.admission;
+              return permission;
+            },
             onAdmission: record => resolveAdmission?.(record),
             entryOverride:
               laneDecision.lane === 'cursor' || laneDecision.lane === 'zero'
@@ -2314,13 +3209,17 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           // A direct, identity-bound refusal is positive no-fire evidence. A
           // missing record encountered after a crash is UNKNOWN, never this path.
           if (
+            !guardAttempted &&
             admitted.cascadeId === custody.identity.cascadeId &&
             admitted.woId === custody.identity.woId &&
             admitted.project === custody.identity.project &&
             Array.isArray(admitted.attempts) &&
             admitted.attempts.length === 0 &&
-            (admitted.status === 'refused' || admitted.status === 'blocked')
+            (admitted.status === 'refused' ||
+              admitted.status === 'blocked' ||
+              admitted.status === 'planned')
           ) {
+            await fireBudget.releaseAutomaticFire(reservation);
             const expired = JSON.stringify({
               ...custody.proposal,
               cascadeId: custody.identity.cascadeId,
@@ -2340,28 +3239,64 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             }
             continue;
           }
+          if (
+            !permission ||
+            admitted.automaticFireAdmission?.actionKey !== permission.actionKey ||
+            admitted.cascadeId !== reservation.cascadeId
+          )
+            throw new Error('automatic_fire_admission_guard_not_enforced');
+          await fireBudget.settleAutomaticFire({
+            actionKey: reservation.actionKey,
+            cascadeId: admitted.cascadeId,
+            state: 'admitted',
+            admittedAt: permission.admittedAt,
+            runIds: admitted.attempts.flatMap(attempt => (attempt.runId ? [attempt.runId] : [])),
+          });
+          // Settlement persists the admission-based deadline. Read it back before
+          // registering immutable supervision, including the crash/recovery path.
+          const settledJournal = await dal.getActionByIdempotencyKey(reservation.actionKey);
+          if (settledJournal?.id !== journalRow.id || settledJournal.outcome !== 'pending')
+            throw new Error('automatic_fire_settled_journal_unavailable');
+          journalRow = settledJournal;
           if (!(await reconcilePendingFire(journalRow, dal, readFireEvidence))) continue;
           unconfirmedFireReservations -= 1;
         } catch {
+          // Release only owned capacity without committed permission. A lost
+          // authorization result remains charged and pending.
+          try {
+            await fireBudget.releaseAutomaticFire(reservation);
+          } catch {
+            // Storage uncertainty must not turn pending custody into retryable failure.
+            log.warn({ journalId: journalRow.id }, 'taskmaster.fire_release_unknown');
+          }
           await retainFireHold(journalRow, dal, 'admission-uncertain');
           log.warn({ journalId: journalRow.id }, 'taskmaster.fire_admission_unknown');
           continue;
         }
       } else {
-        const dispatched = await createTask(
-          { kind: 'system', sender: 'taskmaster' },
-          {
-            correlation_id: `tm-${journalRow.id}`,
-            idempotency_key: proposal.idempotencyKey,
-            task_type: 'agent_message',
-            recipient: proposal.type === 'digest' ? 'duty-officer' : proposal.recipient,
-            body: proposal.body,
-            // Same-subject grouping + unconditional per-verb repeat reason
-            // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
-            subject_key: canonicalizeThreadRef(proposal.threadRef),
-            repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
-          }
-        );
+        dispatchSubjectKey = dispatchSubjectKeyForThreadRef(proposal.threadRef, nowMs);
+        let dispatched: Awaited<ReturnType<typeof createTask>>;
+        try {
+          dispatched = await createTask(
+            { kind: 'system', sender: 'taskmaster' },
+            {
+              correlation_id: `tm-${journalRow.id}`,
+              idempotency_key: proposal.idempotencyKey,
+              task_type: 'agent_message',
+              recipient: proposal.type === 'digest' ? 'duty-officer' : proposal.recipient,
+              body: proposal.body,
+              // Same-subject grouping + unconditional per-verb repeat reason
+              // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
+              subject_key: dispatchSubjectKey,
+              repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
+            }
+          );
+        } catch (sendError) {
+          // Dispatch refused the send itself (validator, recipient, repeat
+          // check). Marked so the catch below fails it LOUD, not silently.
+          dispatchSendRejected = true;
+          throw sendError;
+        }
         const registerExpectation =
           dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
         await registerExpectation?.({
@@ -2386,15 +3321,28 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
                 : 'redispatch',
           max_retries: proposal.type === 'blocker_report' ? 0 : 2,
         });
-        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.updateActionOutcome(journalRow.id, 'sent', escalationSentJson);
       }
       journalRow.outcome = 'sent';
-      if (proposal.type === 'escalate_p0') {
-        recentEscalateP0ByThread.add(canonicalProposalRef);
-      }
+      if (escalationSentJson !== undefined) journalRow.proposal_json = escalationSentJson;
+      if (proposal.type === 'escalate_p0') escalateP0Rows.push(journalRow);
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
+      // Mark the consumed remediation candidate so a later tick does not re-read
+      // it. Best-effort and isolated: a consume failure is logged but must not
+      // turn a successful send into a 'failed' outcome (the tm_journal 'sent' row
+      // under this proposal's idempotency key already prevents a second send).
+      if (proposal.remediationCandidateId) {
+        try {
+          await consumeRemediationCandidate(proposal.remediationCandidateId);
+        } catch (consumeError) {
+          log.warn(
+            { err: consumeError as Error, messageId: proposal.remediationCandidateId },
+            'taskmaster.remediation_candidate_consume_failed'
+          );
+        }
+      }
       log.info(
         {
           actionType: proposal.type,
@@ -2404,10 +3352,46 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         'taskmaster.effect_sent'
       );
     } catch (error) {
-      await dal.updateActionOutcome(journalRow.id, 'failed');
+      // Record WHY: the reason was only logged before, so the 5,319 failed
+      // rows of 2026-11-01 had no recoverable cause in the journal.
+      const failureReason = (error instanceof Error ? error.message : String(error)).slice(0, 200);
+      // A rejected Dispatch send records its reason for EVERY verb (fence 281:
+      // never silent), in the same proposal_json.failure field the 2026-11-01
+      // taskmaster_github_token_missing rows used.
+      // An escalate_p0 failure records WHEN it was attempted: an in-place retry
+      // keeps the row's created_at, and the failed backoff must restart from
+      // the latest attempt (escalation-dedupe.ts latestAttemptIso).
+      const attemptStamp =
+        proposal.type === 'escalate_p0' ? { last_attempt_at: new Date(nowMs).toISOString() } : {};
+      const failedProposalJson = dispatchSendRejected
+        ? JSON.stringify({
+            ...proposal,
+            failure: failureReason,
+            failure_stage: 'dispatch_send',
+            subject_key: dispatchSubjectKey,
+            ...attemptStamp,
+          })
+        : proposal.type === 'escalate_p0'
+          ? JSON.stringify({ ...proposal, failure: failureReason, ...attemptStamp })
+          : undefined;
+      await dal.updateActionOutcome(journalRow.id, 'failed', failedProposalJson);
       journalRow.outcome = 'failed';
+      if (proposal.type === 'escalate_p0' && failedProposalJson !== undefined) {
+        journalRow.proposal_json = failedProposalJson;
+      }
+      if (proposal.type === 'escalate_p0') escalateP0Rows.push(journalRow);
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
+      if (dispatchSendRejected) {
+        await reportRejectedSend(deps, dal, nowMs, {
+          actionType: proposal.type,
+          threadRef: canonicalProposalRef,
+          subjectKey: dispatchSubjectKey,
+          idempotencyKey: proposal.idempotencyKey,
+          journalId: journalRow.id,
+          failure: failureReason,
+        });
+      }
     }
   }
 
@@ -2494,6 +3478,28 @@ export function resolveBlockerReportEnabled(
 }
 
 /**
+ * Release retained shared WO claims (WO-HARNESS-T3-COMMAND-CONSUMER-01, claim
+ * release (c)) once per tick, before any fire. A cascade that exits with a live
+ * run, or a frontier tier that is later rejected, retains its claim; this is the
+ * production path that frees it when every run is terminal. Never throws.
+ */
+export async function reconcileTaskmasterWoClaims(deps: TaskmasterDeps = {}): Promise<string[]> {
+  try {
+    const released = await (
+      deps.reconcileWoClaims ?? ((): Promise<string[]> => reconcileRetainedWoClaims())
+    )();
+    if (released.length > 0) log.info({ released }, 'taskmaster.wo_claims_released');
+    return released;
+  } catch (error) {
+    log.warn(
+      { cause: (error as Error).message?.slice(0, 200) },
+      'taskmaster.wo_claim_reconcile_failed'
+    );
+    return [];
+  }
+}
+
+/**
  * Start the taskmaster loop. Module-scope singleton: subsequent calls are
  * no-ops while a timer exists. TASKMASTER_INTERVAL_MS=0 disables (KILLED).
  */
@@ -2516,6 +3522,7 @@ export function startTaskmaster(ownerIdSuffix: string, deps: TaskmasterDeps = {}
     if (inFlight) return;
     inFlight = true;
     try {
+      await reconcileTaskmasterWoClaims(deps);
       const tickResult = await tick(state, deps);
       if (taskmasterRuntime) taskmasterRuntime.lastTickResult = tickResult;
       if (tickResult.effects > 0 || tickResult.rejected > 0) {

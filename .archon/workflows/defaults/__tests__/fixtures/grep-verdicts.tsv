@@ -1,0 +1,56 @@
+accept	grep -c alpha fixture.txt
+accept	grep -c 'Grand Comics Database' src/components/GcdAttribution.tsx
+accept	grep -c 'a;rm x' f
+accept	grep -c 'a|b' f
+accept	grep -c '$(id)' f
+accept	grep -c '^x' f
+accept	grep -c 'unparsed=' f
+accept	grep -rn x src | wc -l
+accept	LC_ALL=C grep -n x src/a.ts
+accept	find src -name *.ts | wc -l
+accept	test -f src/a.ts
+accept	[ -f src/a.ts ]
+accept	grep -c 'SPEC_DEFECT:' a/b.js
+accept	grep -c 'FROM tenants WHERE deleted_at' a/b.js
+accept	grep -c needle a/b.js
+accept	rg -c 'two words' dir
+accept	grep -rn 'a b' src | wc -l
+accept	LANG=C grep -c 'x y' f
+accept	wc -l f
+accept	head -n 3 f
+accept	grep -c 'a  b' f
+accept	grep -n 'x' f | grep -c 'y z'
+accept	grep -c 'it is' f | wc -l
+accept	[ -f 'a b.txt' ]
+reject	grep -c 'Grand Comics Database src/x.tsx
+reject	grep -c Grand' Comics src/x.tsx
+reject	grep -c 'a b'c f
+reject	grep -c x'a b' f
+reject	grep -c '' f
+reject	grep -c "needle" f
+reject	grep -c a\ b f
+reject	LC_ALL=C grep -n "[^ -~]" f
+reject	grep -c 'a"b' f
+reject	grep -c a;rm x f
+reject	grep -c 'a b' f > out
+reject	grep -c 'a b' f | awk x
+reject	grep '--file=/etc/passwd' x
+reject	grep -f x y
+reject	find . '-exec' rm
+reject	sort '-o' out
+reject	xargs grep x
+reject	FOO=1 grep a b
+reject	git grep -c 'a b' f
+reject	cat $(ls)
+reject	grep a b || grep c d
+reject	grep -c 'a\b' f
+reject	grep -c 'a b' f |
+reject	| grep -c x f
+reject	grep -c "a b" f
+reject	grep -c x f & rm y
+reject	grep -c $HOME f
+reject	grep -c 'a b' f < in
+reject	grep -c `id` f
+reject	grep -c 'a b' f ;
+reject	[-f x ]
+reject	grep -c x f | | wc -l

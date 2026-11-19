@@ -180,5 +180,9 @@ assert_contains "Tests stamped" "Tests: 3/3 (bun test)" "$OUT"
 assert_eq "Grep line appended at end, then audit line" "$(printf 'WO: WO-X\nTests: 3/3 (bun test)\nPRs: x\nGrep assertions: grep -c a b => 1\nStop conditions: tests=passed; greps=passed (observed by run-stop-tests / run-stop-greps in the run worktree)')" "$OUT"
 
 echo
+# WO #3436: blocked evidence stamps FAIL with its reason.
+OUT="$(printf 'Tests: placeholder\nGrep assertions: placeholder\nVALIDATION: PASS\n' | sme_process 'BLOCKED (missing_tool:pytest)' blocked 'N/A' not_required 0 missing_tool:pytest)"
+assert_contains "blocked stamps fail" "VALIDATION: FAIL" "$OUT"
+assert_contains "blocked audit names reason" "missing_tool:pytest" "$(printf '%s\n' "$OUT" | grep '^Stop conditions:')"
 echo "stamp-manifest-evidence.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

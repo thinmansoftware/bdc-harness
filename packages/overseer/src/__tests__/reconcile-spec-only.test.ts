@@ -63,7 +63,7 @@ describe('reconcile -- spec-only guard', () => {
     expect(deps.warnings).toContain('overseer.reconcile.spec_only_merge_tracker_left_open');
   });
 
-  test('DOES close a tracker when the merged PR contains real code', async () => {
+  test('DOES mark a tracker merged when the merged PR contains real code', async () => {
     const deps = fakeDeps();
     const result = await runReconcileOnce({
       deps: {
@@ -75,9 +75,9 @@ describe('reconcile -- spec-only guard', () => {
       },
     });
 
-    expect(deps.closes.length).toBe(1);
-    expect(deps.labels).toContain('wo:done');
-    expect(result.closed).toBe(1);
+    expect(deps.closes).toEqual([]);
+    expect(deps.labels).toContain('status:merged');
+    expect(result.closed).toBe(0);
   });
 
   test('leaves the tracker OPEN when the file listing fails -- fails open, not closed', async () => {
@@ -103,8 +103,8 @@ describe('reconcile -- spec-only guard', () => {
     const deps = fakeDeps();
     const result = await runReconcileOnce({ deps });
 
-    expect(deps.closes.length).toBe(1);
-    expect(result.closed).toBe(1);
+    expect(deps.labels).toEqual(['status:merged']);
+    expect(result.closed).toBe(0);
   });
 
   test('the real anchor case: the spec PR that CREATED the WO does not close it', async () => {

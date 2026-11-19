@@ -17,6 +17,11 @@ const healthMigration = readFileSync(
   'utf8'
 );
 
+const remediationMigration = readFileSync(
+  resolve(import.meta.dir, '../../../../migrations/067_taskmaster_remediation_nudge.sql'),
+  'utf8'
+);
+
 beforeAll(async () => {
   const raw = process.env.TASKMASTER_POSTGRES_TEST_URL;
   if (!raw) throw new Error('TASKMASTER_POSTGRES_TEST_URL is required');
@@ -24,7 +29,9 @@ beforeAll(async () => {
   if (
     !['postgres:', 'postgresql:'].includes(url.protocol) ||
     !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ||
-    (url.pathname !== '/phase15' && !url.pathname.endsWith('_test'))
+    (url.pathname !== '/phase15' && !url.pathname.endsWith('_test')) ||
+    url.search !== '' ||
+    url.hash !== ''
   ) {
     throw new Error('Taskmaster integration requires a loopback test database');
   }
@@ -63,6 +70,12 @@ beforeAll(async () => {
       'utf8'
     )
   );
+  // Isolated legacy Taskmaster lineage; 067 is exercised explicitly below.
+  for (const migration of ['045_taskmaster_fire_verb.sql', '060_taskmaster_blocker_report.sql']) {
+    await primary.query(
+      readFileSync(resolve(import.meta.dir, '../../../../migrations', migration), 'utf8')
+    );
+  }
 });
 
 beforeEach(async () => {
@@ -88,6 +101,56 @@ afterAll(async () => {
       await admin.close();
     }
   }
+});
+
+test('PostgreSQL migration067 widens only the journal verb check and replays safely', async () => {
+  await primary.query(
+    readFileSync(
+      resolve(import.meta.dir, '../../../../migrations/060_taskmaster_blocker_report.sql'),
+      'utf8'
+    )
+  );
+  const insert = (verb: string) =>
+    primary.query(
+      "INSERT INTO tm_journal(id, thread_ref, action_type, proposal_json, outcome) VALUES ($1, 'test:remediation-verbs', $2, '{}', 'deferred')",
+      [randomUUID(), verb]
+    );
+  await expect(insert('remediation_nudge')).rejects.toMatchObject({ code: '23514' });
+  const siblingChecks = () =>
+    primary.query<{ definition: string }>(
+      "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid = to_regclass('tm_journal') AND contype = 'c' AND pg_get_constraintdef(oid) NOT LIKE '%action_type%' ORDER BY definition"
+    );
+  const before = (await siblingChecks()).rows;
+  await primary.query(remediationMigration);
+  for (const verb of [
+    'deliver_ruling',
+    'nudge',
+    'escalate_p0',
+    'digest',
+    'fire_cauldron',
+    'blocker_report',
+    'remediation_nudge',
+  ]) {
+    await insert(verb);
+  }
+  expect(
+    (
+      await primary.query(
+        "SELECT action_type FROM tm_journal WHERE thread_ref='test:remediation-verbs'"
+      )
+    ).rowCount
+  ).toBe(7);
+  await expect(insert('unknown_verb')).rejects.toMatchObject({ code: '23514' });
+  await primary.query(remediationMigration);
+  expect((await siblingChecks()).rows).toEqual(before);
+  expect(
+    (
+      await primary.query(
+        "SELECT action_type FROM tm_journal WHERE thread_ref='test:remediation-verbs'"
+      )
+    ).rowCount
+  ).toBe(7);
+  await expect(insert('unknown_verb')).rejects.toMatchObject({ code: '23514' });
 });
 
 test('independent PostgreSQL pools serialize overlapping resets with one transition', async () => {

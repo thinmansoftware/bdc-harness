@@ -1,0 +1,70 @@
+# Companion MCP compose example (WO-HARNESS-COMPANION-MCP-MAILBOX-01).
+#
+# Static example only. Do not start this service until every go-live gate in
+# docs/runbooks/companion-mcp.md is closed and John has said go. No literal
+# secret appears here. Environment comes from the service block only. Do not mount
+# the live Archon data directory, its dotenv file, the secrets directory, or an
+# operator credential.
+services:
+  bdc-companion-mcp:
+    build:
+      context: ../..
+      dockerfile: deploy/companion-mcp/Dockerfile
+      args:
+        BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+    image: bdc-companion-mcp:${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}
+    container_name: bdc-companion-mcp
+    user: "10001:10001"
+    restart: unless-stopped
+    # Published ports follow the container default gateway, not file order.
+    # companion_publish wins that selection (higher gw_priority, and the
+    # docker network name sorts before archon_archon-network). The process
+    # binds 10.209.48.2 on that bridge. The host tailnet IP is only the
+    # published address; it is not in this namespace. 127.0.0.1 is not
+    # reachable through a published port. 0.0.0.0 and :: are refused.
+    ports:
+      - "${COMPANION_MCP_TAILNET_IP:?COMPANION_MCP_TAILNET_IP is required}:3095:3095"
+    environment:
+      COMPANION_BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+      COMPANION_MCP_BIND_ADDR: "10.209.48.2"
+      COMPANION_MCP_PORT: "3095"
+      COMPANION_MCP_CONFIG: /run/companion-mcp/companions.json
+      COMPANION_MCP_AUDIT_LOG: /var/lib/companion-mcp/audit.log
+      COMPANION_MCP_REVOKED_FILE: /run/companion-mcp/revoked.json
+      COMPANION_WIKI_ROOT: /var/lib/companion-wiki
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: /var/lib/companion-wiki
+      ORACLE_URL: https://n8n.bluedevilcollectibles.com/webhook/chatbot-query
+      DISPATCH_BASE_URL: http://archon-app-1:3090
+      COMPANION_BOARD_REPO: thinmansoftware/bdc-xo
+      COMPANION_BOARD_BASE: main
+      COMPANION_GITHUB_TOKEN_FILE: /run/companion-mcp/github-token
+    volumes:
+      - ${COMPANION_WIKI_ROOT:?COMPANION_WIKI_ROOT is required}:/var/lib/companion-wiki:ro
+      - ${COMPANION_MCP_CONFIG_FILE:?COMPANION_MCP_CONFIG_FILE is required}:/run/companion-mcp/companions.json:ro
+      - ${COMPANION_TOKEN_DIGEST_DIR:?COMPANION_TOKEN_DIGEST_DIR is required}:/run/companion-mcp/digests:ro
+      - ${COMPANION_DISPATCH_CREDENTIAL_DIR:?COMPANION_DISPATCH_CREDENTIAL_DIR is required}:/run/companion-mcp/dispatch:ro
+      - ${COMPANION_REVOKED_FILE:?COMPANION_REVOKED_FILE is required}:/run/companion-mcp/revoked.json:ro
+      - ${COMPANION_GITHUB_TOKEN_FILE:?COMPANION_GITHUB_TOKEN_FILE is required}:/run/companion-mcp/github-token:ro
+      - companion-mcp-audit:/var/lib/companion-mcp
+    networks:
+      companion_publish:
+        ipv4_address: "10.209.48.2"
+        gw_priority: 100
+      archon_archon-network:
+        gw_priority: 1
+
+networks:
+  companion_publish:
+    name: "0-companion-publish"
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "10.209.48.0/29"
+          gateway: "10.209.48.1"
+  archon_archon-network:
+    external: true
+
+volumes:
+  companion-mcp-audit:

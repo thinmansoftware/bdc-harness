@@ -6,7 +6,7 @@
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
 import { existsSync } from 'fs';
-import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, rm, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { isDeepStrictEqual } from 'util';
 import { tmpdir } from 'os';
@@ -19,6 +19,7 @@ import {
 } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
+import { LANE_SCRIPTS_ENV, materializeLaneScripts, scriptUsesLaneScripts } from './lane-scripts';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
   IWorkflowPlatform,
@@ -38,6 +39,15 @@ import {
   getRegisteredProviders,
   isRegisteredProvider,
   resolveProviderId,
+  isOpenRouterRoute,
+  isCustomerRepo,
+  normalizeRepoSlug,
+  scanDiffForOpenRouter,
+  serializeOpenRouterRequestContent,
+  formatHitLocation,
+  OPENROUTER_TOOL_LOOP_PROVIDER_ID,
+  type ScanResult,
+  type ScanHit,
 } from '@archon/providers';
 import type {
   DagNode,
@@ -67,7 +77,7 @@ import {
 } from './schemas';
 import { collectRuntimeEvidence, renderManifestV2 } from './reliability/evidence-collector';
 import { formatToolCall } from './utils/tool-formatter';
-import { createLogger } from '@archon/paths';
+import { createLogger, laneEnv } from '@archon/paths';
 import { getWorkflowEventEmitter, buildGateResultField } from './event-emitter';
 import type { GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store';
@@ -108,6 +118,7 @@ import {
   resolveAgentPersona,
   InfrastructureClassBlock,
   isPaperworkNode,
+  isAdvisoryNode,
   hasPushArtifact,
 } from './executor-shared';
 import {
@@ -134,7 +145,15 @@ import type {
   RunOutcome,
   TerminalWorkflowPersistence,
 } from './reliability/types';
-import { withRunLease } from './run-lease';
+import { runLeaseGapSeconds, withRunLease } from './run-lease';
+import { DEFAULT_CLAUDE_FAILOVER_MODEL, isReviewNode } from './reliability/seat-node-failover';
+import {
+  NODE_TOKEN_ENV,
+  describeNodeTeardown,
+  endNodeProcessTree,
+  finalizeRunTeardown,
+  isTerminalRunStatus,
+} from './run-teardown';
 import {
   isCodexOnlyV2ProviderId,
   type CodexOnlyV2ProviderId,
@@ -171,10 +190,11 @@ async function persistCancellation(
   reason: string
 ): Promise<boolean> {
   try {
-    await deps.store.cancelWorkflowRun(
-      workflowRun.id,
-      cancellationPersistence(workflowRun.id, reason, nodeId)
-    );
+    const teardownMetadataForCancel = await finalizeRunTeardown(deps.store, workflowRun);
+    await deps.store.cancelWorkflowRun(workflowRun.id, {
+      ...cancellationPersistence(workflowRun.id, reason, nodeId),
+      metadata: teardownMetadataForCancel,
+    });
     return true;
   } catch (error) {
     const failedAt = new Date().toISOString();
@@ -590,17 +610,421 @@ function buildApprovalRejectionNode(node: ApprovalNode, prompt: string): PromptN
   };
 }
 
+/**
+ * Nodes built by buildFailoverNode for a cross-provider failover dispatch. The
+ * persona binding sites (resolveNodeProviderAndModel and executeLoopNode) treat
+ * a node in this set like a per-node binding override: the primary persona's
+ * model pin is dropped so the dispatch runs on the failover_model (or the
+ * failover provider's configured default), never on the primary pin. Without
+ * this, resolveAgentPersona passed a Claude pin such as claude-fable-5 or sonnet
+ * straight through to OpenRouter on a Kimi review failover and the recovery
+ * route failed with an incompatible model id (Overseer, bdc-harness PR 1494
+ * round 1; WO-HARNESS-PERSONA-MODEL-DECLARED-01). The persona's instructions and
+ * tool list are kept.
+ */
+const failoverDispatchNodes = new WeakSet();
+
+/** True when the node is a cross-provider failover clone from buildFailoverNode. */
+function isFailoverDispatchNode(node: object): boolean {
+  return failoverDispatchNodes.has(node);
+}
+
 /** Clone an AI node for a provider failover without retaining an incompatible persona. */
 function buildFailoverNode(
   node: DagNode,
   target: { provider: string; model: string | undefined; agent?: string }
 ): DagNode {
-  return {
+  const clone = {
     ...node,
     provider: target.provider,
     model: target.model,
     ...(target.agent !== undefined ? { agent: target.agent, persona: undefined } : {}),
   } as DagNode;
+  failoverDispatchNodes.add(clone);
+  return clone;
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter review fence (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01)
+//
+// Before any diff/prompt from a customer repository reaches an OpenRouter
+// review seat, scan the transmitted content (repository diff + outgoing
+// prompt) for secrets and customer data. On any hit -- or a scan that cannot
+// run -- reroute that review to the node's non-OpenRouter failover (else
+// codex-native-strict). On a clean scan, pin the OpenRouter request to
+// no-training / zero-retention providers. One openrouter_diff_scan event is
+// recorded per decision. The pure scan + classifiers live in
+// @archon/providers/openrouter-review-fence; this is the executor-side gate.
+// ---------------------------------------------------------------------------
+
+/** Non-OpenRouter review seat used when a node declares no usable failover. */
+const CODEX_STRICT_FALLBACK_PROVIDER = 'codex-native-strict';
+
+/**
+ * Repository-diff scan results, cached by `${runId}:${headSha}`. The repo diff
+ * is identical for every node in a run at a fixed HEAD, so it is scanned once;
+ * the outgoing PROMPT is scanned on every request and never cached (a prompt
+ * verdict is never reused for another node, iteration or retry) -- spec Test 10.
+ */
+const openRouterDiffScanCache = new Map<string, ScanResult>();
+
+/** Test hook: drop the cached repository-diff scan results. */
+export function clearOpenRouterDiffScanCache(): void {
+  openRouterDiffScanCache.clear();
+}
+
+/** Git probes used by the gate; overridable in tests. */
+interface FenceGitProbes {
+  resolveRemote: (cwd: string) => Promise<string | null>;
+  resolveHeadSha: (cwd: string) => Promise<string>;
+  resolveDiff: (cwd: string, baseBranch: string) => Promise<string>;
+}
+
+async function defaultResolveRemote(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'remote', 'get-url', 'origin'], {
+      timeout: 10_000,
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function defaultResolveHeadSha(cwd: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['-C', cwd, 'rev-parse', 'HEAD'], {
+    timeout: 10_000,
+  });
+  return stdout.trim();
+}
+
+async function defaultResolveDiff(cwd: string, baseBranch: string): Promise<string> {
+  let base = baseBranch;
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'merge-base', baseBranch, 'HEAD'], {
+      timeout: 15_000,
+    });
+    base = stdout.trim() || baseBranch;
+  } catch {
+    base = baseBranch;
+  }
+  const { stdout } = await execFileAsync('git', ['-C', cwd, 'diff', `${base}..HEAD`], {
+    timeout: 30_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+/** Parse OPENROUTER_FENCE_TENANT_SLUGS (comma list) into trimmed, non-empty slugs. */
+function parseTenantSlugsFromEnv(): string[] {
+  return (process.env.OPENROUTER_FENCE_TENANT_SLUGS ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+/** Persist one openrouter_diff_scan event. Awaited so the decision is durable
+ *  before the (possibly rerouted) request is dispatched. */
+async function emitOpenRouterDiffScanEvent(
+  deps: WorkflowDeps,
+  runId: string,
+  nodeId: string,
+  data: Record<string, unknown>
+): Promise<void> {
+  try {
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'openrouter_diff_scan',
+      step_name: nodeId,
+      data,
+    });
+  } catch (err) {
+    getLog().error(
+      { err: err as Error, workflowRunId: runId, eventType: 'openrouter_diff_scan' },
+      'workflow_event_persist_failed'
+    );
+  }
+}
+
+export interface OpenRouterFenceDecision {
+  /** True when this was an OpenRouter route on a customer repo (gate ran). */
+  applicable: boolean;
+  /** True when the route was moved off OpenRouter. */
+  rerouted: boolean;
+  routedProvider: string;
+  routedModel: string | undefined;
+  /** True when the route stays on OpenRouter and must carry the privacy pin. */
+  privacyPin: boolean;
+  verdict: ScanResult['verdict'] | 'skipped';
+  reason: string;
+  hitKinds: string[];
+  hitLocations: string[];
+}
+
+export interface OpenRouterFenceParams {
+  deps: WorkflowDeps;
+  workflowRun: WorkflowRun;
+  nodeId: string;
+  cwd: string;
+  baseBranch: string;
+  provider: string;
+  model: string | undefined;
+  failoverTarget: { provider: string; model: string | undefined; agent: string | undefined } | null;
+  finalPrompt: string;
+  /** The system / persona prompt transmitted to OpenRouter alongside
+   *  finalPrompt. Scanned together with finalPrompt so customer data carried in
+   *  a persona/system prompt cannot bypass the fence. Undefined when the route
+   *  carries no system prompt. */
+  systemPrompt?: string;
+  /** The structured-output format of the request. GlmProvider appends the
+   *  serialized schema to the transmitted user message, so it is part of the
+   *  scanned outgoing content. */
+  outputFormat?: SendQueryOptions['outputFormat'];
+  /** Overrides the env slug list (tests). */
+  tenantSlugs?: readonly string[];
+  /** Overrides the git probes (tests). */
+  gitProbes?: Partial<FenceGitProbes>;
+  /** Overrides the scanner (tests) -- counts diff vs prompt invocations. */
+  scanText?: (text: string, mode: 'diff' | 'prompt') => Promise<ScanResult>;
+  /** Default true; set false to compute the decision without recording an event. */
+  emitEvent?: boolean;
+}
+
+/**
+ * Resolve the repository identity the fence keys on, as an owner/repo slug.
+ * Order: (1) trusted run metadata -- the harness-registered codebase of this
+ * run (repository_url, else a name already in owner/repo form); (2) the
+ * checkout's git origin. Returns null when neither yields a slug; the caller
+ * fails closed on null.
+ */
+export async function resolveFenceRepoIdentity(
+  deps: WorkflowDeps,
+  workflowRun: WorkflowRun,
+  cwd: string,
+  probes: Pick<FenceGitProbes, 'resolveRemote'>
+): Promise<string | null> {
+  const codebaseId = workflowRun.codebase_id;
+  if (codebaseId) {
+    try {
+      const codebase = await deps.store.getCodebase(codebaseId);
+      const fromMetadata =
+        normalizeRepoSlug(codebase?.repository_url) ?? normalizeRepoSlug(codebase?.name);
+      if (fromMetadata) return fromMetadata;
+    } catch {
+      // fall through to the origin lookup
+    }
+  }
+  const remote = await probes.resolveRemote(cwd).catch(() => null);
+  return normalizeRepoSlug(remote);
+}
+
+/**
+ * Run the review fence for a single (possibly rerouted) node/iteration entry.
+ * Returns a decision the caller applies: reroute the provider/model (and drop
+ * the OpenRouter persona), or keep OpenRouter and set the privacy pin.
+ */
+export async function applyOpenRouterReviewFence(
+  params: OpenRouterFenceParams
+): Promise<OpenRouterFenceDecision> {
+  const {
+    deps,
+    workflowRun,
+    nodeId,
+    cwd,
+    baseBranch,
+    provider,
+    model,
+    failoverTarget,
+    finalPrompt,
+  } = params;
+
+  const notApplicable: OpenRouterFenceDecision = {
+    applicable: false,
+    rerouted: false,
+    routedProvider: provider,
+    routedModel: model,
+    privacyPin: false,
+    verdict: 'skipped',
+    reason: '',
+    hitKinds: [],
+    hitLocations: [],
+  };
+
+  if (!isOpenRouterRoute(provider, model)) return notApplicable;
+
+  const probes: FenceGitProbes = {
+    resolveRemote: defaultResolveRemote,
+    resolveHeadSha: defaultResolveHeadSha,
+    resolveDiff: defaultResolveDiff,
+    ...params.gitProbes,
+  };
+
+  // Repository identity -- FAIL CLOSED (Overseer 45ebb830). Trusted run
+  // metadata first (the codebase registered in the harness for this run), the
+  // checkout's git origin only as a fallback. An OpenRouter route whose repo
+  // identity cannot be resolved is treated as scan_unavailable and rerouted;
+  // rerouting a non-customer repo with unresolvable identity is the accepted
+  // cost (XO decision 2026-11-03).
+  const identity = await resolveFenceRepoIdentity(deps, workflowRun, cwd, probes);
+  if (identity !== null && !isCustomerRepo(identity)) return notApplicable;
+  const identityUnresolved = identity === null;
+  const repoSlug = identity ?? '<unresolved>';
+
+  const tenantSlugs = params.tenantSlugs ?? parseTenantSlugsFromEnv();
+  const scanText =
+    params.scanText ??
+    ((text: string, mode: 'diff' | 'prompt'): Promise<ScanResult> =>
+      scanDiffForOpenRouter(text, { mode, tenantSlugs, cwd }));
+
+  let verdict: ScanResult['verdict'] = 'clean';
+  let reason = '';
+  const hits: ScanHit[] = [];
+
+  if (identityUnresolved) {
+    // Cannot tell whether this is a customer repo -> cannot prove the request
+    // is safe to send. Reroute and record the decision.
+    verdict = 'scan_unavailable';
+    reason = 'repo_identity_unresolved';
+  } else if (resolveProviderId(provider) === OPENROUTER_TOOL_LOOP_PROVIDER_ID) {
+    // The tool-loop seat reads files under cwd and sends tool results to
+    // OpenRouter AFTER this gate runs, so no pre-send scan can cover what it
+    // transmits. Always reroute on a customer repo.
+    verdict = 'scan_unavailable';
+    reason = 'repo_read_unscannable';
+  } else if (tenantSlugs.length === 0) {
+    // Fail closed: cannot prove the change is slug-free without the slug list.
+    verdict = 'scan_unavailable';
+    reason = 'tenant_slugs_unset';
+  } else {
+    // (a) Repository diff -- cached by run id + HEAD sha.
+    let diffResult: ScanResult;
+    try {
+      const headSha = await probes.resolveHeadSha(cwd);
+      const cacheKey = `${workflowRun.id}:${headSha}`;
+      const cached = openRouterDiffScanCache.get(cacheKey);
+      if (cached) {
+        diffResult = cached;
+      } else {
+        const diffText = await probes.resolveDiff(cwd, baseBranch);
+        diffResult = await scanText(diffText, 'diff');
+        openRouterDiffScanCache.set(cacheKey, diffResult);
+      }
+    } catch {
+      diffResult = { verdict: 'scan_unavailable', hits: [], reason: 'repo_diff_unavailable' };
+    }
+
+    // (b) Outgoing request -- the COMPLETE serialized request content, built by
+    // the same function GlmProvider uses to build what it sends: the system /
+    // persona prompt, the user prompt, and the JSON instruction + serialized
+    // outputFormat.schema appended to the user message. Scanning anything less
+    // would let customer data in a persona or schema reach OpenRouter unseen.
+    // Scanned every request, never cached.
+    const outgoingContent = serializeOpenRouterRequestContent(finalPrompt, {
+      systemPrompt: params.systemPrompt,
+      outputFormat: params.outputFormat,
+    });
+    let promptResult: ScanResult;
+    try {
+      promptResult = await scanText(outgoingContent, 'prompt');
+    } catch {
+      promptResult = { verdict: 'scan_unavailable', hits: [], reason: 'prompt_scan_failed' };
+    }
+
+    hits.push(...diffResult.hits, ...promptResult.hits);
+    if (diffResult.verdict === 'scan_unavailable' || promptResult.verdict === 'scan_unavailable') {
+      verdict = 'scan_unavailable';
+      reason =
+        diffResult.verdict === 'scan_unavailable'
+          ? (diffResult.reason ?? 'scan_unavailable')
+          : (promptResult.reason ?? 'scan_unavailable');
+    } else if (diffResult.verdict === 'hit' || promptResult.verdict === 'hit') {
+      verdict = 'hit';
+      reason = 'customer_data';
+    } else {
+      verdict = 'clean';
+    }
+  }
+
+  const hitKinds = [...new Set(hits.map(h => h.kind))];
+  const hitLocations = hits.map(formatHitLocation);
+
+  let rerouted = false;
+  let routedProvider = provider;
+  let routedModel = model;
+  let privacyPin = false;
+
+  if (verdict === 'clean') {
+    privacyPin = true;
+  } else {
+    rerouted = true;
+    if (failoverTarget && !isOpenRouterRoute(failoverTarget.provider, failoverTarget.model)) {
+      routedProvider = failoverTarget.provider;
+      routedModel = failoverTarget.model;
+    } else {
+      routedProvider = CODEX_STRICT_FALLBACK_PROVIDER;
+      routedModel = undefined;
+    }
+  }
+
+  if (params.emitEvent !== false) {
+    await emitOpenRouterDiffScanEvent(deps, workflowRun.id, nodeId, {
+      repo: repoSlug,
+      node_id: nodeId,
+      original_provider: provider,
+      routed_provider: routedProvider,
+      verdict,
+      reason,
+      hit_kinds: hitKinds,
+      hit_locations: hitLocations,
+    });
+  }
+
+  return {
+    applicable: true,
+    rerouted,
+    routedProvider,
+    routedModel,
+    privacyPin,
+    verdict,
+    reason,
+    hitKinds,
+    hitLocations,
+  };
+}
+
+/**
+ * Resolve the non-OpenRouter reroute target after an OpenRouter request was
+ * refused for having no zdr / data_collection:deny endpoint, and record an
+ * openrouter_diff_scan event (reason openrouter_no_private_endpoint). The
+ * request is NEVER retried without the pin -- the provider already failed
+ * closed; this only chooses where the review goes instead.
+ */
+export async function emitNoPrivateEndpointReroute(params: {
+  deps: WorkflowDeps;
+  workflowRun: WorkflowRun;
+  nodeId: string;
+  provider: string;
+  repo: string;
+  failoverTarget: { provider: string; model: string | undefined; agent: string | undefined } | null;
+}): Promise<{ routedProvider: string; routedModel: string | undefined }> {
+  const { failoverTarget } = params;
+  let routedProvider = CODEX_STRICT_FALLBACK_PROVIDER;
+  let routedModel: string | undefined;
+  if (failoverTarget && !isOpenRouterRoute(failoverTarget.provider, failoverTarget.model)) {
+    routedProvider = failoverTarget.provider;
+    routedModel = failoverTarget.model;
+  }
+  await emitOpenRouterDiffScanEvent(params.deps, params.workflowRun.id, params.nodeId, {
+    repo: params.repo,
+    node_id: params.nodeId,
+    original_provider: params.provider,
+    routed_provider: routedProvider,
+    verdict: 'scan_unavailable',
+    reason: 'openrouter_no_private_endpoint',
+    hit_kinds: [],
+    hit_locations: [],
+  });
+  return { routedProvider, routedModel };
 }
 
 /**
@@ -1280,6 +1704,22 @@ async function safeSendMessage(
 }
 
 /**
+ * First error line naming a repair failure (`repair_target_`, `repair_gate_closed:`
+ * or `ERROR:`), else the first non-empty line. Used for repair_failure_reason.
+ */
+export function repairFailureReason(errorText: string): string {
+  const lines = errorText
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+  for (const line of lines) {
+    const idx = line.search(/repair_target_|repair_gate_closed:|ERROR:/);
+    if (idx >= 0) return line.slice(idx);
+  }
+  return lines[0] ?? 'unknown';
+}
+
+/**
  * Single-quote a string for safe inline shell use.
  * Replaces each ' with '\'' (end quote, literal single-quote, re-open quote).
  */
@@ -1734,6 +2174,9 @@ interface DagNodeBindingInput {
   kind: 'prompt' | 'loop' | 'selected-loop';
   // Ordinary loops capture options before the awaited persona-registry read.
   loopOptions?: SendQueryOptions;
+  nodeBindingOverridden?: boolean;
+  /** Preparation remains conservative about loop persona pins. */
+  preparation?: boolean;
   // Ordinary prompt/command fields are captured before awaiting the registry.
   promptFields?: {
     systemPrompt: string | undefined;
@@ -1806,7 +2249,22 @@ function finishDagPersonaBinding(
       input.loopOptions ??
       buildLoopNodeOptions(node as LoopNode, provider, model, config, input.workflowLevelOptions);
     if (persona) {
-      const resolution = resolveAgentPersona(persona, options.model, provider);
+      const personaForLoop =
+        !input.preparation &&
+        (input.nodeBindingOverridden ||
+          input.modelOverride?.nodes?.[node.id] ||
+          isFailoverDispatchNode(node))
+          ? {
+              ...persona,
+              model:
+                provider === 'claude'
+                  ? (options.model ??
+                    persona.model ??
+                    (isReviewNode(node) ? undefined : DEFAULT_CLAUDE_FAILOVER_MODEL))
+                  : undefined,
+            }
+          : persona;
+      const resolution = resolveAgentPersona(personaForLoop, options.model, provider);
       // Keep the explicit undefined model property produced by ordinary Codex personas.
       options.model = resolution.model;
       options.systemPrompt = options.systemPrompt
@@ -1856,8 +2314,18 @@ function resolveDagPromptPersonaBinding(
     // the override for Claude (whose persona resolver requires a model) and
     // removing it for providers whose persona resolver does not.
     const nodeBindingOverride = modelOverride?.nodes?.[node.id];
-    const personaForResolution = nodeBindingOverride
-      ? { ...persona, model: provider === 'claude' ? model : undefined }
+    const bindingReplacesPersonaModel =
+      nodeBindingOverride !== undefined || isFailoverDispatchNode(node);
+    const personaForResolution = bindingReplacesPersonaModel
+      ? {
+          ...persona,
+          model:
+            provider === 'claude'
+              ? (model ??
+                persona.model ??
+                (isReviewNode(node) ? undefined : DEFAULT_CLAUDE_FAILOVER_MODEL))
+              : undefined,
+        }
       : persona;
     const personaResolution = resolveAgentPersona(personaForResolution, effectiveModel, provider);
     effectiveModel = resolveModelForNode({
@@ -1870,6 +2338,8 @@ function resolveDagPromptPersonaBinding(
       assistantModels,
       modelOverride,
     }).model;
+    if (effectiveModel === undefined && bindingReplacesPersonaModel && provider === 'claude')
+      effectiveModel = personaResolution.model;
     // Prepend agent system prompt (agent role comes before node task)
     effectiveSystemPrompt = effectiveSystemPrompt
       ? `${personaResolution.systemPrompt}\n\n${effectiveSystemPrompt}`
@@ -2056,6 +2526,7 @@ export async function prepareDagBindings(
         config: inputs.config,
         modelOverride: inputs.modelOverride,
         workflowLevelOptions: defaults,
+        preparation: true,
         kind: selected ? 'selected-loop' : isLoopNode(node) ? 'loop' : 'prompt',
       };
       assertProvider(node.provider);
@@ -2500,7 +2971,11 @@ async function executeNodeInternal(
   // Persona wiki/oracle context-load state from resolveNodeProviderAndModel,
   // dumped alongside the raw SDK message on a success-contradiction for
   // root-cause evidence (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01).
-  personaContextState = 'none'
+  personaContextState = 'none',
+  // Workflow-level failover defaults -- used by the OpenRouter review fence to
+  // resolve a node's non-OpenRouter reroute target (WO-HARNESS-OPENROUTER-
+  // REVIEW-DIFF-SCAN-01).
+  workflowLevelOptions: WorkflowLevelOptions = {}
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -2607,6 +3082,52 @@ async function executeNodeInternal(
 
   // Substitute upstream node output references
   const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
+
+  // OpenRouter review fence (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01): on a
+  // customer-repo OpenRouter route, scan the repository diff + outgoing prompt
+  // before a provider is chosen. A hit (or a scan that cannot run) reroutes
+  // this node off OpenRouter to its non-OpenRouter failover (else
+  // codex-native-strict); a clean scan keeps OpenRouter and pins the request
+  // to no-training / zero-retention endpoints. Runs on EVERY entry, including
+  // an availability-failover re-dispatch onto an OpenRouter provider.
+  if (isOpenRouterRoute(provider, nodeOptions?.model)) {
+    const fenceDecision = await applyOpenRouterReviewFence({
+      deps,
+      workflowRun,
+      nodeId: node.id,
+      cwd,
+      baseBranch,
+      provider,
+      model: nodeOptions?.model,
+      failoverTarget: resolveFailoverTarget(node, workflowLevelOptions),
+      finalPrompt,
+      systemPrompt: nodeOptions?.systemPrompt,
+      outputFormat: nodeOptions?.outputFormat,
+    });
+    if (fenceDecision.applicable && fenceDecision.rerouted) {
+      getLog().warn(
+        {
+          nodeId: node.id,
+          from: provider,
+          to: fenceDecision.routedProvider,
+          verdict: fenceDecision.verdict,
+          reason: fenceDecision.reason,
+        },
+        'dag.openrouter_review_fence_rerouted'
+      );
+      provider = fenceDecision.routedProvider;
+      // Drop the model override and the OpenRouter persona system prompt the
+      // way buildFailoverNode does -- the reroute target is a different seat.
+      nodeOptions = {
+        ...nodeOptions,
+        model: fenceDecision.routedModel,
+        systemPrompt: undefined,
+        openrouterPrivacyPin: false,
+      };
+    } else if (fenceDecision.applicable && fenceDecision.privacyPin) {
+      nodeOptions = { ...nodeOptions, openrouterPrivacyPin: true };
+    }
+  }
 
   const aiClient = deps.getAgentProvider(provider);
   const streamingMode = platform.getStreamingMode();
@@ -3606,6 +4127,63 @@ async function executeNodeInternal(
 /** Default timeout for subprocess nodes (bash, script): 2 minutes */
 const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
 
+function recordedBaseBranchEnv(metadata: Record<string, unknown> | null | undefined): string {
+  const value = metadata?.base_branch;
+  if (typeof value !== 'string') return '';
+  return value.trim();
+}
+
+/** Persist only the bash event protocol's explicit allowlist. Best-effort always. */
+async function persistBashRunEvents(
+  deps: WorkflowDeps,
+  runId: string,
+  nodeId: string,
+  output: string
+): Promise<void> {
+  for (const line of output.split(/\r?\n/)) {
+    if (!line.startsWith('BDC_RUN_EVENT ') || Buffer.byteLength(line, 'utf8') > 4096) continue;
+    try {
+      const value: unknown = JSON.parse(line.slice('BDC_RUN_EVENT '.length));
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
+      const data = value as Record<string, unknown>;
+      if (data.event_type !== 'duplicate_pr_suppressed') continue;
+      const {
+        existing_pr: existingPr,
+        existing_pr_url: existingPrUrl,
+        kind,
+        salvage_branch: salvageBranch,
+      } = data;
+      if (
+        typeof existingPr !== 'number' ||
+        !Number.isSafeInteger(existingPr) ||
+        existingPr <= 0 ||
+        typeof existingPrUrl !== 'string' ||
+        existingPrUrl.length === 0 ||
+        existingPrUrl.length > 2048 ||
+        kind !== 'fallback' ||
+        typeof salvageBranch !== 'string' ||
+        salvageBranch.length === 0 ||
+        salvageBranch.length > 256
+      )
+        continue;
+      await deps.store.createWorkflowEvent({
+        workflow_run_id: runId,
+        event_type: 'duplicate_pr_suppressed',
+        step_name: nodeId,
+        data: {
+          event_type: 'duplicate_pr_suppressed',
+          existing_pr: existingPr,
+          existing_pr_url: existingPrUrl,
+          kind,
+          salvage_branch: salvageBranch,
+        },
+      });
+    } catch {
+      // Invalid JSON or unavailable event storage must never change node outcome.
+    }
+  }
+}
+
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via a temp file, captures stdout as node output.
@@ -3673,13 +4251,17 @@ async function executeBashNode(
     : nodeRefResolved;
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
+  const bashNodeToken = `${workflowRun.id}:${node.id}`;
   // Inject workflow inputs as INPUT_<NAME> env vars (belt-and-suspenders alongside template substitution).
   const inputEnvVars: Record<string, string> = resolvedInputs
     ? Object.fromEntries(
         Object.entries(resolvedInputs).map(([k, v]) => [`INPUT_${k.toUpperCase()}`, v])
       )
     : {};
-  const subprocessEnv: NodeJS.ProcessEnv = {
+  // laneEnv wraps the FULLY merged environment (including workflow and project envVars), so a
+  // personal GitHub token name or a fallback override added by configuration cannot reach a
+  // lane child (bdc-xo#5464).
+  const subprocessEnv: NodeJS.ProcessEnv = laneEnv({
     ...process.env,
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
@@ -3693,6 +4275,9 @@ async function executeBashNode(
     // recovery, and resolve-review-base all key off origin/$BASE_BRANCH, so a
     // lane-correct baseBranch here makes the whole tail lane-correct.
     BASE_BRANCH: baseBranch,
+    // Recorded run identity (WO-HARNESS-RUN-BRANCH-IDENTITY-01). Empty when the
+    // run has no base_branch, so open-pr fails closed instead of inventing one.
+    RECORDED_BASE_BRANCH: recordedBaseBranchEnv(workflowRun.metadata),
     // WORKFLOW_ID and WORKTREE_PATH as actual env vars (complement the $WORKFLOW_ID template token).
     WORKFLOW_ID: workflowRun.id,
     WORKTREE_PATH: cwd,
@@ -3702,12 +4287,20 @@ async function executeBashNode(
     ARCHON_NODE_OUT: join(artifactsDir || tmpdir(), 'node-out'),
     ...inputEnvVars,
     ...(envVars ?? {}),
-  };
+    // Node-specific ownership for timeout teardown: inherited by every descendant.
+    [NODE_TOKEN_ENV]: bashNodeToken,
+  });
 
   const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
   const safeRunId = workflowRun.id.replace(/[^A-Za-z0-9._-]/g, '_');
   const scriptDir = artifactsDir || tmpdir();
   const scriptFile = join(scriptDir, `node-${safeNodeId}-${safeRunId}.sh`);
+  // Bundled scripts/lane/*.sh (e.g. dprep.sh) for nodes that source them, so
+  // standalone CLI and source runs work without /app/scripts/lane/.
+  const laneScriptsDir = scriptUsesLaneScripts(finalScript)
+    ? join(scriptDir, `lane-scripts-${safeNodeId}-${safeRunId}`)
+    : undefined;
+  if (laneScriptsDir) subprocessEnv[LANE_SCRIPTS_ENV] = laneScriptsDir;
 
   try {
     let stdout = '';
@@ -3717,6 +4310,19 @@ async function executeBashNode(
         await mkdir(scriptDir, { recursive: true });
         await writeFile(scriptFile, finalScript, { mode: 0o600 });
         await chmod(scriptFile, 0o600);
+        if (laneScriptsDir) {
+          try {
+            await materializeLaneScripts(laneScriptsDir);
+          } catch (error) {
+            // Not fatal: the lane stub falls back to /app/scripts/lane/ and then
+            // logs that no dprep.sh was found, exactly like a failed install.
+            delete subprocessEnv.ARCHON_LANE_SCRIPTS_DIR;
+            getLog().warn(
+              { nodeId: node.id, err: (error as Error).message },
+              'lane_scripts_materialize_failed'
+            );
+          }
+        }
       } catch (error) {
         const err = error as Error & { code?: number | string };
         const details = err.message ? `: ${err.message}` : '';
@@ -3738,10 +4344,19 @@ async function executeBashNode(
       } catch {
         // Best-effort cleanup: deletion failures must not change node outcome.
       }
+      if (laneScriptsDir) {
+        try {
+          await rm(laneScriptsDir, { recursive: true, force: true });
+        } catch {
+          // Best-effort cleanup, same as the node script file.
+        }
+      }
     }
 
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
+
+    await persistBashRunEvents(deps, workflowRun.id, node.id, output);
 
     if (stderr.trim()) {
       getLog().warn({ nodeId: node.id, stderr: stderr.trim() }, 'bash_node_stderr');
@@ -3863,10 +4478,13 @@ async function executeBashNode(
     const err = error as Error & {
       killed?: boolean;
       code?: number | string;
+      stdout?: string;
       stderr?: string;
       scriptFile?: string;
       scriptPreparationFailed?: boolean;
     };
+    // A bash node may report an event before exiting nonzero.
+    await persistBashRunEvents(deps, workflowRun.id, node.id, err.stdout ?? '');
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
@@ -3878,6 +4496,13 @@ async function executeBashNode(
       errorMsg = `${label} failed: unable to prepare temporary script at ${err.scriptFile ?? scriptFile}`;
     } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
+      // Reap only this node's own processes (env token), never a concurrent node's.
+      const nodeTeardown = await endNodeProcessTree({
+        run: { id: workflowRun.id, working_path: cwd, started_at: workflowRun.started_at },
+        nodeStartMs: nodeStartTime,
+        nodeToken: bashNodeToken,
+      });
+      errorMsg += describeNodeTeardown(nodeTeardown);
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: bash executable not found in PATH`;
     } else if (err.message?.includes('EACCES')) {
@@ -3987,8 +4612,13 @@ async function executeScriptNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv =
-    envVars && Object.keys(envVars).length > 0 ? { ...process.env, ...envVars } : undefined;
+  const scriptNodeToken = `${workflowRun.id}:${node.id}`;
+  const subprocessEnv: NodeJS.ProcessEnv = laneEnv({
+    ...process.env,
+    ...(envVars ?? {}),
+    // Node-specific ownership for timeout teardown: inherited by every descendant.
+    [NODE_TOKEN_ENV]: scriptNodeToken,
+  });
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -4226,6 +4856,12 @@ async function executeScriptNode(
     let errorMsg: string;
     if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
+      const nodeTeardown = await endNodeProcessTree({
+        run: { id: workflowRun.id, working_path: cwd, started_at: workflowRun.started_at },
+        nodeStartMs: nodeStartTime,
+        nodeToken: scriptNodeToken,
+      });
+      errorMsg += describeNodeTeardown(nodeTeardown);
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: '${cmd}' executable not found in PATH`;
     } else if (err.message?.includes('EACCES')) {
@@ -4329,7 +4965,8 @@ async function executeLoopNode(
   config: WorkflowConfig,
   issueContext?: string,
   workflowLevelOptions?: WorkflowLevelOptions,
-  preparedBinding?: DagBindingResult
+  preparedBinding?: DagBindingResult,
+  nodeBindingOverridden = false
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -4376,6 +5013,7 @@ async function executeLoopNode(
     workflowModel,
     config,
     workflowLevelOptions,
+    nodeBindingOverridden,
     kind: 'selected-loop',
     loopOptions: preparedBinding
       ? undefined
@@ -4752,20 +5390,70 @@ async function executeLoopNode(
         );
         const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
+        // OpenRouter review fence, re-evaluated PER ITERATION (WO-HARNESS-
+        // OPENROUTER-REVIEW-DIFF-SCAN-01): the repository diff is cached by run
+        // id + HEAD sha, but THIS iteration's prompt is scanned fresh (never
+        // cached), so one iteration may pass while a later iteration whose
+        // prompt carries customer data is rerouted -- spec Test 10.
+        let iterationProvider = workflowProvider;
+        let iterationModel = resolvedOptions.model;
+        let iterationClient = aiClient;
         const iterationOptions: SendQueryOptions | undefined = {
           ...resolvedOptions,
           abortSignal: iterationAbortController.signal,
         };
+        if (isOpenRouterRoute(iterationProvider, iterationModel)) {
+          const fenceDecision = await applyOpenRouterReviewFence({
+            deps,
+            workflowRun,
+            nodeId: node.id,
+            cwd,
+            baseBranch,
+            provider: iterationProvider,
+            model: iterationModel,
+            failoverTarget: resolveFailoverTarget(node, workflowLevelOptions ?? {}),
+            finalPrompt,
+            systemPrompt: iterationOptions.systemPrompt,
+            outputFormat: iterationOptions.outputFormat,
+          });
+          if (fenceDecision.applicable && fenceDecision.rerouted) {
+            getLog().warn(
+              {
+                nodeId: node.id,
+                iteration: i,
+                from: iterationProvider,
+                to: fenceDecision.routedProvider,
+                verdict: fenceDecision.verdict,
+                reason: fenceDecision.reason,
+              },
+              'loop_node.openrouter_review_fence_rerouted'
+            );
+            iterationProvider = fenceDecision.routedProvider;
+            iterationModel = fenceDecision.routedModel;
+            iterationClient = deps.getAgentProvider(iterationProvider);
+            iterationOptions.model = iterationModel;
+            // Drop the OpenRouter persona system prompt -- different seat.
+            iterationOptions.systemPrompt = undefined;
+            iterationOptions.openrouterPrivacyPin = false;
+          } else if (fenceDecision.applicable && fenceDecision.privacyPin) {
+            iterationOptions.openrouterPrivacyPin = true;
+          }
+        }
 
         iterationAttempt = await beginProviderAttempt(
           deps,
           workflowRun,
           node,
-          workflowProvider,
-          resolvedOptions.model,
+          iterationProvider,
+          iterationModel,
           workflowModel
         );
-        const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+        const generator = iterationClient.sendQuery(
+          finalPrompt,
+          cwd,
+          resumeSessionId,
+          iterationOptions
+        );
         let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
         for await (const msg of withIdleTimeout(generator, effectiveIdleTimeout, () => {
@@ -5231,7 +5919,7 @@ async function executeLoopNode(
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        await execFileAsync('bash', ['-c', substitutedBash], { cwd, env: laneEnv() });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
@@ -5722,7 +6410,8 @@ async function executeApprovalNode(
       undefined, // fresh session
       configuredCommandFolder,
       issueContext,
-      personaContextState
+      personaContextState,
+      workflowLevelOptions
     );
 
     if (output.state === 'failed') {
@@ -5854,6 +6543,7 @@ async function executeEvidenceNode(
       const result = await execFileAsync(command, [...args], {
         cwd: commandCwd,
         timeout: 30000,
+        env: laneEnv(),
       });
       return { stdout: result.stdout, stderr: result.stderr };
     },
@@ -6008,9 +6698,11 @@ async function executeDagWorkflowInternal(
     });
   }
 
+  let runAbort: { nodeId: string; reason: string } | undefined;
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     if (deps.isRunLeaseValid?.() === false) {
       getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost');
+      await writeRunLeaseLostEvent(deps, workflowRun.id, 'layer_boundary');
       return;
     }
     const layer = layers[layerIdx];
@@ -6278,8 +6970,72 @@ async function executeDagWorkflowInternal(
               config,
               issueContext,
               workflowLevelOptions,
-              preparedLoopBinding
+              preparedLoopBinding,
+              Boolean(modelOverride?.nodes?.[node.id])
             );
+
+            // OpenRouter no-private-endpoint reroute for loop nodes (WO-HARNESS-
+            // OPENROUTER-REVIEW-DIFF-SCAN-01): a pinned OpenRouter loop request
+            // found no zdr / data_collection:deny endpoint, so the provider
+            // failed closed (no unpinned retry) and the loop surfaced the
+            // openrouter_no_private_endpoint error. Reroute the whole loop node
+            // to a non-OpenRouter seat and record the decision -- the same
+            // contract the single-shot path applies. Never retried without the
+            // pin. Checked BEFORE availability failover (this is not an
+            // availability-class error, so it would otherwise fall through to a
+            // plain loop failure).
+            if (
+              output.state === 'failed' &&
+              output.error?.includes('openrouter_no_private_endpoint')
+            ) {
+              try {
+                const declaredFailover = resolveFailoverTarget(node, workflowLevelOptions);
+                const noEndpointRemote = await defaultResolveRemote(cwd).catch(() => null);
+                const reroute = await emitNoPrivateEndpointReroute({
+                  deps,
+                  workflowRun,
+                  nodeId: node.id,
+                  provider: loopProvider,
+                  repo: normalizeRepoSlug(noEndpointRemote) ?? noEndpointRemote ?? '',
+                  failoverTarget: declaredFailover,
+                });
+                const rerouteNode = buildFailoverNode(node, {
+                  provider: reroute.routedProvider,
+                  model: reroute.routedModel,
+                  agent: declaredFailover?.agent,
+                });
+                assertProviderCanExecuteNode(reroute.routedProvider, rerouteNode);
+                await safeSendMessage(
+                  platform,
+                  conversationId,
+                  `! Loop node \`${node.id}\` had no private OpenRouter endpoint on ${loopProvider}; rerouting to ${reroute.routedProvider} (one attempt).`,
+                  { workflowId: workflowRun.id, nodeName: node.id }
+                );
+                output = await executeLoopNode(
+                  deps,
+                  platform,
+                  conversationId,
+                  cwd,
+                  workflowRun,
+                  rerouteNode as LoopNode,
+                  reroute.routedProvider,
+                  reroute.routedModel,
+                  artifactsDir,
+                  logDir,
+                  baseBranch,
+                  docsDir,
+                  nodeOutputs,
+                  config,
+                  issueContext,
+                  workflowLevelOptions
+                );
+              } catch (rerouteErr) {
+                getLog().error(
+                  { err: rerouteErr as Error, nodeId: node.id },
+                  'dag.openrouter_no_private_endpoint_reroute_failed'
+                );
+              }
+            }
 
             // AVAILABILITY failover for loop nodes (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
             // Same doctrine as prompt nodes: one sideways re-dispatch on a declared
@@ -6532,7 +7288,8 @@ async function executeDagWorkflowInternal(
                 resumeSessionId,
                 configuredCommandFolder,
                 issueContext,
-                personaContextState
+                personaContextState,
+                workflowLevelOptions
               );
 
               if (output.state !== 'failed') break;
@@ -6609,6 +7366,79 @@ async function executeDagWorkflowInternal(
               continue sdkContradictionRetry;
             }
             break;
+          }
+
+          // OpenRouter no-private-endpoint reroute (WO-HARNESS-OPENROUTER-
+          // REVIEW-DIFF-SCAN-01): the pinned OpenRouter request found no
+          // zdr / data_collection:deny endpoint. The provider already failed
+          // closed (no unpinned retry); reroute the review to a non-OpenRouter
+          // seat and record the decision. Never retried without the pin.
+          if (
+            output.state === 'failed' &&
+            output.error?.includes('openrouter_no_private_endpoint')
+          ) {
+            try {
+              const declaredFailover = resolveFailoverTarget(node, workflowLevelOptions);
+              const noEndpointRemote = await defaultResolveRemote(cwd).catch(() => null);
+              const reroute = await emitNoPrivateEndpointReroute({
+                deps,
+                workflowRun,
+                nodeId: node.id,
+                provider,
+                repo: normalizeRepoSlug(noEndpointRemote) ?? noEndpointRemote ?? '',
+                failoverTarget: declaredFailover,
+              });
+              const rerouteNode = buildFailoverNode(node, {
+                provider: reroute.routedProvider,
+                model: reroute.routedModel,
+                agent: declaredFailover?.agent,
+              });
+              assertProviderCanExecuteNode(reroute.routedProvider, rerouteNode);
+              const rerouteResolved = await resolveNodeProviderAndModel(
+                rerouteNode,
+                workflowProvider,
+                workflowModel,
+                config,
+                platform,
+                conversationId,
+                workflowRun.id,
+                cwd,
+                workflowLevelOptions,
+                modelOverride
+              );
+              await safeSendMessage(
+                platform,
+                conversationId,
+                `! Node \`${node.id}\` had no private OpenRouter endpoint on ${provider}; rerouting to ${rerouteResolved.provider} (one attempt).`,
+                { workflowId: workflowRun.id, nodeName: node.id }
+              );
+              output = await executeNodeInternal(
+                deps,
+                platform,
+                conversationId,
+                cwd,
+                workflowRun,
+                rerouteNode as CommandNode | PromptNode,
+                rerouteResolved.provider,
+                rerouteResolved.options,
+                rerouteResolved.declaredModelId,
+                artifactsDir,
+                logDir,
+                baseBranch,
+                docsDir,
+                nodeOutputs,
+                resumeSessionId,
+                configuredCommandFolder,
+                issueContext,
+                rerouteResolved.personaContextState,
+                workflowLevelOptions
+              );
+            } catch (rerouteErr) {
+              getLog().error(
+                { err: rerouteErr as Error, nodeId: node.id },
+                'dag.openrouter_no_private_endpoint_reroute_failed'
+              );
+            }
           }
 
           // AVAILABILITY failover (WO-HARNESS-NODE-PROVIDER-FAILOVER-01): the
@@ -6697,7 +7527,8 @@ async function executeDagWorkflowInternal(
                 resumeSessionId,
                 configuredCommandFolder,
                 issueContext,
-                failoverResolved.personaContextState
+                failoverResolved.personaContextState,
+                workflowLevelOptions
               );
             } catch (failoverErr) {
               // A misconfigured failover (e.g. InfrastructureClassBlock from a
@@ -6835,6 +7666,28 @@ async function executeDagWorkflowInternal(
       getLog().warn({ layerIdx, nodeCount: layer.length }, 'dag_layer_had_failures');
     }
 
+    // abort_run_on_failure (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 7): a failed
+    // repair checkout ends the run at once; nothing later runs.
+    const abortingNode = layer.find(
+      n => n.abort_run_on_failure === true && nodeOutputs.get(n.id)?.state === 'failed'
+    );
+    if (abortingNode) {
+      const abortOutput = nodeOutputs.get(abortingNode.id);
+      const abortError =
+        abortOutput?.state === 'failed' ? (abortOutput.error ?? abortOutput.output) : '';
+      runAbort = { nodeId: abortingNode.id, reason: repairFailureReason(abortError) };
+      for (const pending of workflow.nodes) {
+        if (!nodeOutputs.has(pending.id)) {
+          nodeOutputs.set(pending.id, { state: 'skipped', output: '' });
+        }
+      }
+      getLog().warn(
+        { workflowRunId: workflowRun.id, nodeId: abortingNode.id, reason: runAbort.reason },
+        'dag.run_aborted_on_node_failure'
+      );
+      break;
+    }
+
     // Check for non-running status between DAG layers (cancellation, deletion, pause)
     try {
       const dagStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
@@ -6849,6 +7702,11 @@ async function executeDagWorkflowInternal(
           },
           'dag.stop_detected_between_layers'
         );
+        // An external terminal transition (operator cancel, conductor stall cancel)
+        // still owes a teardown: processes in the worktree must not outlive the run.
+        if (isTerminalRunStatus(dagStatus)) {
+          await finalizeRunTeardown(deps.store, workflowRun);
+        }
         // Paused is intentional (approval gate) -- the approval message was already sent
         if (effectiveStatus !== 'paused') {
           await safeSendMessage(
@@ -6871,6 +7729,7 @@ async function executeDagWorkflowInternal(
 
   if (deps.isRunLeaseValid?.() === false) {
     getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost_before_terminal');
+    await writeRunLeaseLostEvent(deps, workflowRun.id, 'before_terminal');
     return;
   }
 
@@ -7031,17 +7890,72 @@ async function executeDagWorkflowInternal(
     'dag_workflow_finished'
   );
 
+  if (runAbort) {
+    if (await skipIfStatusChanged('dag.skip_fail_status_changed')) return;
+    const failMsg =
+      `DAG workflow '${workflow.name}' aborted: node '${runAbort.nodeId}' failed ` +
+      `(abort_run_on_failure): ${runAbort.reason}`;
+    const failedOutcome = await makeTerminalOutcome('failed');
+    const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
+    try {
+      await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
+        outcome: failedOutcome,
+        updatedAt: new Date().toISOString(),
+        metadata: {
+          ...teardownMd,
+          node_counts: nodeCounts,
+          terminal_cause: 'repair_checkout_failed',
+          repair_failure_reason: runAbort.reason,
+          failed_nodes: [runAbort.nodeId],
+        },
+        eventData: {
+          error: failMsg,
+          node_counts: nodeCounts,
+          terminal_cause: 'repair_checkout_failed',
+          repair_failure_reason: runAbort.reason,
+        },
+      });
+    } catch (dbErr) {
+      await handleTerminalPersistenceFailure('failed', failedOutcome, dbErr as Error);
+      return;
+    }
+    emitTerminalRunTokenTotals();
+    await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
+      getLog().error(
+        { err: logErr, workflowRunId: workflowRun.id },
+        'dag.workflow_error_log_write_failed'
+      );
+    });
+    const emitterForAbort = getWorkflowEventEmitter();
+    emitterForAbort.emit({
+      type: 'workflow_failed',
+      runId: workflowRun.id,
+      workflowName: workflow.name,
+      error: failMsg,
+    });
+    emitterForAbort.unregisterRun(workflowRun.id);
+    await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
+      workflowId: workflowRun.id,
+    });
+    return;
+  }
+
   if (!anyCompleted) {
     if (await skipIfStatusChanged('dag.skip_fail_status_changed')) return;
     const failMsg =
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
     const failedOutcome = await makeTerminalOutcome('failed');
+    const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
         updatedAt: new Date().toISOString(),
-        metadata: { node_counts: nodeCounts, terminal_cause: 'no_successful_nodes' },
+        metadata: {
+          ...teardownMd,
+          node_counts: nodeCounts,
+          terminal_cause: 'no_successful_nodes',
+        },
         eventData: {
           error: failMsg,
           node_counts: nodeCounts,
@@ -7090,29 +8004,66 @@ async function executeDagWorkflowInternal(
     const failedNodeIds = [...nodeOutputs.entries()]
       .filter(([, o]) => o.state === 'failed')
       .map(([id]) => id);
-    const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
-    if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
+    // Advisory pre-check nodes (WO-HARNESS-ADVISORY-NODE-FAILURE-NOT-RUN-FAILURE-01): when
+    // every failed node is advisory (or paperwork) the run's substantive work is judged by the
+    // rest of the DAG. Advisory failures need the run's terminal gate to have PASSED (the node
+    // `blocked-terminal-gate`, when the workflow declares it, must have completed; a workflow
+    // without it needs a pushed artifact instead). A failed or skipped terminal gate, or a failed
+    // required node, keeps the run failed exactly as before. Mechanical evidence nodes (for example
+    // the lane's build-manifest) must have COMPLETED for the advisory path: a lane that has them is
+    // the common case (the cursor lane), so the paperwork rule's "no evidence node" guard is not
+    // reused here; the evidence nodes passing is the equivalent proof.
+    const failedAdvisoryNodeIds = failedNodeIds.filter(id => isAdvisoryNode(id));
+    const failedPaperworkNodeIds = failedNodeIds.filter(id => isPaperworkNode(id));
+    const allFailuresAreKnownDegradable = failedNodeIds.every(
+      id => isPaperworkNode(id) || isAdvisoryNode(id)
+    );
+    const terminalGateDeclared = workflow.nodes.some(n => n.id === 'blocked-terminal-gate');
+    const terminalGatePassed = terminalGateDeclared
+      ? nodeOutputs.get('blocked-terminal-gate')?.state === 'completed'
+      : pushArtifactPresent;
+    const advisoryDegraded = failedAdvisoryNodeIds.length > 0;
+    const evidenceNodesCompleted = workflow.nodes
+      .filter(isEvidenceNode)
+      .every(n => nodeOutputs.get(n.id)?.state === 'completed');
+    const paperworkAllowsDegrade =
+      failedPaperworkNodeIds.length === 0 || (!hasMechanicalEvidenceNode && pushArtifactPresent);
+    const advisoryAllowsDegrade =
+      !advisoryDegraded || (terminalGatePassed && evidenceNodesCompleted);
+    if (allFailuresAreKnownDegradable && paperworkAllowsDegrade && advisoryAllowsDegrade) {
       getLog().warn(
-        { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
-        'dag.workflow_completed_paperwork_degraded'
+        {
+          workflowRunId: workflowRun.id,
+          degradedPaperworkNodes: failedPaperworkNodeIds,
+          degradedAdvisoryNodes: failedAdvisoryNodeIds,
+        },
+        advisoryDegraded
+          ? 'dag.workflow_completed_advisory_degraded'
+          : 'dag.workflow_completed_paperwork_degraded'
       );
       const degradedDuration = Date.now() - dagStartTime;
       const degradedOutcome = await makeTerminalOutcome('completed');
+      const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
       try {
         await deps.store.completeWorkflowRun(
           workflowRun.id,
           {
+            ...teardownMd,
             node_counts: nodeCounts,
             // Degraded-success signal consumed by the dashboard (Section 5 of the
             // WO): status 'completed' + paperwork_degraded=true, no new enum value.
-            paperwork_degraded: true,
-            degraded_paperwork_nodes: failedNodeIds,
+            ...(failedPaperworkNodeIds.length > 0
+              ? { paperwork_degraded: true, degraded_paperwork_nodes: failedPaperworkNodeIds }
+              : {}),
+            ...(advisoryDegraded
+              ? { advisory_degraded: true, failed_advisory_nodes: failedAdvisoryNodeIds }
+              : {}),
             ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
             ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
             ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
             ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
             ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
-            terminal_cause: 'paperwork_degraded',
+            terminal_cause: advisoryDegraded ? 'advisory_degraded' : 'paperwork_degraded',
           },
           {
             outcome: degradedOutcome,
@@ -7120,9 +8071,13 @@ async function executeDagWorkflowInternal(
             eventData: {
               duration_ms: degradedDuration,
               node_counts: nodeCounts,
-              terminal_cause: 'paperwork_degraded',
-              paperwork_degraded: true,
-              degraded_paperwork_nodes: failedNodeIds,
+              terminal_cause: advisoryDegraded ? 'advisory_degraded' : 'paperwork_degraded',
+              ...(failedPaperworkNodeIds.length > 0
+                ? { paperwork_degraded: true, degraded_paperwork_nodes: failedPaperworkNodeIds }
+                : {}),
+              ...(advisoryDegraded
+                ? { advisory_degraded: true, failed_advisory_nodes: failedAdvisoryNodeIds }
+                : {}),
             },
           }
         );
@@ -7149,7 +8104,9 @@ async function executeDagWorkflowInternal(
       await safeSendMessage(
         platform,
         conversationId,
-        `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): the build landed (branch/PR artifact present) but paperwork node(s) failed: ${failedNodeIds.join(', ')}. Run marked completed with paperwork_degraded=true.`,
+        advisoryDegraded
+          ? `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): advisory pre-check node(s) failed (${failedAdvisoryNodeIds.join(', ')}) but every required node and the terminal gate passed. Run marked completed with advisory_degraded=true.`
+          : `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): the build landed (branch/PR artifact present) but paperwork node(s) failed: ${failedNodeIds.join(', ')}. Run marked completed with paperwork_degraded=true.`,
         { workflowId: workflowRun.id }
       );
       return;
@@ -7161,11 +8118,13 @@ async function executeDagWorkflowInternal(
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
     const failedOutcome = await makeTerminalOutcome('failed');
+    const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
         updatedAt: new Date().toISOString(),
         metadata: {
+          ...teardownMd,
           node_counts: nodeCounts,
           terminal_cause: 'node_failures',
           failed_nodes: failedNodeIds,
@@ -7210,10 +8169,14 @@ async function executeDagWorkflowInternal(
   // Persist terminal facts before publishing any terminal event.
   const duration = Date.now() - dagStartTime;
   const completedOutcome = await makeTerminalOutcome('completed');
+  // Teardown (N1-N3) runs and persists metadata.teardown_confirmed_at (or
+  // metadata.teardown_survivors) BEFORE the terminal status write below.
+  const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
   try {
     await deps.store.completeWorkflowRun(
       workflowRun.id,
       {
+        ...teardownMd,
         node_counts: nodeCounts,
         // totalCostUsd starts at 0; only write metadata when at least one node reported cost
         ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
@@ -7268,6 +8231,38 @@ async function executeDagWorkflowInternal(
   return terminalOutput;
 }
 
+/**
+ * WO-HARNESS-RUN-LEASE-LOST-SAYS-SO-01: the executor stops a run whose lease was lost at two points. Before
+ * this, nothing was written, so the run ended with the backstop's generic message. Now one `run_lease_lost`
+ * event says where it stopped and the measured numbers, and the loss descriptor remembers where, for the
+ * backstop's failure message. Never throws: the event is a note, the stop itself is unchanged.
+ */
+async function writeRunLeaseLostEvent(
+  deps: WorkflowDeps,
+  runId: string,
+  where: 'layer_boundary' | 'before_terminal'
+): Promise<void> {
+  const loss = deps.getRunLeaseLoss?.() ?? null;
+  if (loss) loss.stoppedAt = where;
+  const leaseClock = deps.runLeaseTiming?.now ?? ((): Date => new Date());
+  try {
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'run_lease_lost',
+      data: {
+        where,
+        reason: loss?.reason ?? 'unknown',
+        last_renewed_at: loss?.lastRenewedAt ?? null,
+        expires_at: loss?.expiresAt ?? null,
+        detected_at: loss?.detectedAt ?? null,
+        gap_seconds: loss ? runLeaseGapSeconds(loss, leaseClock()) : null,
+      },
+    });
+  } catch (err) {
+    getLog().warn({ err: err as Error, workflowRunId: runId }, 'dag.run_lease_lost_event_failed');
+  }
+}
+
 export const executeDagWorkflow: typeof executeDagWorkflowInternal = async (...args) => {
   const [
     deps,
@@ -7312,8 +8307,12 @@ export const executeDagWorkflow: typeof executeDagWorkflowInternal = async (...a
     args[16] = execution.modelOverride;
   }
   const [, ...executionArgs] = args;
-  return withRunLease(deps.store, workflowRun.id, isRunLeaseValid =>
-    executeDagWorkflowInternal({ ...deps, isRunLeaseValid }, ...executionArgs)
+  return withRunLease(
+    deps.store,
+    workflowRun.id,
+    (isRunLeaseValid, getRunLeaseLoss) =>
+      executeDagWorkflowInternal({ ...deps, isRunLeaseValid, getRunLeaseLoss }, ...executionArgs),
+    deps.runLeaseTiming
   );
 };
 

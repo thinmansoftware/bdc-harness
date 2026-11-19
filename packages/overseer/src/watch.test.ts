@@ -136,6 +136,69 @@ describe('watch head-branch recovery', () => {
 
     expect(searched?.headBranch).toBeUndefined();
   });
+
+  test('event unique_branch overrides metadata head_branch for PR search', async () => {
+    const runWithMetadataHead: OverseerRunRecord = {
+      id: 'run-event-wins',
+      woId: 'WO-01',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      status: 'completed',
+      headBranch: 'archon/thread-abc',
+      metadata: { head_branch: 'archon/thread-abc' },
+    };
+    const events = [
+      event('event-1', 'node_completed', 'commit-and-push', '2026-07-28T10:00:00.000Z', {
+        output: 'unique_branch=feat/wo-01-thread-abc\n',
+      }),
+    ];
+
+    let searched: { headBranch?: string } | undefined;
+    const recoveringDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+      listRunsForWatch: async () => [runWithMetadataHead],
+      listRunEvents: async () => events,
+      findPullRequest: async input => {
+        searched = input;
+        return mergeReadyPrEvidence;
+      },
+      mergePullRequest: async () => ({ merged: true }),
+    };
+
+    await watchOnce(recoveringDeps);
+
+    expect(searched?.headBranch).toBe('feat/wo-01-thread-abc');
+  });
+
+  test('keeps the metadata head branch when events report no unique_branch', async () => {
+    const runWithMetadataHead: OverseerRunRecord = {
+      id: 'run-metadata-head',
+      woId: 'WO-01',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      status: 'completed',
+      headBranch: 'archon/thread-abc',
+      metadata: { head_branch: 'archon/thread-abc' },
+    };
+
+    let searched: { headBranch?: string } | undefined;
+    const recoveringDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+      listRunsForWatch: async () => [runWithMetadataHead],
+      listRunEvents: async () => [
+        event('event-1', 'node_completed', 'plan', '2026-07-28T10:00:00.000Z', {
+          output: 'planning complete',
+        }),
+      ],
+      findPullRequest: async input => {
+        searched = input;
+        return failedPrEvidence;
+      },
+      mergePullRequest: async () => ({ merged: true }),
+    };
+
+    await watchOnce(recoveringDeps);
+
+    expect(searched?.headBranch).toBe('archon/thread-abc');
+  });
 });
 
 describe('watch selectFailureEvent', () => {
@@ -317,28 +380,27 @@ describe('watch selectFailureEvent', () => {
   });
 
   test('early_return_path_never_reaches_selector', async () => {
-    const throwingDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+    // Branch recovery may read events. These PR outcomes still do not go
+    // through the failure selector: empty events leave the metadata head in
+    // place, and the PR evidence decides the action.
+    const mergedDeps: OverseerRunStoreDeps & GitHubClientDeps = {
       ...deps([]),
-      listRunEvents: async () => {
-        throw new Error('listRunEvents should not be called for merged PR evidence');
-      },
+      listRunEvents: async () => [],
       findPullRequest: async () => mergedPrEvidence,
     };
 
-    const [record] = await watchOnce(throwingDeps);
+    const [record] = await watchOnce(mergedDeps);
 
     expect(record.action).toBe('success');
     expect(record.errorClass).toBeUndefined();
 
-    const mergeReadyThrowingDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+    const mergeReadyDeps: OverseerRunStoreDeps & GitHubClientDeps = {
       ...deps([]),
-      listRunEvents: async () => {
-        throw new Error('listRunEvents should not be called for merge-ready PR evidence');
-      },
+      listRunEvents: async () => [],
       findPullRequest: async () => mergeReadyPrEvidence,
     };
 
-    const [mergeReadyRecord] = await watchOnce(mergeReadyThrowingDeps);
+    const [mergeReadyRecord] = await watchOnce(mergeReadyDeps);
 
     expect(mergeReadyRecord.action).toBe('merge_ready');
     expect(mergeReadyRecord.errorClass).toBe('tail_node_false_fail');

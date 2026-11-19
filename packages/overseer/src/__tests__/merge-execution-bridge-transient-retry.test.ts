@@ -83,6 +83,8 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
         headBranch: 'feature',
         metadata: {},
       }) as OverseerWatchRun,
+    getEarliestMergeSlotReservation: async () =>
+      new Date(Date.now() - 50 * 60 * 1000).toISOString(),
     reserveMergeSlot: async () => true,
     releaseMergeSlot: async id => {
       releases.push(id);
@@ -100,8 +102,11 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
     },
   };
   const options: MergeExecutionBridgeOptions = {
+    readRunEvents: async () => [],
     store,
     github,
+    hasQualifiedReview: async () => true,
+    reviewConflictAtHead: async () => null,
     now: () => clock,
     retryBaseMinutes: 10,
     retryMaxDelayMinutes: 240,

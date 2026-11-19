@@ -5,17 +5,26 @@ import {
   deferVerdictClaimForMergeExecution,
   finalizeOverseerVerdict,
   getOverseerWatchRunById,
+  getVerdictByRunHead,
   insertOverseerAction,
   listActiveRunUserMessages,
+  listOriginatingRunCandidates,
+  getWorkflowRunUserMessage,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
+  promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
   reserveOverseerMergeSlot,
+  getEarliestOverseerMergeSlotReservation,
 } from '@archon/core/db/overseer';
 import { hasActiveRunForWo } from './active-run-guard';
+import { findOriginatingRunForPullRequest } from './originating-run-lookup';
+import { createMergedSiblingFinder, createOriginatingWoResolver } from './sibling-wo-id';
+import type { OriginatingRun } from './originating-run-lookup';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
 import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
@@ -29,6 +38,7 @@ import { permitFromMetadata } from './permit';
 import { runReconcileOnce } from './reconcile';
 import { watchLoop } from './watch';
 import type {
+  DeterministicMergeHandoff,
   GitHubClientDeps,
   OverseerActionsDeps,
   OverseerRunStoreDeps,
@@ -42,8 +52,18 @@ import { assessBranchRefreshCandidate } from './actions/refresh-rebase';
 import { assessLifecycleCandidate } from './actions/lifecycle';
 import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
-import { createRealGitHubClientDeps } from './adapters/github-real-deps';
+import { createRealGitHubClientDeps, createRealOctokitClient } from './adapters/github-real-deps';
+import {
+  createGitHubMergedSource,
+  createStrayBranchReader,
+  runPostMergeStraySweepOnce,
+  type GitHubMergedListOctokitLike,
+  type StrayBranchOctokitLike,
+} from './post-merge-stray-sweep';
+import { resolveDiscoveryRepos } from './merge-candidate-discovery';
+import { resolveMergeRepoPolicy } from './merge-repo-policy';
 import { runMergeExecutionBridgeOnce } from './merge-execution-bridge';
+import { readWoSpecForMergeHold } from './merge-hold';
 
 /**
  * Integrated S4-S7 assessment surface for Slice 8 wiring.
@@ -71,6 +91,13 @@ export interface OverseerServiceOptions {
   enabled?: boolean;
   dryRun?: boolean;
   mergeCoordinator?: MergeReadyCoordinator;
+  /**
+   * Replay handoff. Tests inject this directly. When the property is omitted,
+   * the service binds mergeBridgeRun only when mergeBridgeEnabled is true.
+   * An explicit undefined fails closed and is never replaced with
+   * mergeCoordinator.
+   */
+  deterministicMergeHandoff?: DeterministicMergeHandoff;
   intervalMs?: number;
   signal?: AbortSignal;
   /**
@@ -87,8 +114,24 @@ export interface OverseerServiceOptions {
   reconcileIntervalMs?: number;
   reconcileRun?: () => Promise<unknown>;
   mergeBridgeIntervalMs?: number;
+  /**
+   * Merge-execution bridge tick. The scheduler uses it when mergeBridgeEnabled
+   * is set. When deterministicMergeHandoff is omitted, replay handoff binds
+   * this runner only when mergeBridgeEnabled is exactly true.
+   */
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
+  /**
+   * Post-merge stray-push sweep (rule (d) of WO-HARNESS-MERGE-OWNER-REWORKING-GUARD-01).
+   * Off unless this is true or OVERSEER_POST_MERGE_SWEEP is 1/true/yes. Hourly by default.
+   */
+  postMergeSweepEnabled?: boolean;
+  postMergeSweepIntervalMs?: number;
+  postMergeSweepRun?: () => Promise<unknown>;
+  /** Test seam: the GitHub client the default sweep uses (pulls.list and git.getRef). */
+  postMergeSweepOctokit?: GitHubMergedListOctokitLike & StrayBranchOctokitLike;
+  /** Tests inject a spy for the delivery isolation line; defaults to the module logger. */
+  logger?: { error?(obj: Record<string, unknown>, msg: string): void };
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -98,6 +141,8 @@ export async function runOperatorCardDeliveryScheduler(input: {
   once?: boolean;
   drain?: () => Promise<unknown>;
   channels?: OperatorCardChannel[];
+  /** Tests inject a spy; defaults to the module logger. */
+  logger?: { error?(obj: Record<string, unknown>, msg: string): void };
 }): Promise<void> {
   const drain =
     input.drain ??
@@ -108,7 +153,19 @@ export async function runOperatorCardDeliveryScheduler(input: {
       }));
   for (;;) {
     if (input.signal?.aborted) return;
-    await drain();
+    // Isolated like the reconcile and merge-bridge schedulers. On 2026-11-04 a
+    // SQLITE_BUSY thrown here went uncaught through abortOnFailure and stopped
+    // the watcher and merge bridge with it, for an hour, with nothing to restart them.
+    try {
+      await drain();
+    } catch (error) {
+      const customLogger = input.logger;
+      const emit = (obj: Record<string, unknown>, msg: string): void => {
+        if (customLogger?.error) customLogger.error(obj, msg);
+        else log.error(obj, msg);
+      };
+      emit({ err: error as Error }, 'overseer.delivery.iteration_failed_isolated');
+    }
     if (input.once || input.signal?.aborted) return;
     await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
   }
@@ -192,6 +249,9 @@ export function emergencyStopEngaged(): boolean {
 const defaultVerdictStore: OverseerVerdictStoreDeps = {
   claimVerdict: claimOverseerVerdict,
   finalizeVerdict: finalizeOverseerVerdict,
+  getVerdictByRunHead,
+  promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
 };
 
 /**
@@ -206,7 +266,8 @@ export async function handleRecord(
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean,
   actor: string,
-  mergeCoordinator?: MergeReadyCoordinator
+  mergeCoordinator?: MergeReadyCoordinator,
+  deterministicMergeHandoff?: DeterministicMergeHandoff
 ): Promise<void> {
   if (emergencyStopEngaged()) {
     log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
@@ -223,6 +284,7 @@ export async function handleRecord(
         dryRun,
         actor,
         mergeCoordinator,
+        deterministicMergeHandoff,
         verdictStore: defaultVerdictStore,
       });
     } catch (error) {
@@ -394,6 +456,138 @@ export async function handleRecord(
   );
 }
 
+function githubCanDriveMergeBridge(github: GitHubClientDeps): boolean {
+  return (
+    typeof github.findPullRequest === 'function' && typeof github.mergePullRequest === 'function'
+  );
+}
+
+function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<void> {
+  const readSiblingContext = github.readSiblingMergeContext?.bind(github);
+  const listMergedFiles = github.listMergedPullRequestFiles?.bind(github);
+  return (): Promise<void> =>
+    runMergeExecutionBridgeOnce({
+      github,
+      readRunEvents: listRunEventsForOverseer,
+      findOriginatingRun: (input): Promise<OriginatingRun | null> =>
+        findOriginatingRunForPullRequest(input, listOriginatingRunCandidates),
+      ...(readSiblingContext && listMergedFiles
+        ? {
+            findMergedSibling: createMergedSiblingFinder({
+              readContext: readSiblingContext,
+              resolve: createOriginatingWoResolver({
+                list: listOriginatingRunCandidates,
+                readUserMessage: getWorkflowRunUserMessage,
+              }),
+              listMergedFiles,
+            }),
+          }
+        : {}),
+      ...(github.hasQualifiedReview
+        ? {
+            hasQualifiedReview: (input): Promise<boolean> =>
+              github.hasQualifiedReview?.(input) ?? Promise.resolve(false),
+          }
+        : {}),
+      ...(github.reviewConflictAtHead
+        ? {
+            reviewConflictAtHead: (
+              input
+            ): ReturnType<NonNullable<GitHubClientDeps['reviewConflictAtHead']>> =>
+              github.reviewConflictAtHead?.(input) ?? Promise.resolve('lookup_failed'),
+          }
+        : {}),
+      store: {
+        listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
+        claimVerdict: claimVerdictForMergeExecution,
+        releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
+        deferVerdictClaim: deferVerdictClaimForMergeExecution,
+        getRunById: getOverseerWatchRunById,
+        hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
+        reserveMergeSlot: reserveOverseerMergeSlot,
+        getEarliestMergeSlotReservation: getEarliestOverseerMergeSlotReservation,
+        releaseMergeSlot: releaseOverseerMergeSlot,
+        recordOutcome: recordVerdictMergeOutcome,
+      },
+      readWoSpec: readWoSpecForMergeHold,
+    });
+}
+
+const POST_MERGE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+
+/** Never throws: a sweep failure is logged and the next tick tries again. */
+/**
+ * The repositories the sweep covers: every repository in the merge policy plus those in
+ * OVERSEER_MERGE_DISCOVERY_REPOS, each once, read through the existing policy helpers.
+ */
+export function postMergeSweepRepos(
+  discoveryRaw: string | undefined = process.env.OVERSEER_MERGE_DISCOVERY_REPOS
+): { owner: string; repo: string }[] {
+  const seen = new Set<string>();
+  const repos: { owner: string; repo: string }[] = [];
+  const add = (owner: string, repo: string): void => {
+    const key = `${owner}/${repo}`.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    repos.push({ owner, repo });
+  };
+  for (const key of Object.keys(resolveMergeRepoPolicy())) {
+    const slash = key.indexOf('/');
+    if (slash > 0 && slash < key.length - 1) add(key.slice(0, slash), key.slice(slash + 1));
+  }
+  for (const target of resolveDiscoveryRepos(discoveryRaw)) add(target.owner, target.repo);
+  return repos;
+}
+
+function createPostMergeStraySweepRun(
+  injected?: GitHubMergedListOctokitLike & StrayBranchOctokitLike
+): (() => Promise<void>) | undefined {
+  let octokit: GitHubMergedListOctokitLike & StrayBranchOctokitLike;
+  if (injected) {
+    octokit = injected;
+  } else {
+    const real = createRealOctokitClient();
+    if (!real.git) {
+      log.error({}, 'overseer.post_merge_sweep.bind_failed');
+      return undefined;
+    }
+    octokit = { pulls: real.pulls, git: real.git } as GitHubMergedListOctokitLike &
+      StrayBranchOctokitLike;
+  }
+  const reader = createStrayBranchReader(octokit);
+  return async (): Promise<void> => {
+    try {
+      const result = await runPostMergeStraySweepOnce({
+        listCandidates: createGitHubMergedSource(octokit, postMergeSweepRepos()),
+        reader,
+      });
+      log.info(
+        {
+          examined: result.examined,
+          alerted: result.alerted.length,
+          alreadyAlerted: result.alreadyAlerted,
+          noStray: result.noStray,
+          unreadable: result.unreadable,
+        },
+        'overseer.post_merge_sweep.tick'
+      );
+    } catch (error) {
+      log.error({ err: error as Error }, 'overseer.post_merge_sweep.iteration_failed_isolated');
+    }
+  };
+}
+
+function resolveDeterministicMergeHandoff(
+  options: OverseerServiceOptions,
+  bridgeRun: (() => Promise<unknown>) | undefined
+): DeterministicMergeHandoff | undefined {
+  if (Object.prototype.hasOwnProperty.call(options, 'deterministicMergeHandoff')) {
+    return options.deterministicMergeHandoff;
+  }
+  if (options.mergeBridgeEnabled !== true || !bridgeRun) return undefined;
+  return { handoff: () => bridgeRun() };
+}
+
 export async function runOverseerService(options: OverseerServiceOptions = {}): Promise<void> {
   const enabled = options.enabled ?? envEnabled(process.env.OVERSEER_ENABLED);
   if (!enabled) return;
@@ -407,6 +601,11 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     throw new Error('overseer_real_adapter_requires_qualified_coordinator');
   }
   const deps = options.deps ?? resolveDefaultDeps();
+  const defaultMergeBridgeRun = githubCanDriveMergeBridge(deps)
+    ? createMergeExecutionBridgeRun(deps)
+    : undefined;
+  const mergeBridgeRun = options.mergeBridgeRun ?? defaultMergeBridgeRun;
+  const deterministicMergeHandoff = resolveDeterministicMergeHandoff(options, mergeBridgeRun);
   const coupledAbort = new AbortController();
   const abortFromParent = (): void => {
     coupledAbort.abort();
@@ -415,7 +614,15 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
-    record => handleRecord(record, deps, dryRun, 'overseer-service', options.mergeCoordinator),
+    record =>
+      handleRecord(
+        record,
+        deps,
+        dryRun,
+        'overseer-service',
+        options.mergeCoordinator,
+        deterministicMergeHandoff
+      ),
     {
       intervalMs: options.intervalMs,
       once: options.once,
@@ -424,31 +631,32 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   );
   const tasks: Promise<void>[] = [watcher];
   if (options.mergeBridgeEnabled) {
-    const mergeBridgeRun =
-      options.mergeBridgeRun ??
-      ((): Promise<void> =>
-        runMergeExecutionBridgeOnce({
-          github: deps,
-          store: {
-            listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
-            claimVerdict: claimVerdictForMergeExecution,
-            releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
-            deferVerdictClaim: deferVerdictClaimForMergeExecution,
-            getRunById: getOverseerWatchRunById,
-            hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
-            reserveMergeSlot: reserveOverseerMergeSlot,
-            releaseMergeSlot: releaseOverseerMergeSlot,
-            recordOutcome: recordVerdictMergeOutcome,
-          },
-        }));
-    tasks.push(
-      runMergeBridgeScheduler({
-        signal: coupledAbort.signal,
-        intervalMs: options.mergeBridgeIntervalMs,
-        once: options.once,
-        run: mergeBridgeRun,
-      })
-    );
+    if (!mergeBridgeRun) {
+      log.error({}, 'overseer.merge_bridge.bind_failed');
+    } else {
+      tasks.push(
+        runMergeBridgeScheduler({
+          signal: coupledAbort.signal,
+          intervalMs: options.mergeBridgeIntervalMs,
+          once: options.once,
+          run: mergeBridgeRun,
+        })
+      );
+    }
+  }
+  if (options.postMergeSweepEnabled ?? envEnabled(process.env.OVERSEER_POST_MERGE_SWEEP)) {
+    const sweepRun =
+      options.postMergeSweepRun ?? createPostMergeStraySweepRun(options.postMergeSweepOctokit);
+    if (sweepRun) {
+      tasks.push(
+        runMergeBridgeScheduler({
+          signal: coupledAbort.signal,
+          intervalMs: options.postMergeSweepIntervalMs ?? POST_MERGE_SWEEP_INTERVAL_MS,
+          once: options.once,
+          run: sweepRun,
+        })
+      );
+    }
   }
   if (options.deliveryEnabled) {
     const delivery = runOperatorCardDeliveryScheduler({
@@ -458,6 +666,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
       once: options.once,
       channels: options.deliveryChannels,
       drain: options.deliveryDrain,
+      ...(options.logger === undefined ? {} : { logger: options.logger }),
     });
     tasks.push(delivery);
   }

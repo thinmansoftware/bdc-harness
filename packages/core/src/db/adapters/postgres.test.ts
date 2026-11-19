@@ -238,6 +238,21 @@ describe('PostgresAdapter', () => {
         // desktop Board/XO seat, added after Phase 0, so combined carries it.
         ['astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 'TRUE'],
         ['taskmaster', 'Taskmaster', 'worker_poll', 'TRUE'],
+        // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065).
+        ['t3-desktop', 'T3 desktop results queue', 'drain_on_start', 'TRUE'],
+        ['pr-review-log', 'PR review receipt log', 'drain_on_start', 'TRUE'],
+        // WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065): companion
+        // mailboxes added after Phase 0. combined carries them; migration 040
+        // must not.
+        ['grokbot', 'Grok Bot (voice companion)', 'drain_on_start', 'TRUE'],
+        ['dot', 'Dot (voice companion)', 'drain_on_start', 'FALSE'],
+        ['muse', 'Muse (voice companion)', 'drain_on_start', 'FALSE'],
+        ['duet', 'Duet (voice companion)', 'drain_on_start', 'FALSE'],
+        // WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067): the cauldron-fire
+        // command consumer mailbox and the t3-bridge VPS sender, seeded after
+        // Phase 0. combined carries them; migration 040 must not.
+        ['cauldron-fire', 'T3 command consumer', 'drain_on_start', 'TRUE'],
+        ['t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', 'TRUE'],
       ] as const;
 
       expect(migration).toContain(

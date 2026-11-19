@@ -140,7 +140,7 @@ describe('CodexProvider', () => {
         costControl: false,
         effortControl: false,
         thinkingControl: false,
-        fallbackModel: false,
+        fallbackModel: true,
         sandbox: false,
       });
     });
@@ -881,6 +881,42 @@ describe('CodexProvider', () => {
         })
       );
       expect(mockStartThread).toHaveBeenCalledTimes(1);
+    });
+
+    test('the Codex CLI env has none of the personal GitHub token names, even from request env (bdc-xo#5464)', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+      const names = [
+        'GH_TOKEN',
+        'GITHUB_TOKEN',
+        'MERGE_MANAGER_GH_TOKEN',
+        'GH_AUTH_TOKEN_INTERNAL',
+        'ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN',
+      ];
+      const saved = Object.fromEntries(names.map(n => [n, process.env[n]]));
+      for (const n of names) process.env[n] = 'ghp_synthetic';
+      try {
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          env: { GITHUB_TOKEN: 'ghp_from_request', MY_SECRET: 'abc123' },
+        })) {
+          // consume
+        }
+      } finally {
+        for (const n of names) {
+          if (saved[n] === undefined) delete process.env[n];
+          else process.env[n] = saved[n];
+        }
+      }
+      const lastCall = MockCodex.mock.calls[MockCodex.mock.calls.length - 1] as unknown as [
+        { env: Record<string, string> },
+      ];
+      const env = lastCall[0].env;
+      for (const n of names) expect(n in env).toBe(false);
+      expect(env.MY_SECRET).toBe('abc123');
+      expect(env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK).toBe('1');
     });
 
     test('builds env by preserving process vars and letting request env win on collisions', async () => {
@@ -2493,5 +2529,229 @@ describe('CodexProvider served-model capture (T3 redirected to T5 -- SDK limitat
     expect(
       result && 'servedModelMissingReason' in result ? result.servedModelMissingReason : undefined
     ).toBe('codex_sdk_does_not_expose_served_model');
+  });
+});
+
+describe('CodexProvider capacity failover', () => {
+  const capacityError = new Error('Selected model is at capacity. Please try a different model.');
+
+  beforeEach(() => {
+    resetCodexSingleton();
+    MockCodex.mockClear();
+    mockStartThread.mockClear();
+    mockResumeThread.mockClear();
+    mockRunStreamed.mockClear();
+    mockStartThread.mockReturnValue(createMockThread('capacity-thread'));
+    mockResumeThread.mockReturnValue(createMockThread('fallback-thread'));
+  });
+
+  test('CapacityIsRetriedOnSameModel', async () => {
+    const failbackFactory = mock(() => {
+      throw new Error('failback must not run');
+    });
+    mockRunStreamed.mockRejectedValueOnce(capacityError).mockResolvedValueOnce({
+      events: (async function* () {
+        yield { type: 'turn.completed', usage: defaultUsage };
+      })(),
+    });
+
+    const provider = new CodexProvider({
+      retryBaseDelayMs: 0,
+      failbackProviderFactory: failbackFactory,
+    });
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('test', '/workspace', undefined, {
+      model: 'gpt-5.6-terra',
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(mockRunStreamed).toHaveBeenCalledTimes(2);
+    expect(mockStartThread.mock.calls.every(call => call[0]?.model === 'gpt-5.6-terra')).toBe(true);
+    expect(chunks.some(chunk => chunk.type === 'provider_route')).toBe(false);
+    expect(failbackFactory).not.toHaveBeenCalled();
+  });
+
+  test('CapacitySwitchesToFallbackModel', async () => {
+    const failbackFactory = mock(() => {
+      throw new Error('failback must not run');
+    });
+    mockRunStreamed
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockResolvedValueOnce({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+    const provider = new CodexProvider({
+      retryBaseDelayMs: 0,
+      failbackProviderFactory: failbackFactory,
+    });
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('test', '/workspace', undefined, {
+      model: 'gpt-5.6-terra',
+      fallbackModel: 'gpt-5.6-sol',
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.filter(chunk => chunk.type === 'provider_route')).toEqual([
+      {
+        type: 'provider_route',
+        route: 'failover',
+        fromProvider: 'codex',
+        fromModel: 'gpt-5.6-terra',
+        toProvider: 'codex',
+        toModel: 'gpt-5.6-sol',
+        reasonCode: 'provider_model_capacity',
+      },
+    ]);
+    expect(mockResumeThread.mock.calls.at(-1)?.[1]?.model).toBe('gpt-5.6-sol');
+    expect(failbackFactory).not.toHaveBeenCalled();
+  });
+
+  test('CapacitySwitchFromUnpinnedModelReportsResolvedDefault', async () => {
+    mockRunStreamed
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockResolvedValueOnce({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+    const provider = new CodexProvider({ retryBaseDelayMs: 0 });
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('test', '/workspace', undefined, {
+      fallbackModel: 'gpt-5.6-terra',
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(mockStartThread.mock.calls[0]?.[0]?.model).toBe('gpt-5.6-sol');
+    expect(chunks.filter(chunk => chunk.type === 'provider_route')).toEqual([
+      {
+        type: 'provider_route',
+        route: 'failover',
+        fromProvider: 'codex',
+        fromModel: 'gpt-5.6-sol',
+        toProvider: 'codex',
+        toModel: 'gpt-5.6-terra',
+        reasonCode: 'provider_model_capacity',
+      },
+    ]);
+  });
+
+  test('SwitchResumesSameThread', async () => {
+    mockRunStreamed.mockRejectedValue(capacityError);
+    const successfulFallbackThread = createMockThread('fallback-thread');
+    successfulFallbackThread.runStreamed = mock(() =>
+      Promise.resolve({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+    mockResumeThread.mockReturnValue(successfulFallbackThread);
+
+    const provider = new CodexProvider({ retryBaseDelayMs: 0 });
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('test', '/workspace', undefined, {
+      model: 'gpt-5.6-terra',
+      fallbackModel: 'gpt-5.6-sol',
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(mockResumeThread).toHaveBeenCalledWith(
+      'capacity-thread',
+      expect.objectContaining({ model: 'gpt-5.6-sol' })
+    );
+    expect(mockStartThread).toHaveBeenCalledTimes(4);
+    expect(chunks.some(chunk => chunk.type === 'system')).toBe(false);
+
+    resetCodexSingleton();
+    mockStartThread.mockClear();
+    mockResumeThread.mockClear();
+    mockRunStreamed.mockClear();
+    mockRunStreamed.mockRejectedValue(capacityError);
+    mockStartThread
+      .mockReturnValueOnce(createMockThread('capacity-thread'))
+      .mockReturnValueOnce(createMockThread('capacity-thread'))
+      .mockReturnValueOnce(createMockThread('capacity-thread'))
+      .mockReturnValueOnce(createMockThread('capacity-thread'))
+      .mockReturnValueOnce(successfulFallbackThread);
+    mockResumeThread.mockImplementation(() => {
+      throw new Error('resume refused');
+    });
+
+    const warningChunks = [];
+    for await (const chunk of provider.sendQuery('test', '/workspace', undefined, {
+      model: 'gpt-5.6-terra',
+      fallbackModel: 'gpt-5.6-sol',
+    })) {
+      warningChunks.push(chunk);
+    }
+    expect(warningChunks).toContainEqual({
+      type: 'system',
+      content: '[WARNING] Could not resume previous session. Starting fresh conversation.',
+    });
+    expect(mockStartThread.mock.calls.at(-1)?.[0]?.model).toBe('gpt-5.6-sol');
+  });
+
+  test('NoFallbackModelKeepsOldTerminalPath', async () => {
+    mockRunStreamed.mockRejectedValue(capacityError);
+    const provider = new CodexProvider({ retryBaseDelayMs: 0, failbackProviderFactory: null });
+    const chunks = [];
+    const consume = async () => {
+      for await (const chunk of provider.sendQuery('test', '/workspace', undefined, {
+        model: 'gpt-5.6-terra',
+      })) {
+        chunks.push(chunk);
+      }
+    };
+
+    await expect(consume()).rejects.toThrow(/Codex capacity/);
+    expect(mockRunStreamed).toHaveBeenCalledTimes(4);
+    expect(chunks.some(chunk => chunk.type === 'provider_route')).toBe(false);
+  });
+
+  test('FallbackAlsoBusyUsesExistingFailback', async () => {
+    mockRunStreamed.mockRejectedValue(capacityError);
+    const failbackSendQuery = mock(async function* () {
+      yield { type: 'result' } as const;
+    });
+    const failbackProvider = {
+      sendQuery: failbackSendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as unknown as ReturnType<CodexProvider['getCapabilities']>,
+    };
+    const provider = new CodexProvider({
+      retryBaseDelayMs: 0,
+      failbackProviderFactory: () => failbackProvider,
+    });
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('test', '/workspace', undefined, {
+      model: 'gpt-5.6-terra',
+      fallbackModel: 'gpt-5.6-sol',
+    })) {
+      chunks.push(chunk);
+    }
+
+    const routes = chunks.filter(chunk => chunk.type === 'provider_route');
+    expect(routes.filter(route => route.reasonCode === 'provider_model_capacity')).toHaveLength(1);
+    expect(routes.filter(route => route.reasonCode === 'provider_unavailable')).toHaveLength(1);
+    expect(failbackSendQuery).toHaveBeenCalledTimes(1);
+    expect(mockRunStreamed).toHaveBeenCalledTimes(8);
+  });
+
+  test('CapabilityAdvertised', () => {
+    expect(new CodexProvider().getCapabilities().fallbackModel).toBe(true);
   });
 });

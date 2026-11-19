@@ -196,25 +196,46 @@ describe('bundled-defaults', () => {
     });
 
     describe('feature-development implement wall timeout placement', () => {
-      const AFFECTED = [
-        'bdc-feature-development',
-        'bdc-feature-development-codex',
-        'bdc-feature-development-codex-only',
-        'bdc-feature-development-fable',
-        'bdc-feature-development-fusion-cx-qwen',
-        'bdc-feature-development-grok',
-        'bdc-feature-development-zero-open',
-        'bdc-feature-development-zero',
+      const LANES: { name: string; implementIdle: number | undefined }[] = [
+        { name: 'bdc-feature-development', implementIdle: 600000 },
+        { name: 'bdc-feature-development-astra', implementIdle: 600000 },
+        { name: 'bdc-feature-development-codex', implementIdle: 600000 },
+        { name: 'bdc-feature-development-codex-only', implementIdle: 600000 },
+        { name: 'bdc-feature-development-cursor', implementIdle: 570000 },
+        { name: 'bdc-feature-development-fable', implementIdle: 600000 },
+        { name: 'bdc-feature-development-grok', implementIdle: 570000 },
+        { name: 'bdc-feature-development-fusion-cx-kimi', implementIdle: undefined },
+        { name: 'bdc-feature-development-fusion-cx-qwen', implementIdle: undefined },
+        { name: 'bdc-feature-development-kimi-k3', implementIdle: undefined },
+        { name: 'bdc-feature-development-zero', implementIdle: undefined },
+        { name: 'bdc-feature-development-zero-claude', implementIdle: undefined },
+        { name: 'bdc-feature-development-zero-open', implementIdle: undefined },
       ];
+      const REMOTE_CI_MARKER = 'Do not wait on remote CI';
 
-      for (const name of AFFECTED) {
-        it(`${name} applies the 30-minute wall timeout to implement, not plan-review`, () => {
-          const content = BUNDLED_WORKFLOWS[name];
+      for (const lane of LANES) {
+        it(`${lane.name} applies the 60-minute wall timeout to implement, not plan-review`, () => {
+          const content = BUNDLED_WORKFLOWS[lane.name];
+          const workflow = parseBundledWorkflow(lane.name);
           const planReview = extractWorkflowNode(content, 'plan-review');
           const implement = extractWorkflowNode(content, 'implement');
+          const implementNode = getWorkflowNode(workflow, 'implement');
 
-          expect(planReview).not.toContain('wall_timeout_ms: 1800000');
-          expect(implement).toContain('wall_timeout_ms: 1800000');
+          expect(content).not.toContain('wall_timeout_ms: 1800000');
+          expect(implement).toContain('wall_timeout_ms: 3600000');
+          expect(implementNode.wall_timeout_ms).toBe(3600000);
+          expect(planReview).not.toContain('wall_timeout_ms: 3600000');
+
+          if (lane.implementIdle === undefined) {
+            expect(implementNode.idle_timeout).toBeUndefined();
+            expect(implement).not.toContain('idle_timeout:');
+          } else {
+            expect(implement).toContain(`idle_timeout: ${String(lane.implementIdle)}`);
+            expect(implementNode.idle_timeout).toBe(lane.implementIdle);
+          }
+
+          expect(implement.split(REMOTE_CI_MARKER).length - 1).toBe(1);
+          expect(content.split(REMOTE_CI_MARKER).length - 1).toBe(1);
         });
       }
     });

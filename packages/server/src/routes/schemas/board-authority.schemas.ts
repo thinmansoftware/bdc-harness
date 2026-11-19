@@ -2,6 +2,13 @@ import { z } from '@hono/zod-openapi';
 
 export const boardSeatSchema = z.enum(['john', 'general', 'xo']);
 
+/**
+ * Longest XO lease the board authority accepts on acquire or renew: 8 hours
+ * (WO-HARNESS-XO-LEASE-8H-CAP-01, John 2026-11-09). This applies to the XO lease ONLY.
+ * The dispatch and execution-claims lease caps stay at 3_600_000 ms.
+ */
+export const XO_LEASE_MAX_DURATION_MS = 28_800_000;
+
 export const xoLeaseSchema = z
   .object({
     lease_id: z.string(),
@@ -21,7 +28,7 @@ export const xoLeaseAcquireBodySchema = z
     principal_token: z.string().min(1).optional(),
     holder_id: z.string().min(1),
     holder_token: z.string().min(1),
-    lease_duration_ms: z.number().int().positive().max(3_600_000).optional(),
+    lease_duration_ms: z.number().int().positive().max(XO_LEASE_MAX_DURATION_MS).optional(),
   })
   .strict()
   .openapi('XoLeaseAcquireBody');
@@ -32,7 +39,7 @@ export const xoLeaseRenewBodySchema = z
     holder_id: z.string().min(1),
     holder_token: z.string().min(1),
     fencing_token: z.number().int().positive(),
-    lease_duration_ms: z.number().int().positive().max(3_600_000).optional(),
+    lease_duration_ms: z.number().int().positive().max(XO_LEASE_MAX_DURATION_MS).optional(),
   })
   .strict()
   .openapi('XoLeaseRenewBody');

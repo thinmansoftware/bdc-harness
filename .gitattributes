@@ -9,3 +9,7 @@ Caddyfile.example text eol=lf
 
 # Verbatim GitHub PR bodies used as reconcile fixtures: keep CRLF bytes as captured
 packages/overseer/src/__tests__/fixtures/reconcile/*.md -text
+
+# Pinned by sha256 in the run-stop-greps test and in the bdc-xo CHECK 14 agreement test
+# (WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01): byte-stable on every checkout.
+.archon/workflows/defaults/__tests__/fixtures/grep-verdicts.tsv text eol=lf

@@ -197,7 +197,7 @@ function parseNextLink(header: string | null): string | null {
 export async function listWorkerAlarmIssueComments(
   issue: DutyOfficerStaleIssue
 ): Promise<WorkerAlarmIssueComment[]> {
-  const token = githubToken();
+  const token = await githubToken();
   if (!token) throw new Error('worker_heartbeat_alarm_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
@@ -247,7 +247,7 @@ export async function postWorkerAlarmComment(
     log.warn({ issue }, 'worker_heartbeat_alarm_repo_refused');
     return;
   }
-  const token = githubToken();
+  const token = await githubToken();
   if (!token) throw new Error('worker_heartbeat_alarm_token_missing');
   const response = await fetch(
     `${GITHUB_API_ORIGIN}/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments`,
@@ -317,8 +317,11 @@ export function parseWorkerRestartEvidence(
  * is already present, so a row already 'sent' is skipped (no duplicate page) and
  * a 'pending'/'failed' row is retried. The alarm therefore holds no state -- a
  * restart mid-drain simply re-reads the row and continues.
+ *
+ * Exported so the Taskmaster's rejected-send alarm pages through this same
+ * journal-first path (one row per idempotency key, so one page per key).
  */
-async function pageOnce(
+export async function pageOnce(
   deps: { pageOperator: (text: string) => Promise<void>; journal: WorkerHeartbeatAlarmJournal },
   args: { idempotencyKey: string; threadRef: string; text: string; proposal: unknown }
 ): Promise<void> {
@@ -459,7 +462,7 @@ export async function runWorkerHeartbeatAlarm(deps: WorkerHeartbeatAlarmDeps): P
     log.warn({ issue }, 'worker_heartbeat_alarm_repo_refused');
     return;
   }
-  if (!githubToken()) {
+  if (!(await githubToken())) {
     // Loud, not silent: without a token no comment alarm can fire.
     log.error('worker_heartbeat_alarm_no_token');
     return;

@@ -247,7 +247,8 @@ function forwardMailboxObservations(stderr: string): void {
 async function runMailboxRace(
   archonHome: string,
   action: 'acknowledge' | 'address',
-  messageId: string
+  messageId: string,
+  beforeStart?: () => Promise<void>
 ): Promise<MailboxProcessResult[]> {
   const dispatchUrl = pathToFileURL(resolve(import.meta.dir, 'dispatch.ts')).href;
   const connectionUrl = pathToFileURL(resolve(import.meta.dir, 'connection.ts')).href;
@@ -389,6 +390,7 @@ async function runMailboxRace(
         await Bun.sleep(5);
       }
     }
+    if (beforeStart) await beforeStart();
     await Bun.write(startFile, 'start');
     results = await Promise.all(children.map(({ output }) => output));
   } catch (error) {
@@ -476,6 +478,171 @@ describe('dispatch db', () => {
       const raceHome = raceHomes.pop();
       if (raceHome) removeTempDirWithRetry(raceHome);
     }
+  });
+
+  test('Chief successful fenced result returns once to its own inbox', async () => {
+    process.env.DISPATCH_PHASE1_ACTIVATED_AT = '2000-01-01T00:00:00.000Z';
+    try {
+      await registerWorker({
+        worker_id: 'chief-worker',
+        host: 'fixture',
+        capabilities: {},
+        max_concurrency: 1,
+      });
+      const source = await createMessage({
+        sender: 'grokbot',
+        sender_principal_id: 'grokbot',
+        recipient: 'codex',
+        task_type: 'agent_message',
+        correlation_id: 'chief-reply',
+        idempotency_key: 'chief-reply-source',
+        body: 'synthetic request',
+      });
+      const claimed = await claimMessage({ id: source.id, worker_id: 'chief-worker' });
+      expect(claimed).not.toBeNull();
+      const done = await postResult({
+        id: source.id,
+        worker_id: 'chief-worker',
+        fencing_token: claimed!.fencing_token,
+        status: 'done',
+        task_outcome: 'succeeded',
+        result_body: 'Synthetic useful reply',
+      });
+      expect(done?.status).toBe('done');
+      expect(
+        await postResult({
+          id: source.id,
+          worker_id: 'chief-worker',
+          fencing_token: claimed!.fencing_token,
+          result_body: 'late duplicate',
+        })
+      ).toBeNull();
+      expect(
+        await reconcileDispatchOutcomeNotices('2000-01-01T00:00:00.000Z', 'chief-success')
+      ).toBe(0);
+      const replies = (await listMessages({ recipient: 'grokbot' })).filter(
+        row => row.idempotency_key === `outcome-notice:${source.id}`
+      );
+      expect(replies).toHaveLength(1);
+      expect(replies[0]?.sender_principal_id).toBe('system:dispatch');
+      expect(replies[0]?.priority).toBe('normal');
+      expect(replies[0]?.correlation_id).toBe(source.correlation_id);
+      expect(JSON.parse(replies[0]!.body)).toMatchObject({
+        result_body: 'Synthetic useful reply',
+        source_id: source.id,
+        worker_recipient: 'codex',
+        untrusted: true,
+      });
+    } finally {
+      delete process.env.DISPATCH_PHASE1_ACTIVATED_AT;
+    }
+  });
+
+  test('Chief notice insertion failure recovers from persisted result without duplicate work', async () => {
+    const cutoff = '2000-01-01T00:00:00.000Z';
+    process.env.DISPATCH_PHASE1_ACTIVATED_AT = cutoff;
+    try {
+      await registerWorker({
+        worker_id: 'chief-worker',
+        host: 'fixture',
+        capabilities: {},
+        max_concurrency: 1,
+      });
+      const source = await createMessage({
+        sender: 'grokbot',
+        sender_principal_id: 'grokbot',
+        recipient: 'codex',
+        task_type: 'agent_message',
+        correlation_id: 'chief-crash-gap',
+        idempotency_key: 'chief-crash-source',
+        body: 'synthetic request',
+      });
+      const claimed = await claimMessage({ id: source.id, worker_id: 'chief-worker' });
+      const original = db.query.bind(db);
+      const failure = spyOn(db, 'query').mockImplementation(async (sql, params) => {
+        if (
+          sql.includes('INSERT INTO agent_dispatch_messages') &&
+          params?.includes(`outcome-notice:${source.id}`)
+        )
+          throw new Error('synthetic_notice_insert_failure');
+        return original(sql, params);
+      });
+      try {
+        expect(
+          (
+            await postResult({
+              id: source.id,
+              worker_id: 'chief-worker',
+              fencing_token: claimed!.fencing_token,
+              status: 'done',
+              task_outcome: 'succeeded',
+              result_body: 'Persisted before notice failure',
+            })
+          )?.status
+        ).toBe('done');
+      } finally {
+        failure.mockRestore();
+      }
+      expect((await listMessages({ recipient: 'grokbot' })).length).toBe(0);
+      expect(await reconcileDispatchOutcomeNotices(cutoff, 'chief-success')).toBe(1);
+      expect(await reconcileDispatchOutcomeNotices(cutoff, 'chief-success')).toBe(0);
+      expect(JSON.parse((await listMessages({ recipient: 'grokbot' }))[0]!.body).result_body).toBe(
+        'Persisted before notice failure'
+      );
+    } finally {
+      delete process.env.DISPATCH_PHASE1_ACTIVATED_AT;
+    }
+  });
+
+  test.each([
+    ['other', 'grokbot', 'agent_message', 'reply'],
+    ['grokbot', 'codex', 'agent_message', 'reply'],
+    ['grokbot', 'grokbot', 'run_review', 'reply'],
+    ['grokbot', 'grokbot', 'agent_message', '   '],
+  ])(
+    'Chief recovery excludes provenance/task/body mismatch: %s/%s/%s',
+    async (principalId, sender, taskType, resultBody) => {
+      const source = await createMessage({
+        sender: sender!,
+        sender_principal_id: principalId!,
+        recipient: 'codex',
+        task_type: taskType!,
+        correlation_id: 'excluded',
+        idempotency_key: 'excluded',
+        body: 'fixture',
+      });
+      await db.query(
+        "UPDATE agent_dispatch_messages SET status='done', task_outcome='succeeded', result_body=$2 WHERE id=$1",
+        [source.id, resultBody]
+      );
+      expect(
+        await reconcileDispatchOutcomeNotices('2000-01-01T00:00:00.000Z', 'chief-success')
+      ).toBe(0);
+      expect(
+        (await listMessages({ recipient: 'grokbot' })).filter(row => row.sender === 'dispatch')
+      ).toHaveLength(0);
+    }
+  );
+
+  test('Chief recovery requires valid cutoff and excludes pre-cutoff results', async () => {
+    const source = await createMessage({
+      sender: 'grokbot',
+      sender_principal_id: 'grokbot',
+      recipient: 'codex',
+      task_type: 'agent_message',
+      correlation_id: 'cutoff',
+      idempotency_key: 'cutoff',
+      body: 'fixture',
+    });
+    await db.query(
+      "UPDATE agent_dispatch_messages SET status='done', task_outcome='succeeded', result_body='reply' WHERE id=$1",
+      [source.id]
+    );
+    expect(await reconcileDispatchOutcomeNotices('', 'chief-success')).toBe(0);
+    expect(await reconcileDispatchOutcomeNotices('invalid', 'chief-success')).toBe(0);
+    expect(await reconcileDispatchOutcomeNotices('2099-01-01T00:00:00.000Z', 'chief-success')).toBe(
+      0
+    );
   });
 
   test('deduplicates repeated idempotency_key posts', async () => {
@@ -1109,6 +1276,46 @@ describe('dispatch db', () => {
       expect(stored.rows[0]?.acknowledged_at).toBe(processResults[0]?.message.acknowledged_at);
     } finally {
       await inspectionDb.close();
+    }
+  });
+
+  test('separate-process acknowledgement waits out a write lock held by a third process', async () => {
+    // Regression for CI runs 41772183976 and 41780148151: a child exited 1 with
+    // "database is locked". Under a deferred BEGIN the mailbox UPDATE is a lock
+    // upgrade, which SQLite fails at once instead of waiting busy_timeout, and
+    // the mailbox retry only covered about 30ms. Holding the write lock longer
+    // than that budget makes the old path fail every time; with BEGIN IMMEDIATE
+    // the children wait for the lock and both succeed.
+    const { archonHome, messageId } = await makeSeparateProcessMailboxFixture(
+      'idem-ack-separate-processes-held-lock',
+      false
+    );
+    const holder = new SqliteAdapter(join(archonHome, 'archon.db'));
+    await holder.query('SELECT 1 AS holder_schema_ready');
+    let released: Promise<unknown> | undefined;
+    try {
+      const results = await runMailboxRace(archonHome, 'acknowledge', messageId, async () => {
+        await holder.query('BEGIN IMMEDIATE');
+        released = Bun.sleep(400).then(() => holder.query('COMMIT'));
+      });
+
+      expect(results.filter(result => result.exitCode !== 0)).toEqual([]);
+      const processResults = results.map(
+        result =>
+          JSON.parse(result.stdout) as {
+            ok: boolean;
+            message: { acknowledged_at: string | null; acknowledged_by: string | null };
+          }
+      );
+      expect(processResults).toEqual([
+        expect.objectContaining({ ok: true }),
+        expect.objectContaining({ ok: true }),
+      ]);
+      expect(new Set(processResults.map(result => result.message.acknowledged_at)).size).toBe(1);
+      expect(processResults[0]?.message.acknowledged_by).toBe('operator');
+    } finally {
+      await released;
+      await holder.close();
     }
   });
 

@@ -13,6 +13,6 @@ export const CODEX_CAPABILITIES: ProviderCapabilities = {
   costControl: false,
   effortControl: false,
   thinkingControl: false,
-  fallbackModel: false,
+  fallbackModel: true,
   sandbox: false,
 };

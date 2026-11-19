@@ -10,6 +10,7 @@ import { rootLogger } from '../packages/paths/src/logger';
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
+  normalizeGitHubEndpoint,
   observationFromResponse,
   recordGitHubApiCall,
   type GitHubApiObservation,
@@ -68,18 +69,23 @@ export function consumeGitHubTrace(
 ): { stderr: string; observations: GitHubApiObservation[] } {
   let inRequest = false;
   let status = 0;
+  let endpoint: string | undefined;
   let headers = new Headers();
   const visible: string[] = [];
   const observations: GitHubApiObservation[] = [];
   const finish = (): void => {
     if (status >= 200 && status <= 599) {
-      observations.push(
-        observationFromResponse(service, poolId, new Response(null, { status, headers }), {
-          permissionFallback,
-        })
+      const observation = observationFromResponse(
+        service,
+        poolId,
+        new Response(null, { status, headers }),
+        { permissionFallback }
       );
+      if (endpoint) observation.endpoint = endpoint;
+      observations.push(observation);
     }
     status = 0;
+    endpoint = undefined;
     headers = new Headers();
   };
   for (const line of raw.split(/\r?\n/)) {
@@ -90,6 +96,8 @@ export function consumeGitHubTrace(
       finish();
       inRequest = false;
     } else if (inRequest) {
+      const requestLine = /^> ([A-Z]+) (\S+) HTTP\//.exec(line);
+      if (requestLine) endpoint = normalizeGitHubEndpoint(requestLine[1], requestLine[2]);
       const response = /^< HTTP\/\S+ (\d{3})/.exec(line);
       const header =
         /^< (x-ratelimit-(?:limit|remaining|reset|resource)|retry-after):\s*(.*)$/i.exec(line);
@@ -146,6 +154,7 @@ export async function runGitHubServiceCommand(input: {
     permissionFallback = false
   ): Promise<CommandResult> => {
     await assertPersistedGitHubPoolAvailable(selected.poolId, resources, db);
+    const cliLabel = `cli:${command} ${args.slice(0, 2).join(' ')}`.slice(0, 120);
     const token =
       selected.kind === 'pat'
         ? selected.token
@@ -166,6 +175,7 @@ export async function runGitHubServiceCommand(input: {
         resource: 'cli',
         status: 0,
         permissionFallback,
+        endpoint: cliLabel,
       });
       await flushGitHubApiMeter(db);
       throw error;
@@ -188,6 +198,7 @@ export async function runGitHubServiceCommand(input: {
         status: 0,
         rateLimited,
         permissionFallback,
+        endpoint: cliLabel,
         ...(rateLimited ? { remaining: 0, reset: Math.floor(Date.now() / 1000) + 60 } : {}),
       });
     }

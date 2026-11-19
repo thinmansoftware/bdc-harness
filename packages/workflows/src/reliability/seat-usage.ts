@@ -21,6 +21,14 @@ import {
   type CreateAuthenticatedMessageData,
 } from '@archon/core/db/dispatch';
 import { getOperatorSetting } from '@archon/core/db/operator-settings';
+import { getLatestSeatUsageReading } from '@archon/core/db/seat-usage-readings';
+import { getRegisteredProviders } from '@archon/providers';
+import type { DagNode } from '../schemas/dag-node';
+import {
+  isReviewNodeId,
+  REVIEW_FAILOVER_CLAUDE_REFUSED_D0,
+  selectSeatNodeFailover,
+} from './seat-node-failover';
 
 export const SEAT_IDS = ['claude', 'codex', 'cursor'] as const;
 export type SeatId = (typeof SEAT_IDS)[number];
@@ -84,11 +92,57 @@ export interface SeatReading {
   http_status?: number;
   allowed?: boolean;
   limit_reached?: boolean;
+  /**
+   * Codex purchased-credit state from the usage endpoint's top-level
+   * `credits` object. When has_credits is true and overage is not blocked,
+   * usage past the plan window bills credits instead of stopping.
+   */
+  credits?: SeatCredits;
+  reading_source?: 'probe' | 'pushed';
+  observed_at?: string;
+}
+
+/**
+ * A seat bound only by individual nodes (never the lane's own seat) that is
+ * at or over the cutoff, where every node on it declares a failover target
+ * with headroom. The run proceeds in degraded mode (WO-HARNESS-SEAT-GATE-
+ * HONORS-FIRED-LANE-TIER-01).
+ */
+export interface SeatGateDegradedSeat {
+  seat: SeatId;
+  window: string;
+  usedPercent: number;
+  cutoffPercent: number;
+  nodeIds: string[];
+  failoverProviders: string[];
+  /** Per-node reroute chosen by the gate (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01). */
+  routes?: SeatGateNodeRoute[];
+}
+
+/** One node the gate rerouted off an over-cutoff seat. */
+export interface SeatGateNodeRoute {
+  nodeId: string;
+  fromProvider: string;
+  toProvider: string;
+}
+export interface SeatCredits {
+  has_credits: boolean;
+  unlimited: boolean;
+  overage_limit_reached: boolean;
+  balance?: string;
 }
 
 export interface SeatGateAllow {
   refused: false;
   unknownSeats: SeatId[];
+  /**
+   * Seats at or over the cutoff that the gate did NOT refuse because the
+   * account bills purchased credits past the window, e.g. `codex:on_credits`.
+   * Present only when non-empty.
+   */
+  onCredits?: string[];
+  /** Present only when the gate is evaluated with a lane scope. */
+  degradedSeats?: SeatGateDegradedSeat[];
 }
 export interface SeatGateRefuse {
   refused: true;
@@ -97,12 +151,53 @@ export interface SeatGateRefuse {
   usedPercent: number;
   cutoffPercent: number;
   unknownSeats: SeatId[];
+  /** Same as SeatGateAllow.onCredits; present only when non-empty. */
+  onCredits?: string[];
+  /**
+   * Present only when the gate is evaluated with a lane scope: 'lane' when the
+   * refused seat is the lane's own seat, 'node' when it is bound only by nodes.
+   */
+  role?: 'lane' | 'node';
+  /**
+   * Present only when a REVIEW node on the refused seat has no non-Claude route:
+   * board decision D0 bars rerouting it to Claude, so the run fails closed with
+   * reason review_failover_claude_refused_d0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+   */
+  reason?: typeof REVIEW_FAILOVER_CLAUDE_REFUSED_D0;
+  /** The review node that could not be routed; present only with `reason`. */
+  reviewNodeId?: string;
 }
 export type SeatGateDecision = SeatGateAllow | SeatGateRefuse;
+
+/** One prompt/command node's resolved provider and its eligible failover target. */
+export interface SeatGateNodeBinding {
+  nodeId: string;
+  providerId: string;
+  /** Set only when selectQuotaExhaustionRoute returns a failover route for the node. */
+  failoverProvider?: string;
+  /** The node itself, so the gate can check provider capabilities for a runtime reroute. */
+  node?: DagNode;
+}
+
+/** The lane the run was fired on plus the per-node bindings of its workflow. */
+export interface SeatGateScope {
+  laneProvider: string;
+  nodes: readonly SeatGateNodeBinding[];
+  /** Workflow-level declared failover provider, first runtime candidate after a node's own. */
+  workflowFailoverProvider?: string;
+}
 
 export interface SeatCutoff {
   percent: number;
   source: 'operator' | 'env' | 'default';
+}
+
+export interface PushedCursorReading {
+  used_percent: number;
+  remaining_percent: number;
+  resets_at: string;
+  observed_at: string;
+  source: string;
 }
 
 export interface SeatReadDeps {
@@ -111,6 +206,8 @@ export interface SeatReadDeps {
   env?: Record<string, string | undefined>;
   claudeCredentialsFile?: string;
   codexAuthFile?: string;
+  /** Cursor only. Omitted in production, which reads the latest stored row. */
+  loadPushedReading?: () => Promise<PushedCursorReading | null>;
 }
 
 export type SeatUsageReader = (
@@ -131,6 +228,11 @@ const inflight = new Map<SeatId, Promise<SeatReading>>();
 const unknownAlertBucket = new Map<SeatId, number>();
 let cutoffOverride: number | null = null;
 let invalidCutoffLogged = false;
+let invalidPushedMaxAgeLogged = false;
+
+const DEFAULT_PUSHED_READING_MAX_AGE_MINUTES = 30;
+const MIN_PUSHED_READING_MAX_AGE_MINUTES = 1;
+const MAX_PUSHED_READING_MAX_AGE_MINUTES = 1440;
 let readerOverride: SeatUsageReader | null = null;
 
 const defaultWarn: WarnLog = (obj, msg) => {
@@ -217,7 +319,7 @@ function sevenDayFromWindows(seat: SeatId, windows: readonly SeatWindow[]): Seve
 function measuredReading(
   seat: SeatId,
   windows: SeatWindow[],
-  extra: { plan?: string; allowed?: boolean; limit_reached?: boolean },
+  extra: { plan?: string; allowed?: boolean; limit_reached?: boolean; credits?: SeatCredits },
   deps?: SeatReadDeps
 ): SeatReading {
   return {
@@ -232,7 +334,39 @@ function measuredReading(
     endpoint: ENDPOINTS[seat],
     ...(extra.allowed !== undefined ? { allowed: extra.allowed } : {}),
     ...(extra.limit_reached !== undefined ? { limit_reached: extra.limit_reached } : {}),
+    ...(extra.credits !== undefined ? { credits: extra.credits } : {}),
   };
+}
+
+/** Parse the Codex usage endpoint's top-level `credits` object, else undefined. */
+export function parseCodexCredits(raw: unknown): SeatCredits | undefined {
+  if (!isRecord(raw) || typeof raw.has_credits !== 'boolean') return undefined;
+  return {
+    has_credits: raw.has_credits,
+    unlimited: raw.unlimited === true,
+    overage_limit_reached: raw.overage_limit_reached === true,
+    ...(typeof raw.balance === 'string' ? { balance: raw.balance } : {}),
+  };
+}
+
+/**
+ * True when a measured codex seat bills purchased credits past its window
+ * (has_credits true, overage not blocked). Such a seat has headroom regardless
+ * of window percent (John Ranson, 2026-10-27).
+ *
+ * The usage endpoint's `allowed` and `limit_reached` describe the plan window
+ * only, so they are not consulted here
+ * (WO-HARNESS-CODEX-CREDITS-HEADROOM-WHEN-WINDOW-EXHAUSTED-01, ruling of
+ * 2026-11-04 that window percent is not capacity). Live proof on bdc-xo issue
+ * 4669: at primary 100 with allowed false and limit_reached true, the codex
+ * CLI in archon-app-1 served a request (exit 0) on credits.
+ */
+export function codexOnCredits(reading: SeatReading): boolean {
+  return (
+    reading.seat === 'codex' &&
+    reading.credits?.has_credits === true &&
+    !reading.credits.overage_limit_reached
+  );
 }
 
 function asResetsAt(value: unknown): string {
@@ -402,6 +536,7 @@ async function probeCodex(deps?: SeatReadDeps): Promise<SeatReading> {
       plan,
       allowed: rate.allowed === true,
       limit_reached: rate.limit_reached === true,
+      credits: parseCodexCredits(result.body.credits),
     },
     deps
   );
@@ -490,13 +625,111 @@ async function probeCursor(deps?: SeatReadDeps): Promise<SeatReading> {
   );
 }
 
+function pushedReadingAgeMinutes(observedAt: string, deps?: SeatReadDeps): number {
+  const observedMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedMs)) return Number.POSITIVE_INFINITY;
+  return Math.floor((nowMs(deps) - observedMs) / 60_000);
+}
+
+function pushedReadingIsFresh(observedAt: string, deps?: SeatReadDeps): boolean {
+  const observedMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedMs)) return false;
+  const maxAgeMs = resolvePushedReadingMaxAgeMinutes(deps) * 60_000;
+  return nowMs(deps) - observedMs <= maxAgeMs;
+}
+
+function seatReadingFromPushed(row: PushedCursorReading, deps?: SeatReadDeps): SeatReading {
+  if (!pushedReadingIsFresh(row.observed_at, deps)) {
+    const ageMinutes = pushedReadingAgeMinutes(row.observed_at, deps);
+    const ageLabel = Number.isFinite(ageMinutes) ? String(ageMinutes) : 'unknown';
+    return {
+      ...unknownSeatReading(
+        'cursor',
+        `reading_stale observed_at=${row.observed_at} age_minutes=${ageLabel}`
+      ),
+      reading_source: 'pushed',
+      observed_at: row.observed_at,
+    };
+  }
+  return {
+    ...measuredReading(
+      'cursor',
+      [
+        {
+          name: 'monthly',
+          used_percent: row.used_percent,
+          remaining_percent: row.remaining_percent,
+          resets_at: row.resets_at,
+        },
+      ],
+      {},
+      deps
+    ),
+    reading_source: 'pushed',
+    observed_at: row.observed_at,
+  };
+}
+
+async function loadProductionPushedReading(): Promise<PushedCursorReading | null> {
+  return getLatestSeatUsageReading('cursor');
+}
+
+/**
+ * Cursor prefers a desktop-pushed reading. A fresh row is measured and does
+ * not probe. A stale row is UNKNOWN. No row falls through to the direct probe.
+ * A loader failure logs once per call and falls through to the direct probe.
+ */
+async function cursorFromPushedReading(deps?: SeatReadDeps): Promise<SeatReading | null> {
+  const loader = deps?.loadPushedReading ?? loadProductionPushedReading;
+  let row: PushedCursorReading | null;
+  try {
+    row = await loader();
+  } catch (err) {
+    warnLog(
+      { error: err instanceof Error ? err.message : String(err) },
+      'fuelglass.pushed_reading_read_failed'
+    );
+    return null;
+  }
+  if (!row) return null;
+  return seatReadingFromPushed(row, deps);
+}
+
 async function probeSeat(seat: SeatId, deps?: SeatReadDeps): Promise<SeatReading> {
   if (seat === 'claude') return probeClaude(deps);
   if (seat === 'codex') return probeCodex(deps);
   return probeCursor(deps);
 }
 
+/** Minutes a pushed cursor reading stays fresh. Blank env uses 30. Invalid env uses 30 and logs once. */
+export function resolvePushedReadingMaxAgeMinutes(deps?: SeatReadDeps): number {
+  const raw = envOf(deps, 'FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES');
+  if (raw === undefined || raw.trim() === '') return DEFAULT_PUSHED_READING_MAX_AGE_MINUTES;
+  const trimmed = raw.trim();
+  const parsed = Number(trimmed);
+  const valid =
+    /^\d+$/.test(trimmed) &&
+    Number.isInteger(parsed) &&
+    parsed >= MIN_PUSHED_READING_MAX_AGE_MINUTES &&
+    parsed <= MAX_PUSHED_READING_MAX_AGE_MINUTES;
+  if (!valid) {
+    if (!invalidPushedMaxAgeLogged) {
+      invalidPushedMaxAgeLogged = true;
+      warnLog({ raw }, 'fuelglass.pushed_reading_max_age_env_invalid');
+    }
+    return DEFAULT_PUSHED_READING_MAX_AGE_MINUTES;
+  }
+  return parsed;
+}
+
 export async function readSeat(seat: SeatId, deps?: SeatReadDeps): Promise<SeatReading> {
+  // A pushed Cursor row is reloaded on every decision so a newer or newly
+  // stale reading is honored inside the 55s probe-cache window. It is not
+  // written into the cache; only a direct probe (no pushed row) is.
+  if (seat === 'cursor') {
+    const pushed = await cursorFromPushedReading(deps);
+    if (pushed) return pushed;
+  }
   const now = nowMs(deps);
   const hit = cache.get(seat);
   if (hit && now - hit.at < CACHE_TTL_MS) return hit.reading;
@@ -552,22 +785,98 @@ export function setSeatAlertSendForTests(send: SeatAlertSend | null): void {
   alertSend = send ?? defaultAlertSend;
 }
 
+/** Drop one seat's cached reading and in-flight probe. Leaves alerts and cutoff alone. */
+export function invalidateSeatUsageCache(seat: SeatId): void {
+  cache.delete(seat);
+  inflight.delete(seat);
+}
+
 export function resetSeatUsageCacheForTests(): void {
   cache.clear();
   inflight.clear();
   unknownAlertBucket.clear();
   cutoffOverride = null;
   invalidCutoffLogged = false;
+  invalidPushedMaxAgeLogged = false;
   readerOverride = null;
   warnLog = defaultWarn;
   alertSend = defaultAlertSend;
 }
 
+interface SeatOverCutoff {
+  window: string;
+  usedPercent: number;
+}
+
+/** The first gate window at or over the cutoff for a measured seat, else null. */
+function seatOverCutoff(
+  seat: SeatId,
+  reading: SeatReading,
+  cutoffPercent: number
+): SeatOverCutoff | null {
+  const gateNames = GATE_WINDOWS[seat];
+  for (const name of gateNames) {
+    const window = reading.windows.find(w => w.name === name);
+    if (window && window.used_percent >= cutoffPercent) {
+      return { window: name, usedPercent: window.used_percent };
+    }
+  }
+  if (seat === 'codex' && reading.limit_reached === true) {
+    const window = reading.windows.find(w => gateNames.includes(w.name)) ?? reading.windows[0];
+    return { window: window?.name ?? 'primary', usedPercent: window?.used_percent ?? 0 };
+  }
+  return null;
+}
+
+/**
+ * Split a lane's bindings into the lane seat (seat of the workflow-level
+ * provider the run was fired on) and node seats (seats bound by individual
+ * nodes, keyed by seat, excluding the lane seat).
+ */
+export function classifySeatGateScope(scope: SeatGateScope): {
+  laneSeat: SeatId | null;
+  nodeSeats: Partial<Record<SeatId, SeatGateNodeBinding[]>>;
+} {
+  const laneSeat = seatForProvider(scope.laneProvider);
+  const nodeSeats: Partial<Record<SeatId, SeatGateNodeBinding[]>> = {};
+  for (const node of scope.nodes) {
+    const seat = seatForProvider(node.providerId);
+    if (seat === null || seat === laneSeat) continue;
+    (nodeSeats[seat] ??= []).push(node);
+  }
+  return { laneSeat, nodeSeats };
+}
+
+/**
+ * Seats a scoped gate needs read: the bound seats, the lane seat, and the
+ * seat of every declared failover target (to judge failover headroom).
+ */
+export function seatsForGateScope(
+  bindings: readonly { providerId: string }[],
+  scope: SeatGateScope
+): SeatId[] {
+  const seats = seatsForBindings(bindings);
+  const extra = [
+    scope.laneProvider,
+    ...scope.nodes.map(node => node.failoverProvider ?? ''),
+    // Runtime reroute candidates: every registered provider's seat is read so the
+    // gate can find headroom (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01).
+    ...getRegisteredProviders().map(provider => provider.id),
+  ];
+  for (const providerId of extra) {
+    const seat = seatForProvider(providerId);
+    if (seat && !seats.includes(seat)) seats.push(seat);
+  }
+  return seats;
+}
+
 export function decideSeatGate(
   bindings: readonly { providerId: string }[],
   readings: Partial<Record<SeatId, SeatReading>>,
-  cutoffPercent: number
+  cutoffPercent: number,
+  scope?: SeatGateScope
 ): SeatGateDecision {
+  if (scope) return decideScopedSeatGate(bindings, readings, cutoffPercent, scope);
   // Collect every unknown seat and the first refusal in one pass over ALL
   // bound seats, independently of each other. A seat that trips the cutoff
   // must not swallow the UNKNOWN diagnostics for other bound seats -- both
@@ -575,6 +884,7 @@ export function decideSeatGate(
   // the unknown-seat log line and operator alert still fire for every seat
   // that could not be measured, refusal or not.
   const unknownSeats: SeatId[] = [];
+  const onCredits: string[] = [];
   let refusal: SeatGateRefuse | null = null;
   for (const seat of seatsForBindings(bindings)) {
     const reading = readings[seat];
@@ -583,35 +893,145 @@ export function decideSeatGate(
       continue;
     }
     if (refusal) continue;
-    const gateNames = GATE_WINDOWS[seat];
-    for (const name of gateNames) {
-      const window = reading.windows.find(w => w.name === name);
-      if (window && window.used_percent >= cutoffPercent) {
-        refusal = {
-          refused: true,
-          seat,
-          window: name,
-          usedPercent: window.used_percent,
-          cutoffPercent,
-          unknownSeats: [],
-        };
-        break;
-      }
+    const over = seatOverCutoff(seat, reading, cutoffPercent);
+    if (over && codexOnCredits(reading)) {
+      onCredits.push(`${seat}:on_credits`);
+      continue;
     }
-    if (!refusal && seat === 'codex' && reading.limit_reached === true) {
-      const window = reading.windows.find(w => gateNames.includes(w.name)) ?? reading.windows[0];
+    if (over) {
       refusal = {
         refused: true,
         seat,
-        window: window?.name ?? 'primary',
-        usedPercent: window?.used_percent ?? 0,
+        window: over.window,
+        usedPercent: over.usedPercent,
         cutoffPercent,
         unknownSeats: [],
       };
     }
   }
-  if (refusal) return { ...refusal, unknownSeats };
-  return { refused: false, unknownSeats };
+  const credits = onCredits.length > 0 ? { onCredits } : {};
+  if (refusal) return { ...refusal, unknownSeats, ...credits };
+  return { refused: false, unknownSeats, ...credits };
+}
+
+/**
+ * Lane-scoped gate (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01). The
+ * lane's own seat over the cutoff refuses (role=lane). A seat bound only by
+ * nodes over the cutoff refuses (role=node) unless EVERY node on it has an
+ * eligible failover target whose seat is not measured at or over the cutoff;
+ * then the run proceeds and the seat is reported in degradedSeats. UNKNOWN
+ * never refuses on its own.
+ */
+function decideScopedSeatGate(
+  bindings: readonly { providerId: string }[],
+  readings: Partial<Record<SeatId, SeatReading>>,
+  cutoffPercent: number,
+  scope: SeatGateScope
+): SeatGateDecision {
+  const { laneSeat, nodeSeats } = classifySeatGateScope(scope);
+  const bound = seatsForBindings(bindings);
+  const seats: SeatId[] = laneSeat ? [laneSeat, ...bound.filter(s => s !== laneSeat)] : bound;
+  const unknownSeats: SeatId[] = [];
+  const degradedSeats: SeatGateDegradedSeat[] = [];
+  const onCredits: string[] = [];
+  let refusal: SeatGateRefuse | null = null;
+
+  const failoverHasHeadroom = (fromSeat: SeatId, failoverProvider: string): boolean => {
+    const target = seatForProvider(failoverProvider);
+    if (target === null) return true;
+    if (target === fromSeat) return false;
+    const reading = readings[target];
+    if (reading?.limit_source !== 'measured') return true;
+    if (codexOnCredits(reading)) return true;
+    return seatOverCutoff(target, reading, cutoffPercent) === null;
+  };
+
+  /**
+   * Provider a node on an over-cutoff seat should run on. A declared failover
+   * wins when it has headroom; otherwise the runtime selector looks for any
+   * registered provider with Fuelglass headroom. Null means refuse.
+   */
+  const pickNodeRoute = (fromSeat: SeatId, binding: SeatGateNodeBinding): string | null => {
+    if (binding.node === undefined) {
+      // D0: a review node never reroutes to Claude, even when Claude is declared.
+      if (binding.failoverProvider === 'claude' && isReviewNodeId(binding.nodeId)) return null;
+      return binding.failoverProvider !== undefined &&
+        failoverHasHeadroom(fromSeat, binding.failoverProvider)
+        ? binding.failoverProvider
+        : null;
+    }
+    return selectSeatNodeFailover({
+      node: binding.node,
+      currentProvider: binding.providerId,
+      workflowFailoverProvider: scope.workflowFailoverProvider,
+      hasHeadroom: providerId => failoverHasHeadroom(fromSeat, providerId),
+    });
+  };
+
+  for (const seat of seats) {
+    const reading = readings[seat];
+    if (reading?.limit_source !== 'measured') {
+      unknownSeats.push(seat);
+      continue;
+    }
+    if (refusal) continue;
+    const over = seatOverCutoff(seat, reading, cutoffPercent);
+    if (!over) continue;
+    if (codexOnCredits(reading)) {
+      onCredits.push(`${seat}:on_credits`);
+      continue;
+    }
+    const base = {
+      refused: true as const,
+      seat,
+      window: over.window,
+      usedPercent: over.usedPercent,
+      cutoffPercent,
+      unknownSeats: [],
+    };
+    if (seat === laneSeat) {
+      refusal = { ...base, role: 'lane' };
+      continue;
+    }
+    const nodes = nodeSeats[seat] ?? [];
+    const routes: SeatGateNodeRoute[] = [];
+    let unroutedReviewNodeId: string | undefined;
+    for (const binding of nodes) {
+      const toProvider = pickNodeRoute(seat, binding);
+      if (toProvider === null) {
+        if (isReviewNodeId(binding.nodeId)) unroutedReviewNodeId = binding.nodeId;
+        break;
+      }
+      routes.push({ nodeId: binding.nodeId, fromProvider: binding.providerId, toProvider });
+    }
+    const covered = nodes.length > 0 && routes.length === nodes.length;
+    if (!covered) {
+      // A review node with no non-Claude route fails closed and names D0, so the
+      // refusal is not mistaken for an ordinary cutoff refusal.
+      refusal =
+        unroutedReviewNodeId !== undefined
+          ? {
+              ...base,
+              role: 'node',
+              reason: REVIEW_FAILOVER_CLAUDE_REFUSED_D0,
+              reviewNodeId: unroutedReviewNodeId,
+            }
+          : { ...base, role: 'node' };
+      continue;
+    }
+    degradedSeats.push({
+      seat,
+      window: over.window,
+      usedPercent: over.usedPercent,
+      cutoffPercent,
+      nodeIds: nodes.map(node => node.nodeId),
+      failoverProviders: [...new Set(routes.map(route => route.toProvider))],
+      routes,
+    });
+  }
+  const credits = onCredits.length > 0 ? { onCredits } : {};
+  if (refusal) return { ...refusal, unknownSeats, ...credits };
+  return { refused: false, unknownSeats, degradedSeats, ...credits };
 }
 
 /** True when percent is a finite number inside the accepted 1-95 range. */

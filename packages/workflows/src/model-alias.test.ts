@@ -43,6 +43,8 @@ describe('isDeclaredServedMatch -- against the real bundled config', () => {
 
   it('fable family resolves', () => {
     expect(isDeclaredServedMatch('fable', 'claude-fable-5')).toBe(true);
+    expect(isDeclaredServedMatch('fable', 'claude-fable-5-2')).toBe(true);
+    expect(isDeclaredServedMatch('fable', 'claude-fable-5-1')).toBe(true);
   });
 
   it('cross-family is a mismatch (sonnet declared, opus family served)', () => {

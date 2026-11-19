@@ -5,8 +5,9 @@
  * based on configuration in .archon/config.yaml
  */
 
-import { copyFile, cp, stat, mkdir } from 'fs/promises';
+import { copyFile, cp, lstat, stat, mkdir, readdir } from 'fs/promises';
 import { join, dirname, relative, isAbsolute, normalize } from 'path';
+import { execFileAsync } from '@archon/git';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -64,8 +65,117 @@ export function isPathWithinRoot(root: string, filePath: string): boolean {
   return true;
 }
 
+/** Forward-slash form of a path, as git prints it. */
+function toPosix(path: string): string {
+  return path.replace(/\\/g, '/');
+}
+
+/**
+ * Paths under `relPath` that git tracks in the destination worktree (forward slashes, relative
+ * to `destRoot`). A tracked path keeps the worktree's own content: the canonical repo may be on a
+ * different branch with an older copy, and overwriting would dirty the worktree (the run-scope
+ * gate then fails) and let a later `git add -A` commit the older text (bdc-xo WO
+ * WO-HARNESS-WORKTREE-SYNC-NO-TRACKED-OVERWRITE-01). Returns an empty set when `destRoot` is not a
+ * git checkout, so the copy then behaves exactly as before; when it IS a git checkout and the
+ * listing fails the result is null and nothing is copied (fail closed).
+ */
+async function listTrackedPaths(destRoot: string, relPath: string): Promise<Set<string> | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', destRoot, 'ls-files', '-z', '--', relPath || '.'],
+      { timeout: 15000, maxBuffer: 64 * 1024 * 1024 }
+    );
+    return new Set(stdout.split('\0').filter(entry => entry.length > 0));
+  } catch (error) {
+    // A git checkout whose listing failed (timeout, corrupt index, ...): the protection cannot be
+    // proven, so the caller must not copy. A directory that is not a git checkout has nothing tracked.
+    if (await pathExists(join(destRoot, '.git'))) {
+      getLog().error({ destRoot, relPath, err: error }, 'tracked_listing_failed');
+      return null;
+    }
+    return new Set();
+  }
+}
+
+/** True when anything (including a dangling link) exists at `path`. */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when `path` is a symbolic link. A missing path is not one. Any other error counts as one
+ * (fail safe: the copy skips the path).
+ */
+async function isSymbolicLink(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isSymbolicLink();
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
+}
+
+/**
+ * True when `destPath`, or any directory between `destRoot` and it, is a symbolic link: writing
+ * there would follow the link and could overwrite a tracked file outside the copied folder (the
+ * worktree may track `.archon/workflows` as a symlink to another directory).
+ */
+async function destinationTraversesSymlink(destRoot: string, destPath: string): Promise<boolean> {
+  const segments = relative(destRoot, destPath)
+    .split(/[\\/]+/)
+    .filter(Boolean);
+  let current = destRoot;
+  for (const segment of segments) {
+    current = join(current, segment);
+    if (await isSymbolicLink(current)) return true;
+    try {
+      await lstat(current);
+    } catch {
+      return false; // the rest of the path does not exist yet, so there is nothing to follow
+    }
+  }
+  return false;
+}
+
+/**
+ * Copy a directory file by file, leaving every path in `tracked` untouched and never following a
+ * destination symbolic link.
+ *
+ * @returns the number of tracked paths skipped
+ */
+async function copyDirectorySkippingTracked(
+  sourceDir: string,
+  destDir: string,
+  destRoot: string,
+  tracked: ReadonlySet<string>
+): Promise<number> {
+  await mkdir(destDir, { recursive: true });
+  let skipped = 0;
+  for (const dirent of await readdir(sourceDir, { withFileTypes: true })) {
+    const sourceEntry = join(sourceDir, dirent.name);
+    const destEntry = join(destDir, dirent.name);
+    if (tracked.has(toPosix(relative(destRoot, destEntry))) || (await isSymbolicLink(destEntry))) {
+      // tracked in the worktree (a file, or a directory the worktree tracks as a link), or a link
+      skipped += 1;
+    } else if (dirent.isDirectory()) {
+      skipped += await copyDirectorySkippingTracked(sourceEntry, destEntry, destRoot, tracked);
+    } else {
+      await cp(sourceEntry, destEntry);
+    }
+  }
+  return skipped;
+}
+
 /**
  * Copy a single file or directory from source repo to worktree
+ *
+ * A path that git tracks in the destination worktree is never overwritten; untracked,
+ * ignored and missing destination paths are copied as before.
  *
  * @param sourceRoot - Canonical repo path
  * @param destRoot - Worktree path
@@ -110,14 +220,46 @@ export async function copyWorktreeFile(
     // Ensure destination directory exists
     await mkdir(dirname(destPath), { recursive: true });
 
+    const destRelative = toPosix(relative(destRoot, destPath));
+    let skippedTracked = 0;
+    if (await destinationTraversesSymlink(destRoot, destPath)) {
+      getLog().info(
+        { source: entry.source, destination: entry.destination },
+        'file_copy_skipped_symlink'
+      );
+      return true;
+    }
+    const tracked = await listTrackedPaths(destRoot, destRelative);
+    if (tracked === null) return false;
+
     if (stats.isDirectory()) {
-      // Copy directory recursively
-      await cp(sourcePath, destPath, { recursive: true });
+      if (tracked.size === 0 && !(await pathExists(destPath))) {
+        // Nothing is tracked under the destination and nothing exists there: nothing to overwrite,
+        // restore or follow, so the plain recursive copy is safe. Anything else is walked entry by
+        // entry (an existing destination may hold links; a tracked path that was deleted locally must
+        // not be restored from the canonical branch).
+        await cp(sourcePath, destPath, { recursive: true });
+      } else {
+        skippedTracked = await copyDirectorySkippingTracked(
+          sourcePath,
+          destPath,
+          destRoot,
+          tracked
+        );
+      }
+    } else if (tracked.has(destRelative)) {
+      skippedTracked = 1;
     } else {
       // Copy single file
       await copyFile(sourcePath, destPath);
     }
 
+    if (skippedTracked > 0) {
+      getLog().info(
+        { source: entry.source, destination: entry.destination, skippedTracked },
+        'file_copy_skipped_tracked'
+      );
+    }
     getLog().debug({ source: entry.source, destination: entry.destination }, 'file_copied');
     return true;
   } catch (error) {

@@ -9,8 +9,8 @@
  *    M-15 tier map, and it gates execution only, never consultation.
  *  - Judge health failures finalize as alarm states and escalate loudly when
  *    the retry budget is exhausted -- they never become semantic verdicts.
- *  - Replay: a lost claim means another pass already owns this evidence; the
- *    pipeline exits without a model call or a second action.
+ *  - Replay: a lost claim does not invoke the judge, but a merge-ready open
+ *    PR may emit one flag_merge_ready action.
  */
 
 import { createLogger } from '@archon/paths';
@@ -25,6 +25,7 @@ import { ruleOnAction, type TierRuling } from './tier-map';
 import { runEscalation } from './escalate';
 import { isPrMergeReady } from './judge-pr';
 import type {
+  DeterministicMergeHandoff,
   GitHubClientDeps,
   OverseerActionsDeps,
   OverseerRunStoreDeps,
@@ -121,6 +122,11 @@ export interface JudgeFirstPipelineOptions {
   dryRun: boolean;
   actor: string;
   mergeCoordinator?: MergeReadyCoordinator;
+  /**
+   * Replay-only handoff. The initial merge_candidate path keeps using
+   * mergeCoordinator. This field is not an alias of that function.
+   */
+  deterministicMergeHandoff?: DeterministicMergeHandoff;
   verdictStore: OverseerVerdictStoreDeps;
   judge?: (
     envelope: ReturnType<typeof buildEvidenceEnvelope>,
@@ -134,6 +140,151 @@ export interface JudgeFirstPipelineOptions {
 
 function actionClass(record: WatchedRunRecord): string {
   return record.errorClass ?? 'none';
+}
+
+function logReplayGreenSkipped(fields: Record<string, unknown>): void {
+  log.info(fields, 'overseer.judge_first.replay_green_skipped');
+}
+
+const REPLAY_PROMOTABLE_VERDICTS: ReadonlySet<string> = new Set(['observe', 'healthy']);
+const REPLAY_PROMOTABLE_ACTIONS: ReadonlySet<string> = new Set([
+  'none',
+  'verdict_write',
+  'comment_findings',
+]);
+
+function replayPromotionSkipReason(row: {
+  verdict: string | null;
+  proposedAction: string | null;
+  actionedAt: string | null;
+}): 'verdict_not_promotable' | 'action_not_promotable' | null {
+  if (row.verdict === null || !REPLAY_PROMOTABLE_VERDICTS.has(row.verdict)) {
+    return 'verdict_not_promotable';
+  }
+  if (
+    row.actionedAt !== null ||
+    row.proposedAction === null ||
+    !REPLAY_PROMOTABLE_ACTIONS.has(row.proposedAction)
+  ) {
+    return 'action_not_promotable';
+  }
+  return null;
+}
+
+/**
+ * Lost-claim come-back for an open PR. The first verdict already exists for
+ * this run and head; when deterministic evidence is now merge-ready, promote
+ * an observe or healthy row whose prior action is still safe, then hand it to
+ * the merge-execution bridge. No judge call and no mergeCoordinator call.
+ * Fail closed on every other verdict, unsafe action, store error, dry run,
+ * missing deterministic handoff, or a failed handoff receipt. The promotion
+ * and the flag_merge_ready receipt commit in one transaction. A failed insert
+ * rolls the promotion back before it is visible, so the bridge cannot merge a
+ * flag_merge_ready row that has no receipt.
+ */
+async function replayGreenHandoff(
+  record: WatchedRunRecord,
+  deps: OverseerActionsDeps,
+  options: JudgeFirstPipelineOptions,
+  headSha: string
+): Promise<void> {
+  if (!isPrMergeReady(record.prEvidence)) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      reason: record.prEvidence.checks.pending > 0 ? 'checks_pending' : 'not_merge_ready',
+    });
+    return;
+  }
+
+  let row: Awaited<ReturnType<OverseerVerdictStoreDeps['getVerdictByRunHead']>>;
+  try {
+    row = await options.verdictStore.getVerdictByRunHead({ runId: record.runId, headSha });
+  } catch (error) {
+    log.error(
+      { err: error as Error, runId: record.runId, headSha, reason: 'verdict_read_failed' },
+      'overseer.judge_first.replay_green_skipped'
+    );
+    return;
+  }
+  if (!row) {
+    logReplayGreenSkipped({ runId: record.runId, headSha, reason: 'verdict_missing' });
+    return;
+  }
+  const skipReason = replayPromotionSkipReason(row);
+  if (skipReason) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      verdict: row.verdict,
+      proposedAction: row.proposedAction,
+      reason: skipReason,
+    });
+    return;
+  }
+
+  const result = `steward_handoff:replay_green:verdict:${row.id}${options.dryRun ? ':dry_run' : ''}`;
+  if (options.dryRun) {
+    await deps.insertOverseerAction({
+      runId: record.runId,
+      woId: record.woId,
+      class: actionClass(record),
+      action: 'flag_merge_ready',
+      result,
+    });
+    log.info(
+      { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: true },
+      'overseer.judge_first.replay_green_handoff'
+    );
+    return;
+  }
+  if (!options.deterministicMergeHandoff) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      reason: 'coordinator_missing',
+    });
+    return;
+  }
+
+  let promoted = false;
+  try {
+    promoted = await options.verdictStore.promoteObserveOrHealthyVerdictWithReceipt({
+      verdictId: row.id,
+      runId: record.runId,
+      woId: record.woId,
+      class: actionClass(record),
+      result,
+    });
+  } catch (error) {
+    log.error(
+      {
+        err: error as Error,
+        runId: record.runId,
+        headSha,
+        verdictId: row.id,
+        reason: 'promote_receipt_failed',
+      },
+      'overseer.judge_first.replay_green_skipped'
+    );
+    return;
+  }
+  if (!promoted) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      reason: 'promote_no_change',
+    });
+    return;
+  }
+  log.info(
+    { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: false },
+    'overseer.judge_first.replay_green_handoff'
+  );
+  await options.deterministicMergeHandoff.handoff(record);
 }
 
 function newestEvent(events: OverseerWorkflowEvent[]): OverseerWorkflowEvent | undefined {
@@ -312,6 +463,9 @@ export async function handleRecordJudgeFirst(
     // its PR opened, while checks were still running -- the loop then never
     // re-examined it. Close only when the PR is merged/closed/missing.
     const prStillOpen = record.prEvidence?.state === 'open';
+    if (prStillOpen) {
+      await replayGreenHandoff(record, deps, options, headSha);
+    }
     if (
       (record.action === 'success' || record.action === 'ignore') &&
       !prStillOpen &&

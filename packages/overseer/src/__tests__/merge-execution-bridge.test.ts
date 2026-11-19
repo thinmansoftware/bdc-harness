@@ -1,17 +1,35 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
 import {
   buildCeScopeCompareAdapter,
-  runMergeExecutionBridgeOnce,
+  runMergeExecutionBridgeOnce as runMergeExecutionBridgeOnceProduction,
+  type MergeExecutionBridgeOptions,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
+import { readWoSpecForMergeHold, specDeclaresMergeHold } from '../merge-hold';
 import { parseMergeRepoPolicy } from '../merge-repo-policy';
+import {
+  REQUIRED_CONTEXTS_BLOCKED_REASON,
+  REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
+  REQUIRED_CONTEXTS_OVERRIDE_ENV,
+  resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
+} from '../adapters/required-contexts.ts';
+import type { RecheckCheckRun } from '../pr-review-check-ingest.ts';
 import type {
   GitHubClientDeps,
   GitHubPullRequestSearchInput,
   PullRequestEvidence,
 } from '../types.ts';
+
+const runMergeExecutionBridgeOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
+  runMergeExecutionBridgeOnceProduction({
+    readRunEvents: async () => [],
+    hasQualifiedReview: async () => true,
+    reviewConflictAtHead: async () => null,
+    ...options,
+  });
 
 const verdict = (id: string, head = 'judged-sha'): OverseerVerdictRow =>
   ({
@@ -89,6 +107,8 @@ function harness(
       return true;
     },
     getRunById: async runId => run(runId.replace('run-', '')),
+    getEarliestMergeSlotReservation: async () =>
+      new Date(Date.now() - 50 * 60 * 1000).toISOString(),
     reserveMergeSlot: async (verdictId, _since, limit) => {
       const existing = slots.get(verdictId);
       if (existing && !existing.released) return false;
@@ -123,6 +143,8 @@ function harness(
       merges += 1;
       return { merged: true, mergeSha: 'merge-sha' };
     },
+    listPullRequestComments: async () => [],
+    commentOnPullRequest: async () => ({ commented: true }),
     ...githubExtras,
   };
   return {
@@ -179,6 +201,118 @@ afterEach(() => {
 });
 
 describe('merge execution bridge', () => {
+  test('fails closed when exact-head review qualification is not wired', async () => {
+    const h = harness([verdict('qualification-missing')]);
+    await runMergeExecutionBridgeOnceProduction({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('review_execution_unqualified');
+  });
+
+  describe('exact-head review conflict (WO-HARNESS-MERGE-GATE-REFUSE-CONFLICTING-VERDICTS-01)', () => {
+    test('Test 1: approved_then_changes_requested_no_merge', async () => {
+      const h = harness([verdict('cr-at-head')]);
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        reviewConflictAtHead: async input => {
+          expect(input).toEqual({
+            owner: 'thinmansoftware',
+            repo: 'bdc-harness',
+            number: 1,
+            headSha: 'judged-sha',
+          });
+          return 'changes_requested';
+        },
+      });
+      expect(h.merges).toBe(0);
+      expect(h.occupied).toBe(0);
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({
+          mutationSent: false,
+          reason: 'review_conflict_at_head:changes_requested',
+        })
+      );
+    });
+
+    test('Test 2: review_in_flight_no_merge', async () => {
+      const h = harness([verdict('in-flight')]);
+      const deferrals: { verdictId: string; reason: string }[] = [];
+      h.store.deferVerdictClaim = async (verdictId, reason) => {
+        deferrals.push({ verdictId, reason });
+        return true;
+      };
+      const capture = captureRootLogLines();
+      try {
+        await runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          readPolicy: () => policy(),
+          reviewConflictAtHead: async () => 'review_in_flight',
+        });
+        expectCoordinatorWarn(
+          capture.lines,
+          'merge-coordinator.merge_refused_conflicting_reviews',
+          {
+            verdictId: 'in-flight',
+            conflict: 'review_in_flight',
+          }
+        );
+      } finally {
+        capture.restore();
+      }
+      expect(h.merges).toBe(0);
+      expect(h.occupied).toBe(0);
+      expect(h.outcomes).toEqual([]);
+      expect(deferrals).toEqual([
+        { verdictId: 'in-flight', reason: 'review_conflict_at_head:review_in_flight' },
+      ]);
+    });
+
+    test('Test 3: no_conflict_merges', async () => {
+      const h = harness([verdict('no-conflict')]);
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        reviewConflictAtHead: async () => null,
+      });
+      expect(h.merges).toBe(1);
+    });
+
+    test('Test 4: missing_dep_fails_closed', async () => {
+      const h = harness([verdict('conflict-missing')]);
+      await runMergeExecutionBridgeOnceProduction({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        hasQualifiedReview: async () => true,
+        // the evidence hold now runs before the conflict check; give it a readable, passing run
+        readRunEvents: async () => [],
+      });
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('review_conflict_at_head:check_unavailable');
+    });
+
+    test('a throwing conflict lookup fails closed as lookup_failed', async () => {
+      const h = harness([verdict('conflict-throws')]);
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        reviewConflictAtHead: async () => {
+          throw new Error('db down');
+        },
+      });
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('review_conflict_at_head:lookup_failed');
+    });
+  });
+
   test('production CE compare adapter accepts 150 page-one files as complete', async () => {
     const compareCommits = mock(async () => ({
       data: {
@@ -462,6 +596,7 @@ describe('merge execution bridge', () => {
         return true;
       },
       getRunById: async () => run(id),
+      getEarliestMergeSlotReservation: async () => null,
       reserveMergeSlot,
       releaseMergeSlot,
       recordOutcome: async input => {
@@ -536,6 +671,7 @@ describe('merge execution bridge', () => {
       store: h.store,
       github: h.github,
       readPolicy: () => policy(),
+      maxMergesPerHour: 4,
     });
     expect(claims).toBe(1);
     expect(h.merges).toBe(0);
@@ -703,6 +839,39 @@ describe('merge execution bridge', () => {
     ]);
     expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
   });
+
+  test('Test 5: production base shopops master is refused by the bridge', async () => {
+    const h = harness(
+      [
+        {
+          ...verdict('shopops-master'),
+          run_id: 'pr-discovery:thinmansoftware/shopops#1',
+          wo_id: 'gh:thinmansoftware/shopops#1',
+        },
+      ],
+      greenPr({
+        baseBranch: 'master',
+        headSha: 'judged-sha',
+        mergeable: true,
+        mergeableState: 'clean',
+        pr: { owner: 'thinmansoftware', repo: 'shopops', number: 1 },
+      })
+    );
+
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({
+        mutationSent: false,
+        reason: 'base_not_allowlisted',
+      })
+    );
+  });
 });
 
 const RUNLESS_PR = 844;
@@ -801,11 +970,6 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     ['(c) closed PR', runlessPr({ state: 'closed' }), 'pr_not_open'],
     ['(c) merged PR', runlessPr({ state: 'merged' }), 'pr_not_open'],
     ['(d) moved head', runlessPr({ headSha: 'moved' }), 'head_moved'],
-    [
-      '(e) lookup failed',
-      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true }),
-      'pr_context_unresolvable',
-    ],
   ])('%s is recorded honestly with no mutation', async (_label, evidence, reason) => {
     const { h } = runlessHarness([runlessVerdict('runless-skip')], evidence);
     await runOnce(h);
@@ -813,6 +977,30 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.approvals).toBe(0);
     expect(h.occupied).toBe(0);
     expect(h.outcomes[0]).toEqual(expect.objectContaining({ mutationSent: false, reason }));
+  });
+
+  test('(e) defers pr_context_fetch_failed and sends no mutation when lookup failed', async () => {
+    const { h } = runlessHarness(
+      [runlessVerdict('runless-lookup-failed')],
+      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true })
+    );
+    const deferrals: { verdictId: string; reason: string; notBefore: string }[] = [];
+    h.store.deferVerdictClaim = async (verdictId, reason, notBefore) => {
+      deferrals.push({ verdictId, reason, notBefore });
+      return true;
+    };
+    await runOnce(h);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.occupied).toBe(0);
+    expect(h.claimReleases).toEqual([]);
+    expect(h.outcomes).toEqual([]);
+    expect(deferrals).toEqual([
+      expect.objectContaining({
+        verdictId: 'runless-lookup-failed',
+        reason: 'pr_context_fetch_failed',
+      }),
+    ]);
   });
 
   test('(e) defers pr_context_fetch_failed and sends no mutation when the fetch throws', async () => {
@@ -922,7 +1110,7 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
       readPolicy: () => policy(),
     });
     expect(h.merges).toBe(1);
-    expect(bodies).toEqual([]);
+    expect(bodies.filter(body => body.includes('merge-manager-receipt'))).toEqual([]);
     expect(h.outcomes[0]?.reason).toBe('merge_executed');
   });
 
@@ -1019,7 +1207,9 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
   test('receipt is a no-throw when commentOnPullRequest is absent', async () => {
     const captured = captureRootLogLines();
     try {
-      const h = harness([verdict('receipt-absent')]);
+      const h = harness([verdict('receipt-absent')], greenPr(), 0, {
+        commentOnPullRequest: undefined,
+      });
       expect(h.github.commentOnPullRequest).toBeUndefined();
       await expect(
         runMergeExecutionBridgeOnce({
@@ -1042,7 +1232,7 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     }
   });
 
-  test('receipt skip, hold, and failed merge post no comment', async () => {
+  test('receipt skip, hold, and failed merge post no receipt', async () => {
     const bodies: string[] = [];
     const commentOnPullRequest = async (input: {
       body: string;
@@ -1077,7 +1267,7 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
       github: failed.github,
       readPolicy: () => policy(),
     });
-    expect(bodies).toEqual([]);
+    expect(bodies.filter(body => body.includes('merge-manager-receipt'))).toEqual([]);
     expect(skipped.outcomes[0]?.reason).toBe('required_checks_not_success');
     expect(held.claimReleases).toEqual([
       { verdictId: 'receipt-hold', reason: 'rate_ceiling_deferred' },
@@ -1160,5 +1350,1445 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     const body = bodies[0] ?? '';
     expect(/^[\x00-\x7F]*$/.test(body)).toBe(true);
     expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
+  });
+});
+
+function httpStatusError(status: number): Error & { status: number } {
+  const error = new Error(`github status ${status}`) as Error & { status: number };
+  error.status = status;
+  return error;
+}
+
+describe('merge hold', () => {
+  test('spec hold blocks an otherwise mergeable PR', async () => {
+    const row = { ...verdict('spec-hold'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async () => 'WO: WO-X-01\nmerge_hold: true\n',
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'spec-hold', reason: 'merge_hold' }]);
+  });
+
+  test('header parsing is strict', () => {
+    expect(specDeclaresMergeHold('merge_hold: false')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold: true # note')).toBe(false);
+    expect(specDeclaresMergeHold('The words merge_hold true appear in a prose paragraph.')).toBe(
+      false
+    );
+    expect(specDeclaresMergeHold(' merge_hold: true')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold: true')).toBe(true);
+    expect(specDeclaresMergeHold('merge_hold: true   ')).toBe(true);
+    expect(specDeclaresMergeHold('Merge_Hold: TRUE')).toBe(true);
+    expect(specDeclaresMergeHold('WO: WO-X-01\nmerge_hold: true\n\nBody text.\n')).toBe(true);
+    // `\s` used to swallow the newline and treat the next line's `true` as the value.
+    expect(specDeclaresMergeHold('merge_hold:\ntrue')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold:\r\ntrue')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold: \ntrue')).toBe(false);
+    expect(specDeclaresMergeHold('WO: WO-X-01\nmerge_hold:\ntrue\n')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold: true\r\n')).toBe(true);
+  });
+
+  test('malformed spec bytes throw so the hold stays unverified', async () => {
+    const woId = 'WO-X-01';
+    const clientFor = (content: string, encoding = 'base64') => ({
+      repos: {
+        getContent: async () => ({
+          data: { type: 'file' as const, encoding, content },
+        }),
+      },
+    });
+
+    const malformed = readWoSpecForMergeHold(woId, clientFor('!!!!'));
+    await expect(malformed).rejects.toMatchObject({
+      message: 'wo_spec_decode_failed',
+      status: 422,
+    });
+
+    const missingPadding = readWoSpecForMergeHold(woId, clientFor('YQ'));
+    await expect(missingPadding).rejects.toMatchObject({ status: 422 });
+
+    const invalidUtf8 = readWoSpecForMergeHold(
+      woId,
+      clientFor(Buffer.from([0xff, 0xfe]).toString('base64'))
+    );
+    await expect(invalidUtf8).rejects.toMatchObject({
+      message: 'wo_spec_decode_failed',
+      status: 422,
+    });
+
+    const spec = 'WO: WO-X-01\nmerge_hold: true\n';
+    const wrapped = Buffer.from(spec).toString('base64').replace(/.{60}/g, '$&\n');
+    await expect(readWoSpecForMergeHold(woId, clientFor(wrapped))).resolves.toBe(spec);
+  });
+
+  test('lifting the hold merges normally', async () => {
+    let spec = 'WO: WO-X-01\nmerge_hold: true\n';
+    const row = { ...verdict('lift-hold'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    const options = {
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async (): Promise<string> => spec,
+    };
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'lift-hold', reason: 'merge_hold' }]);
+
+    spec = 'WO: WO-X-01\n\nThe hold line is gone.\n';
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(1);
+    expect(h.approvals).toBe(1);
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        verdictId: 'lift-hold',
+        mutationSent: true,
+        reason: 'merge_executed',
+      }),
+    ]);
+  });
+
+  test('malformed spec base64 defers, never merges', async () => {
+    const row = { ...verdict('bad-b64'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: woId =>
+        readWoSpecForMergeHold(woId, {
+          repos: {
+            getContent: async () => ({
+              data: { type: 'file', encoding: 'base64', content: '!!!!' },
+            }),
+          },
+        }),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'bad-b64', reason: 'merge_hold_unverified' }]);
+  });
+
+  test('fetch error defers, never merges', async () => {
+    const row = { ...verdict('fetch-502'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async () => {
+        throw httpStatusError(502);
+      },
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'fetch-502', reason: 'merge_hold_unverified' }]);
+  });
+
+  test('missing spec is no hold', async () => {
+    const row = { ...verdict('missing-spec'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async () => {
+        throw httpStatusError(404);
+      },
+    });
+    expect(h.merges).toBe(1);
+    expect(h.approvals).toBe(1);
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        verdictId: 'missing-spec',
+        mutationSent: true,
+        reason: 'merge_executed',
+      }),
+    ]);
+  });
+
+  test('label hold applies to non-WO PRs', async () => {
+    const row = {
+      ...verdict('label-hold'),
+      run_id: 'pr-discovery:thinmansoftware/bdc-harness#5',
+      wo_id: 'gh:thinmansoftware/bdc-harness#5',
+    };
+    const h = harness(
+      [row],
+      greenPr({
+        labels: ['merge-hold'],
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 5 },
+      })
+    );
+    let reads = 0;
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async () => {
+        reads += 1;
+        return 'merge_hold: true\n';
+      },
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'label-hold', reason: 'merge_hold_label' }]);
+    expect(reads).toBe(0);
+  });
+
+  // WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01: the run:blocked label is enforced
+  // in the shared execution guard, so the originating-run path (a merge_ready verdict from a
+  // run, not from PR discovery) cannot merge a PR opened from a BLOCKED run.
+  test('run:blocked on an originating-run merge_ready verdict does not merge (bridge path)', async () => {
+    const row = verdict('orig-run-blocked');
+    expect(String(row.run_id).startsWith('pr-discovery:')).toBe(false);
+    const h = harness(
+      [row],
+      greenPr({
+        labels: ['run:blocked'],
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 },
+      })
+    );
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([
+      { verdictId: 'orig-run-blocked', reason: 'run_blocked_label' },
+    ]);
+  });
+
+  test('the same originating-run verdict merges when the PR carries no run:blocked label', async () => {
+    const h = harness(
+      [verdict('orig-run-clean')],
+      greenPr({ pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 } })
+    );
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(h.claimReleases).toEqual([]);
+  });
+
+  test('run:blocked on a discovered PR does not merge (bridge path)', async () => {
+    const row = {
+      ...verdict('disc-blocked'),
+      run_id: 'pr-discovery:thinmansoftware/bdc-harness#6',
+      wo_id: 'gh:thinmansoftware/bdc-harness#6',
+    };
+    const h = harness(
+      [row],
+      greenPr({
+        labels: ['run:blocked'],
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 6 },
+      })
+    );
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.claimReleases).toEqual([{ verdictId: 'disc-blocked', reason: 'run_blocked_label' }]);
+  });
+});
+
+describe('merge ceiling queue notices', () => {
+  const marker = '<!-- overseer:merge-ceiling-queued -->';
+  const now = new Date('2026-11-03T12:00:00.000Z');
+  function queued(head = 'abc', comments: string[] = []) {
+    const post = mock(async (_input: { body: string }) => ({ commented: true }));
+    const h = harness(
+      [verdict('queued', head)],
+      greenPr({
+        headSha: head,
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1439 },
+      }),
+      4,
+      {
+        commentOnPullRequest: post,
+        listPullRequestComments: async () => comments.map(body => ({ body, authorLogin: 'bot' })),
+      }
+    );
+    h.store.getEarliestMergeSlotReservation = async since => {
+      expect(since).toBe('2026-11-03T11:00:00.000Z');
+      return '2026-11-03T11:10:00.000Z';
+    };
+    return {
+      h,
+      post,
+      execute: () =>
+        runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          now: () => now,
+          maxMergesPerHour: 4,
+          readPolicy: () => policy(),
+        }),
+    };
+  }
+
+  test('ceiling_deferral_posts_notice', async () => {
+    const { h, post, execute } = queued();
+    h.store.listUnactionedVerdicts = async () => [
+      verdict('a'),
+      { ...verdict('other'), proposed_action: 'observe' } as OverseerVerdictRow,
+      verdict('b'),
+      verdict('queued', 'abc'),
+    ];
+    h.store.claimVerdict = async id => id === 'queued';
+    await execute();
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ number: 1439, body: expect.stringContaining(marker) })
+    );
+    const body = (post.mock.calls[0] as unknown as [{ body: string }])[0].body;
+    for (const value of ['abc', 'position 3', 'ceiling 4', '2026-11-03T12:10:00.000Z']) {
+      expect(body).toContain(value);
+    }
+  });
+
+  test('next_slot_time_from_oldest_live_reservation', async () => {
+    const { post, execute } = queued();
+    await execute();
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.stringContaining('2026-11-03T12:10:00.000Z'),
+      })
+    );
+  });
+
+  test('no_duplicate_notice_same_head', async () => {
+    const { post, execute } = queued('abc', [`${marker}\nHead: \`abc\``]);
+    await execute();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  test('new_head_gets_new_notice', async () => {
+    const { post, execute } = queued('def', [
+      `${marker}\nHead: \`abc\``,
+      `${marker}\nHead: \`def123\``,
+    ]);
+    await execute();
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.stringContaining('Head: `def`') })
+    );
+  });
+
+  test.each(['post', 'list', 'missing-post', 'missing-list', 'lookup', 'empty', 'invalid'])(
+    'comment_failure_does_not_break_deferral: %s',
+    async failure => {
+      const { h, execute } = queued();
+      const logs = captureRootLogLines();
+      const claims: string[] = [];
+      const claim = h.store.claimVerdict;
+      h.store.claimVerdict = async id => {
+        claims.push(id);
+        return claim(id);
+      };
+      h.store.listUnactionedVerdicts = async () => [verdict('queued', 'abc'), verdict('next')];
+      const fail = async (): Promise<never> => {
+        throw new Error('notice failed');
+      };
+      if (failure === 'post') h.github.commentOnPullRequest = fail;
+      if (failure === 'list') h.github.listPullRequestComments = fail;
+      if (failure === 'missing-post') h.github.commentOnPullRequest = undefined;
+      if (failure === 'missing-list') h.github.listPullRequestComments = undefined;
+      if (failure === 'lookup') h.store.getEarliestMergeSlotReservation = fail;
+      if (failure === 'empty') h.store.getEarliestMergeSlotReservation = async () => null;
+      if (failure === 'invalid') h.store.getEarliestMergeSlotReservation = async () => 'invalid';
+      try {
+        await execute();
+        expect(h.claimReleases).toContainEqual({
+          verdictId: 'queued',
+          reason: 'rate_ceiling_deferred',
+        });
+        expect(claims).toEqual(['queued', 'next']);
+        expect(
+          logs.lines.some(
+            line => line.includes('ceiling_queue_notice_failed') && line.includes('"level":40')
+          )
+        ).toBe(true);
+      } finally {
+        logs.restore();
+      }
+    }
+  );
+});
+
+describe('merge execution bridge required contexts', () => {
+  const required = ['docker-build', 'test (ubuntu-latest)'] as const;
+
+  function checkRun(
+    id: number,
+    name: string,
+    status: string,
+    conclusion: string | null
+  ): RecheckCheckRun {
+    return { id, name, status, conclusion, completed_at: `2026-11-0${id}T00:00:00.000Z` };
+  }
+
+  function contextsLookup(
+    contexts: readonly string[]
+  ): NonNullable<GitHubClientDeps['requiredContextsLookups']> {
+    return {
+      fetchWithAppClient: async () => ({ data: [...contexts] }),
+    };
+  }
+
+  async function evaluate(h: ReturnType<typeof harness>): Promise<void> {
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+  }
+
+  beforeEach(() => {
+    resetRequiredContextsCache();
+    resetRequiredContextsAttemptCounters();
+    delete process.env[REQUIRED_CONTEXTS_OVERRIDE_ENV];
+    delete process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV];
+  });
+
+  afterEach(() => {
+    resetRequiredContextsCache();
+    resetRequiredContextsAttemptCounters();
+    delete process.env[REQUIRED_CONTEXTS_OVERRIDE_ENV];
+    delete process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV];
+  });
+
+  test('non-required cancelled check does not block when required checks succeed', async () => {
+    const h = harness(
+      [verdict('required-green')],
+      greenPr({
+        checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'failure'),
+          checkRun(2, ' Docker-Build ', 'completed', 'success'),
+          checkRun(3, 'test (ubuntu-latest)', 'completed', 'success'),
+          checkRun(4, 'test (windows-latest)', 'completed', 'cancelled'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('unstable mergeable state merges when every known required context passed', async () => {
+    // GitHub reports `unstable` when only a non-required check failed or was
+    // cancelled, which is exactly the Windows-job case this gate exists for.
+    const h = harness(
+      [verdict('required-green-unstable')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+          checkRun(3, 'test (windows-latest)', 'completed', 'cancelled'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('a newer queued rerun beats an older completed success and blocks unstable', async () => {
+    // filter=all returns the historical success next to the queued rerun. The
+    // rerun has no timestamps yet; creation order (id) must still pick it.
+    const h = harness(
+      [verdict('required-rerun-queued')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 3, passed: 3, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          {
+            id: 9,
+            name: 'docker-build',
+            status: 'queued',
+            conclusion: null,
+            started_at: null,
+            completed_at: null,
+          },
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: false, reason: 'required_checks_not_success' })
+    );
+  });
+
+  test('unstable mergeable state still skips without a known required set', async () => {
+    const h = harness(
+      [verdict('empty-unstable')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'docker-build', 'completed', 'success')],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup([]) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('mergeable_state_not_clean');
+  });
+
+  test('blocked mergeable state still skips when known required contexts passed', async () => {
+    const h = harness(
+      [verdict('required-green-blocked')],
+      greenPr({
+        mergeableState: 'blocked',
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('mergeable_state_not_clean');
+  });
+
+  test('required failure still blocks and the skip log names the context', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('required-red')],
+        greenPr({
+          checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (ubuntu-latest)', 'completed', 'failure'),
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup(required) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: false, reason: 'required_checks_not_success' })
+      );
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.merge_skipped', {
+        reason: 'required_checks_not_success',
+        blockingContexts: ['test (ubuntu-latest)'],
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('required pending check blocks even when the aggregate summary is green', async () => {
+    const h = harness(
+      [verdict('required-pending')],
+      greenPr({
+        checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'in_progress', null),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('missing required check blocks even when the aggregate summary is green', async () => {
+    const h = harness(
+      [verdict('required-missing')],
+      greenPr({
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('unknown required set falls back to aggregate checks and logs the fallback', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('required-unknown')],
+        greenPr({
+          checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+            checkRun(3, 'test (windows-latest)', 'completed', 'cancelled'),
+          ],
+        })
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.required_contexts_fallback', {
+        state: 'unknown',
+        reason: 'protection_api_unavailable',
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('authoritative empty required set merges when reported checks pass', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('empty-pass')],
+        greenPr({
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          checkRuns: [checkRun(1, 'test (windows-latest)', 'completed', 'success')],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup([]) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(1);
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+      );
+      expect(
+        captured.lines.some(line => line.includes('merge-coordinator.required_contexts_fallback'))
+      ).toBe(false);
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('authoritative empty required set skips when a reported check fails', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('empty-fail')],
+        greenPr({
+          checks: { total: 2, passed: 1, failed: 1, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (windows-latest)', 'completed', 'failure'),
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup([]) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expect(
+        captured.lines.some(line => line.includes('merge-coordinator.required_contexts_fallback'))
+      ).toBe(false);
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('exhausted required set falls back to aggregate checks and logs the fallback', async () => {
+    process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV] = '1';
+    const captured = captureRootLogLines();
+    try {
+      const head = 'exhausted-head';
+      const h = harness(
+        [verdict('required-exhausted', head)],
+        greenPr({
+          headSha: head,
+          checks: { total: 1, passed: 0, failed: 1, pending: 0 },
+          checkRuns: [checkRun(1, 'test (windows-latest)', 'completed', 'cancelled')],
+        }),
+        0,
+        {
+          requiredContextsLookups: {
+            fetchWithAppClient: async () => {
+              throw new Error('lookup_down');
+            },
+          },
+        }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.required_contexts_fallback', {
+        state: 'exhausted',
+        reason: REQUIRED_CONTEXTS_BLOCKED_REASON,
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('a newer successful commit status satisfies a required context with no check run', async () => {
+    const h = harness(
+      [verdict('status-green')],
+      greenPr({
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+        commitStatuses: [
+          {
+            id: 3,
+            context: ' Docker-Build ',
+            state: 'success',
+            createdAt: '2026-11-03T00:00:00.000Z',
+          },
+          {
+            id: 50,
+            context: 'docker-build',
+            state: 'failure',
+            createdAt: '2026-11-01T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('a newer failed commit status blocks and the skip log names the context', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('status-red')],
+        greenPr({
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+          commitStatuses: [
+            {
+              id: 3,
+              context: 'docker-build',
+              state: 'success',
+              createdAt: '2026-11-01T00:00:00.000Z',
+            },
+            {
+              id: 1,
+              context: 'docker-build',
+              state: 'failure',
+              createdAt: '2026-11-03T00:00:00.000Z',
+            },
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup(required) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.merge_skipped', {
+        reason: 'required_checks_not_success',
+        blockingContexts: ['docker-build'],
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('a pending commit status blocks when the context has no check run', async () => {
+    const h = harness(
+      [verdict('status-pending')],
+      greenPr({
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+        commitStatuses: [
+          {
+            id: 4,
+            context: 'docker-build',
+            state: 'pending',
+            createdAt: '2026-11-03T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('a successful commit status does not clear a failing check run of the same name', async () => {
+    const h = harness(
+      [verdict('check-beats-status')],
+      greenPr({
+        checks: { total: 2, passed: 1, failed: 1, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'failure'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+        commitStatuses: [
+          {
+            id: 9,
+            context: 'docker-build',
+            state: 'success',
+            createdAt: '2026-11-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('a successful check run does not clear a newer failed commit status of the same name', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('status-and-check-red')],
+        greenPr({
+          checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+          ],
+          commitStatuses: [
+            {
+              id: 8,
+              context: 'docker-build',
+              state: 'success',
+              createdAt: '2026-11-01T00:00:00.000Z',
+            },
+            {
+              id: 9,
+              context: ' Docker-Build ',
+              state: 'failure',
+              createdAt: '2026-11-04T00:00:00.000Z',
+            },
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup(required) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.merge_skipped', {
+        reason: 'required_checks_not_success',
+        blockingContexts: ['docker-build'],
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('a successful check run does not clear a pending commit status of the same name', async () => {
+    const h = harness(
+      [verdict('status-and-check-pending')],
+      greenPr({
+        checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+        commitStatuses: [
+          {
+            id: 10,
+            context: 'docker-build',
+            state: 'pending',
+            createdAt: '2026-11-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('a required context passes when its check run and latest commit status both succeed', async () => {
+    const h = harness(
+      [verdict('status-and-check-green')],
+      greenPr({
+        checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+        commitStatuses: [
+          {
+            id: 1,
+            context: 'docker-build',
+            state: 'failure',
+            createdAt: '2026-11-01T00:00:00.000Z',
+          },
+          {
+            id: 11,
+            context: 'docker-build',
+            state: 'success',
+            createdAt: '2026-11-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+});
+
+// WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01 (bdc-xo#5581): the skip for a repository with
+// no policy entry is a warning that names the repository and the pull request, once per verdict.
+describe('merge execution bridge -- repo_not_allowed skip line', () => {
+  type Line = { level: 'info' | 'warn'; obj: Record<string, unknown>; msg: string };
+  const capture = (): {
+    lines: Line[];
+    logger: NonNullable<MergeExecutionBridgeOptions['logger']>;
+  } => {
+    const lines: Line[] = [];
+    return {
+      lines,
+      logger: {
+        info: (obj, msg) => lines.push({ level: 'info', obj, msg }),
+        warn: (obj, msg) => lines.push({ level: 'warn', obj, msg }),
+      },
+    };
+  };
+  const skipLines = (lines: Line[]): Line[] =>
+    lines.filter(line => line.msg === 'merge-coordinator.merge_skipped');
+
+  test('3: an unlisted repository logs ONE warn line with repo and number; a replay of the verdict stays info', async () => {
+    const first = capture();
+    const { h } = runlessHarness([
+      runlessVerdict('skipline-3', {
+        run_id: 'pr-discovery:thinmansoftware/not-listed#7',
+        wo_id: 'gh:thinmansoftware/not-listed#7',
+      }),
+    ]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      logger: first.logger,
+    });
+    expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+    const lines = skipLines(first.lines);
+    expect(lines.length).toBe(1);
+    expect(lines[0]?.level).toBe('warn');
+    expect(lines[0]?.obj).toEqual(
+      expect.objectContaining({
+        verdictId: 'skipline-3',
+        reason: 'repo_not_allowed',
+        owner: 'thinmansoftware',
+        repo: 'not-listed',
+        prNumber: 7,
+        env: 'MERGE_MANAGER_REPO_POLICY',
+        hint: 'add_repo_to_merge_policy',
+      })
+    );
+    // The same verdict handled again in this process is recorded again but not warned again.
+    const second = capture();
+    const again = runlessHarness([
+      runlessVerdict('skipline-3', {
+        run_id: 'pr-discovery:thinmansoftware/not-listed#7',
+        wo_id: 'gh:thinmansoftware/not-listed#7',
+      }),
+    ]);
+    await runMergeExecutionBridgeOnce({
+      store: again.h.store,
+      github: again.h.github,
+      readPolicy: () => policy(),
+      logger: second.logger,
+    });
+    expect(again.h.outcomes[0]?.reason).toBe('repo_not_allowed');
+    expect(skipLines(second.lines).map(line => line.level)).toEqual(['info']);
+  });
+
+  test('4: the provisioner is listed in the default policy, so it is not skipped for the repository', async () => {
+    const cap = capture();
+    const { h } = runlessHarness([
+      runlessVerdict('skipline-4', {
+        run_id: 'pr-discovery:thinmansoftware/comicstoreos-provisioner#95',
+        wo_id: 'gh:thinmansoftware/comicstoreos-provisioner#95',
+      }),
+    ]);
+    const saved = process.env.MERGE_MANAGER_REPO_POLICY;
+    delete process.env.MERGE_MANAGER_REPO_POLICY;
+    try {
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        logger: cap.logger,
+      });
+    } finally {
+      if (saved !== undefined) process.env.MERGE_MANAGER_REPO_POLICY = saved;
+    }
+    expect(h.outcomes[0]?.reason).not.toBe('repo_not_allowed');
+    expect(skipLines(cap.lines).filter(line => line.obj.reason === 'repo_not_allowed')).toEqual([]);
+  });
+
+  test('5: the run-bound path warns too, with the run owner and repo', async () => {
+    const cap = capture();
+    const h = harness([verdict('skipline-5')]);
+    h.store.getRunById = async () => ({ ...run('skipline-5'), repo: 'not-allowed' });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      logger: cap.logger,
+    });
+    expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+    const lines = skipLines(cap.lines);
+    expect(lines.length).toBe(1);
+    expect(lines[0]?.level).toBe('warn');
+    expect(lines[0]?.obj).toEqual(
+      expect.objectContaining({
+        owner: 'thinmansoftware',
+        repo: 'not-allowed',
+        hint: 'add_repo_to_merge_policy',
+      })
+    );
+  });
+
+  test('6: other skip reasons keep their level and shape', async () => {
+    const cap = capture();
+    const h = harness([verdict('skipline-6')]);
+    h.store.getRunById = async () => null;
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      logger: cap.logger,
+    });
+    const lines = skipLines(cap.lines);
+    expect(h.outcomes[0]?.reason).toBe('run_context_unresolvable');
+    expect(lines.map(line => line.level)).toEqual(['info']);
+    expect(lines[0]?.obj).not.toHaveProperty('hint');
+  });
+});
+
+// WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01 (bdc-xo#5654): the merge gate's sibling check. A second
+// implementation of an already-merged work order must not merge (provisioner PR 103 after PR 102).
+describe('merge gate: sibling of a merged pull request', () => {
+  const siblingOptions = (
+    findMergedSibling: NonNullable<MergeExecutionBridgeOptions['findMergedSibling']>,
+    warns: Array<Record<string, unknown>> = []
+  ): Partial<MergeExecutionBridgeOptions> => ({
+    findMergedSibling,
+    logger: {
+      info: () => undefined,
+      warn: (fields, message) => {
+        warns.push({ ...fields, message });
+      },
+    },
+  });
+
+  test('skips with sibling_pr_already_merged, does not merge, and warns once with both PR numbers', async () => {
+    const h = harness([verdict('sibling')], greenPr());
+    const asked: Array<{ owner: string; repo: string; number: number }> = [];
+    const warns: Array<Record<string, unknown>> = [];
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      ...siblingOptions(async input => {
+        asked.push(input);
+        return { number: 102, url: 'https://github.test/pr/102', woId: 'WO-TEST' };
+      }, warns),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('sibling_pr_already_merged');
+    expect(asked).toEqual([{ owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 }]);
+    const warned = warns.filter(line => line.reason === 'sibling_pr_already_merged');
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toMatchObject({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 1,
+      mergedPrNumber: 102,
+    });
+  });
+
+  test('no sibling found merges as before', async () => {
+    const h = harness([verdict('no-sibling')], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      ...siblingOptions(async () => null),
+    });
+    expect(h.merges).toBe(1);
+  });
+
+  test('a failing lookup never blocks an unrelated merge', async () => {
+    const h = harness([verdict('lookup-fails')], greenPr());
+    const warns: Array<Record<string, unknown>> = [];
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      ...siblingOptions(async () => {
+        throw new Error('event store unavailable');
+      }, warns),
+    });
+    expect(h.merges).toBe(1);
+    expect(warns.some(line => line.message === 'merge-coordinator.sibling_lookup_failed')).toBe(
+      true
+    );
+    expect(h.outcomes.some(outcome => outcome.reason === 'sibling_pr_already_merged')).toBe(false);
+  });
+});
+
+// bdc-xo#5571 follow-up (acting XO ruling 2026-11-12): a green PR waiting for the hourly ceiling carries
+// the `merge-queued` label, so it does not look stuck (the queue comment alone was missed on PR 5662).
+describe('merge-queued label', () => {
+  const now = new Date('2026-11-03T12:00:00.000Z');
+  const ref = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1439 };
+
+  function deferred(
+    labels: string[] | undefined,
+    extras: Partial<GitHubClientDeps> = {}
+  ): { run: () => Promise<void>; h: ReturnType<typeof harness> } {
+    const h = harness(
+      [verdict('queued', 'abc')],
+      greenPr({ headSha: 'abc', pr: ref, ...(labels ? { labels } : {}) }),
+      4,
+      {
+        commentOnPullRequest: async () => ({ commented: true }),
+        listPullRequestComments: async () => [],
+        ...extras,
+      }
+    );
+    h.store.getEarliestMergeSlotReservation = async () => '2026-11-03T11:10:00.000Z';
+    return {
+      h,
+      run: () =>
+        runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          now: () => now,
+          maxMergesPerHour: 4,
+          readPolicy: () => policy(),
+        }),
+    };
+  }
+
+  test('a deferral labels the PR merge-queued once', async () => {
+    const add = mock(async (_input: { number: number; labels: string[] }) => undefined);
+    const { run, h } = deferred(undefined, { addPullRequestLabels: add });
+    await run();
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(add).toHaveBeenCalledWith(
+      expect.objectContaining({ number: 1439, labels: ['merge-queued'] })
+    );
+    expect(h.claimReleases).toEqual([{ verdictId: 'queued', reason: 'rate_ceiling_deferred' }]);
+  });
+
+  test('a PR that already carries the label costs no extra call', async () => {
+    const add = mock(async () => undefined);
+    const { run } = deferred(['merge-queued'], { addPullRequestLabels: add });
+    await run();
+    expect(add).not.toHaveBeenCalled();
+  });
+
+  test('a label failure never breaks the deferral and is logged', async () => {
+    const lines = captureRootLogLines();
+    try {
+      const { run, h } = deferred(undefined, {
+        addPullRequestLabels: async () => {
+          throw new Error('labels refused');
+        },
+      });
+      await run();
+      expect(h.claimReleases).toEqual([{ verdictId: 'queued', reason: 'rate_ceiling_deferred' }]);
+      expect(lines.lines.some(line => line.includes('merge-coordinator.queued_label_failed'))).toBe(
+        true
+      );
+    } finally {
+      lines.restore();
+    }
+  });
+
+  test('merging a PR that carries the label removes it', async () => {
+    const remove = mock(async (_input: { label: string; number: number }) => undefined);
+    const h = harness([verdict('merge-it')], greenPr({ labels: ['merge-queued'] }), 0, {
+      removePullRequestLabel: remove,
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith(
+      expect.objectContaining({ label: 'merge-queued', number: 1 })
+    );
+  });
+
+  test('merging a PR without the label makes no label call, and a removal failure never undoes the merge', async () => {
+    const remove = mock(async () => undefined);
+    const plain = harness([verdict('plain')], greenPr(), 0, { removePullRequestLabel: remove });
+    await runMergeExecutionBridgeOnce({
+      store: plain.store,
+      github: plain.github,
+      readPolicy: () => policy(),
+    });
+    expect(plain.merges).toBe(1);
+    expect(remove).not.toHaveBeenCalled();
+
+    const failing = harness([verdict('fail-remove')], greenPr({ labels: ['merge-queued'] }), 0, {
+      removePullRequestLabel: async () => {
+        throw new Error('label api down');
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: failing.store,
+      github: failing.github,
+      readPolicy: () => policy(),
+    });
+    expect(failing.merges).toBe(1);
+  });
+});
+
+describe('no global hourly merge ceiling', () => {
+  const ceilingMarker = '<!-- overseer:merge-ceiling-queued -->';
+
+  function readyRows(count: number): ReturnType<typeof verdict>[] {
+    return Array.from({ length: count }, (_, index) => verdict(`ready-${String(index)}`));
+  }
+
+  test('merges every ready verdict in one sweep when no ceiling is set', async () => {
+    delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+    const comments: string[] = [];
+    const addPullRequestLabels = mock(async () => undefined);
+    const heads: string[] = [];
+    const h = harness(readyRows(15), greenPr(), 0, {
+      addPullRequestLabels,
+      commentOnPullRequest: async input => {
+        comments.push(input.body);
+        return { commented: true };
+      },
+    });
+    h.github.mergePullRequest = async input => {
+      heads.push(input.expectedHeadSha);
+      return { merged: true, mergeSha: 'merge-sha' };
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(heads).toEqual(Array<string>(15).fill('judged-sha'));
+    expect(h.claimReleases.some(row => row.reason === 'rate_ceiling_deferred')).toBe(false);
+    expect(addPullRequestLabels).not.toHaveBeenCalled();
+    expect(comments.some(body => body.includes(ceilingMarker))).toBe(false);
+  });
+
+  test('keeps the sweep serial when no ceiling is set', async () => {
+    delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+    const h = harness(readyRows(15));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const heads: string[] = [];
+    h.github.mergePullRequest = async input => {
+      heads.push(input.expectedHeadSha);
+      inFlight += 1;
+      if (inFlight > maxInFlight) maxInFlight = inFlight;
+      await new Promise(resolve => {
+        setTimeout(resolve, 0);
+      });
+      inFlight -= 1;
+      return { merged: true, mergeSha: 'merge-sha' };
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(heads).toHaveLength(15);
+    expect(maxInFlight).toBe(1);
+  });
+
+  test('still honors an explicit OVERSEER_MAX_MERGES_PER_HOUR ceiling', async () => {
+    process.env.OVERSEER_MAX_MERGES_PER_HOUR = '12';
+    const h = harness(readyRows(15));
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(12);
+    expect(h.claimReleases).toContainEqual({
+      verdictId: 'ready-12',
+      reason: 'rate_ceiling_deferred',
+    });
+  });
+
+  test('fails closed to 4 and warns once when the ceiling value is invalid', async () => {
+    process.env.OVERSEER_MAX_MERGES_PER_HOUR = 'abc';
+    const h = harness(readyRows(6));
+    const captured = captureRootLogLines();
+    try {
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+      });
+      const invalid = captured.lines.filter(line => {
+        const start = line.indexOf('{');
+        if (start < 0) return false;
+        try {
+          const parsed = JSON.parse(line.slice(start)) as { msg?: unknown };
+          return parsed.msg === 'merge-coordinator.max_merges_per_hour_invalid';
+        } catch {
+          return false;
+        }
+      });
+      expect(h.merges).toBe(4);
+      expect(h.claimReleases).toContainEqual({
+        verdictId: 'ready-4',
+        reason: 'rate_ceiling_deferred',
+      });
+      expect(invalid).toHaveLength(1);
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('treats an empty OVERSEER_MAX_MERGES_PER_HOUR as no ceiling', async () => {
+    process.env.OVERSEER_MAX_MERGES_PER_HOUR = '';
+    const h = harness(readyRows(6));
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(6);
+  });
+
+  test('merges a clean verdict once and still applies the other gates with no ceiling', async () => {
+    delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+    const rows = [
+      verdict('head-moved'),
+      verdict('reworking'),
+      verdict('red'),
+      verdict('evidence'),
+      verdict('clean'),
+    ];
+    const h = harness(rows);
+    h.github.findPullRequest = async input => {
+      switch (input.headBranch) {
+        case 'branch-head-moved':
+          return greenPr({ headSha: 'moved-sha' });
+        case 'branch-reworking':
+          return greenPr({ labels: ['owner:reworking'] });
+        case 'branch-red':
+          return greenPr({ checks: { total: 2, passed: 1, failed: 1, pending: 0 } });
+        case 'branch-evidence':
+        case 'branch-clean':
+          return greenPr();
+        default:
+          throw new Error(`unexpected branch ${input.headBranch ?? ''}`);
+      }
+    };
+    const mergedHeads: string[] = [];
+    h.github.mergePullRequest = async input => {
+      mergedHeads.push(input.expectedHeadSha);
+      return { merged: true, mergeSha: 'merge-sha' };
+    };
+    const claimed = new Set<string>();
+    const claimVerdict = h.store.claimVerdict;
+    h.store.claimVerdict = async verdictId => {
+      if (claimed.has(verdictId)) return false;
+      claimed.add(verdictId);
+      return claimVerdict(verdictId);
+    };
+    const options = {
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readRunEvents: async (runId: string) => {
+        if (runId !== 'run-evidence') return [];
+        return [
+          {
+            id: 'evidence-failed',
+            workflow_run_id: 'run-evidence',
+            event_type: 'node_failed',
+            step_name: 'manifest-evidence-check',
+            data: {},
+          },
+        ];
+      },
+    };
+    await Promise.all([runMergeExecutionBridgeOnce(options), runMergeExecutionBridgeOnce(options)]);
+    expect(mergedHeads).toEqual(['judged-sha']);
+    expect(h.outcomes).toContainEqual(
+      expect.objectContaining({ verdictId: 'head-moved', reason: 'verdict_stale_head' })
+    );
+    expect(h.outcomes.some(row => row.verdictId === 'reworking')).toBe(false);
+    expect(h.claimReleases).toContainEqual({
+      verdictId: 'reworking',
+      reason: 'owner_reworking_label',
+    });
+    expect(h.outcomes).toContainEqual(
+      expect.objectContaining({ verdictId: 'red', reason: 'required_checks_not_success' })
+    );
+    expect(h.outcomes.some(row => row.verdictId === 'evidence')).toBe(false);
+    expect(h.claimReleases).toContainEqual({
+      verdictId: 'evidence',
+      reason: 'originating_run_failed_evidence_gate',
+    });
+    expect(h.claimReleases.some(row => row.reason === 'rate_ceiling_deferred')).toBe(false);
+    expect(mergedHeads).toHaveLength(1);
   });
 });

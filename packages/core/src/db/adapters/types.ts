@@ -28,10 +28,17 @@ export interface IDatabase {
    * they either all commit or all roll back on error.
    *
    * @param fn - Callback receiving a transaction-scoped query function
+   * @param options - `immediate: true` asks SQLite to take the write lock at
+   *   BEGIN (BEGIN IMMEDIATE). Use it for read-then-write transactions that
+   *   other processes may race: a deferred BEGIN that has already read cannot
+   *   wait for the write lock (SQLite skips busy_timeout to avoid deadlock), so
+   *   its first write fails at once with "database is locked". Postgres
+   *   ignores it.
    * @returns The callback's return value
    */
   withTransaction<T>(
-    fn: (query: <U>(sql: string, params?: unknown[]) => Promise<QueryResult<U>>) => Promise<T>
+    fn: (query: <U>(sql: string, params?: unknown[]) => Promise<QueryResult<U>>) => Promise<T>,
+    options?: { immediate?: boolean }
   ): Promise<T>;
 
   /**

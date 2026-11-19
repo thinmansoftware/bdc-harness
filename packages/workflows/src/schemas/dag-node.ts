@@ -209,6 +209,14 @@ export const dagNodeBaseSchema = z.object({
    * how the node was authored.
    */
   load_bearing: z.boolean().optional(),
+  /**
+   * WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01: when this node fails, end the run at
+   * once -- not-started nodes are skipped and the run fails with
+   * metadata.terminal_cause = 'repair_checkout_failed' and
+   * metadata.repair_failure_reason = the first error line starting
+   * `repair_target_`, `repair_gate_closed:` or `ERROR:`.
+   */
+  abort_run_on_failure: z.boolean().optional(),
 });
 
 export type DagNodeBase = z.infer<typeof dagNodeBaseSchema>;
@@ -718,6 +726,9 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.trigger_rule !== undefined ? { trigger_rule: data.trigger_rule } : {}),
       ...(data.idle_timeout !== undefined ? { idle_timeout: data.idle_timeout } : {}),
       ...(data.wall_timeout_ms !== undefined ? { wall_timeout_ms: data.wall_timeout_ms } : {}),
+      ...(data.abort_run_on_failure !== undefined
+        ? { abort_run_on_failure: data.abort_run_on_failure }
+        : {}),
     };
 
     // Shared optional fields (valid on AI and bash nodes)

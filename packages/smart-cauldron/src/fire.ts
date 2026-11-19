@@ -34,6 +34,12 @@ interface FireTierOptions {
   discoverTimeoutMs?: number;
   /** Poll interval for discovery (ms). Default: 3000. */
   discoverIntervalMs?: number;
+  /**
+   * Transport for Archon API reads/writes. Defaults to global fetch. The
+   * in-process T3 command consumer passes the server's own in-process API
+   * dispatcher here so no network self-call is made.
+   */
+  fetchImpl?: typeof fetch;
 }
 
 interface CodebaseSummary {
@@ -79,7 +85,8 @@ export async function resolveCodebaseId(
   project: string,
   apiBaseUrl: string,
   token: string,
-  readJson?: (url: string) => Promise<unknown>
+  readJson?: (url: string) => Promise<unknown>,
+  doFetch: typeof fetch = fetch
 ): Promise<{ codebaseId: string | null; error: string | null; defaultCwd?: unknown }> {
   if (readJson) {
     const codebases = await readJson(`${apiBaseUrl}/api/codebases`);
@@ -87,7 +94,7 @@ export async function resolveCodebaseId(
   }
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl}/api/codebases`, {
+    response = await doFetch(`${apiBaseUrl}/api/codebases`, {
       headers: authHeaders(token),
     });
   } catch (error) {
@@ -268,6 +275,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
     discoverTimeoutMs = 30_000,
     discoverIntervalMs = 3_000,
   } = opts;
+  const doFetch = opts.fetchImpl ?? fetch;
 
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
   if (workflowName === CODEX_ONLY_WORKFLOW) {
@@ -289,7 +297,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
   }
   const binding = opts.validatedBinding
     ? { codebaseId: opts.validatedBinding.codebaseId, error: null }
-    : await resolveCodebaseId(project, apiBaseUrl, token);
+    : await resolveCodebaseId(project, apiBaseUrl, token, undefined, doFetch);
   if (binding.codebaseId === null) {
     return { ok: false, runId: null, conversationId: null, infraError: binding.error };
   }
@@ -306,7 +314,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
 
   let fireResponse: Response;
   try {
-    fireResponse = await fetch(`${apiBaseUrl}/api/conversations`, {
+    fireResponse = await doFetch(`${apiBaseUrl}/api/conversations`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -369,6 +377,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
     timeoutMs: discoverTimeoutMs,
     intervalMs: discoverIntervalMs,
     token,
+    fetchImpl: doFetch,
   });
   if (runId === null) {
     return {
@@ -390,15 +399,19 @@ async function discoverRunId(opts: {
   timeoutMs: number;
   intervalMs: number;
   token: string;
+  fetchImpl: typeof fetch;
 }): Promise<string | null> {
   const deadline = Date.now() + opts.timeoutMs;
   const query = new URLSearchParams({ codebaseId: opts.codebaseId, limit: '50' });
 
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${opts.apiBaseUrl}/api/workflows/runs?${query.toString()}`, {
-        headers: authHeaders(opts.token),
-      });
+      const response = await opts.fetchImpl(
+        `${opts.apiBaseUrl}/api/workflows/runs?${query.toString()}`,
+        {
+          headers: authHeaders(opts.token),
+        }
+      );
       if (response.ok) {
         const body = (await response.json()) as { runs?: WorkflowRunSummary[] };
         const run = body.runs?.find(

@@ -31,6 +31,7 @@ import type {
   ProviderCapabilities,
   SendQueryOptions,
 } from '../../types';
+import { stripPersonalTokens } from '@archon/paths';
 import { CURSOR_AGENT_CAPABILITIES } from './capabilities';
 import { parseCursorAgentConfig } from './config';
 
@@ -115,7 +116,12 @@ export class CursorAgentProvider implements IAgentProvider {
     }
     const model = options?.model ?? this.model;
     const argv = buildCursorAgentArgv(this.binaryPath, model, cwd);
-    const child = this.spawn(argv, { cwd, env: { ...process.env, ...(options?.env ?? {}) } });
+    // No personal GitHub token names for the cursor-agent child (bdc-xo#5464).
+    const env = {
+      ...stripPersonalTokens({ ...process.env, ...(options?.env ?? {}) }),
+      ARCHON_GITHUB_NO_PERMISSION_FALLBACK: '1',
+    };
+    const child = this.spawn(argv, { cwd, env });
     const onAbort = (): void => {
       child.kill();
     };

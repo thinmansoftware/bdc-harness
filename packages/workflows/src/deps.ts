@@ -126,4 +126,8 @@ export interface WorkflowDeps {
   ) => Promise<FrozenSpecSource>;
   /** Internal execution guard installed by the run-lease wrapper. */
   isRunLeaseValid?: () => boolean;
+  /** Why the lease was lost, when it was (installed by the run-lease wrapper). */
+  getRunLeaseLoss?: () => import('./run-lease').RunLeaseLoss | null;
+  /** Lease timing overrides for tests (the lease wrapper reads them; production leaves this unset). */
+  runLeaseTiming?: { leaseDurationMs?: number; heartbeatIntervalMs?: number; now?: () => Date };
 }

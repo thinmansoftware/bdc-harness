@@ -1,0 +1,5 @@
+E2E merge canary 15
+
+E2E_MERGE_CANARY_OK
+
+Canary run 2026-11-04 (lane codex) proves Test 1 (the file exists), Test 2 (the diff contains exactly this marker file), and Test 3 (the dated marker is present).

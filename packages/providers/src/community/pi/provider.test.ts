@@ -901,8 +901,10 @@ describe('PiProvider', () => {
     );
 
     const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
-    // tools key should be absent -- Pi uses its default codingTools
-    expect('tools' in callArgs).toBe(false);
+    // The default tool set (read/bash/edit/write) is built explicitly so the bash tool carries
+    // the env-stripping spawnHook (bdc-xo#5464).
+    const tools = callArgs.tools as { __piTool: string }[];
+    expect(tools.map(t => t.__piTool).sort()).toEqual(['bash', 'edit', 'read', 'write']);
   });
 
   test('requestOptions.env with no tool restrictions overrides Pi defaults with env-aware bash', async () => {
@@ -962,7 +964,7 @@ describe('PiProvider', () => {
     expect(merged.env.PATH).toBe('/usr/bin');
   });
 
-  test('empty requestOptions.env does NOT construct a spawnHook', async () => {
+  test('empty requestOptions.env still installs the env-stripping spawnHook (bdc-xo#5464)', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAgentEnd());
 
@@ -973,9 +975,17 @@ describe('PiProvider', () => {
       })
     );
 
-    // Every createBashTool call in this test path is either (cwd) or (cwd, undefined).
+    // Every bash tool carries a spawnHook that removes the personal GitHub token names.
+    expect(mockCreateBashTool.mock.calls.length).toBeGreaterThan(0);
     for (const call of mockCreateBashTool.mock.calls) {
-      expect(call[1]).toBeUndefined();
+      const hook = (call[1] as { spawnHook: (c: unknown) => { env: Record<string, string> } })
+        .spawnHook;
+      const out = hook({
+        command: 'true',
+        cwd: '/tmp',
+        env: { PATH: '/usr/bin', GH_TOKEN: 'x', GITHUB_TOKEN: 'x', MERGE_MANAGER_GH_TOKEN: 'x' },
+      });
+      expect(Object.keys(out.env).sort()).toEqual(['ARCHON_GITHUB_NO_PERMISSION_FALLBACK', 'PATH']);
     }
   });
 

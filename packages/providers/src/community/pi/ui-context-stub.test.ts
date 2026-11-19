@@ -107,10 +107,15 @@ describe('createArchonUIContext', () => {
     expect(result.error).toBeDefined();
   });
 
-  test('theme getter returns a proxy that throws on property access', () => {
+  test('theme getter preserves text with identity decorators in headless sessions', () => {
     const { ui } = mk();
     const themeRef = ui.theme;
-    expect(() => themeRef.fg('accent', 'text')).toThrow(/Archon's remote UI stub/);
+    expect(themeRef.fg('accent', 'text')).toBe('text');
+    expect(themeRef.bg('selectedBg', 'background')).toBe('background');
+    expect(themeRef.bold('bold')).toBe('bold');
+    expect(themeRef.getFgAnsi('accent')).toBe('');
+    expect(themeRef.getBgAnsi('selectedBg')).toBe('');
+    expect(themeRef.getThinkingBorderColor('low')('border')).toBe('border');
   });
 
   test('onTerminalInput returns a disposer that is safe to call', () => {

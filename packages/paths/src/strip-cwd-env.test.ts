@@ -203,6 +203,56 @@ describe('stripCwdEnv -- nested Claude Code marker stripping', () => {
     expect(process.env.VSCODE_INSPECTOR_OPTIONS).toBeUndefined();
   });
 
+  // Node 26 defines a global localStorage that returns undefined; vitest DOM
+  // environments then cannot install their own and every localStorage test
+  // crashes. The builder image sets NODE_OPTIONS=--no-experimental-webstorage
+  // to prevent that, and it must survive into lane bash nodes (bdc-xo, 2026-11-05).
+  it('keeps NODE_OPTIONS when every flag is on the safe allowlist', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('keeps an allowlisted NODE_OPTIONS with surrounding whitespace', () => {
+    process.env.NODE_OPTIONS = '  --no-experimental-webstorage  ';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBe('  --no-experimental-webstorage  ');
+  });
+
+  // One unknown flag must not take the safe flag down with it: an all-or-nothing
+  // delete is how the localStorage fix vanished from every lane on 2026-11-05.
+  it('keeps the allowlisted flags and drops only the unknown ones', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage --inspect';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('keeps the allowlisted flag when it is not first', () => {
+    process.env.NODE_OPTIONS =
+      '--max-old-space-size=4096 --no-experimental-webstorage --require=/tmp/x.js';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('strips NODE_OPTIONS that only looks like the allowlisted flag', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage=1';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('strips an empty NODE_OPTIONS', () => {
+    process.env.NODE_OPTIONS = '   ';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('strips an allowlisted NODE_OPTIONS that came from a CWD .env file', () => {
+    writeFileSync(join(tmpDir, '.env'), 'NODE_OPTIONS=--no-experimental-webstorage\n');
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
   it('handles combined CWD .env + nested session markers in one call', () => {
     writeFileSync(join(tmpDir, '.env'), 'TEST_STRIP_KEY=leaked\n');
     process.env.TEST_STRIP_KEY = 'leaked';
@@ -214,5 +264,182 @@ describe('stripCwdEnv -- nested Claude Code marker stripping', () => {
     expect(process.env.CLAUDECODE).toBeUndefined();
     expect(process.env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('keep-me');
+  });
+});
+
+describe('stripCwdEnv -- NODE_OPTIONS removals are reported, never silent', () => {
+  const tmpDir = join(import.meta.dir, '__strip-nodeopts-log-tmp__');
+  let stderrSpy: ReturnType<typeof spyOn>;
+  let stderrWrites: string[];
+
+  beforeEach(() => {
+    mkdirSync(tmpDir, { recursive: true });
+    stderrWrites = [];
+    stderrSpy = spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      stderrWrites.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.NODE_OPTIONS;
+    delete process.env.VSCODE_INSPECTOR_OPTIONS;
+  });
+
+  it('names each removed flag and what was kept', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage --inspect --max-old-space-size=4096';
+    stripCwdEnv(tmpDir);
+    const line = stderrWrites.find(w => w.startsWith('[archon] NODE_OPTIONS: removed'));
+    expect(line).toBeDefined();
+    expect(line).toContain('removed 2 flag(s)');
+    expect(line).toContain('--inspect');
+    expect(line).toContain('--max-old-space-size');
+    expect(line).toContain('kept --no-experimental-webstorage');
+  });
+
+  it('never prints a flag value', () => {
+    process.env.NODE_OPTIONS = '--require=/home/secret/preload.js --inspect=0.0.0.0:9229';
+    stripCwdEnv(tmpDir);
+    const line = stderrWrites.find(w => w.startsWith('[archon] NODE_OPTIONS: removed'));
+    expect(line).toBeDefined();
+    expect(line).toContain('--require');
+    expect(line).not.toContain('/home/secret/preload.js');
+    expect(line).not.toContain('9229');
+    expect(line).toContain('NODE_OPTIONS unset');
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  const nodeOptionsLine = (): string => {
+    const line = stderrWrites.find(w => w.startsWith('[archon] NODE_OPTIONS: removed'));
+    expect(line).toBeDefined();
+    return line ?? '';
+  };
+
+  const TAIL =
+    '. Add a flag to SAFE_NODE_OPTIONS_FLAGS in packages/paths/src/strip-cwd-env.ts to pass it to lanes.\n';
+
+  it('never prints a space-separated value (--require /path)', () => {
+    process.env.NODE_OPTIONS = '--require /home/secret/preload.js --no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (--require); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('preload');
+    expect(nodeOptionsLine()).not.toContain('/home');
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('never prints a double-quoted value that contains spaces', () => {
+    process.env.NODE_OPTIONS = '--require "/home/my secret/pre load.js" --inspect';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 2 flag(s) not on the safe list (--require, --inspect); NODE_OPTIONS unset' +
+        TAIL
+    );
+    for (const fragment of ['secret', 'my', 'pre', 'load', '/home', '"']) {
+      expect(nodeOptionsLine()).not.toContain(fragment);
+    }
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('keeps an escaped quote inside a quoted value from splitting it', () => {
+    process.env.NODE_OPTIONS = '--require "a\\" b secret" --no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (--require); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+  });
+
+  it('never prints a single-quoted value that contains spaces', () => {
+    process.env.NODE_OPTIONS =
+      "--import 'file:///c:/my secret/hook.mjs' --no-experimental-webstorage";
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (--import); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('hook');
+    expect(nodeOptionsLine()).not.toContain('file:');
+  });
+
+  it('never prints a quoted value attached with equals', () => {
+    process.env.NODE_OPTIONS = '--require="/home/my secret/x.js" --no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (--require); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('x.js');
+  });
+
+  it('logs only the name for the equals form, mixed with a safe flag', () => {
+    process.env.NODE_OPTIONS =
+      '--require=/home/secret/preload.js --no-experimental-webstorage --inspect=0.0.0.0:9229';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 2 flag(s) not on the safe list (--require, --inspect); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('9229');
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('logs a placeholder for unrecognized tokens and never echoes them', () => {
+    process.env.NODE_OPTIONS =
+      'hunter2-token --no-experimental-webstorage /home/secret/stray.js --pass=word';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 3 flag(s) not on the safe list (<unrecognized>, <unrecognized>, --pass); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('hunter2');
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('word');
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('logs a placeholder for an unquoted value with spaces after an equals flag', () => {
+    process.env.NODE_OPTIONS = '--require=/home/my secret/x.js';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 2 flag(s) not on the safe list (--require, <unrecognized>); NODE_OPTIONS unset' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('x.js');
+  });
+
+  it('logs a placeholder when a whole flag-and-value is quoted as one token', () => {
+    process.env.NODE_OPTIONS = '"--require /home/secret/x.js"';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (<unrecognized>); NODE_OPTIONS unset' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+  });
+
+  it('prints nothing when every flag is allowlisted', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(stderrWrites.some(w => w.includes('NODE_OPTIONS'))).toBe(false);
+  });
+
+  it('reports a stripped VSCODE_INSPECTOR_OPTIONS', () => {
+    process.env.VSCODE_INSPECTOR_OPTIONS = '{"port":9229}';
+    stripCwdEnv(tmpDir);
+    expect(stderrWrites.some(w => w.startsWith('[archon] stripped VSCODE_INSPECTOR_OPTIONS'))).toBe(
+      true
+    );
+    expect(stderrWrites.some(w => w.includes('9229'))).toBe(false);
   });
 });

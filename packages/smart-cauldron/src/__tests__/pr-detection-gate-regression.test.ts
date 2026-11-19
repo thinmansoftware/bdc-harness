@@ -379,7 +379,15 @@ async function baseOpts(deps: CascadeDeps): Promise<RunCascadeOptions> {
     outDir: await makeOutDir(),
     token: 'test-token',
     project: 'lspro-react',
-    deps,
+    deps: {
+      readRunDetail: async () => ({
+        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+      }),
+      // No open PR; a climb's open-PR lookup fails closed (bdc-xo #4638), so tests
+      // must not fall through to real `gh`.
+      listOpenWoPullRequests: async () => [],
+      ...deps,
+    },
   };
 }
 

@@ -3,7 +3,7 @@
 .gitignore
 
 # Dependencies (installed in container)
-# Must match root AND per-package node_modules — workspace symlinks from the
+# Must match root AND per-package node_modules -- workspace symlinks from the
 # host are broken inside Linux containers and would shadow the production install.
 node_modules
 **/node_modules
@@ -51,3 +51,6 @@ coverage/
 *.test.tsx
 **/*.test.ts
 **/*.test.tsx
+# GitHub App private keys live in secrets/ on the host: never copy them into a build (bdc-xo#5444)
+secrets/
+*.private-key.pem

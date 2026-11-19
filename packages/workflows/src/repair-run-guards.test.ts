@@ -59,6 +59,16 @@ const GUARDED_WHEN: Record<string, string> = {
   'open-pr-if-needed': "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'",
 };
 
+const IMPLEMENT_GATE = "$implement-block-gate.output.terminal == 'no'";
+const IMPLEMENT_GATED = new Set([
+  'diff-repair',
+  'checkpoint-diff-repair',
+  'opus-repair',
+  'apply-suggested-fix',
+  'commit-and-push',
+  'open-pr-if-needed',
+]);
+
 const LINE_START_RULE = 'first non-whitespace text on its line';
 
 interface LaneNode {
@@ -283,6 +293,9 @@ function runningAtoms(gate: string | undefined): Map<string, NodeOutput> {
     'block-reclassify': '{"status":"PROCEED"}',
     'classify-apply-review': '{"verdict":"satisfied"}',
     'classify-opus-rereview': '{"verdict":"satisfied"}',
+    // A normal run: the implement step did not declare BLOCKED (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-
+    // AND-IMPLEMENT-BLOCK-STOP-01), so the gate does not change what repair-gate decides.
+    'implement-block-gate': '{"terminal":"no"}',
   };
   if (gate !== undefined) entries['repair-gate'] = gate;
   return outputMap(entries);
@@ -295,8 +308,16 @@ function assertGuarded(
   allow: boolean
 ): void {
   const outputs = runningAtoms(gate);
-  for (const [id, expectedWhen] of Object.entries(GUARDED_WHEN)) {
+  for (const [id, guardedWhen] of Object.entries(GUARDED_WHEN)) {
     const node = nodeOf(nodes, id, file);
+    // The nodes that repair, push, commit or open a PR also carry the implement-block gate on every
+    // OR clause (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01).
+    const expectedWhen = IMPLEMENT_GATED.has(id)
+      ? guardedWhen
+          .split(' || ')
+          .map(clause => `${clause} && ${IMPLEMENT_GATE}`)
+          .join(' || ')
+      : guardedWhen;
     expect(node.when, `${file} ${id}`).toBe(expectedWhen);
     expect(node.depends_on ?? [], `${file} ${id}`).toContain('repair-gate');
     expect((node.depends_on ?? [])[(node.depends_on ?? []).length - 1], `${file} ${id}`).toBe(
