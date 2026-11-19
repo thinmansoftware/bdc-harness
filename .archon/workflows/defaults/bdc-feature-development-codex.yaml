@@ -249,7 +249,10 @@ nodes:
       }
       rtw_proc_field() {
         local stat rest
-        stat=$(cat "$proc_root/$1/stat" 2>/dev/null) || return 1
+        if ! stat=$(cat "$proc_root/$1/stat" 2>&1); then
+          printf '%s\n' "$stat" >&2
+          return 1
+        fi
         rest=${stat##*) }
         printf '%s\n' "$rest" | awk -v n="$2" '{print $n}'
       }
@@ -265,7 +268,7 @@ nodes:
         printf '%s\n' "${c:-unknown}"
       }
       rtw_proc_uid() {
-        awk '/^Uid:/ {print $2; exit}' "$proc_root/$1/status" 2>/dev/null
+        awk '/^Uid:/ {print $2; exit}' "$proc_root/$1/status"
       }
       rtw_proc_start_ms() {
         local ticks
@@ -297,12 +300,19 @@ nodes:
         done
         return 1
       }
+      rtw_note_unreadable() {
+        local detail
+        detail=$(printf '%s' "$3" | tr '\r\n' '  ' | cut -c1-240)
+        rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+        rtw_scan_errors="${rtw_scan_errors:+$rtw_scan_errors; }pid=$1 uid=$2 read_error=${detail:-unavailable}"
+      }
       rtw_scan_holder() {
-        local d pid cwdlink resolved uid start comm reason
+        local d pid cwdlink resolved uid start comm reason cwd_error
         rtw_scan_result="clear"
         rtw_scan_detail=""
         rtw_scan_foreign=""
         rtw_scan_unreadable=0
+        rtw_scan_errors=""
         for d in "$proc_root"/[0-9]*; do
           [ -d "$d" ] || continue
           pid=${d##*/}
@@ -314,22 +324,31 @@ nodes:
           fi
           cwdlink="$d/cwd"
           resolved=""
+          cwd_error="cwd link unavailable"
           if [ -L "$cwdlink" ] || [ -e "$cwdlink" ]; then
-            resolved=$(readlink -f "$cwdlink" 2>/dev/null || true)
+            if resolved=$(readlink -f "$cwdlink" 2>&1); then
+              cwd_error="cwd resolved to empty path"
+            else
+              cwd_error="$resolved"
+              resolved=""
+            fi
           fi
           if [ -z "$resolved" ]; then
             [ -d "$d" ] || continue
-            if ! uid=$(rtw_proc_uid "$pid") || [ -z "$uid" ]; then
+            if ! uid=$(rtw_proc_uid "$pid" 2>&1) || [ -z "$uid" ]; then
               [ -d "$d" ] || continue
-              rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+              rtw_note_unreadable "$pid" unknown "status: ${uid:-Uid field missing}; cwd: $cwd_error"
               continue
             fi
             if [ "$uid" = "$rtw_self_uid" ]; then
-              if start=$(rtw_proc_start_ms "$pid") && [ "$start" -le "$rtw_holder_started_ms" ]; then
-                continue
+              if start=$(rtw_proc_start_ms "$pid" 2>&1); then
+                [ "$start" -le "$rtw_holder_started_ms" ] && continue
+                reason="cwd: $cwd_error (process newer than holder)"
+              else
+                reason="stat: ${start:-start time unavailable}; cwd: $cwd_error"
               fi
               [ -d "$d" ] || continue
-              rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+              rtw_note_unreadable "$pid" "$uid" "$reason"
             fi
             continue
           fi
@@ -342,16 +361,16 @@ nodes:
           fi
           comm=$(rtw_proc_comm "$pid")
           reason="run_owned"
-          if ! uid=$(rtw_proc_uid "$pid") || [ -z "$uid" ]; then
+          if ! uid=$(rtw_proc_uid "$pid" 2>&1) || [ -z "$uid" ]; then
             [ -d "$d" ] || continue
-            rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+            rtw_note_unreadable "$pid" unknown "status: ${uid:-Uid field missing}"
             continue
           fi
           if [ "$uid" != "$rtw_self_uid" ]; then
             reason="foreign_uid"
-          elif ! start=$(rtw_proc_start_ms "$pid"); then
+          elif ! start=$(rtw_proc_start_ms "$pid" 2>&1); then
             [ -d "$d" ] || continue
-            rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+            rtw_note_unreadable "$pid" "$uid" "stat: ${start:-start time unavailable}"
             continue
           elif [ "$start" -le "$rtw_holder_started_ms" ]; then
             reason="predates_run"
@@ -378,7 +397,7 @@ nodes:
           case "$rtw_scan_result" in
             clear) return 0 ;;
             incomplete)
-              rtw_refuse "process scan incomplete (${rtw_scan_unreadable} unreadable)"
+              rtw_refuse "process scan incomplete (${rtw_scan_unreadable} unreadable): $rtw_scan_errors"
               return 1
               ;;
           esac
