@@ -249,7 +249,10 @@ nodes:
       }
       rtw_proc_field() {
         local stat rest
-        stat=$(cat "$proc_root/$1/stat" 2>/dev/null) || return 1
+        if ! stat=$(cat "$proc_root/$1/stat" 2>&1); then
+          printf '%s\n' "$stat" >&2
+          return 1
+        fi
         rest=${stat##*) }
         printf '%s\n' "$rest" | awk -v n="$2" '{print $n}'
       }
@@ -265,7 +268,7 @@ nodes:
         printf '%s\n' "${c:-unknown}"
       }
       rtw_proc_uid() {
-        awk '/^Uid:/ {print $2; exit}' "$proc_root/$1/status" 2>/dev/null
+        awk '/^Uid:/ {print $2; exit}' "$proc_root/$1/status"
       }
       rtw_proc_start_ms() {
         local ticks
@@ -297,12 +300,82 @@ nodes:
         done
         return 1
       }
+      rtw_proc_cmdline() {
+        local py
+        py=$(command -v python || command -v python3) || return 1
+        "$py" -I -S - "$proc_root/$1/cmdline" <<'PY'
+      import os, re, sys
+      try:
+          with open(sys.argv[1], 'rb') as stream:
+              data = stream.read(8193)
+      except OSError:
+          print('[unavailable]')
+          raise SystemExit(0)
+      # Keep complete NUL-delimited arguments only. Never log a partial argument.
+      sample = data[:8192]
+      args = [part.decode('utf-8', 'replace') for part in sample.split(b'\0')[:-1]]
+      secrets = [value for key, value in os.environ.items()
+                 if re.search(r'token|secret|password|credential|api.?key|auth', key, re.I)
+                 and len(value) >= 8]
+      def scrub(value):
+          for secret in secrets:
+              value = value.replace(secret, '[REDACTED]')
+          return value
+      def safe_path(value):
+          credential = re.search(r'(?<![A-Za-z0-9])(?:gh[pousr]_|github_pat_|sk-|oat0|eyJ[A-Za-z0-9_-]+\.)', value)
+          return not credential and re.fullmatch(r'/[A-Za-z0-9_./-]+', value) and '..' not in value.split('/')
+      def workspace(value):
+          value = scrub(value)
+          match = re.fullmatch(r'/\.archon/workspaces/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:source|worktrees/(?:archon/)?[A-Za-z0-9_.-]+)', value)
+          return value if match and safe_path(value) else '[REDACTED]'
+      binaries = {'node', 'bun', 'cursor-agent', 'codex', 'claude', 'bash', 'sh', 'setsid', 'python', 'python3'}
+      zero_flags = {'--print', '--trust', '--verbose'}
+      hidden_flags = {'--model', '--mode', '--output-format', '--resume', '--session-id', '--prompt-file', '-p'}
+      path_flags = {'--workspace', '--cwd', '--cd'}
+      out, pending = [], None
+      executable = os.path.basename(args[0]) if args else ''
+      for index, raw in enumerate(args[:64]):
+          value = scrub(raw)
+          if pending:
+              out.append(workspace(value) if pending == 'path' else '[REDACTED]')
+              pending = None
+          elif index == 0:
+              trusted = value in binaries or (safe_path(value) and os.path.basename(value) in binaries and value.startswith(('/opt/cursor-agent/', '/usr/bin/', '/usr/local/bin/', '/bin/')))
+              out.append(value if trusted else '[REDACTED]')
+          elif index == 1 and executable in {'node', 'bun'} and safe_path(value) and value.startswith(('/opt/cursor-agent/', '/app/scripts/')) and value.endswith(('.js', '.mjs', '.cjs', '.ts')):
+              out.append(value)
+          elif value in zero_flags:
+              out.append(value)
+          elif value in path_flags or value in hidden_flags:
+              out.append(value)
+              pending = 'path' if value in path_flags else 'hidden'
+          elif any(value.startswith(flag + '=') for flag in path_flags):
+              flag, path = value.split('=', 1)
+              out.append(flag + '=' + workspace(path))
+          else:
+              # Opaque values include prompts, URLs, credentials and unknown flags.
+              out.append('[REDACTED]')
+              if value.startswith('-') and '=' not in value:
+                  pending = 'hidden'
+      if len(data) > 8192 or (sample and not sample.endswith(b'\0')) or len(args) > 64:
+          out.append('[TRUNCATED]')
+      print((' '.join(out) or '[empty]')[:512])
+      PY
+      }
+      rtw_note_unreadable() {
+        local detail cmdline
+        detail=$(printf '%s' "$3" | tr '\r\n' '  ' | cut -c1-240)
+        cmdline=$(rtw_proc_cmdline "$1" 2>/dev/null) || cmdline='[unavailable]'
+        rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+        rtw_scan_errors="${rtw_scan_errors:+$rtw_scan_errors; }pid=$1 uid=$2 read_error=${detail:-unavailable} cmdline=$cmdline"
+      }
       rtw_scan_holder() {
-        local d pid cwdlink resolved uid start comm reason
+        local d pid cwdlink resolved uid start comm reason cwd_error
         rtw_scan_result="clear"
         rtw_scan_detail=""
         rtw_scan_foreign=""
         rtw_scan_unreadable=0
+        rtw_scan_errors=""
         for d in "$proc_root"/[0-9]*; do
           [ -d "$d" ] || continue
           pid=${d##*/}
@@ -314,22 +387,31 @@ nodes:
           fi
           cwdlink="$d/cwd"
           resolved=""
+          cwd_error="cwd link unavailable"
           if [ -L "$cwdlink" ] || [ -e "$cwdlink" ]; then
-            resolved=$(readlink -f "$cwdlink" 2>/dev/null || true)
+            if resolved=$(readlink -f "$cwdlink" 2>&1); then
+              cwd_error="cwd resolved to empty path"
+            else
+              cwd_error="$resolved"
+              resolved=""
+            fi
           fi
           if [ -z "$resolved" ]; then
             [ -d "$d" ] || continue
-            if ! uid=$(rtw_proc_uid "$pid") || [ -z "$uid" ]; then
+            if ! uid=$(rtw_proc_uid "$pid" 2>&1) || [ -z "$uid" ]; then
               [ -d "$d" ] || continue
-              rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+              rtw_note_unreadable "$pid" unknown "status: ${uid:-Uid field missing}; cwd: $cwd_error"
               continue
             fi
             if [ "$uid" = "$rtw_self_uid" ]; then
-              if start=$(rtw_proc_start_ms "$pid") && [ "$start" -le "$rtw_holder_started_ms" ]; then
-                continue
+              if start=$(rtw_proc_start_ms "$pid" 2>&1); then
+                [ "$start" -le "$rtw_holder_started_ms" ] && continue
+                reason="cwd: $cwd_error (process newer than holder)"
+              else
+                reason="stat: ${start:-start time unavailable}; cwd: $cwd_error"
               fi
               [ -d "$d" ] || continue
-              rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+              rtw_note_unreadable "$pid" "$uid" "$reason"
             fi
             continue
           fi
@@ -342,16 +424,16 @@ nodes:
           fi
           comm=$(rtw_proc_comm "$pid")
           reason="run_owned"
-          if ! uid=$(rtw_proc_uid "$pid") || [ -z "$uid" ]; then
+          if ! uid=$(rtw_proc_uid "$pid" 2>&1) || [ -z "$uid" ]; then
             [ -d "$d" ] || continue
-            rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+            rtw_note_unreadable "$pid" unknown "status: ${uid:-Uid field missing}"
             continue
           fi
           if [ "$uid" != "$rtw_self_uid" ]; then
             reason="foreign_uid"
-          elif ! start=$(rtw_proc_start_ms "$pid"); then
+          elif ! start=$(rtw_proc_start_ms "$pid" 2>&1); then
             [ -d "$d" ] || continue
-            rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
+            rtw_note_unreadable "$pid" "$uid" "stat: ${start:-start time unavailable}"
             continue
           elif [ "$start" -le "$rtw_holder_started_ms" ]; then
             reason="predates_run"
@@ -369,7 +451,7 @@ nodes:
         fi
       }
       rtw_wait_for_holder_exit() {
-        local waited=0 limit="${RTW_HOLDER_WAIT_SECONDS:-120}"
+        local waited=0 incomplete_scans=0 limit="${RTW_HOLDER_WAIT_SECONDS:-120}"
         case "$limit" in
           ''|*[!0-9]*) limit=120 ;;
         esac
@@ -378,8 +460,16 @@ nodes:
           case "$rtw_scan_result" in
             clear) return 0 ;;
             incomplete)
-              rtw_refuse "process scan incomplete (${rtw_scan_unreadable} unreadable)"
-              return 1
+              # Retry missing evidence, never exempt it. Changing PIDs cannot reset
+              # this budget; only a subsequent fully clear scan permits reclaim.
+              incomplete_scans=$((incomplete_scans + 1))
+              if [ "$incomplete_scans" -ge 3 ] || [ "$((waited + 5))" -gt "$limit" ] || [ -n "$rtw_scan_foreign" ]; then
+                rtw_refuse "process scan incomplete (${rtw_scan_unreadable} unreadable): $rtw_scan_errors"
+                return 1
+              fi
+              sleep 5
+              waited=$((waited + 5))
+              continue
               ;;
           esac
           if [ -n "$rtw_scan_foreign" ]; then
