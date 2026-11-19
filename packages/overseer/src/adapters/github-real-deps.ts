@@ -502,6 +502,8 @@ export type BoundReposMethodName = (typeof BOUND_REPOS_METHODS)[number] &
 
 export interface ExactHeadPullRequestEvidence {
   bundleProofUnavailable?: boolean;
+  /** The bundle changed and its Test Suite run is unfinished: defer as checks_pending. */
+  bundleRunPending?: boolean;
   coverage?: BundleCoverage;
   diff: string;
   checks: { name: string; status: string; conclusion: string | null }[];
@@ -675,6 +677,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
     }
     let coverage: BundleCoverage | undefined;
     let bundleProofUnavailable: boolean | undefined;
+    let bundleRunPending: boolean | undefined;
     // OFF until a separate operator GO admits an immutable producer commit.
     const admittedProducer = configuredBundleProducer();
     if (admittedProducer && input.owner === 'thinmansoftware' && input.repo === 'bdc-harness') {
@@ -687,9 +690,14 @@ export function createRealFetchExactHeadPullRequestEvidence(
           { ...input, baseSha },
           admittedProducer
         );
-        diff = proof.diff;
-        coverage = proof.coverage;
-        bundleProofUnavailable = proof.bundleProofUnavailable;
+        if ('bundleRunPending' in proof) {
+          // Keep the diff already fetched; the evaluator defers before composing any prompt.
+          bundleRunPending = true;
+        } else {
+          diff = proof.diff;
+          coverage = proof.coverage;
+          bundleProofUnavailable = proof.bundleProofUnavailable;
+        }
       } catch (error) {
         if (classifyRateLimitError(error)) throw error;
         throw new Error('pr_review_diff_evidence_unavailable');
@@ -776,6 +784,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
       diff,
       ...(coverage ? { coverage } : {}),
       ...(bundleProofUnavailable ? { bundleProofUnavailable } : {}),
+      ...(bundleRunPending ? { bundleRunPending } : {}),
       checks: checkRuns.map((run, index) => ({
         id: run.id,
         name: run.name?.trim() || `check-${index + 1}`,

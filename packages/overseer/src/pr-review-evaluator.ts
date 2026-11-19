@@ -194,6 +194,7 @@ export interface PrReviewDeps {
     requiredContexts?: string[] | null;
     coverage?: BundleCoverage;
     bundleProofUnavailable?: boolean;
+    bundleRunPending?: boolean;
   }>;
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
   invokeModel(
@@ -631,6 +632,7 @@ export async function evaluatePullRequest(
 
   let evidence: {
     bundleProofUnavailable?: boolean;
+    bundleRunPending?: boolean;
     coverage?: BundleCoverage;
     diff: string;
     checks: PrReviewCheck[];
@@ -684,6 +686,21 @@ export async function evaluatePullRequest(
   // and silently fail open. The model is not invoked in this branch.
   if (!checksAreTerminal(evidence.checks, evidence.requiredContexts)) {
     return checksPending(input, deps, evidence.checks, evidence.requiredContexts);
+  }
+
+  // The bundle changed and its Test Suite run (any of its six jobs) is unfinished: the producer
+  // receipt cannot be read yet, so defer instead of composing an oversized full-diff prompt.
+  // Built directly: checksPending() derives its list from check names, not this workflow.
+  if (evidence.bundleRunPending) {
+    return {
+      verdict: 'CHECKS_PENDING',
+      findings: [],
+      reviewed_head_sha: input.head_sha,
+      reviewer: deps.reviewer,
+      acceptance_criteria_available: false,
+      error: 'checks_pending',
+      pendingChecks: ['Test Suite'],
+    };
   }
 
   let acceptanceCriteria: string | null = null;

@@ -16,7 +16,8 @@ spec.loader.exec_module(producer)
 
 
 class ProducerGuards(unittest.TestCase):
-    def run_order_fixture(self, nonbuiltin):
+    def run_order_fixture(self, nonbuiltin, root_files=None, tracked=frozenset(), expect_receipt=None):
+        expect_receipt = (not nonbuiltin) if expect_receipt is None else expect_receipt
         data = self.archive()
         output = io.StringIO()
         calls = []
@@ -36,6 +37,9 @@ class ProducerGuards(unittest.TestCase):
             bundle = root / producer.BUNDLE
             bundle.parent.mkdir(parents=True)
             bundle.write_bytes(b"bundle fixture\n")
+            for relative, raw in (root_files or {}).items():
+                (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                (root / relative).write_bytes(raw)
             event = root / "event.json"
             event.write_text(json.dumps({"number": 1609, "pull_request": {"head": {"sha": head}, "base": {"sha": base}}}))
             def git(_root, *args):
@@ -45,12 +49,12 @@ class ProducerGuards(unittest.TestCase):
             def run(argv, **kwargs):
                 calls.append(argv[1:])
                 if argv[1] == "install":
-                    self.assertEqual("BUNDLE_PROOF_V1 " in output.getvalue(), not nonbuiltin)
+                    self.assertEqual("BUNDLE_PROOF_V1 " in output.getvalue(), expect_receipt)
             with patch.object(producer.platform, "system", return_value="Linux"), \
                  patch.object(producer.platform, "machine", return_value="x86_64"), \
                  patch.object(producer.urllib.request, "urlopen", return_value=io.BytesIO(data)), \
                  patch.object(producer, "ARCHIVE_SHA256", hashlib.sha256(data).hexdigest()), \
-                 patch.object(producer, "verified_checkout", return_value="tree"), \
+                 patch.object(producer, "verified_checkout", return_value=("tree", frozenset(tracked))), \
                  patch.object(producer, "git", side_effect=git), \
                  patch.object(producer.shutil, "which", side_effect=lambda *a, **k: str(next(root.glob("bundle-proof-*/bin/bun")))), \
                  patch.object(producer.subprocess, "run", side_effect=run), \
@@ -70,6 +74,49 @@ class ProducerGuards(unittest.TestCase):
         self.assertEqual(calls, [["install", "--frozen-lockfile"]])
         self.assertNotIn("BUNDLE_PROOF_V1 ", output)
         self.assertIn("BUNDLE_PROOF_UNAVAILABLE", output)
+    # WO-HARNESS-BUNDLE-REVIEW-PROOF-REPAIR-01 D1: the repo tracks .env.example and
+    # .env.staging.example at its root, so the old root `.env*` glob refused every checkout.
+    def test_tracked_env_example_templates_still_get_one_receipt(self):
+        templates = {".env.example": b"FOO=placeholder\n", ".env.staging.example": b"BAR=placeholder\n"}
+        calls, output = self.run_order_fixture(False, templates, set(templates))
+        self.assertEqual(output.count("BUNDLE_PROOF_V1 "), 1)
+        self.assertNotIn("BUNDLE_PROOF_UNAVAILABLE", output)
+        self.assertEqual(calls, [["run", "scripts/generate-bundled-defaults.ts", "--check"], ["install", "--frozen-lockfile"]])
+
+    def eligible_root(self, root):
+        repo = Path(__file__).resolve().parents[2]
+        (root / "scripts").mkdir()
+        for relative in ("scripts/generate-bundled-defaults.ts", "bunfig.toml", "package.json"):
+            (root / relative).write_bytes((repo / relative).read_text().encode())
+        return {"scripts/generate-bundled-defaults.ts", "bunfig.toml", "package.json"}
+
+    def test_untracked_env_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            tracked = self.eligible_root(root)
+            # Premise: the root is otherwise eligible, so the refusal below is the .env file's.
+            self.assertTrue(producer.generator_is_builtin_only(root, tracked))
+            (root / ".env").write_bytes(b"SECRET=placeholder\n")
+            with self.assertRaisesRegex(ValueError, "untracked_execution_config"):
+                producer.assert_no_untracked_config(root, tracked)
+            self.assertFalse(producer.generator_is_builtin_only(root, tracked))
+
+    def test_tracked_real_env_file_gets_no_receipt(self):
+        # A tracked .env, .env.local, .env.development (a name Bun loads by default), and a
+        # root DIRECTORY named .env.example holding a tracked file.
+        cases = [
+            {".env": b"A=1\n"},
+            {".env.local": b"A=1\n"},
+            {".env.development": b"A=1\n"},
+            {".env.example/inner.txt": b"A=1\n"},
+        ]
+        for files in cases:
+            with self.subTest(files=sorted(files)):
+                calls, output = self.run_order_fixture(False, files, set(files), expect_receipt=False)
+                self.assertIn("BUNDLE_PROOF_UNAVAILABLE non_builtin_or_unadmitted_generator_config", output)
+                self.assertNotIn("BUNDLE_PROOF_V1", output)
+                self.assertEqual(calls, [["install", "--frozen-lockfile"]])
+
     def test_checkout_failure_identifies_path_and_kind_without_file_contents(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -150,7 +197,7 @@ class ProducerGuards(unittest.TestCase):
             script.parent.mkdir()
             script.write_text('import evil from "external-module"; evil();')
             with patch.object(producer.subprocess, "run") as execute:
-                self.assertFalse(check(root))
+                self.assertFalse(check(root, frozenset()))
                 execute.assert_not_called()
 
     def test_check_runtime_mutation_prevents_receipt_and_install(self):
@@ -168,7 +215,7 @@ class ProducerGuards(unittest.TestCase):
                  patch.object(producer.platform, "machine", return_value="x86_64"), \
                  patch.object(producer.urllib.request, "urlopen", return_value=io.BytesIO(data)), \
                  patch.object(producer, "ARCHIVE_SHA256", hashlib.sha256(data).hexdigest()), \
-                 patch.object(producer, "verified_checkout", return_value="tree"), \
+                 patch.object(producer, "verified_checkout", return_value=("tree", frozenset())), \
                  patch.object(producer, "generator_is_builtin_only", return_value=True, create=True), \
                  patch.object(producer, "git", return_value=b"checkout"), \
                  patch.object(producer.shutil, "which", side_effect=lambda *a, **k: str(next(root.glob("bundle-proof-*/bin/bun")))), \

@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 
 export const BUNDLE_PATH = 'packages/workflows/src/defaults/bundled-defaults.generated.ts';
-export const PRODUCER_ANCHOR = '21bf3f8ec537e12928d3a831eb2ebbfa5d9677bc';
 export const ARCHIVE_DIGEST = '8611ba935af886f05a6f38740a15160326c15e5d5d07adef966130b4493607ed';
 const WORKFLOW = '.github/workflows/test.yml';
 const HELPER = 'scripts/ci/verified-bundle-proof.py';
+const GENERATOR = 'scripts/generate-bundled-defaults.ts';
+const UBUNTU_JOB = 'test (ubuntu-latest)';
+const STAMP = String.raw`^\d{4}-\d\d-\d\dT[\d:.]+Z`;
 const INPUTS = [
   '.archon/commands/defaults/',
   '.archon/workflows/defaults/',
@@ -62,7 +64,7 @@ function closure(path: string): boolean {
   return (
     path === WORKFLOW ||
     path === HELPER ||
-    path === 'scripts/generate-bundled-defaults.ts' ||
+    path === GENERATOR ||
     path.startsWith('.husky/') ||
     path.startsWith('patches/') ||
     /\.(json|jsonc|lock)$/.test(name) ||
@@ -71,29 +73,130 @@ function closure(path: string): boolean {
     )
   );
 }
+/**
+ * PRE-RECEIPT paths can affect anything before the producer prints its receipt (#6398 section 4a):
+ * the workflow, everything under scripts/ci/ (frozen even though most of it is not a closure
+ * name: with `python3 -I` Python no longer imports from there, and a planted module there is
+ * still refused), the generator, closure paths directly in the repo root or directly in scripts/
+ * (Bun resolves the generator's tsconfig and package.json from scripts/ upward and reads
+ * bunfig.toml from the working directory), and .gitattributes/.gitmodules at any depth.
+ */
+function preReceipt(path: string): boolean {
+  const name = path.split('/').at(-1) ?? '';
+  return (
+    path === WORKFLOW ||
+    path.startsWith('scripts/ci/') ||
+    path === GENERATOR ||
+    (closure(path) && /^(scripts\/)?[^/]+$/.test(path)) ||
+    name === '.gitattributes' ||
+    name === '.gitmodules'
+  );
+}
+/**
+ * D3 anchor: the pull request's authenticated base on dev (the caller proves base is on dev and
+ * descends from the admitted producer). POST-RECEIPT closure paths (workspace manifests, nested
+ * locks, .husky/, patches/, other JSON) run only after the receipt and are not compared; a line
+ * they print can only add a second receipt or an unavailable line, and either refuses (D5).
+ */
 export function producerClosureMatches(
-  anchor: Inventory,
+  mergeBase: Inventory,
+  base: Inventory,
   producer: Inventory,
   tested: Inventory,
   head: Inventory
 ): boolean {
-  const paths = new Set([...anchor.keys(), ...producer.keys(), ...tested.keys(), ...head.keys()]);
-  return [...paths].filter(closure).every(path => {
+  const paths = new Set([
+    ...mergeBase.keys(),
+    ...base.keys(),
+    ...producer.keys(),
+    ...tested.keys(),
+    ...head.keys(),
+  ]);
+  return [...paths].filter(preReceipt).every(path => {
     if (path === WORKFLOW || path === HELPER) {
-      // Only the independently admitted producer delta may replace the frozen head producer.
+      // Only the independently admitted producer may run; a head that predates it may keep its
+      // merge base's copy.
       return (
         regular(producer.get(path)) &&
         same(tested.get(path), producer.get(path)) &&
-        (same(head.get(path), anchor.get(path)) || same(head.get(path), producer.get(path)))
+        (same(head.get(path), mergeBase.get(path)) || same(head.get(path), producer.get(path)))
       );
     }
+    // Dev drift is allowed (the tested merge takes dev's reviewed version); a pull-request
+    // change is not.
     return (
-      same(anchor.get(path), producer.get(path)) &&
-      same(anchor.get(path), tested.get(path)) &&
-      same(anchor.get(path), head.get(path)) &&
-      (!anchor.has(path) || regular(anchor.get(path)))
+      same(tested.get(path), base.get(path)) &&
+      same(head.get(path), mergeBase.get(path)) &&
+      (!base.has(path) || regular(base.get(path)))
     );
   });
+}
+
+function jobsOfAttempt(
+  read: ProofRead,
+  runId: unknown,
+  attempt: number
+): Promise<Record<string, unknown>[]> {
+  return read('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs', {
+    run_id: runId,
+    attempt_number: attempt,
+    per_page: 100,
+  }).then(raw => {
+    const jobs = object(raw);
+    requireProof(Number(jobs.total_count) === list(jobs.jobs).length);
+    return list(jobs.jobs).map(object);
+  });
+}
+function singleUbuntuJob(jobs: Record<string, unknown>[]): Record<string, unknown> {
+  const selected = jobs.filter(j => j.name === UBUNTU_JOB);
+  requireProof(selected.length === 1);
+  return selected[0];
+}
+/**
+ * D5 receipt rules over one job log. Premise (the trust argument rests on it): the log GitHub
+ * returns for a job is complete and append-only, and secret masking never rewrites a line that
+ * was already printed. Under that premise, any line printed after the producer's own line can
+ * only ADD a second BUNDLE_PROOF_V1 line or an UNAVAILABLE line, and both refuse here.
+ */
+function receiptFromLog(logs: string): Record<string, unknown> {
+  requireProof(!new RegExp(`${STAMP} BUNDLE_PROOF_UNAVAILABLE`, 'm').test(logs));
+  const matches = [
+    ...logs.matchAll(new RegExp(`${STAMP} BUNDLE_PROOF_V1 ([A-Za-z0-9+/=]+)\\r?$`, 'gm')),
+  ];
+  requireProof(matches.length === 1);
+  const encoded = matches[0][1];
+  const raw = Buffer.from(encoded, 'base64');
+  requireProof(raw.toString('base64') === encoded && raw.length <= 10_000);
+  return object(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)));
+}
+async function readReceipt(read: ProofRead, jobId: unknown): Promise<Record<string, unknown>> {
+  return receiptFromLog(
+    string(await read('GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs', { job_id: jobId }))
+  );
+}
+function stepThreeSucceeded(job: Record<string, unknown>): boolean {
+  return list(job.steps)
+    .map(object)
+    .some(
+      s =>
+        s.number === 3 &&
+        s.name === 'Verified bundle producer' &&
+        s.status === 'completed' &&
+        s.conclusion === 'success'
+    );
+}
+async function onDevAndAfterProducer(
+  read: ProofRead,
+  baseSha: string,
+  producer: string
+): Promise<boolean> {
+  const [dev, admitted] = await Promise.all([
+    read('GET /repos/{owner}/{repo}/compare/{basehead}', { basehead: `${baseSha}...dev` }),
+    read('GET /repos/{owner}/{repo}/compare/{basehead}', { basehead: `${producer}...${baseSha}` }),
+  ]);
+  const ok = (value: unknown): boolean =>
+    ['identical', 'ahead'].includes(string(object(value).status));
+  return ok(dev) && ok(admitted);
 }
 
 async function tree(
@@ -288,11 +391,46 @@ export interface BundleRequest {
   headSha: string;
   baseSha: string;
 }
+export type BundleCoverageResult =
+  | { diff: string; coverage?: BundleCoverage; bundleProofUnavailable?: boolean }
+  | { bundleRunPending: true };
+/** The newest Test Suite pull_request run for the head (repository, workflow and run reads). */
+async function newestTestSuiteRun(
+  read: ProofRead,
+  input: BundleRequest,
+  producer: string
+): Promise<{ workflow: Record<string, unknown>; run: Record<string, unknown> }> {
+  requireProof(
+    input.owner === 'thinmansoftware' && input.repo === 'bdc-harness' && SHA.test(producer)
+  );
+  requireProof(object(await read('GET /repos/{owner}/{repo}', {})).id === 1233963411);
+  const workflow = object(
+    await read('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}', {
+      workflow_id: 273810118,
+    })
+  );
+  requireProof(workflow.path === WORKFLOW && workflow.id === 273810118);
+  const runs = object(
+    await read('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs', {
+      workflow_id: 273810118,
+      event: 'pull_request',
+      head_sha: input.headSha,
+      per_page: 100,
+    })
+  );
+  const candidates = list(runs.workflow_runs).map(object);
+  requireProof(candidates.length > 0 && Number(runs.total_count) === candidates.length);
+  candidates.sort((a, b) => Number(b.id) - Number(a.id));
+  const run = object(
+    await read('GET /repos/{owner}/{repo}/actions/runs/{run_id}', { run_id: candidates[0].id })
+  );
+  return { workflow, run };
+}
 export async function collectBundleCoverage(
   read: ProofRead,
   input: BundleRequest,
   producer: string
-): Promise<{ diff: string; coverage?: BundleCoverage; bundleProofUnavailable?: boolean }> {
+): Promise<BundleCoverageResult> {
   const { headSha, baseSha, prNumber } = input;
   const comparison = object(
     await read('GET /repos/{owner}/{repo}/compare/{basehead}', {
@@ -302,6 +440,18 @@ export async function collectBundleCoverage(
   const mergeBase = string(object(comparison.merge_base_commit).sha);
   // Coverage authentication is mandatory even when producer proof is unavailable.
   const [before, head] = await Promise.all([tree(read, mergeBase), tree(read, headSha)]);
+  // D2a: decide early and cheaply. Only a pull request that changes the bundle needs the Test
+  // Suite run; while that run (any of its six jobs) is unfinished, defer before the full diff,
+  // reconciliation or any blob read. No run at all keeps the unavailable/full-diff outcome.
+  let found: Awaited<ReturnType<typeof newestTestSuiteRun>> | undefined;
+  if (!same(before.entries.get(BUNDLE_PATH), head.entries.get(BUNDLE_PATH))) {
+    try {
+      found = await newestTestSuiteRun(read, input, producer);
+    } catch {
+      found = undefined;
+    }
+    if (found && found.run.status !== 'completed') return { bundleRunPending: true };
+  }
   const whole = await read('GET /repos/{owner}/{repo}/compare/{basehead}', {
     basehead: `${baseSha}...${headSha}`,
     headers: { accept: 'application/vnd.github.diff' },
@@ -314,30 +464,8 @@ export async function collectBundleCoverage(
       '$&\n[binary or patch unavailable]'
     );
   try {
-    requireProof(
-      input.owner === 'thinmansoftware' && input.repo === 'bdc-harness' && SHA.test(producer)
-    );
-    requireProof(object(await read('GET /repos/{owner}/{repo}', {})).id === 1233963411);
-    const workflow = object(
-      await read('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}', {
-        workflow_id: 273810118,
-      })
-    );
-    requireProof(workflow.path === WORKFLOW && workflow.id === 273810118);
-    const runs = object(
-      await read('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs', {
-        workflow_id: 273810118,
-        event: 'pull_request',
-        head_sha: headSha,
-        per_page: 100,
-      })
-    );
-    const candidates = list(runs.workflow_runs).map(object);
-    requireProof(candidates.length > 0 && Number(runs.total_count) === candidates.length);
-    candidates.sort((a, b) => Number(b.id) - Number(a.id));
-    const run = object(
-      await read('GET /repos/{owner}/{repo}/actions/runs/{run_id}', { run_id: candidates[0].id })
-    );
+    requireProof(found);
+    const { workflow, run } = found;
     requireProof(
       run.event === 'pull_request' &&
         run.path === WORKFLOW &&
@@ -355,35 +483,40 @@ export async function collectBundleCoverage(
           object(object(p).base).sha === baseSha
       )
     );
-    const jobs = object(
-      await read('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs', {
-        run_id: run.id,
-        attempt_number: run.run_attempt,
-        per_page: 100,
-      })
-    );
-    requireProof(Number(jobs.total_count) === list(jobs.jobs).length);
-    const selected = list(jobs.jobs)
-      .map(object)
-      .filter(j => j.name === 'test (ubuntu-latest)');
-    requireProof(selected.length === 1);
-    const job = selected[0];
+    // D2c: L is the latest attempt. JL is its single Ubuntu job. The receipt in JL's log names
+    // the attempt A that printed it; a re-run carries an earlier attempt's job forward (new id,
+    // same times, same log), and then the proof job is attempt A's own JA.
+    const latest = run.run_attempt;
+    requireProof(typeof latest === 'number' && Number.isInteger(latest) && latest >= 1);
+    const jl = singleUbuntuJob(await jobsOfAttempt(read, run.id, latest));
     requireProof(
-      job.run_id === run.id &&
-        job.run_attempt === run.run_attempt &&
-        job.status === 'completed' &&
-        job.conclusion === 'success'
+      jl.run_id === run.id &&
+        jl.run_attempt === latest &&
+        jl.status === 'completed' &&
+        jl.conclusion === 'success'
     );
-    const steps = list(job.steps).map(object);
+    let job = jl;
+    let proof = await readReceipt(read, jl.id);
+    const attempt = proof.attempt;
     requireProof(
-      steps.some(
-        s =>
-          s.number === 3 &&
-          s.name === 'Verified bundle producer' &&
-          s.status === 'completed' &&
-          s.conclusion === 'success'
-      )
+      typeof attempt === 'number' && Number.isInteger(attempt) && attempt >= 1 && attempt <= latest
     );
+    if (attempt < latest) {
+      const ja = singleUbuntuJob(await jobsOfAttempt(read, run.id, attempt));
+      requireProof(
+        ja.run_id === run.id &&
+          ja.run_attempt === attempt &&
+          ja.status === 'completed' &&
+          ja.conclusion === 'success' &&
+          typeof ja.started_at === 'string' &&
+          typeof ja.completed_at === 'string' &&
+          ja.started_at === jl.started_at &&
+          ja.completed_at === jl.completed_at
+      );
+      job = ja;
+      proof = await readReceipt(read, ja.id);
+    }
+    requireProof(stepThreeSucceeded(job));
     const check = object(
       await read('GET /repos/{owner}/{repo}/check-runs/{check_run_id}', { check_run_id: job.id })
     );
@@ -405,17 +538,6 @@ export async function collectBundleCoverage(
         suite.head_sha === headSha &&
         object(suite.app).id === 15368
     );
-    const logs = string(
-      await read('GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs', { job_id: job.id })
-    );
-    const matches = [
-      ...logs.matchAll(/^\d{4}-\d\d-\d\dT[\d:.]+Z BUNDLE_PROOF_V1 ([A-Za-z0-9+/=]+)\r?$/gm),
-    ];
-    requireProof(matches.length === 1);
-    const encoded = matches[0][1];
-    const raw = Buffer.from(encoded, 'base64');
-    requireProof(raw.toString('base64') === encoded && raw.length <= 10_000);
-    const proof = object(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)));
     requireProof(
       proof.schema === 1 &&
         proof.phase === 'preinstall' &&
@@ -424,7 +546,7 @@ export async function collectBundleCoverage(
         proof.repository === `${input.owner}/${input.repo}` &&
         proof.pr === prNumber &&
         proof.run === run.id &&
-        proof.attempt === run.run_attempt &&
+        proof.attempt === job.run_attempt &&
         proof.head === headSha &&
         proof.base === baseSha &&
         proof.archive === ARCHIVE_DIGEST &&
@@ -441,17 +563,25 @@ export async function collectBundleCoverage(
         /^[a-f0-9]{64}$/.test(string(proof.gitSha256)) &&
         /^[a-f0-9]{64}$/.test(string(proof.nodeSha256))
     );
-    const [tested, admitted, anchor] = await Promise.all([
+    // D3 base conditions: dev is at or ahead of base, and the admitted producer is an ancestor
+    // of base. The live base ref is checked with the live head and base below.
+    requireProof(await onDevAndAfterProducer(read, baseSha, producer));
+    const [tested, admitted, baseTree] = await Promise.all([
       tree(read, string(proof.checkout)),
       tree(read, producer),
-      tree(read, PRODUCER_ANCHOR),
+      tree(read, baseSha),
     ]);
     requireProof(
       tested.treeSha === proof.tree && tested.parents.join(',') === [baseSha, headSha].join(',')
     );
     requireProof(
-      producerClosureMatches(anchor.entries, admitted.entries, tested.entries, head.entries) &&
-        inputInventoriesMatch(tested.entries, head.entries)
+      producerClosureMatches(
+        before.entries,
+        baseTree.entries,
+        admitted.entries,
+        tested.entries,
+        head.entries
+      ) && inputInventoriesMatch(tested.entries, head.entries)
     );
     const bundleEntry = head.entries.get(BUNDLE_PATH);
     requireProof(bundleEntry);
@@ -467,13 +597,17 @@ export async function collectBundleCoverage(
     const live = object(
       await read('GET /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: prNumber })
     );
-    requireProof(object(live.head).sha === headSha && object(live.base).sha === baseSha);
+    requireProof(
+      object(live.head).sha === headSha &&
+        object(live.base).sha === baseSha &&
+        object(live.base).ref === 'dev'
+    );
     const url = `https://github.com/${input.owner}/${input.repo}/actions/runs/${String(run.id)}/job/${String(job.id)}`;
     const notice =
       `Review coverage: excluded only ${BUNDLE_PATH}; verified deterministic output, raw LF-only. ` +
-      `Anchor ${PRODUCER_ANCHOR}; producer ${producer}; head ${headSha}; base ${baseSha}; tested ${String(proof.checkout)} tree ${tested.treeSha}; ` +
+      `Anchor ${baseSha}; producer ${producer}; head ${headSha}; base ${baseSha}; tested ${String(proof.checkout)} tree ${tested.treeSha}; ` +
       `bundle ${bundleEntry.sha} sha256 ${proof.bundle}; runtime sha256 ${proof.runtime}; archive ${ARCHIVE_DIGEST}; ` +
-      `run ${String(run.id)} attempt ${String(run.run_attempt)} suite ${String(suite.id)} check/job ${String(job.id)} step 3. ` +
+      `run ${String(run.id)} attempt ${String(job.run_attempt)} of ${String(latest)} suite ${String(suite.id)} check/job ${String(job.id)} step 3. ` +
       `Original ${Buffer.byteLength(marked(diff), 'utf8')} bytes; retained ${Buffer.byteLength(retained, 'utf8')} bytes. Proof: ${url}. Authored source retained completely.`;
     return { diff: retained, coverage: { notice, baseSha, producer } };
   } catch {
