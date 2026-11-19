@@ -307,3 +307,20 @@ describe('originating run evidence gate', () => {
     }
   });
 });
+
+describe('run-bound terminal prerequisite (bdc-xo#6382)', () => {
+  test('active run with approved green head refuses before merge', async () => {
+    const f = fixture({ readRunEvents: async () => [event('node_completed')] });
+    f.record.status = 'running';
+    const result = await f.manager(f.record);
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'originating_run_in_progress',
+      execution: null,
+    });
+    expect(f.mergePullRequest).not.toHaveBeenCalled();
+    expect(f.insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'merge_denied', result: 'originating_run_in_progress' })
+    );
+  });
+});
