@@ -80,7 +80,10 @@ describe('blocked build and the conductor gate', () => {
         }),
         releaseWoLock: async () => {},
         readRunDetail: async () => ({
-          metadata: { teardown_confirmed_at: '2026-11-10T00:00:00Z' },
+          metadata: {
+            teardown_confirmed_at: '2026-11-10T00:00:00Z',
+            head_branch: 'archon/task-web-worker-1-fixture',
+          },
         }),
         fetchNodeTimeouts: async () => ({}),
         fire: async () => {

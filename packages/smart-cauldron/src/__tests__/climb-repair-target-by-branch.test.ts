@@ -32,6 +32,49 @@ function ghRow(overrides: { number: number; ref: string; body?: string; draft?: 
 }
 
 describe('listOpenWoPullRequests (bdc-xo #4638)', () => {
+  test('the climb safety read includes draft identity without changing the default (#6346)', async () => {
+    const options = {
+      woId: WO,
+      project: 'bdc-harness',
+      lookup: async () => [ghRow({ number: 117, ref: PRIOR_BRANCH, draft: true })],
+      headBranches: [PRIOR_BRANCH],
+      includeDrafts: true,
+      failOnError: true,
+    };
+    const found = await listOpenWoPullRequests(options);
+    expect(found.map(pr => [pr.number, pr.isDraft])).toEqual([[117, true]]);
+    expect(await listOpenWoPullRequests({ ...options, includeDrafts: false })).toEqual([]);
+  });
+
+  test('a capped strict listing cannot prove absence of a held draft (#6346)', async () => {
+    const old = process.env.SMART_CAULDRON_HERMETIC;
+    delete process.env.SMART_CAULDRON_HERMETIC;
+    let calls = 0;
+    const execFn = (async () => {
+      calls += 1;
+      return {
+        stdout: JSON.stringify(
+          Array.from({ length: 100 }, (_, index) => ghRow({ number: index + 1, ref: PRIOR_BRANCH }))
+        ),
+        stderr: '',
+      };
+    }) as unknown as NonNullable<Parameters<typeof listOpenWoPullRequests>[0]['execFn']>;
+    try {
+      await expect(
+        listOpenWoPullRequests({
+          woId: WO,
+          project: 'bdc-harness',
+          failOnError: true,
+          execFn,
+        })
+      ).rejects.toThrow('open_pr_listing_incomplete');
+      expect(calls).toBe(10);
+    } finally {
+      if (old === undefined) delete process.env.SMART_CAULDRON_HERMETIC;
+      else process.env.SMART_CAULDRON_HERMETIC = old;
+    }
+  });
+
   test('pr_found_by_prior_run_branch (Test 1)', async () => {
     const lookup = async () => [ghRow({ number: 1476, ref: PRIOR_BRANCH })];
     // Without the prior branch the marker-less PR is invisible (today's gap).
@@ -173,6 +216,70 @@ function openPr(number: number, headRefName: string): OpenWoPullRequest {
 }
 
 describe('climb repair target by earlier run branch (bdc-xo #4638)', () => {
+  test('held draft on the recorded repair branch stops after the first failure (#6346)', async () => {
+    const row = {
+      ...ghRow({ number: 117, ref: PRIOR_BRANCH, draft: true, body: 'Different original WO' }),
+      labels: [{ name: 'merge-hold' }],
+    };
+    const before = JSON.stringify(row);
+    const h = harness(async (_wo, _project, options) =>
+      listOpenWoPullRequests({
+        woId: WO,
+        project: 'bdc-harness',
+        lookup: async () => [row],
+        ...options,
+      })
+    );
+    const record = await runCascade(h.opts);
+    expect(record.status).toBe('infra-alert');
+    expect(h.messages).toHaveLength(1);
+    expect(h.prsCreated).toEqual([]);
+    expect(h.escalations).toHaveLength(1);
+    expect(h.escalations[0]?.reason).toContain('draft');
+    expect(h.escalations[0]?.reason).toContain('#117');
+    expect(JSON.stringify(row)).toBe(before);
+  });
+
+  test('a newer ready sibling cannot bypass a matching draft (#6346)', async () => {
+    const draft = { ...openPr(117, PRIOR_BRANCH), isDraft: true };
+    const ready = { ...openPr(118, PRIOR_BRANCH), createdAt: '2026-11-05T00:00:00Z' };
+    const h = harness(async () => [ready, draft]);
+    const record = await runCascade(h.opts);
+    expect(record.status).toBe('infra-alert');
+    expect(h.messages).toHaveLength(1);
+    expect(h.prsCreated).toEqual([]);
+    expect(h.escalations).toHaveLength(1);
+  });
+
+  test('a missing prior head cannot establish absence of a protected repair target (#6346)', async () => {
+    const h = harness(
+      async () => [],
+      async () => ({
+        status: 'failed',
+        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00Z' },
+      })
+    );
+    const record = await runCascade(h.opts);
+    expect(record.status).toBe('infra-alert');
+    expect(h.messages).toHaveLength(1);
+    expect(h.escalations[0]?.reason).toContain('head branch unavailable');
+  });
+
+  test('unknown draft state in a matching PR holds the climb (#6346)', async () => {
+    const h = harness(async (_wo, _project, options) =>
+      listOpenWoPullRequests({
+        woId: WO,
+        project: 'bdc-harness',
+        lookup: async () => [{ ...ghRow({ number: 117, ref: PRIOR_BRANCH }), draft: undefined }],
+        ...options,
+      })
+    );
+    const record = await runCascade(h.opts);
+    expect(record.status).toBe('infra-alert');
+    expect(h.messages).toHaveLength(1);
+    expect(h.escalations[0]?.reason).toContain('draft_state_unknown');
+  });
+
   test('escalation_replay_with_open_pr_opens_no_new_pr (Test 3)', async () => {
     const seen: { headBranches?: readonly string[]; failOnError?: boolean }[] = [];
     const h = harness(async (_wo, _project, options) => {
@@ -184,7 +291,9 @@ describe('climb repair target by earlier run branch (bdc-xo #4638)', () => {
 
     expect(record.status).toBe('won');
     expect(h.messages.length).toBe(2);
-    expect(seen).toEqual([{ headBranches: [PRIOR_BRANCH], failOnError: true }]);
+    expect(seen).toEqual([
+      { headBranches: [PRIOR_BRANCH], failOnError: true, includeDrafts: true },
+    ]);
     expect(h.messages[1]?.split('\n').filter(l => l.startsWith('Repair target: '))).toEqual([
       `Repair target: PR #1476 (branch ${PRIOR_BRANCH})`,
     ]);

@@ -110,7 +110,10 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
       findWoClaim: async () => null,
       listOpenWoPullRequests: async () => [],
       readRunDetail: async () => ({
-        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        metadata: {
+          teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+          head_branch: 'archon/task-web-worker-1-fixture',
+        },
       }),
     };
 
@@ -152,7 +155,10 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
       findWoClaim: async () => null,
       listOpenWoPullRequests: async () => [],
       readRunDetail: async () => ({
-        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        metadata: {
+          teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+          head_branch: 'archon/task-web-worker-1-fixture',
+        },
       }),
     };
 
@@ -189,7 +195,10 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
       findWoClaim: async () => null,
       listOpenWoPullRequests: async () => [],
       readRunDetail: async () => ({
-        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        metadata: {
+          teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+          head_branch: 'archon/task-web-worker-1-fixture',
+        },
       }),
     };
 
@@ -226,7 +235,10 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
       findWoClaim: async () => null,
       listOpenWoPullRequests: async () => [],
       readRunDetail: async () => ({
-        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        metadata: {
+          teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+          head_branch: 'archon/task-web-worker-1-fixture',
+        },
       }),
       ruleset,
     };
