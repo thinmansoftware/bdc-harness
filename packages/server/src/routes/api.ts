@@ -4312,6 +4312,10 @@ export function registerApiRoutes(
             if (run?.status !== 'waiting_provider') {
               throw new Error(`provider_wait_run_not_waiting: ${wait.runId}`);
             }
+            if (isCodexOnlyContinuation(run)) {
+              await schedulerStore.failWorkflowRun(run.id, 'codex_only_resume_unsupported');
+              throw new Error('codex_only_resume_unsupported');
+            }
             const dispatched = await tryAutoResumeRun(run, 'provider_wait');
             if (!dispatched) throw new Error(`provider_wait_resume_not_dispatched: ${wait.runId}`);
           },

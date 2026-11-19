@@ -1594,6 +1594,7 @@ describe('restricted provider-wait registered timer', () => {
     const before = structuredClone(run);
     const oldNodeEnv = process.env.NODE_ENV;
     const oldInterval = process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS;
+    const oldSweep = process.env.ARCHON_TERMINAL_LEASE_SWEEP_MS;
     const oldGetConversation = mockContinuationGetConversation.getMockImplementation();
     const oldExecute = mockContinuationExecute.getMockImplementation();
     const oldDeps = mockContinuationDeps.getMockImplementation();
@@ -1616,7 +1617,7 @@ describe('restricted provider-wait registered timer', () => {
         statusReads += 1;
         return mode === 'cancel-before' || (mode === 'cancel-after' && statusReads > 1)
           ? 'cancelled'
-          : 'waiting_provider';
+          : run.status;
       }),
       claimProviderWait: mock(async (data: Parameters<IWorkflowStore['claimProviderWait']>[0]) => {
         if (data.waitId !== 'owned-wait' || wait.state !== 'scheduled') return false;
@@ -1626,6 +1627,10 @@ describe('restricted provider-wait registered timer', () => {
         return true;
       }),
       getWorkflowRun: mock(async () => run),
+      failWorkflowRun: mock(async (_id: string, reason: string) => {
+        run.status = 'failed';
+        run.metadata = { ...run.metadata, failure_reason: reason };
+      }),
       completeProviderWait: mock(
         async (data: Parameters<IWorkflowStore['completeProviderWait']>[0]) => {
           if (
@@ -1719,6 +1724,7 @@ describe('restricted provider-wait registered timer', () => {
     try {
       process.env.NODE_ENV = 'provider-wait-hermetic-test';
       process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS = '15000';
+      process.env.ARCHON_TERMINAL_LEASE_SWEEP_MS = '0';
       const app = new OpenAPIHono({ defaultHook: validationErrorHook });
       registerApiRoutes(
         app,
@@ -1737,7 +1743,10 @@ describe('restricted provider-wait registered timer', () => {
       } else {
         result = await promises[0];
       }
-      expect(run).toEqual(before);
+      if (store.failWorkflowRun.mock.calls.length) {
+        expect(run.status).toBe('failed');
+        expect(store.failWorkflowRun).toHaveBeenCalledWith(run.id, 'codex_only_resume_unsupported');
+      } else expect(run).toEqual(before);
       expect(mockWaitTaskmasterStart).toHaveBeenCalledTimes(1);
       expect(mockWaitDeadmanStart).toHaveBeenCalledTimes(1);
       expect(mockWaitInboxStart).toHaveBeenCalledTimes(1);
@@ -1751,6 +1760,8 @@ describe('restricted provider-wait registered timer', () => {
       intervalSpy.mockRestore();
       if (oldNodeEnv === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = oldNodeEnv;
+      if (oldSweep === undefined) delete process.env.ARCHON_TERMINAL_LEASE_SWEEP_MS;
+      else process.env.ARCHON_TERMINAL_LEASE_SWEEP_MS = oldSweep;
       if (oldInterval === undefined) delete process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS;
       else process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS = oldInterval;
       if (oldGetConversation)
@@ -1777,15 +1788,14 @@ describe('restricted provider-wait registered timer', () => {
 
   function expectRefused(effects: Awaited<ReturnType<typeof runRegisteredTick>>) {
     expect(effects.store.completeProviderWait).not.toHaveBeenCalled();
-    expect(effects.store.releaseProviderWaitClaim).toHaveBeenCalledTimes(1);
-    expect(effects.store.releaseProviderWaitClaim).toHaveBeenCalledWith({
-      waitId: 'owned-wait',
-      claimToken: expect.any(String),
-      resumeAt: expect.any(String),
-    });
-    expect(effects.store.cancelProviderWaits).not.toHaveBeenCalled();
+    expect(effects.store.releaseProviderWaitClaim).not.toHaveBeenCalled();
+    expect(effects.store.cancelProviderWaits).toHaveBeenCalledTimes(1);
+    expect(effects.store.failWorkflowRun).toHaveBeenCalledWith(
+      'owned-provider-wait-run',
+      'codex_only_resume_unsupported'
+    );
     expect(effects.store.getWorkflowRun).toHaveBeenCalledTimes(1);
-    expect(mockContinuationDeps).toHaveBeenCalledTimes(1);
+    expect(mockContinuationDeps).toHaveBeenCalledTimes(2);
     for (const effect of [
       mockContinuationGetConversation,
       mockContinuationExecute,
@@ -1806,27 +1816,25 @@ describe('restricted provider-wait registered timer', () => {
     ['v2', { version: 'codex-only-v2' }],
     ['unknown', { version: 'codex-only-v999' }],
   ] as const) {
-    test('defers own ' + label + ' marker before resume effects', async () => {
+    test('terminates own ' + label + ' marker before resume effects', async () => {
       const effects = await runRegisteredTick(
         makeWaitRun({ metadata: { codex_only_dispatch: marker } })
       );
-      expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 0, deferred: 1 });
+      expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 1, deferred: 0 });
       expect(effects.wait).toEqual({
-        state: 'scheduled',
-        claimToken: null,
-        ownerId: null,
-        resumeAt: expect.any(String),
+        state: 'cancelled',
+        claimToken: expect.any(String),
+        ownerId: expect.any(String),
+        resumeAt: null,
       });
       expectRefused(effects);
     });
   }
 
-  test('defers reserved name without marker before resume effects', async () => {
+  test('terminates reserved name without marker before resume effects', async () => {
     const effects = await runRegisteredTick(makeWaitRun({ workflow_name: reserved }));
-    expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 0, deferred: 1 });
-    expect(effects.wait.state).toBe('scheduled');
-    expect(effects.wait.claimToken).toBeNull();
-    expect(effects.wait.ownerId).toBeNull();
+    expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 1, deferred: 0 });
+    expect(effects.wait.state).toBe('cancelled');
     expectRefused(effects);
   });
 
@@ -1837,7 +1845,7 @@ describe('restricted provider-wait registered timer', () => {
     expect(effects.store.completeProviderWait).toHaveBeenCalledTimes(1);
     expect(effects.store.releaseProviderWaitClaim).not.toHaveBeenCalled();
     expect(mockContinuationExecute).toHaveBeenCalledTimes(1);
-    expect(mockContinuationDeps).toHaveBeenCalledTimes(2);
+    expect(mockContinuationDeps).toHaveBeenCalledTimes(3);
     expect(effects.mapping).toHaveBeenCalledTimes(1);
     expect(effects.bridge).toHaveBeenCalledTimes(1);
   });
@@ -1845,7 +1853,10 @@ describe('restricted provider-wait registered timer', () => {
   test('preserves ordinary missing-parent defer', async () => {
     const effects = await runRegisteredTick(makeWaitRun({ parent_conversation_id: null }));
     expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 0, deferred: 1 });
-    expectRefused(effects);
+    expect(effects.store.releaseProviderWaitClaim).toHaveBeenCalledTimes(1);
+    expect(effects.store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(effects.store.cancelProviderWaits).not.toHaveBeenCalled();
+    expect(mockContinuationExecute).not.toHaveBeenCalled();
   });
 
   for (const mode of ['cancel-before', 'cancel-after'] as const) {
@@ -1868,11 +1879,13 @@ describe('restricted provider-wait registered timer', () => {
 
   test('retains refusal when claim release fails without false completion', async () => {
     const effects = await runRegisteredTick(
-      makeWaitRun({ workflow_name: reserved }),
+      makeWaitRun({ parent_conversation_id: null }),
       'release-fails'
     );
     expect(effects.result).toBeUndefined();
     expect(effects.wait.state).toBe('cancelled');
-    expectRefused(effects);
+    expect(effects.store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(effects.store.releaseProviderWaitClaim).toHaveBeenCalledTimes(1);
+    expect(effects.store.completeProviderWait).not.toHaveBeenCalled();
   });
 });

@@ -1264,7 +1264,47 @@ describe('executeWorkflow', () => {
       expect(result.workflowRunId).toBe('run-123');
     });
 
-    it('stops without creating a run when findResumableRun throws', async () => {
+    it('ordinary and provider-wait resume carry the same selected run and completed outputs', async () => {
+      for (const waiting of [false, true]) {
+        mockExecuteDagWorkflow.mockClear();
+        const prior = makeRun({
+          id: 'equivalent-run',
+          status: waiting ? 'waiting_provider' : 'failed',
+        });
+        const outputs = new Map([['done', 'retained output']]);
+        const store = makeStore({
+          findResumableRun: mock(async () => prior),
+          getCompletedDagNodeOutputs: mock(async () => outputs),
+          resumeWorkflowRun: mock(async () => ({ ...prior, status: 'running' })),
+        });
+        const result = await executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow(),
+          'test message',
+          'db-conv-1',
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          waiting ? prior : undefined
+        );
+        expect(result.success).toBe(true);
+        expect(store.resumeWorkflowRun).toHaveBeenCalledWith('equivalent-run');
+        expect(store.getCompletedDagNodeOutputs).toHaveBeenCalledWith('equivalent-run');
+        const args = mockExecuteDagWorkflow.mock.calls[0];
+        expect(args?.[5]).toEqual(
+          expect.objectContaining({ id: 'equivalent-run', status: 'running' })
+        );
+        expect(args?.[15]).toEqual(outputs);
+        expect(store.findResumableRun).toHaveBeenCalledTimes(waiting ? 0 : 1);
+        expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      }
+    });
+
+    it('retains dev fresh-run fallback when findResumableRun throws', async () => {
       const store = makeStore({
         findResumableRun: mock(async () => {
           throw new Error('DB error');
@@ -1280,8 +1320,8 @@ describe('executeWorkflow', () => {
         'test message',
         'db-conv-1'
       );
-      expect(store.createWorkflowRun).not.toHaveBeenCalled();
-      expect(result.success).toBe(false);
+      expect(store.createWorkflowRun).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
     });
 
     it('starts fresh run when prior run has 0 completed nodes', async () => {
@@ -1629,16 +1669,20 @@ describe('executeWorkflow', () => {
       expect(store.findResumableRun).not.toHaveBeenCalled();
     });
 
-    it('repeated lookup failure preserves the supplied claim and hides native payload text', async () => {
+    it('ordinary lookup failure preserves supplied claim and falls through without exposing payload', async () => {
       const claim = makeRun({ id: 'claim', status: 'pending' });
       const store = makeStore({
         findResumableRun: mock(async () => {
           throw new Error(sentinel);
         }),
       });
-      expectStopped(store, await invoke(store, claim));
-      expectStopped(store, await invoke(store, claim));
-      expect(claim.status).toBe('pending');
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const outcome = await invoke(store, claim);
+        expect(outcome.result.success).toBe(true);
+        expect(outcome.result.workflowRunId).toBe('claim');
+        expect(inspect(outcome)).not.toContain(sentinel);
+      }
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
       expect(store.findResumableRun).toHaveBeenCalledTimes(2);
       expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
     });

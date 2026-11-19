@@ -899,6 +899,12 @@ export async function executeWorkflow(
     let resumableRunId = '';
     try {
       resumableRun = await deps.store.findResumableRun(workflow.name, cwd);
+    } catch {
+      // Ordinary lookup errors retain dev's fresh-run fallback. Classification
+      // below still fails closed for a returned restricted or unreadable row.
+      getLog().error({}, 'workflow_resume_check_failed');
+    }
+    try {
       // Presence, including unknown markers, refuses before output or activation.
       if (resumableRun !== null) {
         const ordinaryRunId = getOrdinaryContinuationRunId(resumableRun);

@@ -533,10 +533,26 @@ describe('bounded supervised Codex-only dispatch', () => {
     const ladderUrl = pathToFileURL(join(import.meta.dir, '../ladder.ts')).href;
     const pollUrl = pathToFileURL(join(import.meta.dir, '../poll.ts')).href;
     try {
-      for (const [refused, premium, nextTier] of [
-        [[], ['claude'], 'claude'],
-        [['claude'], ['frontier'], 'frontier'],
-        [['claude', 'frontier'], ['frontier'], null],
+      for (const [refused, premium, seat, nextTier] of [
+        [
+          [],
+          ['claude'],
+          { limit_source: 'measured', windows: [{ name: 'session', used_percent: 10 }] },
+          'claude',
+        ],
+        [[], ['claude'], { limit_source: 'UNKNOWN', windows: [] }, 'frontier'],
+        [
+          ['claude'],
+          ['frontier'],
+          { limit_source: 'measured', windows: [{ name: 'session', used_percent: 10 }] },
+          'frontier',
+        ],
+        [
+          ['claude', 'frontier'],
+          ['frontier'],
+          { limit_source: 'measured', windows: [{ name: 'session', used_percent: 10 }] },
+          null,
+        ],
       ] as const) {
         const script = join(directory, 'fixture.mjs');
         await writeFile(
@@ -558,7 +574,7 @@ describe('bounded supervised Codex-only dispatch', () => {
               name:'bdc-feature-development-codex-only',description:'Test',provider:'codex',nodes:[{id:'build',prompt:'Build'}]}});
           let fires = 0, cancels = 0;
           const record = await runCascade({woId:'TEST',project:'test-project',token:'test',entryOverride:'codex',codexOnly:true,
-            deps:{findWoClaim:async()=>null,acquireWoLock:async()=>({acquired:true}),releaseWoLock:async()=>{},
+            deps:{seatUsage:async()=>({claude:${JSON.stringify(seat)}}),seatCutoff:async()=>80,findWoClaim:async()=>null,acquireWoLock:async()=>({acquired:true}),releaseWoLock:async()=>{},
               createRecord:async record=>({created:true,path:'memory',record}),writeRecord:async()=> 'memory',
               fire:async()=>{fires++;return {ok:true,runId:'owned-run',conversationId:'test',infraError:null}},
               fetchNodeTimeouts:async()=>({}),poll:async()=>{throw new TimeoutError('stalled')},
