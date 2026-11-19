@@ -1015,6 +1015,86 @@ describe('run-completion-report merged-or-owned', () => {
     expect(rb.reason).toContain('incomplete:pulls:shopops');
   });
 
+  async function completionWithCounts(
+    pullCount: number,
+    pullTotal: number,
+    issueCount = 0,
+    issueTotal = 0
+  ) {
+    resetGitHubApiMeterForTests();
+    const units = new Map([['WO-LAG', new Set(['shopops'])]]);
+    const pulls = Array.from({ length: pullCount }, (_, i) => ({
+      title: `pr ${i}`,
+      merged_at: '2026-10-20T00:00:00Z',
+    }));
+    const issues = Array.from({ length: issueCount }, (_, i) => ({
+      title: `WO-${i}`,
+      state: 'open',
+    }));
+    const execute = (argv: Argv, _env: Env): ExecResult => {
+      if (argv.includes('repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'))
+        return ok([issues]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-xo label:wo is:issue'))
+        return ok({ total_count: issueTotal });
+      if (argv.includes('repos/thinmansoftware/shopops/pulls?state=closed&per_page=100'))
+        return ok([pulls.slice(0, 100), pulls.slice(100, 200), pulls.slice(200)]);
+      if (argv.includes('q=repo:thinmansoftware/shopops is:pr is:merged'))
+        return ok({ total_count: pullTotal });
+      throw new Error(`unexpected gh call: ${argv.join(' ')}`);
+    };
+    const db = new SqliteAdapter(':memory:');
+    try {
+      return await computeWoCompletion(units, AS_OF, {
+        noGithub: false,
+        execute,
+        identity: PAT,
+        db,
+      });
+    } finally {
+      await db.close();
+      resetGitHubApiMeterForTests();
+    }
+  }
+
+  test('Search lag Test 1: pulls list one above search is available with the difference', async () => {
+    const result = await completionWithCounts(251, 250);
+    expect(result.available).toBe(true);
+    expect(result).toHaveProperty('count_lag', 1);
+  });
+
+  test('Search lag Test 2: pulls list below search stays unavailable', async () => {
+    const result = await completionWithCounts(250, 251);
+    expect(result).toEqual({ available: false, reason: 'incomplete:pulls:shopops' });
+  });
+
+  test('Search lag Test 3: equal counts are available with no lag', async () => {
+    const result = await completionWithCounts(1, 1);
+    expect(result.available).toBe(true);
+    expect(result).toHaveProperty('count_lag', 0);
+
+    // The CLI's zero-WO case yields an available result with no lag and needs no GitHub calls.
+    const { path, db } = newDb();
+    db.close();
+    const report = execDefault(base(path));
+    expect(report.code).toBe(0);
+    expect(report.out).toContain('wo_merged_or_owned: 0/0');
+    expect(report.out).not.toContain('wo_count_lag:');
+    const jsonReport = execDefault(base(path, ['--json']));
+    expect(jsonReport.code).toBe(0);
+    expect(JSON.parse(jsonReport.out).wo_completion.count_lag).toBe(0);
+  });
+
+  test('Search lag Test 4: issues list one above search is available with the difference', async () => {
+    const result = await completionWithCounts(1, 1, 2, 1);
+    expect(result.available).toBe(true);
+    expect(result).toHaveProperty('count_lag', 1);
+  });
+
+  test('Search lag Test 5: issues list below search stays unavailable', async () => {
+    const result = await completionWithCounts(1, 1, 1, 2);
+    expect(result).toEqual({ available: false, reason: 'incomplete:issues' });
+  });
+
   test('Test 8: request arguments are exact (one project)', async () => {
     resetGitHubApiMeterForTests();
     const units = new Map([['WO-I', new Set(['shopops'])]]);
