@@ -2,9 +2,11 @@ import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+import { createMockLogger } from '../test/mocks/logger';
 import { SqliteAdapter } from './adapters/sqlite';
 import type { IDatabase } from './adapters/types';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import { workflowRunStatusSchema } from '@archon/workflows/schemas/workflow-run';
 import type {
   ProviderAttemptRecord,
   RunAuthorityRecord,
@@ -16,6 +18,16 @@ import type {
 } from '@archon/workflows/reliability/types';
 
 const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockLogger = createMockLogger();
+mock.module('@archon/paths', () => ({
+  createLogger: mock(() => mockLogger),
+  getArchonHome: mock(() => '/home/test/.archon'),
+  getArchonConfigPath: mock(() => '/home/test/.archon/config.yaml'),
+  getArchonWorkspacesPath: mock(() => '/home/test/.archon/workspaces'),
+  getArchonWorktreesPath: mock(() => '/home/test/.archon/worktrees'),
+  getDefaultCommandsPath: mock(() => '/app/.archon/commands/defaults'),
+  getDefaultWorkflowsPath: mock(() => '/app/.archon/workflows/defaults'),
+}));
 const mockTransactionQuery = mock(() => Promise.resolve(createQueryResult([])));
 const mockWithTransaction = mock((fn: (query: typeof mockTransactionQuery) => Promise<unknown>) =>
   fn(mockTransactionQuery)
@@ -32,16 +44,18 @@ mock.module('./connection', () => ({
   pool: {
     query: mockQuery,
   },
-  getDialect: () => mockPostgresDialect,
+  getDialect: () => activeDatabase.sql,
   getDatabaseType: () => 'postgresql' as const,
   getDatabase: () => activeDatabase,
 }));
 
 import {
   createWorkflowRun,
+  activatePendingWorkflowRun,
   getWorkflowRun,
   getWorkflowRunStatus,
   getActiveWorkflowRun,
+  getPausedWorkflowRun,
   getActiveWorkflowRunByPath,
   updateWorkflowRun,
   completeWorkflowRun,
@@ -49,6 +63,7 @@ import {
   cancelWorkflowRun,
   updateWorkflowActivity,
   findResumableRun,
+  findResumableRunByParentConversation,
   resumeWorkflowRun,
   failOrphanedRuns,
   listWorkflowRuns,
@@ -103,6 +118,8 @@ describe('workflows database', () => {
     mockTransactionQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
     mockWithTransaction.mockClear();
     activeDatabase = defaultMockDatabase;
+    mockLogger.error.mockClear();
+    mockLogger.warn.mockClear();
   });
 
   const mockWorkflowRun: WorkflowRun = {
@@ -194,6 +211,266 @@ describe('workflows database', () => {
     });
   });
 
+  describe('v2 pending activation CAS', () => {
+    const activationSql =
+      "UPDATE remote_agent_workflow_runs SET status = 'running' WHERE id = $1 AND status = 'pending'";
+
+    test('issues one conditional update and returns true for exactly one affected row', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await expect(activatePendingWorkflowRun('pending-run')).resolves.toBe(true);
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledWith(activationSql, ['pending-run']);
+    });
+
+    test.each([0, 2])('refuses an affected-row count of %s', async rowCount => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], rowCount));
+
+      await expect(activatePendingWorkflowRun('unmatched-run')).resolves.toBe(false);
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledWith(activationSql, ['unmatched-run']);
+    });
+
+    test('propagates the identical database error without retry or false conversion', async () => {
+      const failure = new Error('activation commit uncertain');
+      mockQuery.mockRejectedValueOnce(failure);
+
+      await expect(activatePendingWorkflowRun('uncertain-run')).rejects.toBe(failure);
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledWith(activationSql, ['uncertain-run']);
+    });
+
+    async function withPendingRun(
+      check: (
+        sqlite: SqliteAdapter,
+        run: WorkflowRun,
+        authority: RunAuthorityRecord
+      ) => Promise<void>
+    ): Promise<void> {
+      const dbPath = join(import.meta.dir, `.test-pending-activation-${crypto.randomUUID()}.db`);
+      const sqlite = new SqliteAdapter(dbPath);
+      activeDatabase = sqlite;
+      mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
+      try {
+        const codebaseId = crypto.randomUUID();
+        const conversationId = crypto.randomUUID();
+        await sqlite.query(
+          'INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES ($1, $2, $3)',
+          [codebaseId, 'pending-activation-test', '/tmp/pending-activation-test']
+        );
+        await sqlite.query(
+          `INSERT INTO remote_agent_conversations
+           (id, platform_type, platform_conversation_id, codebase_id)
+           VALUES ($1, 'test', 'pending-activation-conversation', $2)`,
+          [conversationId, codebaseId]
+        );
+        const run = await createWorkflowRun({
+          workflow_name: 'pending-activation-test',
+          conversation_id: conversationId,
+          codebase_id: codebaseId,
+          user_message: 'Hermetic activation test',
+          working_path: '/tmp/pending-activation-test',
+          metadata: {
+            github_context: 'Synthetic test context',
+            model_override: { provider: 'codex', model: 'synthetic-model' },
+            codex_only_dispatch: {
+              version: 2,
+              comparison_binding: {
+                codebase_id: codebaseId,
+                workflow_name: 'pending-activation-test',
+                default_cwd: '/tmp/pending-activation-test',
+              },
+              raw_workflow_digest: 'a'.repeat(64),
+              executable_workflow_digest: 'b'.repeat(64),
+              actual_cwd: '/tmp/pending-activation-test',
+              logical_provider: 'codex',
+              strict_transport: 'codex-only',
+            },
+          },
+        });
+        expect(run.status).toBe('pending');
+        const authority: RunAuthorityRecord = {
+          runId: run.id,
+          dispatchId: crypto.randomUUID(),
+          woId: 'WO-HARNESS-PENDING-ACTIVATION-TEST',
+          specSource: 'git:docs/work-orders/synthetic-test.md',
+          specRevision: 'c'.repeat(40),
+          specHash: 'd'.repeat(64),
+          workflowName: run.workflow_name,
+          codebaseId,
+          canonicalRemote: 'synthetic/repo',
+          baseBranch: 'dev',
+          baseSha: 'e'.repeat(40),
+          runScopeSha: 'f'.repeat(40),
+          headBranch: 'test/pending-activation',
+          worktreePath: '/tmp/pending-activation-test',
+          workflowRevision: '1'.repeat(64),
+          bundleRevision: 'synthetic-bundle',
+          engineRevision: '2'.repeat(40),
+          runtimeImageRevision: null,
+          createdAt: '2026-10-23T12:00:00.000Z',
+        };
+        expect(await createRunAuthority(authority)).toBe('created');
+        await check(sqlite, run, authority);
+      } finally {
+        await sqlite.close();
+        activeDatabase = defaultMockDatabase;
+        for (const suffix of ['', '-wal', '-shm']) {
+          try {
+            unlinkSync(dbPath + suffix);
+          } catch {
+            // File may not exist depending on SQLite checkpoint timing.
+          }
+        }
+      }
+    }
+
+    async function readStoredRun(
+      sqlite: SqliteAdapter,
+      id: string
+    ): Promise<Record<string, unknown>> {
+      const result = await sqlite.query<Record<string, unknown>>(
+        'SELECT * FROM remote_agent_workflow_runs WHERE id = $1',
+        [id]
+      );
+      return result.rows[0]!;
+    }
+
+    async function seedProviderWait(sqlite: SqliteAdapter, runId: string): Promise<string> {
+      const attemptId = crypto.randomUUID();
+      const waitId = crypto.randomUUID();
+      await sqlite.query(
+        `INSERT INTO remote_agent_provider_attempts
+         (attempt_id, run_id, node_id, attempt_number, provider, model,
+          declared_provider, declared_model, started_at)
+         VALUES ($1, $2, 'test-node', 1, 'codex', 'synthetic-model',
+                 'codex', 'synthetic-model', '2026-10-23T12:00:00.000Z')`,
+        [attemptId, runId]
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_scheduled_waits
+         (wait_id, run_id, attempt_id, provider, reason_code, resume_at, created_at)
+         VALUES ($1, $2, $3, 'codex', 'provider_quota',
+                 '2026-10-23T12:05:00.000Z', '2026-10-23T12:00:00.000Z')`,
+        [waitId, runId, attemptId]
+      );
+      return waitId;
+    }
+
+    async function expectCancelledWait(sqlite: SqliteAdapter, waitId: string): Promise<void> {
+      const result = await sqlite.query<{ state: string; cancelled_at: string | null }>(
+        'SELECT state, cancelled_at FROM remote_agent_scheduled_waits WHERE wait_id = $1',
+        [waitId]
+      );
+      expect(result.rows[0]?.state).toBe('cancelled');
+      expect(result.rows[0]?.cancelled_at).not.toBeNull();
+    }
+
+    test('activates the same SQLite row once and preserves all other columns and authority', async () => {
+      await withPendingRun(async (sqlite, run, authority) => {
+        const before = await readStoredRun(sqlite, run.id);
+        mockQuery.mockClear();
+
+        await expect(activatePendingWorkflowRun(run.id)).resolves.toBe(true);
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        expect(mockQuery).toHaveBeenCalledWith(activationSql, [run.id]);
+        const activated = await readStoredRun(sqlite, run.id);
+        expect(activated).toEqual({ ...before, status: 'running' });
+        expect(await getRunAuthority(run.id)).toEqual(authority);
+        mockQuery.mockClear();
+
+        await expect(activatePendingWorkflowRun(run.id)).resolves.toBe(false);
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        expect(await readStoredRun(sqlite, run.id)).toEqual(activated);
+        expect(await getRunAuthority(run.id)).toEqual(authority);
+      });
+    });
+
+    test('refuses an unknown SQLite ID without changing the owned pending row', async () => {
+      await withPendingRun(async (sqlite, run, authority) => {
+        const before = await readStoredRun(sqlite, run.id);
+        mockQuery.mockClear();
+
+        await expect(activatePendingWorkflowRun(crypto.randomUUID())).resolves.toBe(false);
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        expect(await readStoredRun(sqlite, run.id)).toEqual(before);
+        expect(await getRunAuthority(run.id)).toEqual(authority);
+      });
+    });
+
+    test.each(workflowRunStatusSchema.options.filter(status => status !== 'pending'))(
+      'refuses SQLite status %s without changing any column or authority',
+      async status => {
+        await withPendingRun(async (sqlite, run, authority) => {
+          await sqlite.query('UPDATE remote_agent_workflow_runs SET status = $2 WHERE id = $1', [
+            run.id,
+            status,
+          ]);
+          const before = await readStoredRun(sqlite, run.id);
+          mockQuery.mockClear();
+
+          await expect(activatePendingWorkflowRun(run.id)).resolves.toBe(false);
+
+          expect(mockQuery).toHaveBeenCalledTimes(1);
+          expect(await readStoredRun(sqlite, run.id)).toEqual(before);
+          expect(await getRunAuthority(run.id)).toEqual(authority);
+        });
+      }
+    );
+
+    test('cancel-first SQLite schedule refuses activation and preserves the committed cancellation', async () => {
+      await withPendingRun(async (sqlite, run, authority) => {
+        const before = await readStoredRun(sqlite, run.id);
+        const waitId = await seedProviderWait(sqlite, run.id);
+        await cancelWorkflowRun(run.id);
+        const cancelled = await readStoredRun(sqlite, run.id);
+        expect(cancelled).toEqual({
+          ...before,
+          status: 'cancelled',
+          completed_at: expect.any(String),
+        });
+        await expectCancelledWait(sqlite, waitId);
+        mockQuery.mockClear();
+
+        await expect(activatePendingWorkflowRun(run.id)).resolves.toBe(false);
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        expect(await readStoredRun(sqlite, run.id)).toEqual(cancelled);
+        expect(await getRunAuthority(run.id)).toEqual(authority);
+        await expectCancelledWait(sqlite, waitId);
+      });
+    });
+
+    test('activate-first SQLite schedule permits the later existing cancellation', async () => {
+      await withPendingRun(async (sqlite, run, authority) => {
+        const before = await readStoredRun(sqlite, run.id);
+        const waitId = await seedProviderWait(sqlite, run.id);
+        mockQuery.mockClear();
+
+        await expect(activatePendingWorkflowRun(run.id)).resolves.toBe(true);
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        expect(await readStoredRun(sqlite, run.id)).toEqual({ ...before, status: 'running' });
+        expect(await getRunAuthority(run.id)).toEqual(authority);
+        await cancelWorkflowRun(run.id);
+
+        expect(await readStoredRun(sqlite, run.id)).toEqual({
+          ...before,
+          status: 'cancelled',
+          completed_at: expect.any(String),
+        });
+        expect(await getRunAuthority(run.id)).toEqual(authority);
+        await expectCancelledWait(sqlite, waitId);
+      });
+    });
+  });
+
   describe('getWorkflowRun', () => {
     test('returns workflow run by id', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
@@ -213,6 +490,231 @@ describe('workflows database', () => {
       const result = await getWorkflowRun('non-existent');
 
       expect(result).toBeNull();
+    });
+  });
+
+  describe('UNKNOWN read contract', () => {
+    const sentinel = 'persisted-private-payload-90210';
+    const readers: [string, () => Promise<WorkflowRun | null>][] = [
+      ['getWorkflowRun', () => getWorkflowRun('workflow-run-123')],
+      ['getPausedWorkflowRun', () => getPausedWorkflowRun('conv-456')],
+      ['findResumableRun', () => findResumableRun('feature-development', '/repo/path')],
+      [
+        'findResumableRunByParentConversation',
+        () => findResumableRunByParentConversation('feature-development', 'conv-parent'),
+      ],
+    ];
+    const unreadableMetadata: [string, unknown][] = [
+      ['corrupt JSON', `{"private":"${sentinel}"`],
+      ['JSON null', 'null'],
+      ['JSON string', `"${sentinel}"`],
+      ['JSON number', '42'],
+      ['JSON boolean', 'false'],
+      ['JSON array', '[{"codex_only_dispatch":false}]'],
+      ['empty string', ''],
+      ['direct number', 42],
+      ['direct boolean', false],
+      ['direct array', [{ codex_only_dispatch: undefined, private: sentinel }]],
+    ];
+
+    for (const [name, read] of readers) {
+      describe(name, () => {
+        test.each(unreadableMetadata)(
+          'rejects %s without rewriting or exposing metadata',
+          async (_label, metadata) => {
+            const row = { ...mockWorkflowRun, metadata } as WorkflowRun;
+            const before = { ...row };
+            mockQuery.mockResolvedValueOnce(createQueryResult([row]));
+
+            const result = read();
+            await expect(result).rejects.toThrow();
+            const failure: unknown = await result.catch((error: unknown) => error);
+
+            expect(row).toEqual(before);
+            expect(row.metadata).toBe(metadata);
+            expect(failure).toBeInstanceOf(Error);
+            expect((failure as Error).message.length).toBeLessThan(200);
+            expect(
+              Bun.inspect({
+                failure,
+                errors: mockLogger.error.mock.calls,
+                warnings: mockLogger.warn.mock.calls,
+              })
+            ).not.toContain(sentinel);
+            expect(mockQuery).toHaveBeenCalledTimes(1);
+          }
+        );
+
+        test.each([
+          ['undefined', undefined],
+          ['null', null],
+          ['false', false],
+          ['unknown version', { version: 999 }],
+        ])('preserves every field and the own %s marker', async (_label, marker) => {
+          const metadata = { codex_only_dispatch: marker, extra: { unchanged: true } };
+          const row = { ...mockWorkflowRun, metadata, extra_column: 'retained' };
+          mockQuery.mockResolvedValueOnce(createQueryResult([row]));
+
+          const result = await read();
+
+          expect(result).toBe(row);
+          expect(result?.metadata).toBe(metadata);
+          expect(Object.hasOwn(result!.metadata!, 'codex_only_dispatch')).toBe(true);
+          expect(result?.metadata?.codex_only_dispatch).toBe(marker);
+          expect(result).toEqual({ ...mockWorkflowRun, metadata, extra_column: 'retained' });
+        });
+
+        test.each([null, undefined])('preserves raw legacy %s absence', async metadata => {
+          const row = { ...mockWorkflowRun, metadata } as WorkflowRun;
+          mockQuery.mockResolvedValueOnce(createQueryResult([row]));
+
+          const result = await read();
+
+          expect(result).toBe(row);
+          expect(result?.metadata).toBe(metadata);
+          expect(Object.hasOwn(result!, 'metadata')).toBe(true);
+        });
+
+        test('preserves an absent metadata property', async () => {
+          const row = { ...mockWorkflowRun };
+          delete row.metadata;
+          mockQuery.mockResolvedValueOnce(createQueryResult([row]));
+
+          expect(await read()).toBe(row);
+          expect(Object.hasOwn(row, 'metadata')).toBe(false);
+        });
+
+        test('parses a JSON object while retaining every metadata field and row field', async () => {
+          const row = {
+            ...mockWorkflowRun,
+            metadata: '{"codex_only_dispatch":false,"empty":"","nested":{"value":null}}',
+            extra_column: 'retained',
+          } as unknown as WorkflowRun;
+          mockQuery.mockResolvedValueOnce(createQueryResult([row]));
+
+          expect(await read()).toEqual({
+            ...mockWorkflowRun,
+            metadata: { codex_only_dispatch: false, empty: '', nested: { value: null } },
+            extra_column: 'retained',
+          });
+          expect(Object.hasOwn(row.metadata!, 'codex_only_dispatch')).toBe(true);
+        });
+      });
+    }
+
+    test('paused lookup returns null only after a successful query with zero rows', async () => {
+      await expect(getPausedWorkflowRun('conv-456')).resolves.toBeNull();
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledWith(
+        `SELECT * FROM remote_agent_workflow_runs
+       WHERE (conversation_id = $1 OR parent_conversation_id = $2) AND status = 'paused'
+       ORDER BY started_at DESC LIMIT 1`,
+        ['conv-456', 'conv-456']
+      );
+    });
+
+    test.each([undefined, null, false, 0, '', [], 'invalid row'])(
+      'paused lookup rejects a returned malformed row %j instead of no-row null',
+      async row => {
+        mockQuery.mockResolvedValueOnce(createQueryResult([row]));
+
+        await expect(getPausedWorkflowRun('conv-456')).rejects.toThrow();
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    test('paused lookup preserves the real query error without logging its payload', async () => {
+      const failure = new Error(`query failed with input ${sentinel}`);
+      mockQuery.mockRejectedValueOnce(failure);
+
+      await expect(getPausedWorkflowRun('conv-456')).rejects.toBe(failure);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockLogger.error).toHaveBeenCalledTimes(1);
+      expect(Bun.inspect(mockLogger.error.mock.calls)).not.toContain(sentinel);
+    });
+
+    test('does not add a full-row schema requirement to metadata normalization', async () => {
+      const partial = { metadata: { ordinary: true }, unrelated: 'retained' };
+      mockQuery.mockResolvedValueOnce(createQueryResult([partial]));
+
+      expect(await getWorkflowRun('legacy-id')).toBe(partial);
+    });
+
+    test('creation return normalizes readable metadata using the shared guard', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ ...mockWorkflowRun, metadata: '{"empty":""}' }])
+      );
+
+      await expect(
+        createWorkflowRun({
+          workflow_name: 'ordinary',
+          conversation_id: 'conv-456',
+          user_message: 'synthetic',
+        })
+      ).resolves.toEqual({ ...mockWorkflowRun, metadata: { empty: '' } });
+    });
+
+    test('list return preserves raw absence and readable objects using the shared guard', async () => {
+      const metadata = { codex_only_dispatch: undefined };
+      const rows = [
+        { ...mockWorkflowRun, metadata: null },
+        { ...mockWorkflowRun, metadata },
+        { ...mockWorkflowRun, metadata: '{"ordinary":true}' },
+      ];
+      mockQuery.mockResolvedValueOnce(createQueryResult(rows));
+
+      const result = await listWorkflowRuns();
+
+      expect(result.map(row => row.metadata)).toEqual([null, metadata, { ordinary: true }]);
+      expect(result[1].metadata).toBe(metadata);
+      expect(Object.hasOwn(result[1].metadata!, 'codex_only_dispatch')).toBe(true);
+    });
+
+    test('SQLite paused reads reject corrupt stored metadata without changing the row', async () => {
+      const sqlite = new SqliteAdapter(':memory:');
+      activeDatabase = sqlite;
+      mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
+      try {
+        await sqlite.query(
+          `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id)
+           VALUES ('read-conversation', 'test', 'unknown-read-contract')`
+        );
+        const run = await createWorkflowRun({
+          workflow_name: 'ordinary',
+          conversation_id: 'read-conversation',
+          user_message: 'synthetic',
+        });
+        await sqlite.query(
+          "UPDATE remote_agent_workflow_runs SET status = 'paused', metadata = $2 WHERE id = $1",
+          [run.id, `{"private":"${sentinel}"`]
+        );
+        const before = await sqlite.query(
+          'SELECT * FROM remote_agent_workflow_runs WHERE id = $1',
+          [run.id]
+        );
+
+        await expect(getPausedWorkflowRun('read-conversation')).rejects.toThrow();
+        expect(
+          (await sqlite.query('SELECT * FROM remote_agent_workflow_runs WHERE id = $1', [run.id]))
+            .rows
+        ).toEqual(before.rows);
+
+        await sqlite.query('UPDATE remote_agent_workflow_runs SET metadata = $2 WHERE id = $1', [
+          run.id,
+          '{"codex_only_dispatch":false,"empty":""}',
+        ]);
+        expect((await getPausedWorkflowRun('read-conversation'))?.metadata).toEqual({
+          codex_only_dispatch: false,
+          empty: '',
+        });
+        await sqlite.query('UPDATE remote_agent_workflow_runs SET metadata = NULL WHERE id = $1', [
+          run.id,
+        ]);
+        expect((await getPausedWorkflowRun('read-conversation'))?.metadata).toBeNull();
+      } finally {
+        await sqlite.close();
+        activeDatabase = defaultMockDatabase;
+      }
     });
   });
 

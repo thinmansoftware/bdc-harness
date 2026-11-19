@@ -3,6 +3,7 @@ import type { IWorkflowStore } from '@archon/workflows/store';
 
 // Mock DB modules before importing store-adapter
 const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
+const mockActivatePendingWorkflowRun = mock((_id: string) => Promise.resolve(false));
 const mockGetWorkflowRun = mock(() => Promise.resolve(null));
 const mockGetActiveWorkflowRunByPath = mock(() => Promise.resolve(null));
 const mockFailOrphanedRuns = mock(() => Promise.resolve({ count: 0 }));
@@ -46,6 +47,7 @@ const mockReleaseSupervisorRepairLease = mock(() => Promise.resolve(false));
 
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
+  activatePendingWorkflowRun: mockActivatePendingWorkflowRun,
   getWorkflowRun: mockGetWorkflowRun,
   getActiveWorkflowRunByPath: mockGetActiveWorkflowRunByPath,
   failOrphanedRuns: mockFailOrphanedRuns,
@@ -122,6 +124,48 @@ mock.module('../config/config-loader', () => ({
 }));
 
 const { createWorkflowStore, createWorkflowDeps } = await import('./store-adapter');
+
+describe('v2 pending activation adapter', () => {
+  beforeEach(() => {
+    mockActivatePendingWorkflowRun.mockReset();
+    mockActivatePendingWorkflowRun.mockResolvedValue(false);
+  });
+
+  test('always exposes the optional activation method on the real store', () => {
+    expect(typeof createWorkflowStore().activatePendingWorkflowRun).toBe('function');
+  });
+
+  test('forwards the identical ID once and returns true unchanged', async () => {
+    mockActivatePendingWorkflowRun.mockResolvedValueOnce(true);
+    const store = createWorkflowStore();
+
+    await expect(store.activatePendingWorkflowRun?.('activation-true')).resolves.toBe(true);
+
+    expect(mockActivatePendingWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockActivatePendingWorkflowRun).toHaveBeenCalledWith('activation-true');
+  });
+
+  test('forwards the identical ID once and returns false unchanged', async () => {
+    mockActivatePendingWorkflowRun.mockResolvedValueOnce(false);
+    const store = createWorkflowStore();
+
+    await expect(store.activatePendingWorkflowRun?.('activation-false')).resolves.toBe(false);
+
+    expect(mockActivatePendingWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockActivatePendingWorkflowRun).toHaveBeenCalledWith('activation-false');
+  });
+
+  test('propagates the identical database error without retry', async () => {
+    const failure = new Error('activation forwarding uncertainty');
+    mockActivatePendingWorkflowRun.mockRejectedValueOnce(failure);
+    const store = createWorkflowStore();
+
+    await expect(store.activatePendingWorkflowRun?.('activation-error')).rejects.toBe(failure);
+
+    expect(mockActivatePendingWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockActivatePendingWorkflowRun).toHaveBeenCalledWith('activation-error');
+  });
+});
 
 describe('createWorkflowStore', () => {
   test('returns object with all IWorkflowStore methods', () => {

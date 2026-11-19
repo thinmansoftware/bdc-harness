@@ -158,6 +158,99 @@ describe('decision', () => {
     expect(refusal([failedRow, ...superseded, row('queued')])).toContain('already pending');
   });
 
+  const indeterminate = JSON.stringify({
+    disposition: 'changes_requested',
+    reason: 'indeterminate:prompt_too_large',
+  });
+
+  test('RER-1 a done row with indeterminate prompt_too_large is re-enqueued with the same body', () => {
+    const older = row('failed');
+    const prior = row('done', head, { result_body: indeterminate });
+    const rows = [older, prior, row('cancelled')];
+    const d = decide(rows, input);
+    expect(d.ok).toBe(true);
+    if (!d.ok) return;
+    expect(d.prior.id).toBe(prior.id);
+    expect(d.message.repeat_reason).toBe(
+      `operator_request:rereview_indeterminate:${head} ${reason}`
+    );
+    expect(isAutoRereviewReason(d.message.repeat_reason)).toBe(false);
+    expect(d.message.idempotency_key).toBe(`pr-rereview:${repository}#${pr}@${head}:4`);
+    expect(d.message.body).toBe(prior.body);
+    expect(d.message.correlation_id).toBe(`pr-review:${repository}#${pr}@${head}`);
+  });
+
+  test('RER-2 a done row with any other verdict is refused, naming the row, status and verdict', () => {
+    const cases: [string, string][] = [
+      [JSON.stringify({ disposition: 'approved' }), 'approved'],
+      [JSON.stringify({ disposition: 'changes_requested' }), 'changes_requested'],
+      [
+        JSON.stringify({
+          disposition: 'changes_requested',
+          reason: 'indeterminate:evidence_error',
+        }),
+        'changes_requested/indeterminate:evidence_error',
+      ],
+    ];
+    for (const [resultBody, verdict] of cases) {
+      const done = row('done', head, { result_body: resultBody });
+      const line = refusal([done]);
+      expect(line).toContain(`row ${done.id}`);
+      expect(line).toContain('is done');
+      expect(line).toContain(`verdict ${verdict}`);
+    }
+    // A reason that only starts with the accepted one is not accepted.
+    expect(
+      refusal([
+        row('done', head, {
+          result_body: JSON.stringify({
+            disposition: 'changes_requested',
+            reason: 'indeterminate:prompt_too_large:bytes=2',
+          }),
+        }),
+      ])
+    ).toContain('is done');
+  });
+
+  test('RER-3 failed-row outcomes are unchanged and the edge sweep never re-runs a done row', async () => {
+    const failed = row('failed');
+    const d = decide([failed], input);
+    expect(d.ok && d.message.repeat_reason).toBe(
+      `operator_request:rereview_failed:${head} ${reason}`
+    );
+    expect(refusal([failed, row('done')])).toContain('is done, not failed');
+
+    // A transport failure inside the window, then a done-indeterminate row at the same head.
+    const transportFailure = row('failed', head, {
+      completed_at: '2026-11-12T15:01:51.732Z',
+      result_body: JSON.stringify({
+        disposition: 'submission_failed',
+        reason: 'head_recheck_failed:Service Unavailable',
+      }),
+    });
+    const doneIndeterminate = row('done', head, {
+      completed_at: '2026-11-12T15:02:00.000Z',
+      result_body: indeterminate,
+    });
+    const all = [transportFailure, doneIndeterminate];
+    const sent: OutgoingMessage[] = [];
+    const port: DispatchPort = {
+      list: async () => all,
+      listFailed: async () => all.filter(r => r.status === 'failed'),
+      send: async message => {
+        sent.push(message);
+        return { id: 'new', status: 'queued' };
+      },
+    };
+    const swept = await edgeSweep(
+      port,
+      { since: '2026-11-12T14:58:52.000Z', until: '2026-11-12T15:03:31.000Z' },
+      { dryRun: false }
+    );
+    expect(sent).toHaveLength(0);
+    expect(swept.lines.at(-1)).toContain('candidates=1 reenqueued=0 refused=1 errors=0');
+  });
+
   test('7: the reason is not an automatic re-review reason, and the message matches the intake naming', () => {
     const d = decide([row('failed')], input);
     expect(d.ok).toBe(true);
@@ -366,6 +459,40 @@ describe('against the real Dispatch store', () => {
     ]);
     expect([a.code, b.code]).toEqual([0, 0]);
     expect((await rowsAtHead(head)).length).toBe(2);
+  });
+
+  test('RER-1 store path: one new row from a done-indeterminate row, and the same state returns the same row', async () => {
+    const priorId = await seedFailedRow(head);
+    await db.query(
+      `UPDATE agent_dispatch_messages SET status = 'done', result_body = $2 WHERE id = $1`,
+      [
+        priorId,
+        JSON.stringify({
+          disposition: 'changes_requested',
+          reason: 'indeterminate:prompt_too_large',
+        }),
+      ]
+    );
+    const port = storePort();
+    const snapshot = await port.list(subject);
+    const result = await reEnqueue(port, input);
+    expect(result.code).toBe(0);
+    expect(result.lines[0]).toBe(
+      `REENQUEUED row=${(await rowsAtHead(head))[1]?.id} head=${head} prior=${priorId}:done-indeterminate sender=operator`
+    );
+    const rows = await rowsAtHead(head);
+    expect(rows).toHaveLength(2);
+    expect(rows[1]?.body).toBe(rows[0]?.body ?? '');
+    expect(rows[1]?.idempotency_key).toBe(`pr-rereview:${repository}#${pr}@${head}:2`);
+    expect(rows[1]?.repeat_reason).toBe(
+      `operator_request:rereview_indeterminate:${head} ${reason}`
+    );
+    // A second run from the same state computes the same key and Dispatch returns the same row.
+    const again = decide(snapshot, input);
+    expect(again.ok).toBe(true);
+    if (!again.ok) return;
+    expect((await port.send(again.message)).id).toBe(rows[1]?.id ?? '');
+    expect(await rowsAtHead(head)).toHaveLength(2);
   });
 
   test('a dry run reads and prints but sends nothing', async () => {

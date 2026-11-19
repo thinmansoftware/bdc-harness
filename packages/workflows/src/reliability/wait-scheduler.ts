@@ -75,6 +75,13 @@ export async function processDueProviderWaits(
       if (!completed) throw new Error(`provider_wait_complete_failed: ${wait.waitId}`);
       result.resumed += 1;
     } catch (error) {
+      // A terminal refusal or cancellation must never requeue the wait.
+      const statusAfterRefusal = await store.getWorkflowRunStatus(wait.runId);
+      if (['completed', 'failed', 'cancelled', 'escalated'].includes(statusAfterRefusal ?? '')) {
+        await store.cancelProviderWaits(wait.runId, now().toISOString());
+        result.cancelled += 1;
+        continue;
+      }
       if (!store.releaseProviderWaitClaim) throw error;
       const released = await store.releaseProviderWaitClaim({
         waitId: wait.waitId,

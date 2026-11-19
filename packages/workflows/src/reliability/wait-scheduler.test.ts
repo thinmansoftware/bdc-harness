@@ -21,7 +21,7 @@ function wait(): ScheduledProviderWaitRecord {
   };
 }
 
-function store(statuses: Array<'waiting_provider' | 'cancelled'>): IWorkflowStore {
+function store(statuses: Array<'waiting_provider' | 'cancelled' | 'failed'>): IWorkflowStore {
   let statusIndex = 0;
   return {
     listDueProviderWaits: mock(async () => [wait()]),
@@ -95,4 +95,19 @@ describe('processDueProviderWaits', () => {
     );
     expect(workflowStore.completeProviderWait).not.toHaveBeenCalled();
   });
+});
+
+it('cancels a terminal refusal without deferring or completing its provider wait', async () => {
+  const workflowStore = store(['waiting_provider', 'waiting_provider', 'failed']);
+  const result = await processDueProviderWaits(
+    workflowStore,
+    async () => {
+      throw new Error('codex_only_resume_unsupported');
+    },
+    { ownerId: 'scheduler-1' }
+  );
+  expect(result).toEqual({ due: 1, resumed: 0, cancelled: 1, deferred: 0 });
+  expect(workflowStore.cancelProviderWaits).toHaveBeenCalledWith('run-1', expect.any(String));
+  expect(workflowStore.releaseProviderWaitClaim).not.toHaveBeenCalled();
+  expect(workflowStore.completeProviderWait).not.toHaveBeenCalled();
 });
