@@ -16103,6 +16103,35 @@ describe('v2 binding-only preparation', () => {
     expect(Object.keys(prepared)).toEqual([]);
   });
 
+  for (const mutation of ['none', 'registry', 'definition'] as const) {
+    it(`v1 prepared dispatch freshness: ${mutation}`, async () => {
+      await persona('Original role.');
+      workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned' }];
+      const prepared = await prepareDagBindings(
+        cwd,
+        workflow,
+        'codex',
+        'workflow-choice',
+        config,
+        undefined,
+        'codex-only-v1'
+      );
+      if (mutation === 'registry') await persona('Changed role.');
+      if (mutation === 'definition') workflow.nodes[0].id = 'changed';
+      captured.mockClear();
+      if (mutation === 'none') {
+        await run(prepared);
+        expect(captured).toHaveBeenCalledTimes(1);
+      } else {
+        await expect(run(prepared)).rejects.toThrow(
+          mutation === 'registry' ? 'registry_changed' : 'changed inputs'
+        );
+        expect(captured).not.toHaveBeenCalled();
+        expect(deps.getAgentProvider).not.toHaveBeenCalled();
+      }
+    });
+  }
+
   it('uses a fresh snapshot despite ordinary stale cache and consumes it after disk changes', async () => {
     workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned' }];
     await persona('STALE ordinary persona.');
