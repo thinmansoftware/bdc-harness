@@ -389,7 +389,7 @@ nodes:
         fi
       }
       rtw_wait_for_holder_exit() {
-        local waited=0 limit="${RTW_HOLDER_WAIT_SECONDS:-120}"
+        local waited=0 incomplete_scans=0 limit="${RTW_HOLDER_WAIT_SECONDS:-120}"
         case "$limit" in
           ''|*[!0-9]*) limit=120 ;;
         esac
@@ -398,8 +398,16 @@ nodes:
           case "$rtw_scan_result" in
             clear) return 0 ;;
             incomplete)
-              rtw_refuse "process scan incomplete (${rtw_scan_unreadable} unreadable): $rtw_scan_errors"
-              return 1
+              # Retry missing evidence, never exempt it. Changing PIDs cannot reset
+              # this budget; only a subsequent fully clear scan permits reclaim.
+              incomplete_scans=$((incomplete_scans + 1))
+              if [ "$incomplete_scans" -ge 3 ] || [ "$((waited + 5))" -gt "$limit" ] || [ -n "$rtw_scan_foreign" ]; then
+                rtw_refuse "process scan incomplete (${rtw_scan_unreadable} unreadable): $rtw_scan_errors"
+                return 1
+              fi
+              sleep 5
+              waited=$((waited + 5))
+              continue
               ;;
           esac
           if [ -n "$rtw_scan_foreign" ]; then
