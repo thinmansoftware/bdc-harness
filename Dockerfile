@@ -343,6 +343,11 @@ COPY scripts/worktree-copy-proof.ts ./scripts/
 # (docs/operations/overseer-re-review.md; WO-HARNESS-OVERSEER-REREVIEW-FAILED-HEAD-COMMAND-01).
 COPY scripts/overseer/re-enqueue-review.ts ./scripts/overseer/
 
+# Evidence-only repair helper run by the bdc-feature-development lanes as
+# /app/scripts/evidence-repair.ts (bdc-harness PR 1609). Its one non-builtin import,
+# packages/workflows/src/reliability/, is already in the image above.
+COPY scripts/evidence-repair.ts ./scripts/
+
 # Shared shell cores SOURCED by the bdc-feature-development lane YAMLs
 # (prep-dependencies / run-stop-tests source /app/scripts/lane/dprep.sh).
 COPY scripts/lane/ ./scripts/lane/

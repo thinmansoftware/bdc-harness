@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { readFile } from 'fs/promises';
+import { readdir, readFile } from 'fs/promises';
 import { join } from 'path';
 
 // Root bunfig.toml sets [test] root = "./packages". Stop 5 passes
@@ -216,5 +216,62 @@ describe('production Docker packaging', () => {
     expect(argAt).toBeGreaterThanOrEqual(0);
     expect(labelAt).toBeGreaterThan(argAt);
     expect(dockerfile.match(/org\.opencontainers\.image\.revision/g)).toHaveLength(1);
+  });
+
+  it('copies every /app/scripts/ file the workflow defaults run into the production image', async () => {
+    // bdc-harness PR 1609 App review 5981426563: thirteen lanes ran
+    // /app/scripts/evidence-repair.ts, but the production stage never copied it.
+    const root = join(import.meta.dir, '..', '..', '..');
+    const dockerfile = await readFile(join(root, 'Dockerfile'), 'utf8');
+    const production = dockerfile.split('AS production')[1] ?? '';
+    expect(production).not.toBe('');
+
+    // Sources a production-stage COPY puts at the same path under /app.
+    const coveredFiles = new Set<string>();
+    const coveredDirs: string[] = [];
+    for (const raw of production.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line.startsWith('COPY ') || line.includes('--from=')) continue;
+      const parts = line.split(/\s+/).slice(1);
+      const dest = parts.pop() ?? '';
+      for (const source of parts) {
+        if (!source.startsWith('scripts/')) continue;
+        if (source.endsWith('/')) {
+          if (dest === `./${source}`) coveredDirs.push(`/app/${source}`);
+          continue;
+        }
+        const dir = source.slice(0, source.lastIndexOf('/') + 1);
+        if (dest === `./${dir}`) coveredFiles.add(`/app/${source}`);
+      }
+    }
+
+    // References that are knowingly NOT in this image, each with its reason.
+    // A stale entry fails below, so this list cannot outlive its reason.
+    const notInHarnessImage = new Map<string, string>([
+      // Runs inside the shopops-api container (docker exec shopops-api node /app/scripts/...).
+      ['/app/scripts/validate-terminal-hardware.js', 'shopops-api container, not archon-app-1'],
+      // The lanes fall back to `gh api .../files` when this helper file is absent.
+      ['/app/scripts/gh-pr-files.sh', 'optional helper with an inline gh api fallback'],
+    ]);
+
+    const defaultsDir = join(root, '.archon', 'workflows', 'defaults');
+    const yamlFiles = (await readdir(defaultsDir)).filter(name => name.endsWith('.yaml'));
+    expect(yamlFiles.length).toBeGreaterThan(0);
+    const referenced = new Set<string>();
+    for (const name of yamlFiles) {
+      const text = await readFile(join(defaultsDir, name), 'utf8');
+      for (const match of text.matchAll(/\/app\/scripts\/[A-Za-z0-9_./-]+/g)) {
+        const path = match[0].replace(/\.+$/, '');
+        if (!path.endsWith('/')) referenced.add(path);
+      }
+    }
+    expect(referenced.size).toBeGreaterThan(0);
+
+    const uncovered = [...referenced]
+      .filter(path => !coveredFiles.has(path) && !coveredDirs.some(dir => path.startsWith(dir)))
+      .filter(path => !notInHarnessImage.has(path))
+      .sort();
+    expect(uncovered).toEqual([]);
+    for (const path of notInHarnessImage.keys()) expect(referenced.has(path)).toBe(true);
   });
 });

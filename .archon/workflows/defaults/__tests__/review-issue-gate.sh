@@ -105,6 +105,9 @@ extract_node_bash "$CANONICAL_FLIP" flip-notion-on-failure > "$FAIL_BODY"
 prepare_copy() {
   local evidence="$1" reclassify="$2" dest="$3" src="$4"
   awk -v evidence="$evidence" -v reclassify="$reclassify" '
+    index($0, "$assert-implement-produced-work.output") { print "ER_BUILD=\"\""; next }
+    index($0, "$evidence-repair-verify.output") { print "ER_RECEIPT=\"\""; next }
+    index($0, "$evidence-repair-final.output") { print "ER_RECEIPT=\"\""; next }
     index($0, "$manifest-evidence-check.output") { print evidence; next }
     index($0, "$block-reclassify.output") { print reclassify; next }
     index($0, "$war-council-validator.output") { print "Verdict: satisfied"; next }

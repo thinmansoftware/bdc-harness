@@ -56,7 +56,7 @@ extract_assert_body() {
     n && /^    bash: \|$/ { b=1; next }
     n && b && /^  - id: / { exit }
     n && b { print }
-  ' "$1" | sed 's/^      //'
+  ' "$1" | sed 's/^      //' | python3 -c 'import shlex,sys; print(sys.stdin.read().replace("$evidence-repair-start.output", shlex.quote("{\"state\":\"not_applicable\"}")))'
 }
 
 LANES=$(cd "$DEFAULTS_DIR" && grep -l '^  - id: assert-implement-produced-work$' ./*.yaml | sed 's|^\./||')

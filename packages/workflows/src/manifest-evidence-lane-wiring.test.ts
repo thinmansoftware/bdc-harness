@@ -1,3 +1,9 @@
+// Keep evidence-only repair acceptance in the existing CI-selected lane suite.
+import './reliability/evidence-repair-body.test';
+import './reliability/evidence-repair-invocation.test';
+import './reliability/evidence-repair-collector.test';
+import './reliability/evidence-repair-lane.test';
+import './reliability/evidence-repair-integration.test';
 import { describe, expect, it } from 'bun:test';
 import {
   existsSync,
