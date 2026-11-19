@@ -179,7 +179,10 @@ describe('cascade entry override and refuse', () => {
         escalate: async () => undefined,
         findWoClaim: async () => null,
         readRunDetail: async () => ({
-          metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+          metadata: {
+            teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+            head_branch: 'archon/task-web-worker-1-fixture',
+          },
         }),
         seatUsage: async () => ({
           claude: {
@@ -238,7 +241,10 @@ describe('cascade entry override and refuse', () => {
         escalate: async () => undefined,
         findWoClaim: async () => null,
         readRunDetail: async () => ({
-          metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+          metadata: {
+            teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+            head_branch: 'archon/task-web-worker-1-fixture',
+          },
         }),
         // the case that let a climb land on the claude lane on 2026-11-11: the seat reads cool
         seatUsage: async () => ({
@@ -294,7 +300,10 @@ describe('cascade entry override and refuse', () => {
         // A climb's open-PR lookup fails closed (bdc-xo #4638); no open PR here.
         listOpenWoPullRequests: async () => [],
         readRunDetail: async () => ({
-          metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+          metadata: {
+            teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+            head_branch: 'archon/task-web-worker-1-fixture',
+          },
         }),
       };
 

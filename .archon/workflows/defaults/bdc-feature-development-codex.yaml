@@ -6478,6 +6478,13 @@ nodes:
           fi
           CREATE_OUT=""
           CREATE_RC=0
+          # held-draft-repair-no-create: begin
+          REPAIR_CHECKOUT_CONTEXT=""
+          if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ] || ! REPAIR_CHECKOUT_CONTEXT=$(cat "${ARCHON_NODE_OUT:?}/checkout-repair-target.out" 2>/dev/null) || [ "$(printf '%s\n' "$REPAIR_CHECKOUT_CONTEXT" | sed -n '/^REPAIR_TARGET=/p')" != "REPAIR_TARGET=none" ]; then
+            echo "ERROR: repair_target_new_pr_forbidden: checkout context does not prove a new-PR path" >&2
+            exit 1
+          fi
+          # held-draft-repair-no-create: end
           CREATE_OUT=$(gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" --base "$BASE_BRANCH" 2>&1) || CREATE_RC=$?
           printf '%s\n' "$CREATE_OUT"
           # Verify and record even when gh reports a nonzero exit after creation.

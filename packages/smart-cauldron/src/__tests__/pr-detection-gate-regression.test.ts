@@ -329,7 +329,10 @@ function baseOpts(deps: CascadeDeps): RunCascadeOptions {
     project: 'lspro-react',
     deps: {
       readRunDetail: async () => ({
-        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        metadata: {
+          teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+          head_branch: 'archon/task-web-worker-1-fixture',
+        },
       }),
       // No open PR; a climb's open-PR lookup fails closed (bdc-xo #4638), so tests
       // must not fall through to real `gh`.

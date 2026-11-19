@@ -269,6 +269,8 @@ export interface ListOpenWoPullRequestsOptions {
    * keeps failing open.
    */
   readonly failOnError?: boolean;
+  /** Safety lookup only: retain drafts so a climb can stop instead of losing its target. */
+  readonly includeDrafts?: boolean;
   /** Override the paginated open-PR read (tests). */
   readonly lookup?: (repo: string) => Promise<GhOpenPullRow[]>;
   readonly execFn?: typeof execFileAsync;
@@ -287,9 +289,10 @@ function toOpenWoPullRequest(
   row: GhOpenPullRow,
   targetRepo: string,
   woId: string,
-  headBranches: ReadonlySet<string> = new Set()
+  headBranches: ReadonlySet<string> = new Set(),
+  includeDrafts = false
 ): OpenWoPullRequest | null {
-  if (row.draft === true) return null;
+  if (row.draft === true && !includeDrafts) return null;
   const fullName = row.head?.repo?.full_name;
   if (typeof fullName !== 'string' || fullName.length === 0) return null;
   if (fullName.toLowerCase() !== targetRepo.toLowerCase()) return null;
@@ -299,13 +302,16 @@ function toOpenWoPullRequest(
   const body = typeof row.body === 'string' ? row.body : '';
   const branchClaims = matchesWoToken(headRefName, woId) || headBranches.has(headRefName);
   if (!branchClaims && !bodyLineClaimsWo(body, woId)) return null;
+  if (includeDrafts && typeof row.draft !== 'boolean') {
+    throw new Error(`open_pr_draft_state_unknown:#${String(number)}`);
+  }
   return {
     number,
     headRefName,
     headSha: typeof row.head?.sha === 'string' ? row.head.sha : '',
     url: typeof row.html_url === 'string' ? row.html_url : '',
     createdAt: typeof row.created_at === 'string' ? row.created_at : '',
-    isDraft: false,
+    isDraft: row.draft === true,
     isFork: false,
     body,
   };
@@ -314,7 +320,7 @@ function toOpenWoPullRequest(
 /**
  * Paginated open-PR listing. Fails open to [] on throw, timeout, a non-array
  * page, or SMART_CAULDRON_HERMETIC=1 (hermetic mode makes no GitHub call).
- * A full page at the cap returns the pages already read.
+ * A full page at the cap throws for strict safety reads; legacy callers keep the partial list.
  */
 async function ghListOpenPullRequestsDefault(
   repo: string,
@@ -348,6 +354,7 @@ async function ghListOpenPullRequestsDefault(
       out.push(...(parsed as GhOpenPullRow[]));
       if (parsed.length < OPEN_PR_PAGE_SIZE) return out;
     }
+    if (failOnError) throw new Error('open_pr_listing_incomplete');
     return out;
   } catch (error) {
     if (failOnError) throw error;
@@ -357,7 +364,8 @@ async function ghListOpenPullRequestsDefault(
 
 /**
  * OPEN, non-fork PRs in the target repo whose body has a WO: line token-matching
- * woId, or whose head branch token-matches woId (matchesWoToken). Drafts excluded.
+ * woId, or whose head branch token-matches woId (matchesWoToken). Drafts excluded
+ * unless explicitly requested by the climb's safety read.
  * Head repositories that cannot be verified, and forks, are excluded.
  */
 export async function listOpenWoPullRequests(
@@ -392,7 +400,7 @@ export async function listOpenWoPullRequests(
   );
   const matched: OpenWoPullRequest[] = [];
   for (const row of rows) {
-    const candidate = toOpenWoPullRequest(row, repo, opts.woId, headBranches);
+    const candidate = toOpenWoPullRequest(row, repo, opts.woId, headBranches, opts.includeDrafts);
     if (candidate) matched.push(candidate);
   }
   return matched;

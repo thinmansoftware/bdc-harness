@@ -122,7 +122,8 @@ export interface CascadeDeps {
   findWoClaim?: (woId: string, project: string) => Promise<WoClaim | null>;
   /**
    * OPEN non-fork PRs that claim this WO. Used to declare a repair target on a
-   * climb fire. Defaults to listOpenWoPullRequests (fails open to []).
+   * climb fire. The climb requests a complete safety read including drafts;
+   * lookup errors, protected targets and unknown identity hold the next fire.
    */
   listOpenWoPullRequests?: (
     woId: string,
@@ -1511,7 +1512,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
             woId,
             reason:
               `${CLIMB_HELD_REASON_PREFIX} ${woId} on tier ${tier.name}: ${decision.held}. ` +
-              'Not fired, so no second PR was opened. Re-run the cascade once the lookup works.',
+              'Not fired, so no second PR was opened. Resolve the protected or unknown repair ' +
+              'target before retrying; keep any draft and merge-hold in place.',
             overseerPermit: opts.overseerPermit,
             runId: attempts.at(-2)?.runId ?? null,
           });
@@ -2021,6 +2023,8 @@ export interface OpenWoPullRequestLookupOptions {
   readonly headBranches?: readonly string[];
   /** Throw on a lookup error instead of failing open to []. */
   readonly failOnError?: boolean;
+  /** Include draft targets so their protection cannot disappear from climb selection. */
+  readonly includeDrafts?: boolean;
 }
 
 /**
@@ -2041,6 +2045,8 @@ function isValidRepairCandidate(pr: OpenWoPullRequest): boolean {
   return (
     Number.isInteger(pr.number) &&
     pr.number > 0 &&
+    pr.isFork === false &&
+    typeof pr.headRefName === 'string' &&
     pr.headRefName.length > 0 &&
     !/\s/.test(pr.headRefName)
   );
@@ -2059,8 +2065,8 @@ function logClimbRepairTarget(woId: string, pr: number | 'none', reason: string)
 }
 
 /**
- * Select the repair target for a climb fire. Never throws: a reader error,
- * an empty list, or an invalid selected candidate yields no declaration.
+ * Select the repair target for a climb fire. Reader errors, unknown identity,
+ * draft protection and invalid candidates hold; a complete empty list has no target.
  */
 async function resolveClimbRepairTarget(
   woId: string,
@@ -2089,11 +2095,15 @@ async function resolveClimbRepairTarget(
       return { ...none, held: `run detail unavailable for prior run ${prior.runId}` };
     }
     const head = detail.metadata?.head_branch;
-    if (typeof head === 'string' && head.length > 0) headBranches.push(head);
+    if (typeof head !== 'string' || head.length === 0 || /\s/.test(head)) {
+      logClimbRepairTarget(woId, 'none', `run_head_unavailable:${prior.runId}`);
+      return { ...none, held: `head branch unavailable for prior run ${prior.runId}` };
+    }
+    headBranches.push(head);
   }
   let opens: OpenWoPullRequest[];
   try {
-    opens = await read(woId, project, { headBranches, failOnError: true });
+    opens = await read(woId, project, { headBranches, failOnError: true, includeDrafts: true });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     logClimbRepairTarget(woId, 'none', 'reader_error');
@@ -2107,13 +2117,25 @@ async function resolveClimbRepairTarget(
     logClimbRepairTarget(woId, 'none', 'none');
     return none;
   }
+  const protectedTarget = opens.find(pr => !pr || pr.isDraft !== false);
+  if (opens.some(pr => !pr || pr.isDraft !== false)) {
+    const label =
+      protectedTarget && Number.isInteger(protectedTarget.number)
+        ? `#${String(protectedTarget.number)}`
+        : 'unreadable';
+    logClimbRepairTarget(woId, 'none', `protected_draft:${label}`);
+    return {
+      ...none,
+      held: `draft or unknown draft state on repair target ${label}; climb refused`,
+    };
+  }
   const sorted = [...opens].sort(compareOpenPrNewest);
   const selected = sorted[0];
   if (!selected || !isValidRepairCandidate(selected)) {
     const label =
       selected && Number.isFinite(selected.number) ? `#${String(selected.number)}` : 'unreadable';
     logClimbRepairTarget(woId, 'none', `invalid_candidate:${label}`);
-    return none;
+    return { ...none, held: `repair target identity unavailable: ${label}` };
   }
   const alternates =
     sorted.length > 1
