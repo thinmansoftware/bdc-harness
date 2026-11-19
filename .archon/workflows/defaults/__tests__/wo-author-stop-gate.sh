@@ -110,9 +110,19 @@ mkdir -p "$XO/scripts/cauldron" "$XO/docs/work-orders"
 cat > "$XO/scripts/cauldron/cauldron-projects.json" <<'EOF_MAP'
 {
   "fixture": { "repo": "acme/fixture", "base_branch": "dev" },
+  "other": { "repo": "acme/other", "base_branch": "dev" },
+  "canon": { "repo": "acme/canon", "base_branch": "dev" },
   "mismatch": { "repo": "other/mismatch", "base_branch": "dev" }
 }
 EOF_MAP
+cat > "$XO/scripts/cauldron/repo-canonical-map.json" <<'EOF_CANON'
+{
+  "fixture": { "github": "acme/fixture" },
+  "other": { "github": "acme/other" },
+  "canon": { "github": "acme/elsewhere" },
+  "mismatch": { "github": "other/mismatch" }
+}
+EOF_CANON
 
 # ---- stub validators ----
 STUBS="$T/stubs"
@@ -418,7 +428,13 @@ echo "--- Test 9: the gate fails closed ---"
 code_spec WO-T-UNK-01 "Stop 1 (test suite): ok
   bash tests/ok.sh
   Expected: 2 passing"
-run_gate first "$(preview_for WO-T-UNK-01 acme/nothere)"
+write_spec WO-T-NOTHERE-01 "WO Class: CODE" "target_repo: acme/nothere
+Base branch: dev" "## 8. Stop conditions (CI-executable)
+
+Stop 1 (test suite): ok
+  bash tests/ok.sh
+  Expected: 2 passing"
+run_gate first "$(preview_for WO-T-NOTHERE-01 acme/nothere)"
 assert_eq "Test 9 (a) target not in the project map fails base_unknown" "fail|no|yes|base_unknown" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o base_unknown | head -n 1)"
 BDC_WAG_REPO_URL="file://$T/does-not-exist" run_gate first "$(preview_for WO-T-UNK-01)"
 assert_eq "Test 9 (b) a clone URL that does not exist fails checkout_failed" "fail|no|yes|checkout_failed" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o checkout_failed | head -n 1)"
@@ -459,6 +475,28 @@ Stop 1 (test suite): ok
   Expected: 2 passing"
 run_gate first "$(preview_for WO-T-BASE-01)"
 assert_eq "Test 9 (i) spec Base branch differs from the map fails base_mismatch" "fail|no|yes|base_mismatch" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o base_mismatch | head -n 1)"
+assert_eq "Test 9 (i) base_mismatch is refused before any checkout" "0|" "$(printf '%s\n' "$ERR" | grep -c 'checked out' || true)|$(jfield GATE_BASE_SHA)"
+
+# Target from the spec (review App, PR 1618 review 5978276734): the repo is read from the
+# drafted spec's own target_repo: line and must equal the dry-run footer, the project map
+# and repo-canonical-map.json; any mismatch is refused before any checkout.
+run_gate first "$(preview_for WO-T-GREEN-01 acme/other)"
+assert_eq "Test 9 (footer) footer names repo B while the spec says repo A: repo_mismatch before clone" "fail|no|yes|repo_mismatch|0|" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o repo_mismatch | head -n 1)|$(printf '%s\n' "$ERR" | grep -c 'checked out' || true)|$(jfield GATE_BASE_SHA)"
+write_spec WO-T-NOTARGET-01 "WO Class: CODE" "Base branch: dev" "## 8. Stop conditions (CI-executable)
+
+Stop 1 (test suite): ok
+  bash tests/ok.sh
+  Expected: 2 passing"
+run_gate first "$(preview_for WO-T-NOTARGET-01)"
+assert_eq "Test 9 (footer) a spec with no target_repo: line is refused repo_mismatch before clone" "fail|no|yes|repo_mismatch|0|" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o repo_mismatch | head -n 1)|$(printf '%s\n' "$ERR" | grep -c 'checked out' || true)|$(jfield GATE_BASE_SHA)"
+write_spec WO-T-CANON-01 "WO Class: CODE" "target_repo: acme/canon
+Base branch: dev" "## 8. Stop conditions (CI-executable)
+
+Stop 1 (test suite): ok
+  bash tests/ok.sh
+  Expected: 2 passing"
+run_gate first "$(preview_for WO-T-CANON-01 acme/canon)"
+assert_eq "Test 9 (footer) repo-canonical-map.json disagreeing with the target is repo_mismatch before clone" "fail|no|yes|repo_mismatch|0|" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o repo_mismatch | head -n 1)|$(printf '%s\n' "$ERR" | grep -c 'checked out' || true)|$(jfield GATE_BASE_SHA)"
 SAVED="$BDC_WAG_SCRIPT"
 BDC_WAG_SCRIPT="$T/missing-gate.sh" ARCHON_LANE_SCRIPTS_DIR="$T/none" run_gate first "$(preview_for WO-T-GREEN-01)"
 assert_eq "Test 9 (extra) a missing gate script fails closed gate_script_missing" "fail|no|yes|gate_script_missing" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o gate_script_missing | head -n 1)"

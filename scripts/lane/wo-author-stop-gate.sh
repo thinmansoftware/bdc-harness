@@ -12,8 +12,11 @@
 #   1. reads wo_id, spec_path and target_repo from the dry-run-preview output; no wo_id
 #      is GATE no_spec (the run then fails at stop-command-gate-fail)
 #   1b. refuses a MIXED spec (mixed_unsupported)
-#   2. reads the base branch for the target from scripts/cauldron/cauldron-projects.json
-#      in the bdc-xo worktree (base_unknown, repo_mismatch, base_mismatch)
+#   2. reads the target repo and base branch from the drafted spec itself (its
+#      target_repo: and Base branch: lines) and refuses, before any checkout, unless
+#      they agree with the dry-run footer, scripts/cauldron/cauldron-projects.json and
+#      scripts/cauldron/repo-canonical-map.json in the bdc-xo worktree (base_unknown,
+#      repo_mismatch, base_mismatch)
 #   2a. runs the bdc-xo template validator scripts/cauldron/validate-wo-spec.sh on the
 #      spec (validator_failed, validator_missing)
 #   3. makes a clean shallow clone of the target repo's base branch under $ARTIFACTS_DIR
@@ -256,9 +259,28 @@ print(b if isinstance(b, str) else "")
 ' "$1"
 }
 
+# wag_canon_entry <bare-repo-name>   (-> the entry's "github" owner/repo from
+#   scripts/cauldron/repo-canonical-map.json; rc nonzero when the file, the entry or
+#   the field is missing)
+wag_canon_entry() {
+  [ -f scripts/cauldron/repo-canonical-map.json ] || return 1
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+e = d.get(sys.argv[1]) if isinstance(d, dict) else None
+g = e.get("github") if isinstance(e, dict) else None
+if not isinstance(g, str) or not g:
+    sys.exit(3)
+print(g)
+' "$1" < scripts/cauldron/repo-canonical-map.json
+}
+
 wag_main() {
   local mode="$1" preview="${2:-}" first="${3:-}"
-  local ovr="" wo_id="" spec_path="" target_repo="" spec="" class="" name="" map_out="" map_repo="" base="" spec_base=""
+  local ovr="" wo_id="" spec_path="" target_repo="" spec="" class="" name="" map_out="" map_repo="" base="" spec_base="" spec_target="" canon_repo=""
   local validator="" vout="" vrc=0 vlines="" url="" sha="" pin_sha="" g1="" reasons="" fatal=0 cmds_status=""
   local report="" art="" cmd="" all_count=0 line="" idx=0 expect="" rescued="" cf="" clog="" result="" rc=0 counts="" env=""
   local rep="" status="" breason="" fr="" p="" t="" first_path="" runner="" verdict=""
@@ -313,11 +335,22 @@ wag_main() {
     fi
   fi
 
-  # 2. Base branch from the project map.
+  # 2. Target repo and base branch come from the drafted spec itself. The spec's
+  #    target_repo: line must equal the dry-run footer, the project map entry and the
+  #    repo-canonical-map.json entry; its Base branch: line must equal the project map's
+  #    base_branch. Any mismatch is refused here, before any checkout.
   if [ "$fatal" -eq 0 ]; then
-    name="${target_repo#*/}"
-    if [ -z "$target_repo" ] || [ "$name" = "$target_repo" ] || [ ! -f scripts/cauldron/cauldron-projects.json ]; then
-      add_reason 0 base_unknown "${target_repo:-(empty target_repo)}"
+    spec_target="$(wag_spec_value 'target_repo' "$spec")"
+    spec_base="$(wag_spec_value 'Base branch' "$spec")"
+    name="${spec_target#*/}"
+    if [ -z "$spec_target" ] || [ "$name" = "$spec_target" ]; then
+      add_reason 0 repo_mismatch "spec has no owner/repo target_repo: line (footer says '${target_repo}')"
+      fatal=1
+    elif [ "$spec_target" != "$target_repo" ]; then
+      add_reason 0 repo_mismatch "spec target_repo '$spec_target' is not the dry-run footer target_repo '$target_repo'"
+      fatal=1
+    elif [ ! -f scripts/cauldron/cauldron-projects.json ]; then
+      add_reason 0 base_unknown "scripts/cauldron/cauldron-projects.json missing"
       fatal=1
     elif ! map_out="$(wag_map_entry "$name" < scripts/cauldron/cauldron-projects.json)"; then
       add_reason 0 base_unknown "$name not in scripts/cauldron/cauldron-projects.json"
@@ -328,15 +361,20 @@ wag_main() {
       if [ -z "$base" ]; then
         add_reason 0 base_unknown "$name has no base_branch in scripts/cauldron/cauldron-projects.json"
         fatal=1
-      elif [ "$map_repo" != "$target_repo" ]; then
-        add_reason 0 repo_mismatch "map repo $map_repo is not target_repo $target_repo"
+      elif [ "$map_repo" != "$spec_target" ]; then
+        add_reason 0 repo_mismatch "project map repo $map_repo is not spec target_repo $spec_target"
+        fatal=1
+      elif ! canon_repo="$(wag_canon_entry "$name")"; then
+        add_reason 0 repo_mismatch "$name not in scripts/cauldron/repo-canonical-map.json"
+        fatal=1
+      elif [ "$canon_repo" != "$spec_target" ]; then
+        add_reason 0 repo_mismatch "repo-canonical-map.json github $canon_repo is not spec target_repo $spec_target"
+        fatal=1
+      elif [ "$spec_base" != "$base" ]; then
+        add_reason 0 base_mismatch "spec Base branch '$spec_base' is not map base_branch '$base'"
         fatal=1
       else
-        spec_base="$(wag_spec_value 'Base branch' "$spec")"
-        if [ "$spec_base" != "$base" ]; then
-          add_reason 0 base_mismatch "spec Base branch '$spec_base' is not map base_branch '$base'"
-        fi
-        echo "base branch: $base (scripts/cauldron/cauldron-projects.json)" >> "$report.part"
+        echo "target: $spec_target (spec, footer, project map and canonical map agree); base branch: $base" >> "$report.part"
       fi
     fi
   fi

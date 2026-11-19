@@ -1257,17 +1257,16 @@ nodes:
          place in the spec file, then run
          bash scripts/cauldron/validate-wo-spec.sh <spec_path>
          and fix what it still reports.
-      5. base_mismatch: set the spec's `Base branch:` line to the base_branch of its
-         target in scripts/cauldron/cauldron-projects.json.
 
       ## What you must not do
       - Do not delete a stop, a test scenario or a required section to make the gate pass.
       - Do not weaken an expectation (for example, lowering a count) unless the spec's
         own text shows the old value was wrong.
       - Do not touch any other file. Do not commit, push or open a PR.
-      - mixed_unsupported, base_unknown, repo_mismatch, checkout_failed,
-        commands_over_limit and gate_script_missing need a different spec or a human;
-        say so in one line and change nothing for them.
+      - mixed_unsupported, base_unknown, repo_mismatch, base_mismatch, checkout_failed,
+        commands_over_limit and gate_script_missing need a different spec or a human
+        (the target checks refuse before any checkout, so the final gate has no base
+        commit to re-check against); say so in one line and change nothing for them.
 
       ## Output
       One line per reason: `REVISED <n>:<reason>: <what changed>` or
