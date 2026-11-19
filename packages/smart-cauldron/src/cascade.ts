@@ -88,6 +88,8 @@ export const CODEX_ONLY_DISPATCH_CAPABILITY = 'codex-only-v1';
 // ---------------------------------------------------------------------------
 
 export interface CascadeDeps {
+  /** One invocation transport for Codex-only preflight and dispatch. */
+  dispatchFetch?: typeof fetch;
   /** Verify that the selected workflow lane is available before any provider fire. */
   preflight?: (tier: LadderTier) => Promise<void>;
   fire?: typeof fireTier;
@@ -681,7 +683,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       validatedBinding = await preflightCodexOnly(
         project ?? '',
         apiBaseUrl,
-        token ?? process.env.ARCHON_OPERATOR_TOKEN ?? ''
+        token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
+        opts.deps?.dispatchFetch ?? fetch
       );
   }
   const ruleset = opts.deps?.ruleset ?? loadRuleset();
@@ -1582,7 +1585,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         if (decision.declaration) message = `${message}\n${decision.declaration}`;
       }
       const fireResult: FireResult = await fireImpl({
-        ...(validatedBinding ? { validatedBinding } : {}),
+        ...(validatedBinding
+          ? { validatedBinding, fetchImpl: opts.deps?.dispatchFetch ?? fetch }
+          : {}),
         workflowName: tier.workflowName,
         woId,
         project,

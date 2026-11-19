@@ -82,3 +82,63 @@ describe('loaded dispatch definition binding', () => {
       })
     ).toBe(false));
 });
+test('uses one injected transport for preflight, revalidation, POST and discovery', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error('global transport forbidden');
+  }) as typeof fetch;
+  const calls: string[] = [];
+  const transport = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    calls.push(`${init?.method ?? 'GET'} ${url}`);
+    if (url.endsWith('/api/codebases'))
+      return Response.json([{ id: 'target', name: 'harness', default_cwd: '/work/harness' }]);
+    if (url.includes('/api/workflows/runs?'))
+      return Response.json({
+        runs: [
+          {
+            id: 'run',
+            workflow_name: 'bdc-feature-development-codex-only',
+            parent_conversation_id: 'parent',
+            codebase_id: 'target',
+          },
+        ],
+      });
+    if (init?.method === 'POST')
+      return Response.json({ dispatched: true, conversationId: 'conversation', id: 'parent' });
+    return Response.json({
+      filename: 'bdc-feature-development-codex-only.yaml',
+      source: 'bundled',
+      workflow: {
+        name: 'bdc-feature-development-codex-only',
+        description: 'test',
+        provider: 'codex',
+        nodes: [{ id: 'work', prompt: 'test' }],
+      },
+    });
+  }) as typeof fetch;
+  try {
+    const binding = await preflightCodexOnly('harness', 'http://test', 'token', transport);
+    const result = await fireTier({
+      project: 'harness',
+      woId: 'WO-TEST',
+      workflowName: 'bdc-feature-development-codex-only',
+      message: 'WO_ID=WO-TEST --project harness',
+      apiBaseUrl: 'http://test',
+      token: 'token',
+      validatedBinding: binding,
+      fetchImpl: transport,
+    });
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual([
+      'GET http://test/api/codebases',
+      'GET http://test/api/workflows/bdc-feature-development-codex-only?cwd=%2Fwork%2Fharness',
+      'GET http://test/api/codebases',
+      'GET http://test/api/workflows/bdc-feature-development-codex-only?cwd=%2Fwork%2Fharness',
+      'POST http://test/api/conversations',
+      'GET http://test/api/workflows/runs?codebaseId=target&limit=50',
+    ]);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
