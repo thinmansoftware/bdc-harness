@@ -64,6 +64,23 @@ def git(root, *args):
     return subprocess.check_output(["/usr/bin/git", "-C", str(root), *args])
 
 
+def merge_parents(root):
+    # actions/checkout fetches the merge commit at depth 1, and git hides a shallow commit's
+    # parents from %P. Read the parent lines from the raw commit object instead, after proving
+    # its bytes hash to HEAD; --no-replace-objects keeps a replace ref from substituting another.
+    raw = git(root, "--no-replace-objects", "cat-file", "commit", "HEAD")
+    if hashlib.sha1(b"commit " + str(len(raw)).encode() + b"\0" + raw).hexdigest() != git(root, "rev-parse", "HEAD").decode().strip():
+        raise ValueError("commit_object_mismatch")
+    parents = []
+    for line in raw.split(b"\n\n", 1)[0].split(b"\n"):
+        if line.startswith(b"parent "):
+            value = line[len(b"parent "):]
+            if not re.fullmatch(rb"[0-9a-f]{40}", value):
+                raise ValueError("unsupported_commit_parent")
+            parents.append(value.decode("ascii"))
+    return parents
+
+
 def assert_no_untracked_config(root, tracked):
     # Newly introduced effective runtime/install/preload config must not be invisible.
     config_names = {"bunfig.toml", ".bunfig.toml", ".npmrc", ".gitattributes", "package.json", "tsconfig.json"}
@@ -165,7 +182,7 @@ def run_producer(root):
     node_sha = digest(node_bytes)
     initial_tree, tracked = verified_checkout(root)
     checkout = git(root, "rev-parse", "HEAD").decode().strip()
-    parents = git(root, "show", "-s", "--format=%P", "HEAD").decode().strip().split()
+    parents = merge_parents(root)
     env = {
         "PATH": str(executable.parent) + ":/usr/bin:/bin",
         "HOME": str(home), "BUN_INSTALL": str(home), "CI": "true",

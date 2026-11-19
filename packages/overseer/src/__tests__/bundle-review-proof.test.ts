@@ -333,7 +333,7 @@ describe('#6357 producer and exhaustive proof guards', () => {
       [script],
       { encoding: 'utf8' }
     );
-    expect(result.stderr).toContain('Ran 15 tests');
+    expect(result.stderr).toContain('Ran 16 tests');
     expect(result.status).toBe(0);
   });
   test('authenticated new producer excludes only bundle and publishes complete provenance', async () => {
