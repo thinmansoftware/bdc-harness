@@ -96,11 +96,28 @@ test('current parsed Codex-only lane is refused before admission and leaves glob
       .map((node: Record<string, unknown>) => node.id)
       .sort()
   ).toEqual([...strictSlots].sort());
+  const openRouterFailoverSteps = [
+    'apply-diff-review-final',
+    'diff-review',
+    'diff-review-final',
+    'findings-consolidate',
+    'opus-rereview',
+    'plan-review',
+    'war-council-validator',
+  ];
+  expect(
+    workflow.nodes
+      .filter((node: Record<string, unknown>) => node.failover_provider === 'openrouter')
+      .map((node: Record<string, unknown>) => node.id)
+      .sort()
+  ).toEqual(openRouterFailoverSteps);
   for (const node of workflow.nodes) {
     expect(node.provider ?? workflow.provider).toBe(
       strictSlots.includes(node.id) ? 'codex-native-strict' : 'codex'
     );
-    expect(node.failover_provider).toBeUndefined();
+    if (openRouterFailoverSteps.includes(node.id))
+      expect(node.failover_provider).toBe('openrouter');
+    else expect(node.failover_provider).toBeUndefined();
   }
   const before = loadLadder();
   const originalFetch = globalThis.fetch;
