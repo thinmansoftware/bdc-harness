@@ -24,8 +24,9 @@
 #      rst_split_segments | rst_command_looks_runnable); more than 8 found is
 #      commands_over_limit; none runnable is no_runnable_command for CODE or MIXED only
 #   6. refuses `bun test` on a path without ./ (bun_path_without_dot_slash)
-#   7. treats a command as expected red when its Stop block, or its own When: line,
-#      carries the literal marker [expected red before the fix]
+#   7. treats a command as expected red when its own declaring Stop block, or its own
+#      When: line, carries the literal marker [expected red before the fix]; the marker
+#      covers only the complete commands that source yields (exact equality)
 #   8. runs each command in the clone and judges it with rst_parse_counts / rst_report
 #   9. prints exactly ONE JSON object on stdout:
 #      {"GATE":"pass|fail|no_spec","GATE_ALLOW":"yes|no","GATE_REASONS":"...",
@@ -174,25 +175,47 @@ wag_bun_path_without_dot_slash() {
   return 1
 }
 
-# wag_marked_red <cmd> <spec-file>   (rc 0 when ANY source occurrence of the command
-#   carries the expected-red marker: inside a "Stop N" block, from its header line to
-#   the next Stop header or heading, the marker may be anywhere in the block; on a
-#   When: line the marker must be on that same line)
-wag_marked_red() {
-  WAG_CMD="$1" WAG_MARK="$WAG_MARKER" awk '
-    function norm(s) { gsub(/`/, "", s); gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
-    function flush() { if (inblk && index(blk, ENVIRON["WAG_CMD"]) && index(blk, ENVIRON["WAG_MARK"])) found = 1; blk = ""; inblk = 0 }
-    /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+/ { flush(); inblk = 1; blk = norm($0); next }
-    /^#+ / { flush() }
+# wag_marked_sources <spec-file>   (-> one record per MARKED source, each ended by a
+#   line holding only ASCII 0x1E: a "Stop N" block, from its header line to the next
+#   Stop header or heading, whose text holds the expected-red marker anywhere, printed
+#   after the heading that governs it; or a When: line that holds the marker itself)
+wag_marked_sources() {
+  WAG_MARK="$WAG_MARKER" awk -v RSEP="$(printf '\036')" '
+    function flush() { if (inblk && marked) { print head; printf "%s", blk; print RSEP } inblk = 0; marked = 0; blk = "" }
+    /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+/ { flush(); inblk = 1; blk = $0 "\n"; marked = (index($0, ENVIRON["WAG_MARK"]) > 0); next }
+    /^#+ / { flush(); head = $0; next }
     {
-      if ($0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/) {
-        l = norm($0)
-        if (index(l, ENVIRON["WAG_CMD"]) && index(l, ENVIRON["WAG_MARK"])) found = 1
-      }
-      if (inblk) { line = $0; sub(/[ \t]*\\$/, "", line); blk = blk " " norm(line) }
+      if ($0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/ && index($0, ENVIRON["WAG_MARK"])) { print $0; print RSEP }
+      if (inblk) { blk = blk $0 "\n"; if (index($0, ENVIRON["WAG_MARK"])) marked = 1 }
     }
-    END { flush(); exit(found ? 0 : 1) }
-  ' "$2"
+    END { flush() }
+  ' "$1"
+}
+
+# wag_marked_red <cmd> <spec-file>   (rc 0 when ANY source occurrence of the command
+#   carries the expected-red marker. The marker applies only to the COMPLETE commands
+#   that its own declaring source yields: each marked Stop block (with its governing
+#   heading) or marked When: line is run through the same extraction rule as the whole
+#   spec (wag_extract_all | rst_split_segments), and the command must EQUAL one of
+#   them. A substring never matches, and a marker never reaches another block.)
+wag_marked_red() {
+  local want="$1" rec="" line c rs
+  rs="$(printf '\036')"
+  while IFS= read -r line; do
+    if [ "$line" = "$rs" ]; then
+      while IFS= read -r c; do
+        if [ -n "$c" ] && [ "$c" = "$want" ]; then return 0; fi
+      done <<EOF_WAG_MARKED
+$(printf '%s' "$rec" | wag_extract_all | rst_split_segments)
+EOF_WAG_MARKED
+      rec=""
+      continue
+    fi
+    rec+="$line"$'\n'
+  done <<EOF_WAG_SOURCES
+$(wag_marked_sources "$2")
+EOF_WAG_SOURCES
+  return 1
 }
 
 # wag_listed_created <path> <spec text>   (rc 0 when the path is on the spec's manifest

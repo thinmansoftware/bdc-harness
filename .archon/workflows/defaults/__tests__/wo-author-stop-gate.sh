@@ -367,6 +367,52 @@ code_spec WO-T-RED-H-01 "Stop 1 (test suite): runner missing, marked $M
 PATH="$NOCARGO_PATH" run_gate first "$(preview_for WO-T-RED-H-01)"
 assert_eq "Test 8 (h) marked command whose runner is not on PATH fails red_runner_missing" "fail|no|1:red_runner_missing:cargo test tests/new.sh" "$(verdict)|$(jfield GATE_REASONS)"
 
+# Marker scope (review App, PR 1618 review 5977808481): a marker applies only to the
+# COMPLETE extracted command of its own declaring Stop block (or its own When: line):
+# exact command equality, never a substring, never across blocks.
+code_spec WO-T-SCOPE-A-01 "Stop 1 (test suite): bad, unmarked
+  bash tests/bad.sh
+  Expected: 1 passing
+
+Stop 2 (test suite): bad with an argument, marked $M
+  bash tests/bad.sh extra
+  Expected: red before the fix"
+run_gate first "$(preview_for WO-T-SCOPE-A-01)"
+assert_eq "Test 8 (marker scope) App case: a marked longer command does not waive the unmarked shorter one" "fail|no|1:green_failed:bash tests/bad.sh" "$(verdict)|$(jfield GATE_REASONS)"
+assert_eq "Test 8 (marker scope) App case: the marked longer command itself is red_confirmed" "red" "$(grep -F '| 2 | `bash tests/bad.sh extra` |' "$REPORT" | awk -F'|' '{gsub(/ /, "", $4); print $4}')"
+code_spec WO-T-SCOPE-B-01 "Stop 1 (test suite): bad, unmarked here
+  bash tests/bad.sh
+  Expected: 1 passing
+
+Stop 2 (test suite): the same command, marked here $M
+  bash tests/bad.sh
+  Expected: red before the fix"
+run_gate first "$(preview_for WO-T-SCOPE-B-01)"
+assert_eq "Test 8 (marker scope) same command in two blocks, one marked: the marked block declares it red (F4 any occurrence)" "pass|yes|red" "$(verdict)|$(grep -F '| 1 | `bash tests/bad.sh` |' "$REPORT" | awk -F'|' '{gsub(/ /, "", $4); print $4}')"
+code_spec WO-T-SCOPE-C-01 "Stop 1 (test suite): bad, unmarked
+  bash tests/bad.sh
+  Expected: 1 passing
+
+Stop 2 (test suite): a different command, marked $M
+  bash tests/ok.sh
+  Expected: red"
+run_gate first "$(preview_for WO-T-SCOPE-C-01)"
+assert_contains "Test 8 (marker scope) a marker in another block never reaches an unmarked command" "1:green_failed:bash tests/bad.sh" "$(jfield GATE_REASONS)"
+write_spec WO-T-SCOPE-D-01 "WO Class: CODE" "target_repo: acme/fixture
+Base branch: dev" "## 7. Test scenarios
+
+Test 1: bad
+When: the test runs \`bash tests/bad.sh extra\` $M
+Then: it fails before the fix
+
+## 8. Stop conditions (CI-executable)
+
+Stop 1 (test suite): bad, unmarked
+  bash tests/bad.sh
+  Expected: 1 passing"
+run_gate first "$(preview_for WO-T-SCOPE-D-01)"
+assert_eq "Test 8 (marker scope) a marked When: line covers only its own complete command" "fail|no|green" "$(verdict)|$(grep -F '| 2 | `bash tests/bad.sh` |' "$REPORT" | awk -F'|' '{gsub(/ /, "", $4); print $4}')"
+
 # ---- Test 9 ----
 echo "--- Test 9: the gate fails closed ---"
 code_spec WO-T-UNK-01 "Stop 1 (test suite): ok
