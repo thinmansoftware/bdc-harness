@@ -2045,7 +2045,8 @@ function isValidRepairCandidate(pr: OpenWoPullRequest): boolean {
   return (
     Number.isInteger(pr.number) &&
     pr.number > 0 &&
-    pr.isFork === false &&
+    typeof pr.isFork === 'boolean' &&
+    !pr.isFork &&
     typeof pr.headRefName === 'string' &&
     pr.headRefName.length > 0 &&
     !/\s/.test(pr.headRefName)
@@ -2117,8 +2118,10 @@ async function resolveClimbRepairTarget(
     logClimbRepairTarget(woId, 'none', 'none');
     return none;
   }
-  const protectedTarget = opens.find(pr => !pr || pr.isDraft !== false);
-  if (opens.some(pr => !pr || pr.isDraft !== false)) {
+  const isProtectedTarget = (pr: OpenWoPullRequest | undefined): boolean =>
+    typeof pr?.isDraft !== 'boolean' || pr.isDraft;
+  const protectedTarget = opens.find(isProtectedTarget);
+  if (opens.some(isProtectedTarget)) {
     const label =
       protectedTarget && Number.isInteger(protectedTarget.number)
         ? `#${String(protectedTarget.number)}`
