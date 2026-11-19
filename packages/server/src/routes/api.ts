@@ -3320,6 +3320,12 @@ export async function approvePausedWorkflowRun(
     getLog().info({ runId }, 'api.workflow_run_approve_not_found');
     return { ok: false, status: 404, message: 'Workflow run not found' };
   }
+  if (
+    run.workflow_name === 'bdc-feature-development-codex-only' ||
+    Object.prototype.hasOwnProperty.call(run.metadata ?? {}, 'codex_only_dispatch')
+  ) {
+    return { ok: false, status: 400, message: 'codex_only_resume_unsupported' };
+  }
   const priorResponse = run.metadata.approval_response as string | undefined;
   if (run.status !== 'paused') {
     if (priorResponse === 'approved') {
@@ -7739,9 +7745,6 @@ export function registerApiRoutes(
       // 400 BEFORE anything is persisted. The OpenAPI defaultHook (validationErrorHook)
       // returns 400 on a Zod failure before this handler runs; Zod also applies the
       // .default('approve_as_is') so decision_verb is always a valid enum value here.
-      const restrictedRun = await workflowDb.getWorkflowRun(runId);
-      if (restrictedRun && isCodexOnlyContinuation(restrictedRun))
-        return apiError(c, 400, 'codex_only_resume_unsupported');
       const body = getValidatedBody(c, approveWorkflowRunBodySchema);
       // Auto-resume: dispatch to the orchestrator so the workflow continues
       // without requiring the user to re-run the workflow command. Mirrors what
