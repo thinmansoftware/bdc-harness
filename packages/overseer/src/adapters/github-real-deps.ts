@@ -51,6 +51,11 @@ import {
   type WorkflowAttempt,
 } from '../pr-review-check-ingest';
 import type { SubmitOutcome } from '../pr-review-submit.ts';
+import {
+  collectBundleCoverage,
+  configuredBundleProducer,
+  type BundleCoverage,
+} from '../bundle-review-proof';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -165,6 +170,8 @@ function selectWoSearchCandidate(
  * mock object without constructing a real client.
  */
 export interface RealGitHubOctokitLike {
+  /** Existing authenticated Octokit request seam; never another credential. */
+  request?(route: string, parameters: Record<string, unknown>): Promise<{ data: unknown }>;
   pulls: {
     list(input: Record<string, unknown>): Promise<{
       data: {
@@ -494,6 +501,10 @@ export type BoundReposMethodName = (typeof BOUND_REPOS_METHODS)[number] &
   keyof NonNullable<RealGitHubOctokitLike['repos']>;
 
 export interface ExactHeadPullRequestEvidence {
+  bundleProofUnavailable?: boolean;
+  /** The bundle changed and its Test Suite run is unfinished: defer as checks_pending. */
+  bundleRunPending?: boolean;
+  coverage?: BundleCoverage;
   diff: string;
   checks: { name: string; status: string; conclusion: string | null }[];
   /**
@@ -664,6 +675,34 @@ export function createRealFetchExactHeadPullRequestEvidence(
         throw new Error('pr_review_diff_evidence_unavailable');
       }
     }
+    let coverage: BundleCoverage | undefined;
+    let bundleProofUnavailable: boolean | undefined;
+    let bundleRunPending: boolean | undefined;
+    // OFF until a separate operator GO admits an immutable producer commit.
+    const admittedProducer = configuredBundleProducer();
+    if (admittedProducer && input.owner === 'thinmansoftware' && input.repo === 'bdc-harness') {
+      try {
+        if (!octokit.request) throw new Error('proof_api_unavailable');
+        const request = octokit.request.bind(octokit);
+        const proof = await collectBundleCoverage(
+          async (route, parameters) =>
+            (await request(route, { owner: input.owner, repo: input.repo, ...parameters })).data,
+          { ...input, baseSha },
+          admittedProducer
+        );
+        if ('bundleRunPending' in proof) {
+          // Keep the diff already fetched; the evaluator defers before composing any prompt.
+          bundleRunPending = true;
+        } else {
+          diff = proof.diff;
+          coverage = proof.coverage;
+          bundleProofUnavailable = proof.bundleProofUnavailable;
+        }
+      } catch (error) {
+        if (classifyRateLimitError(error)) throw error;
+        throw new Error('pr_review_diff_evidence_unavailable');
+      }
+    }
     // Required status-check contexts on the base branch are the authoritative
     // complete-suite signal: without them, one fast check completing before the
     // rest of CI registers could trigger review prematurely.
@@ -743,6 +782,9 @@ export function createRealFetchExactHeadPullRequestEvidence(
         : {}),
       ...(noChecksBlocked ? { requiredContextsBlocked: noChecksBlocked } : {}),
       diff,
+      ...(coverage ? { coverage } : {}),
+      ...(bundleProofUnavailable ? { bundleProofUnavailable } : {}),
+      ...(bundleRunPending ? { bundleRunPending } : {}),
       checks: checkRuns.map((run, index) => ({
         id: run.id,
         name: run.name?.trim() || `check-${index + 1}`,

@@ -7,6 +7,7 @@
 
 import type { GateMisfire } from './gate-misfire.js';
 import type { EntrySelection } from './headroom.js';
+import type { CodexOnlyDispatchBinding } from '../../workflows/src/reliability/dispatch-binding.js';
 
 export type TierName = string; // e.g. "zero", "qwen", "codex", "claude", "frontier"
 
@@ -126,6 +127,10 @@ export interface CascadeRunRecord {
     tags: string[];
     entryOverride: TierName | null;
     dryRun: boolean;
+    /** Omitted on legacy requests to preserve replay identity. */
+    codexOnly?: true;
+    /** Full comparison identity; its version discriminates restricted protocol replays. */
+    dispatchBinding?: CodexOnlyDispatchBinding;
   };
   createdAt: string;
   status: CascadeStatus;
@@ -225,6 +230,19 @@ export interface CascadeRunRecord {
    * (terminate as needs-human) later. See FrontierApprovalPacket.
    */
   frontierApproval?: FrontierApprovalPacket;
+  providerBoundary?: {
+    reason: 'codex-only-capacity';
+    nextTier: TierName | null;
+    sourceEventId: string;
+    sourceEventAt: string;
+    cancellation?: {
+      runId: string;
+      attempted: true;
+      result: 'acknowledged' | 'failed';
+      errorClass: string | null;
+      runStopVerified: false;
+    };
+  };
   /**
    * Other OPEN WO PRs passed over when a climb selected the newest one.
    * Absent when the climb had zero or one open PR, or no climb repair decision.

@@ -1226,8 +1226,10 @@ export function buildIndeterminateSummary(
   diagnostics?: readonly SanitizedTermination[]
 ): string {
   const code = reviewErrorCode(error);
+  // Only our exact numeric oversize payload is safe to publish, never arbitrary detail.
+  const size = /^prompt_too_large:bytes=(\d{1,16}):cap=(\d{1,16})$/.exec(error ?? '');
   const summary = code
-    ? `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.`
+    ? `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.${size ? ` Prompt: ${size[1]} UTF-8 bytes; cap: ${size[2]}.` : ''}`
     : INDETERMINATE_REVIEW_SUMMARY;
   const safe = Array.isArray(diagnostics) ? diagnostics.filter(isTrustedTermination) : [];
   return safe.length
@@ -1416,7 +1418,7 @@ export function createRealSubmitDeps(
             : {}),
         };
       }
-      const summary =
+      let summary =
         result.findings.length > 0
           ? result.findings
               .map(finding => `[${finding.severity}] ${finding.scope}: ${finding.summary}`)
@@ -1427,6 +1429,9 @@ export function createRealSubmitDeps(
                 executionProof ? result.diagnostics : undefined
               )
             : 'No blocking findings.';
+      if (result.bundleProofUnavailable)
+        summary +=
+          '\nBundle exclusion unavailable: producer proof missing or untrusted; full diff retained.';
       // #847: the INDETERMINATE reason code travels to the submit receipt as
       // well as the PR body, so the event store says WHY (usage_limit_until,
       // provider_credits_exhausted, auth_expired) without a container probe.
@@ -1440,6 +1445,7 @@ export function createRealSubmitDeps(
         // remediation classification can read severity per finding. The
         // summary string has already lost that.
         findings: result.findings,
+        ...(result.coverage ? { coverage: result.coverage } : {}),
         ...(indeterminateCode ? { reasonCode: indeterminateCode } : {}),
         ...(executionProof ? { executionProof } : {}),
       };
@@ -1452,6 +1458,14 @@ export function createRealSubmitDeps(
         pull_number: input.prNumber,
       });
       return pr.data.head.sha;
+    },
+    async currentReviewRefs(input): Promise<{ headSha: string; baseSha: string }> {
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+      });
+      return { headSha: pr.data.head.sha, baseSha: pr.data.base?.sha ?? '' };
     },
     // WO-HARNESS-MERGE-GATES-01 Amendment 1: no review on a draft. A response without a boolean draft
     // field throws, which the submit path turns into a non-terminal deferral (fail closed).

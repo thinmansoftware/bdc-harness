@@ -1,8 +1,127 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { parseArgs, resolveAllowSatisfied, resolveFireAuth, statusToExitCode } from '../cli.js';
 import type { CascadeStatus } from '../types.js';
+import { mkdtemp, readFile, writeFile, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 let originalToken: string | undefined;
+
+describe('explicit Codex-only CLI option', () => {
+  test('actual CLI dry-run preserves legacy project and forwards explicit variant project', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-cli-dry-run-'));
+    try {
+      const source = await readFile(new URL('../cli.ts', import.meta.url), 'utf8');
+      const candidate = join(directory, 'cli.ts');
+      await writeFile(candidate, source);
+      await writeFile(
+        join(directory, 'cascade.js'),
+        `export async function runCascade(opts) {
+        const explicit = process.env.TEST_CASE === 'explicit';
+        if (opts.dryRun !== true || opts.token !== undefined || opts.codexOnly !== (explicit ? true : undefined) || opts.project !== (explicit ? 'test-project' : undefined)) throw new Error('dry-run forwarding failed');
+        return {status:'planned',winningTier:null,attempts:[],telemetry:{climbed:false,climbCount:0,wonCheap:false},totalCostUsd:null};
+      }`
+      );
+      for (const mode of ['legacy', 'explicit'] as const) {
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            candidate,
+            'fire',
+            'WO-TEST',
+            '--dry-run',
+            '--project',
+            'test-project',
+            ...(mode === 'explicit' ? ['--entry', 'codex', '--codex-only'] : []),
+          ],
+          {
+            env: { ...process.env, ARCHON_OPERATOR_TOKEN: '', TEST_CASE: mode },
+            stdout: 'pipe',
+            stderr: 'pipe',
+          }
+        );
+        const [stdout, stderr, status] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        expect(status).toBe(0);
+        expect(stdout).toContain('status:      planned');
+        expect(stderr).not.toContain('[smart-cauldron] Fatal error:');
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('requires an explicitly selected Codex entry', () => {
+    for (const entry of [[], ['--entry', 'claude'], ['--entry', 'frontier']]) {
+      expect(() => parseArgs(['bun', 'cli.ts', 'fire', 'WO-1', '--codex-only', ...entry])).toThrow(
+        'codex_only_invalid_options'
+      );
+    }
+    expect(
+      parseArgs(['bun', 'cli.ts', 'fire', 'WO-1', '--codex-only', '--entry', 'codex']).codexOnly
+    ).toBe(true);
+    expect(
+      parseArgs(['bun', 'cli.ts', 'fire', 'WO-1', '--entry', 'codex']).codexOnly
+    ).toBeUndefined();
+  });
+
+  test('actual CLI main forwards the variant and preserves exit 1/2 failures', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-cli-main-'));
+    try {
+      const source = await readFile(new URL('../cli.ts', import.meta.url), 'utf8');
+      const stub = join(directory, 'cascade.js');
+      const candidate = join(directory, 'cli.ts');
+      // The entrypoint, parser, auth checks and exit handling are the actual source.
+      // Only the conductor import is replaced by a harmless boundary stub.
+      await writeFile(candidate, source);
+      await writeFile(
+        stub,
+        `export async function runCascade(opts) {
+        if (opts.codexOnly !== true || opts.entryOverride !== 'codex' || opts.project !== 'test-project') throw new Error('forwarding failed');
+        if (process.env.TEST_CASE === 'preflight') throw new Error('codex_only_preflight_http');
+        return {status:'blocked',winningTier:null,attempts:[{}],telemetry:{climbed:false,climbCount:0,wonCheap:false},totalCostUsd:null};
+      }`
+      );
+      for (const [mode, exit] of [
+        ['preflight', 1],
+        ['blocked', 2],
+      ] as const) {
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            candidate,
+            'fire',
+            'WO-TEST',
+            '--project',
+            'test-project',
+            '--entry',
+            'codex',
+            '--codex-only',
+          ],
+          {
+            env: { ...process.env, ARCHON_OPERATOR_TOKEN: 'harmless-test-token', TEST_CASE: mode },
+            stdout: 'pipe',
+            stderr: 'pipe',
+          }
+        );
+        const [stdout, stderr, status] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        expect(status).toBe(exit);
+        if (mode === 'preflight') expect(stderr).toContain('codex_only_preflight_http');
+        else expect(stdout).toContain('status:      blocked');
+        expect(stdout + stderr).not.toContain('harmless-test-token');
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
 
 beforeEach(() => {
   originalToken = process.env.ARCHON_OPERATOR_TOKEN;

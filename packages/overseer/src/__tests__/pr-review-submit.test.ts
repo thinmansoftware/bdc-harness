@@ -57,6 +57,54 @@ function makeDeps(overrides: Partial<SubmitDeps> = {}): { deps: SubmitDeps; rec:
 }
 
 describe('approve path', () => {
+  const coverage = {
+    notice: 'Protected exact-head bundle coverage',
+    baseSha: 'b'.repeat(40),
+    producer: 'c'.repeat(40),
+  };
+  test('#6357 protected coverage survives long model findings', () => {
+    const body = buildReviewBody(WORK, {
+      approved: true,
+      summary: 'x'.repeat(70_000),
+      reviewedHeadSha: HEAD,
+      coverage,
+    });
+    expect(body).toContain(coverage.notice);
+    expect(body.length).toBeLessThanOrEqual(60_000);
+  });
+  for (const refs of [
+    undefined,
+    { headSha: NEW_HEAD, baseSha: coverage.baseSha },
+    { headSha: HEAD, baseSha: 'changed' },
+  ]) {
+    test(`#6357 missing or changed final refs prevent publication: ${JSON.stringify(refs)}`, async () => {
+      const { deps, rec } = makeDeps({
+        runReviewer: async () => ({
+          approved: true,
+          summary: 'good',
+          reviewedHeadSha: HEAD,
+          coverage,
+        }),
+        currentReviewRefs: refs ? async () => refs : undefined,
+      });
+      const outcome = await runAndSubmitReview(WORK, deps);
+      expect(outcome.disposition).toBe('stale_head');
+      expect(rec.submitted).toHaveLength(0);
+    });
+  }
+  test('#6357 final fresh head and base permit a coverage-bound review', async () => {
+    const { deps, rec } = makeDeps({
+      runReviewer: async () => ({
+        approved: true,
+        summary: 'good',
+        reviewedHeadSha: HEAD,
+        coverage,
+      }),
+      currentReviewRefs: async () => ({ headSha: HEAD, baseSha: coverage.baseSha }),
+    });
+    expect((await runAndSubmitReview(WORK, deps)).disposition).toBe('approved');
+    expect(rec.submitted[0]?.body).toContain(coverage.notice);
+  });
   test('an approving verdict submits APPROVE', async () => {
     const { deps, rec } = makeDeps();
     const outcome = await runAndSubmitReview(WORK, deps);

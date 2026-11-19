@@ -448,6 +448,7 @@ export type WoCompletion =
       neither: number;
       rate: string;
       neither_wos: string[];
+      count_lag: number;
     }
   | { available: false; reason: string };
 
@@ -658,6 +659,7 @@ export async function computeWoCompletion(
       neither: 0,
       rate: rate(0, 0),
       neither_wos: [],
+      count_lag: 0,
     };
   // Read-only contract (docs/operations/run-completion-report.md: "nothing is
   // written"). runGitHubServiceCommand meters every call and flushes those rows
@@ -692,7 +694,9 @@ export async function computeWoCompletion(
     // The issues endpoint also returns PRs; keep only real issues to match is:issue.
     const issues = issueItems.filter(i => i != null && i.pull_request == null);
     const issueTotal = await searchCount('issues', `repo:${XO_REPO} label:wo is:issue`, inj);
-    if (issues.length !== issueTotal) return { available: false, reason: 'incomplete:issues' };
+    if (issues.length < issueTotal) return { available: false, reason: 'incomplete:issues' };
+    // GitHub search can lag the list endpoints. Count the difference for each collection.
+    let countLag = issues.length - issueTotal;
     const issueByTitle = new Map<string, GhIssue>();
     for (const i of issues) if (typeof i.title === 'string') issueByTitle.set(i.title, i);
 
@@ -711,7 +715,8 @@ export async function computeWoCompletion(
         (p): p is GhPull & { merged_at: string } => p?.merged_at != null
       );
       const mergedTotal = await searchCount(col, `repo:${repo} is:pr is:merged`, inj);
-      if (merged.length !== mergedTotal) return { available: false, reason: `incomplete:${col}` };
+      if (merged.length < mergedTotal) return { available: false, reason: `incomplete:${col}` };
+      countLag += merged.length - mergedTotal;
       mergedByProject.set(
         project,
         merged.filter(p => Date.parse(p.merged_at) <= asOfMs)
@@ -756,6 +761,7 @@ export async function computeWoCompletion(
       neither: neitherWos.length,
       rate: rate(num, den),
       neither_wos: neitherWos,
+      count_lag: countLag,
     };
   } catch (e) {
     if (e instanceof GhIncompleteError) return { available: false, reason: e.message };
@@ -891,6 +897,7 @@ async function main(): Promise<void> {
     out.push(
       `wo_merged_or_owned: ${woCompletion.num}/${woCompletion.den} rate ${woCompletion.rate}`
     );
+    if (woCompletion.count_lag > 0) out.push(`wo_count_lag: ${woCompletion.count_lag}`);
     out.push(
       `wo_breakdown: merged ${woCompletion.merged}, owned ${woCompletion.owned}, ` +
         `neither ${woCompletion.neither}`

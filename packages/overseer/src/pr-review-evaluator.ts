@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { BundleCoverage } from './bundle-review-proof';
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
@@ -41,6 +42,8 @@ import {
  * classification that already exists observable.
  */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
+/** Fully composed UTF-8 prompt limit; oversize is terminal, never a transport retry. */
+export const MAX_REVIEW_PROMPT_BYTES = 1_048_576;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('overseer.pr-review-evaluator');
   return cachedLog;
@@ -118,6 +121,8 @@ export interface PrReviewCheckPartition {
 }
 
 export interface PrReviewResult {
+  bundleProofUnavailable?: boolean;
+  coverage?: BundleCoverage;
   diagnostics?: readonly SanitizedTermination[];
   verdict: PrReviewVerdict;
   findings: IndependentReviewFinding[];
@@ -183,9 +188,14 @@ export interface PrReviewDeps {
    * to the reported-checks heuristic. The real GitHub adapter always sets it
    * explicitly to `string[] | null`.
    */
-  fetchEvidence(
-    input: PrReviewInput
-  ): Promise<{ diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null }>;
+  fetchEvidence(input: PrReviewInput): Promise<{
+    diff: string;
+    checks: PrReviewCheck[];
+    requiredContexts?: string[] | null;
+    coverage?: BundleCoverage;
+    bundleProofUnavailable?: boolean;
+    bundleRunPending?: boolean;
+  }>;
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
   invokeModel(
     binary: string,
@@ -269,6 +279,8 @@ export function buildReviewPrompt(input: {
   diff: string;
   checkPartition: PrReviewCheckPartition;
   acceptanceCriteria: string | null;
+  coverageNotice?: string;
+  bundleProofUnavailable?: boolean;
 }): string {
   return [
     'You are an independent pull-request code reviewer.',
@@ -286,6 +298,10 @@ export function buildReviewPrompt(input: {
     `Required checks (these gate the verdict): ${JSON.stringify(input.checkPartition.gating)}`,
     `Non-required checks (informational only; report a failure as severity note, never blocker or major): ${JSON.stringify(input.checkPartition.nonRequired)}`,
     'Diff:',
+    ...(input.coverageNotice ? [input.coverageNotice] : []),
+    ...(input.bundleProofUnavailable
+      ? ['Bundle exclusion unavailable: producer proof missing or untrusted; full diff retained.']
+      : []),
     input.diff,
   ].join('\n');
 }
@@ -615,6 +631,9 @@ export async function evaluatePullRequest(
   }
 
   let evidence: {
+    bundleProofUnavailable?: boolean;
+    bundleRunPending?: boolean;
+    coverage?: BundleCoverage;
     diff: string;
     checks: PrReviewCheck[];
     requiredContexts?: string[] | null;
@@ -669,6 +688,21 @@ export async function evaluatePullRequest(
     return checksPending(input, deps, evidence.checks, evidence.requiredContexts);
   }
 
+  // The bundle changed and its Test Suite run (any of its six jobs) is unfinished: the producer
+  // receipt cannot be read yet, so defer instead of composing an oversized full-diff prompt.
+  // Built directly: checksPending() derives its list from check names, not this workflow.
+  if (evidence.bundleRunPending) {
+    return {
+      verdict: 'CHECKS_PENDING',
+      findings: [],
+      reviewed_head_sha: input.head_sha,
+      reviewer: deps.reviewer,
+      acceptance_criteria_available: false,
+      error: 'checks_pending',
+      pendingChecks: ['Test Suite'],
+    };
+  }
+
   let acceptanceCriteria: string | null = null;
   if (input.wo_id) {
     try {
@@ -684,7 +718,31 @@ export async function evaluatePullRequest(
     diff: evidence.diff,
     checkPartition,
     acceptanceCriteria,
+    coverageNotice: evidence.coverage?.notice,
+    bundleProofUnavailable: evidence.bundleProofUnavailable,
   });
+  const promptBytes = Buffer.byteLength(prompt, 'utf8');
+  if (promptBytes > MAX_REVIEW_PROMPT_BYTES) {
+    getLog().warn(
+      {
+        promptBytes,
+        cap: MAX_REVIEW_PROMPT_BYTES,
+        prNumber: input.pr_number,
+        headSha: input.head_sha,
+      },
+      'prompt_too_large'
+    );
+    return {
+      ...indeterminate(
+        input,
+        deps,
+        acceptanceCriteriaAvailable,
+        `prompt_too_large:bytes=${promptBytes}:cap=${MAX_REVIEW_PROMPT_BYTES}`
+      ),
+      ...(evidence.coverage ? { coverage: evidence.coverage } : {}),
+      ...(evidence.bundleProofUnavailable ? { bundleProofUnavailable: true } : {}),
+    };
+  }
   const ladder = deps.ladder ?? defaultReviewLadder();
   const supported = deps.executionContext ? supportedPrReviewLadder(ladder) : ladder;
   const diagnostics: SanitizedTermination[] = [];
@@ -724,7 +782,7 @@ export async function evaluatePullRequest(
     const rungStartedAt = Date.now();
     const invocationId = randomUUID();
     getLog().info(
-      { binary, promptBytes: prompt.length, prNumber: input.pr_number, headSha: input.head_sha },
+      { binary, promptBytes, prNumber: input.pr_number, headSha: input.head_sha },
       'judge_rung_started'
     );
     try {
@@ -806,6 +864,8 @@ export async function evaluatePullRequest(
       } catch {
         return {
           ...indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch'),
+          ...(evidence.coverage ? { coverage: evidence.coverage } : {}),
+          ...(evidence.bundleProofUnavailable ? { bundleProofUnavailable: true } : {}),
           ...(diagnostics.length > 0 ? { diagnostics } : {}),
         };
       }
@@ -817,6 +877,8 @@ export async function evaluatePullRequest(
         ...applyRequiredCheckGate(parsed, checkPartition),
         reviewer: { provider: deps.reviewer.provider, model: describeJudgeModel(binary) },
         acceptance_criteria_available: acceptanceCriteriaAvailable,
+        ...(evidence.coverage ? { coverage: evidence.coverage } : {}),
+        ...(evidence.bundleProofUnavailable ? { bundleProofUnavailable: true } : {}),
       };
     } catch (error) {
       const rungMs = Date.now() - rungStartedAt;
@@ -897,7 +959,12 @@ export async function evaluatePullRequest(
   if (transportFailure && !reachedAnyRung && !nonTransportFailure) {
     return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
   }
-  return { ...indeterminate(input, deps, acceptanceCriteriaAvailable, lastError), diagnostics };
+  return {
+    ...indeterminate(input, deps, acceptanceCriteriaAvailable, lastError),
+    diagnostics,
+    ...(evidence.coverage ? { coverage: evidence.coverage } : {}),
+    ...(evidence.bundleProofUnavailable ? { bundleProofUnavailable: true } : {}),
+  };
 }
 
 /** The configured judge ladder, cheapest first. Exported for the breaker (#847). */
