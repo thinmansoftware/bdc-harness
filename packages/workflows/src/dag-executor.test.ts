@@ -12386,6 +12386,61 @@ describe('agent persona dispatch', () => {
     expect(optionsArg.model).toBe('sonnet');
   });
 
+  for (const [label, pin, explicitModel, expected] of [
+    ['pinned review persona', 'opus', undefined, 'haiku'],
+    ['unpinned review persona', undefined, undefined, 'haiku'],
+    ['explicit node model wins', 'opus', 'sonnet', 'sonnet'],
+  ] as const) {
+    it(`configured Claude assistant precedence: ${label}`, async () => {
+      await writeAgentFile('assistant-precedence-reviewer', pin);
+      const store = createMockStore();
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-assistant-precedence',
+        testDir,
+        {
+          name: 'assistant-precedence',
+          nodes: [
+            {
+              id: 'plan-review',
+              agent: 'assistant-precedence-reviewer',
+              prompt: 'Review.',
+            } as unknown as DagNode,
+          ],
+        },
+        makeWorkflowRun('assistant-precedence-run'),
+        'codex',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        {
+          ...minimalConfig,
+          assistants: { ...minimalConfig.assistants, claude: { model: 'haiku' } },
+        },
+        undefined,
+        undefined,
+        undefined,
+        {
+          nodes: {
+            'plan-review': {
+              provider: 'claude',
+              ...(explicitModel ? { model: explicitModel } : {}),
+            },
+          },
+        }
+      );
+      expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+      const options = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+      expect(options.model).toBe(expected);
+      expect(store.createProviderAttempt).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'claude', model: expected })
+      );
+    });
+  }
+
   it('Claude node override supplies the model for a persona without one', async () => {
     await writeAgentFile('provider-agnostic-test-agent');
 
