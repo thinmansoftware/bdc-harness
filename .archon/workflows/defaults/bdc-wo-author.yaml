@@ -13,39 +13,74 @@
 # Fire examples:
 #   /workflow run bdc-wo-author MODE=--draft-only USER_MESSAGE="Author a WO to add pull-list export to ShopOps"
 #   /workflow run bdc-wo-author MODE=--queue     USER_MESSAGE="bdc-harness#128"
-#   /workflow run bdc-wo-author MODE=--fire      USER_MESSAGE="Author WO for SIGTERM cleanup --fire it"
+#   (--fire is dead and fail-closed: the approval-gate and fire-cauldron when: lines do
+#   not parse, so both nodes are always skipped; making it work belongs to bdc-xo#2924.)
 #
-# Author.md / Validate.md skills: their 12-section template + 12-check gate are
-# inlined in the author-loop prompt (the same way bdc-author-wo-batch inlines
-# them). Builders firing this YAML do not need filesystem access to ~/.claude/.
+# Repaired by WO-HARNESS-WO-AUTHOR-INTAKE-REPAIR-01 (2026-11-19):
+#   - Provider: every model node runs on provider codex, model gpt-6.1-sol, with the
+#     no-model -opr personas (xo-opr, major-build-opr). The old engine-default Claude
+#     provider returned empty answers and killed the only run (1685c5a0).
+#   - Notion: the file-notion and flip-notion nodes are gone. Notion is read-only.
+#   - Drafting: author-loop drafts from the per-class template
+#     (bash scripts/cauldron/new-wo.sh <WO_ID> <CLASS> <owner/repo>, run in the bdc-xo
+#     worktree) and runs bash scripts/cauldron/validate-wo-spec.sh on the draft. MIXED
+#     specs are not authored by this intake.
+#
+# Stop-command gate (stop-command-gate -> stop-command-revise -> stop-command-gate-final,
+# then commit-spec only when GATE_ALLOW is yes, else stop-command-gate-fail fails the run):
+#   Both gate nodes SOURCE scripts/lane/wo-author-stop-gate.sh (resolution:
+#   $BDC_WAG_SCRIPT, then $ARCHON_LANE_SCRIPTS_DIR/wo-author-stop-gate.sh, then
+#   /app/scripts/lane/wo-author-stop-gate.sh; none found = fail closed). The gate:
+#   runs validate-wo-spec.sh on the draft in its normal mode; shallow-clones the target
+#   repo's base branch (from scripts/cauldron/cauldron-projects.json) under
+#   $ARTIFACTS_DIR; extracts the draft's test and stop commands with the build lane's
+#   own rule (the rst core below, byte-identical to bdc-feature-development-codex.yaml);
+#   refuses `bun test` on a path without ./ and more than 8 commands; runs each command
+#   in the clone and judges it by the lane's status law. Its stdout is one JSON object
+#   (GATE, GATE_ALLOW, GATE_REASONS, GATE_BASE_SHA, GATE_OVERRIDES); its report is
+#   $ARTIFACTS_DIR/stop-gate-report.md. A failed gate gets ONE revise pass, then
+#   stop-command-gate-final re-checks the revised spec at exactly the first gate's
+#   GATE_BASE_SHA. The gate never commits, pushes or opens a PR.
+#   Expected-red marker: a test that must fail until the WO is built is declared by
+#   writing the literal text [expected red before the fix] in its Stop block (or on its
+#   own When: line). Such a command must exit nonzero with at least one failing test
+#   (red_confirmed), or name a not-yet-existing path that is listed on the spec's
+#   Files created: line with its runner on PATH (red_new_file). Every other command
+#   must pass (exit 0 and passed == total > 0). Operator stops are written in plain
+#   words with no backticks and are never run.
+#   Gate tests: bash .archon/workflows/defaults/__tests__/wo-author-stop-gate.sh
+#   Wiring tests: bun test ./packages/workflows/src/wo-author-intake-provider.test.ts
 
 name: bdc-wo-author
 description: |
   Use when: Authoring any new BDC WO. This is the canonical front door -- chat,
-  GitHub issue, Notion stub, and file-drop intake all normalize into one
-  pipeline (Author.md 12-section draft -> Validate.md 12-check adversarial gate
-  -> dry-run preview -> optional approval gate -> commit-spec -> file-notion
-  -> optional fire-cauldron). Replaces informal handoff via chat/VS Code.
+  GitHub issue and file-drop intake all normalize into one pipeline (per-class
+  template draft via new-wo.sh -> validate-wo-spec.sh -> dry-run preview ->
+  stop-command gate -> one revise pass -> final gate -> commit-spec).
+  Replaces informal handoff via chat/VS Code.
   Inputs:
     USER_MESSAGE: free-text description, or "@<repo>#<N>" for GitHub issue,
-                  or "--notion <page-id>" for Notion stub,
                   or "--spec <repo-relative-path>" for an existing draft file.
                   Mode flags inline: --draft-only | --queue (default) | --fire
                   Auto-approve flag: --auto-approve, "fire it", "fire now"
     MODE: optional explicit mode override (--draft-only|--queue|--fire); USER_MESSAGE wins
-    NOTION_DB_ID: Notion WO database (default: a6df831c-0b52-449f-8ca4-d77be6b70d0a)
-  Does: Normalizes intake, runs adversarial author-loop (max 5 iterations),
-        emits dry-run preview block (always), gates on operator approval when
-        --fire mode (unless auto-approve), commits spec to bdc-xo feature
-        branch, files Notion page (unless --draft-only), fires
-        bdc-feature-development against the target repo (--fire only).
+  Does: Normalizes intake, runs the author-loop (max 5 iterations), emits the
+        dry-run preview block (always), runs the stop-command gate on the drafted
+        spec (fails the run closed when the spec fails the validator or its
+        commands do not behave as declared), and commits the spec to a held
+        wo/author- branch on bdc-xo. Writes no Notion page. --fire is dead and
+        fail-closed (see the header comment).
   Repo: thinmansoftware/bdc-xo (operator selects bdc-xo codebase when firing).
   NOT for: Doctrine-only WOs (use bdc-doctrine-update). Existing WOs already in
         REVIEW status. Batch authoring (use bdc-author-wo-batch).
   parallel_ok: false
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+# Claude-free intake (WO-HARNESS-WO-AUTHOR-INTAKE-REPAIR-01): the codex lane's root
+# declaration (bdc-feature-development-codex.yaml lines 18-19). Every model node also
+# pins it, with a no-model -opr persona.
+provider: codex
+model: gpt-6.1-sol
 
 # interactive: true forces foreground execution on web. Required because
 # approval-gate is an approval node that hangs silently otherwise (Archon
@@ -60,8 +95,6 @@ interactive: true
 inputs:
   MODE:
     default: "--queue"
-  NOTION_DB_ID:
-    default: "a6df831c-0b52-449f-8ca4-d77be6b70d0a"
 
 nodes:
 
@@ -85,7 +118,11 @@ nodes:
   # that the --notion <page-id> path can use the Notion MCP tool without
   # splitting into two nodes with fragile when: chains.
   - id: normalize-intake
-    persona: xo
+    persona: xo-opr
+    # Provider pin: Claude-free intake. The -opr persona carries no model, so the node
+    # pin below is what runs (codex lane plan node pattern).
+    provider: codex
+    model: gpt-6.1-sol
     depends_on: [preflight-github-auth]
     task_class: medium_work
     prompt: |
@@ -121,8 +158,8 @@ nodes:
       Scan USER_MESSAGE and (if intake_source != chat_message) the fetched content
       for any of: `lspro-react`, `shopops-storefront`, `shopops`, `bdc-harness`,
       `bdc-xo`, `pricing-monolith`, `arena`. Emit the first match as target_repo_hint.
-      If none found, emit `target_repo_hint=unknown` -- the author-loop will infer
-      from the WO spec body's Section 10 Deploy Target.
+      If none found, emit `target_repo_hint=unknown` -- the author-loop will choose
+      the target repo and write it on the spec's own `target_repo:` line.
 
       ## WO ID Hint Extraction
 
@@ -212,12 +249,14 @@ nodes:
         printf '%s\n' "$RECIPE_HEAD"
       fi
 
-  # author-loop: adversarial AUTHOR -> REVIEW -> FIX cycle.
-  # 12-section template + 12-check Validate.md gate are inlined here so the
-  # workflow does not depend on filesystem access to ~/.claude/skills/.
-  # Pattern source: bdc-author-wo-batch.yaml lines 165-310 (3-phase prompt).
+  # author-loop: AUTHOR -> REVIEW -> FIX cycle. Drafts from the bdc-xo per-class
+  # template (scripts/cauldron/new-wo.sh) and checks the draft with the bdc-xo
+  # validator (scripts/cauldron/validate-wo-spec.sh), both run from this bdc-xo
+  # worktree. The loop's validator run is advisory; stop-command-gate is binding.
   - id: author-loop
-    persona: major-build
+    persona: major-build-opr
+    provider: codex
+    model: gpt-6.1-sol
     depends_on: [read-context]
     task_class: medium_work
     loop:
@@ -242,7 +281,7 @@ nodes:
 
         ---
 
-        ## PHASE 1 -- AUTHOR
+        ## PHASE 1 -- AUTHOR FROM THE CLASS TEMPLATE
 
         **1a. Idempotency check**: Parse wo_id_hint from intake. If it is a real
         WO ID (not "auto-generate") AND `docs/work-orders/<wo_id>.md` already
@@ -257,108 +296,83 @@ nodes:
         - Deterministic from Objective: running twice with same description
           MUST produce same ID (idempotency req from spec Section 8 Q8).
 
-        **1c. Draft the 12-section WO spec** (wo-recipe.md template):
-        ```
-        ## 1. Objective
-        ## 2. Behavior Source of Truth   <-- must cite concrete file path or WO ID
-        ## 3. Prior Art Check
-        ## 4. System Context             <-- list dependencies or state "standalone"
-        ## 5. UI Hierarchy               <-- N/A with one-line reason if not UI
-        ## 6. Mode Behavior Matrix       <-- N/A with one-line reason if not multi-mode
-        ## 7. Backend Function Inventory <-- every function labeled EXISTING (file:line) or NEW
-        ## 8. Data Flow
-        ## 9. Database Schema References <-- N/A with one-line reason if no DB;
-                                            if DB: cite information_schema query OR migration file
-        ## 10. Deploy Target
-        ## 11. Test Scenarios            <-- >= 3 tests, each with Given/When/Then structure
-        ## 12. Stop Point                <-- CI-executable commands, Given/When/Then
-        ```
-        Add a "Grep assertions" section if the WO touches 2+ repos (Check 8A).
-        Reference `wo-recipe.md` somewhere in the body (Check 2).
-        Include 8 required questions answered somewhere in the body (Check 10):
-          1. What behavior exists AFTER this WO?
-          2. Where is the source of truth?
-          3. Who owns this system?
-          4. What existing logic is reused?
-          5. What is the exact schema? (N/A if no DB)
-          6. What MUST NEVER break? (invariants)
-          7. How does CI prove it works?
-          8. What happens if it runs twice? (idempotency)
+        **1c. Choose the class and the target repo.**
+        - Class: exactly one of CODE, INFRA, OPERATOR-EXECUTION, DOCUMENTATION-ONLY.
+          This intake does NOT author MIXED specs: the stop-command gate fails every
+          MIXED spec with mixed_unsupported, because a MIXED spec has a stages: list
+          and no target_repo: line. If the work spans several repos, choose a
+          single-repo class for one repo, or end with BATCH_FAILURE.
+        - Target: an owner/repo that is listed in scripts/cauldron/repo-canonical-map.json
+          (read the file; never guess a repo). Its base branch is the `base_branch`
+          of its entry in scripts/cauldron/cauldron-projects.json.
+
+        **1d. Generate the template.** From the bdc-xo worktree root (this CWD), run:
+          bash scripts/cauldron/new-wo.sh <WO_ID> <CLASS> <owner/repo>
+        It copies docs/work-orders/templates/TEMPLATE-<CLASS>.md to /tmp/<WO_ID>.md.
+        Copy that file to docs/work-orders/<WO_ID>.md. Never write the layout by hand.
+
+        **1e. Fill every field.** Replace every double-brace template field, top to
+        bottom, from what you have read (source files, live schema), never from memory:
+        - Spec author section: model id gpt-6.1-sol; seat "bdc-wo-author run $WORKFLOW_ID";
+          today's UTC date; Direction source = the intake DESCRIPTION, quoted. Add
+          exactly one Amendment log row for this first version.
+        - `target_repo:` line = the chosen owner/repo; `Base branch:` line = its
+          base_branch from scripts/cauldron/cauldron-projects.json, exactly.
+        - Stop conditions (templates/README.md rules 10 and 11): the build lane RUNS
+          every backticked runner command in the stop section. A command that needs a
+          live system (staging, a login, live data, a running service) is written in
+          plain words with NO backticks, under a `Stop N (operator check): ...` header,
+          ending `-- recorded by the operator`.
+        - Every `bun test` path starts with ./ (bare paths are name filters and run
+          zero tests).
+        - A test that must fail until the WO is built carries the literal marker
+          [expected red before the fix] in its Stop block, and any file it runs that
+          does not exist yet is listed on the manifest `Files created:` line.
+        - Every command you put in the stop section must pass against a clean checkout
+          of the target repo's base branch, except the ones marked expected red. The
+          stop-command gate runs them all.
+
+        **1f. Validate.** Run:
+          bash scripts/cauldron/validate-wo-spec.sh docs/work-orders/<WO_ID>.md
+        Fix every numbered failure it prints and re-run it until it prints RESULT: PASS.
 
         ---
 
         ## PHASE 2 -- ADVERSARIAL REVIEW (you are now a blocking reviewer)
 
-        Apply all 12 checks to the drafted spec:
+        1. The validator verdict from step 1f binds: anything other than RESULT: PASS
+           is a FAIL with the validator's numbered failures as the gaps.
+        2. Anti-guess rule (reviewer duty): every file, function, table, column and route
+           named in the spec traces to a source you read in this run. No invented names.
+           -> FAIL if any specific claim is not anchored to a real source.
+        3. Read the stop section once as the build lane does: every backticked runner
+           command in it will be executed in a clean checkout of the target repo.
+           -> FAIL if a backticked command needs a live system, or a bun test path lacks ./.
 
-        **Check 1**: 8 always-required headers present verbatim:
-          ## 1. Objective, ## 2. Behavior Source of Truth, ## 3. Prior Art Check,
-          ## 7. Backend Function Inventory, ## 8. Data Flow, ## 10. Deploy Target,
-          ## 11. Test Scenarios, ## 12. Stop Point
-          -> BLOCK if any missing.
-
-        **Check 2**: Body contains the substring `wo-recipe.md`.
-          -> BLOCK if absent.
-
-        **Check 3**: Section 2 references at least one concrete artifact (file path or WO ID).
-          -> BLOCK if Section 2 contains only TBD, "see body", or empty text.
-
-        **Check 4**: WO ID matches `WO-[A-Z][A-Z0-9-]*-[0-9]+`; consistent across
-        filename, H1, and (planned) Notion title.
-          -> BLOCK if inconsistent.
-
-        **Check 5**: Section 2 cites a real path (e.g. `docs/plans/foo.md`, `WO-XYZ-01`).
-          -> BLOCK if Section 2 is vague without a concrete locator.
-
-        **Check 6**: Every function/route/script in Section 7 labeled `EXISTING (file:line)` or `NEW`.
-          -> BLOCK if any name appears without a label.
-
-        **Check 7**: Section 9 column/table claims cite `information_schema` query result
-        or migration file path.
-          -> BLOCK if Section 9 makes a column claim without citing source.
-
-        **Check 8**: Section 11 has >= 3 test scenarios each with Given/When/Then structure.
-          -> BLOCK if fewer than 3, or any test is purely descriptive.
-
-        **Check 8A**: If WO's files span 2+ repos -> must have `Grep assertions`
-        block with grep command per repo.
-          -> BLOCK if split-repo WO lacks grep assertions.
-
-        **Check 9**: Section 12 stop conditions are CI-executable commands (Given/When/Then).
-          -> BLOCK if any stop condition is vague ("staging accessible").
-
-        **Check 10**: 8 required questions addressed somewhere in body (see PHASE 1c).
-          -> BLOCK if any unanswered.
-
-        **Check 11** (HARDEST -- anti-guess hardening): Every component name, table
-        name, column name, route path in the spec traces to a source file. No
-        invented names. If Section 7 lists `fetchPullList`, the spec must label it
-        `EXISTING (lib/storefront-api.ts:142)` or `NEW`.
-          -> BLOCK if any specific claim is not anchored to a real source.
-
-        **Check 12**: Section 4 lists dependencies OR explicitly says "standalone".
-          -> BLOCK if Section 4 is empty and WO touches more than one subsystem.
-
-        Output per WO: `VALIDATE: PASS` (all 12) or
-        `VALIDATE: FAIL -- Check N: <gap>` for each failure.
+        Output `REVIEW: PASS` or `REVIEW: FAIL -- <gap>` for each failure.
 
         ---
 
         ## PHASE 3 -- FIX OR COMMIT
 
-        - **FAIL**: Revise spec to address each listed gap. Re-run all 12 checks
-          on the revision. If revised passes -> write file; if still fails ->
-          continue to next iteration.
-        - **PASS** or **IDEMPOTENT_SKIP**: Write `docs/work-orders/<WO_ID>.md` to disk.
-          Also emit a footer block (parsed by downstream dry-run-preview):
+        - **FAIL**: Revise the spec file to address each listed gap, then re-run
+          bash scripts/cauldron/validate-wo-spec.sh docs/work-orders/<WO_ID>.md on the
+          revision. If it prints RESULT: PASS and the review passes -> done; otherwise
+          continue to the next iteration.
+        - **PASS** or **IDEMPOTENT_SKIP**: the spec is at `docs/work-orders/<WO_ID>.md`.
+          Emit this footer block (parsed by downstream dry-run-preview):
           ```
           === AUTHOR-LOOP RESULT ===
           wo_id=<WO_ID>
           spec_path=docs/work-orders/<WO_ID>.md
-          target_repo=<owner/repo from Section 10 Deploy Target>
+          target_repo=<owner/repo, copied from the spec's own target_repo: line>
           mode=<--draft-only|--queue|--fire from intake>
           auto_approve=<true|false from intake>
           ```
+
+        This loop's validator run is advisory. After the loop, the stop-command gate
+        runs the validator again and runs every command in the stop section; it is the
+        binding check, and it fails the run closed.
 
         ---
 
@@ -367,21 +381,22 @@ nodes:
         Output `<promise>VALIDATE_PASS</promise>` ONLY when:
         - `docs/work-orders/<wo_id>.md` exists on disk (or IDEMPOTENT_SKIP fired)
         - The AUTHOR-LOOP RESULT footer block is present in your output
-        - Final review verdict was VALIDATE: PASS (or IDEMPOTENT_SKIP)
+        - The latest run of scripts/cauldron/validate-wo-spec.sh on that file printed
+          RESULT: PASS (or IDEMPOTENT_SKIP fired), and the review passed
 
         If iteration 5 ends without passing, do NOT emit the sentinel.
         Instead output a BATCH_FAILURE block:
         ```
         BATCH_FAILURE:
           WO_ID: <id or "(unassigned)">
-          failed_checks: [list of Check N]
+          failed_checks: [validator failure numbers or review gaps]
           critique: <specific gaps that could not be resolved>
         ```
 
   # dry-run-preview: ALWAYS runs. Emits the preview block that operator sees
-  # before any Notion create or Cauldron fire. Cross-checks: existing spec on
-  # disk (idempotency), existing Notion page (idempotency), active Cauldron
-  # runs for same WO_ID (duplicate run detection per spec Scenario 3).
+  # before the stop-command gate and commit. Cross-checks: existing spec on
+  # disk (idempotency), active Cauldron runs for same WO_ID (duplicate run
+  # detection per spec Scenario 3).
   - id: dry-run-preview
     persona: major-build
     depends_on: [author-loop]
@@ -433,7 +448,7 @@ nodes:
         fi
       fi
 
-      # Emit preview block (always shown -- operator gate before Notion/fire)
+      # Emit preview block (always shown -- read by the stop-command gate)
       echo "=== DRY-RUN PREVIEW ==="
       echo "wo_id=$WO_ID"
       echo "spec_path=$SPEC_PATH"
@@ -442,24 +457,21 @@ nodes:
       echo "mode=$MODE"
       echo "auto_approve=$AUTO_APPROVE"
       echo "fire_workflow=bdc-feature-development"
-      echo "notion_db=${INPUT_NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}"
+      echo "notion=read-only (Notion is read-only; no Notion entry is created)"
       echo "$DUPLICATE_INFO"
       echo ""
       echo "Mode behavior:"
       case "$MODE" in
         --draft-only)
           echo "  - Commit spec to bdc-xo feature branch + open PR"
-          echo "  - NO Notion entry created"
           echo "  - NO Cauldron fire"
           ;;
         --queue)
           echo "  - Commit spec to bdc-xo feature branch + open PR"
-          echo "  - Notion entry created (Claude Status=QUEUED)"
           echo "  - NO Cauldron fire (operator fires separately)"
           ;;
         --fire)
           echo "  - Commit spec to bdc-xo feature branch + open PR"
-          echo "  - Notion entry created (Claude Status=QUEUED)"
           if [ "$AUTO_APPROVE" = "true" ]; then
             echo "  - Cauldron fire IMMEDIATE (auto-approve flag detected)"
           else
@@ -487,14 +499,1552 @@ nodes:
         - If DUPLICATE_RUN_DETECTED is in the preview, type "fire anyway" to override
       capture_response: true
 
-  # commit-spec: ALWAYS runs (depends only on dry-run-preview, not approval-gate).
-  # Spec commits regardless of mode -- mode only controls Notion + Cauldron fire.
+  # stop-command-gate: runs the drafted spec's validator and declared commands against a
+  # clean shallow clone of the target repo's base branch (WO-HARNESS-WO-AUTHOR-INTAKE-
+  # REPAIR-01, "Gate algorithm"). Stdout is exactly one JSON object (GATE, GATE_ALLOW,
+  # GATE_REASONS, GATE_BASE_SHA, GATE_OVERRIDES); the report goes to stderr and
+  # $ARTIFACTS_DIR/stop-gate-report.md. The gate logic is the shared script
+  # scripts/lane/wo-author-stop-gate.sh; the rst core below is byte-identical to the build
+  # lanes so the gate extracts and judges commands exactly as a build would. 30 minutes is
+  # the node's whole budget (validator, clone, dependency install, every command); a
+  # timeout kill can skip the cleanup trap, and any leftover clone stays in $ARTIFACTS_DIR.
+  - id: stop-command-gate
+    depends_on: [dry-run-preview]
+    timeout: 1800000
+    bash: |
+      set -uo pipefail
+      # ---- BEGIN rst core (byte-identical across lanes; extracted by unit test) ----
+      # POSIX awk only (the container ships mawk, not gawk): no IGNORECASE, no gensub.
+      # rst_class   (spec on stdin -> CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR; default CODE)
+      #   Reads the first "WO Class:" / "Class:" line. Doctrine default is CODE (Rule 14).
+      rst_class() {
+        local c
+        c="$(grep -m1 -E '^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*(CODE|INFRA|MIXED|DOCUMENTATION|DOCS|OPERATOR)' | sed -E 's/^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*//' | grep -oE '^[A-Z]+' | head -1 || true)"
+        case "$c" in
+          CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR) printf '%s' "$c" ;;
+          DOCS) printf 'DOCUMENTATION' ;;
+          *) printf 'CODE' ;;
+        esac
+      }
+      # inline-flag rejection: -c -e --eval -p --print -r --require -i -m
+      rst_has_inline_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            -c|-e|--eval|-p|--print|-r|--require|-i|-m|-c=*|-e=*|--eval=*|-p=*|--print=*|-r=*|--require=*|-i=*|-m=*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      # The command check and the execution consume the words of ONE shared quote-aware
+      # tokenizer, scripts/lane/rsg-argv.sh (rsg_parse_chain, WO-HARNESS-GREP-STOP-EXTRACTION-
+      # SILENT-WAIVE-01), the same file the run-stop-greps node sources. Resolution order:
+      # $BDC_RSGARGV_SCRIPT (tests), then the engine per-node copy
+      # $ARCHON_LANE_SCRIPTS_DIR/rsg-argv.sh, then the image copy /app/scripts/lane/rsg-argv.sh.
+      # When none exists a command that contains a quote character is refused (fail closed) and
+      # a command with no quote character is split on whitespace exactly as before.
+      RSGARGV_SCRIPT=""
+      for rsgargv_candidate in "${BDC_RSGARGV_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/rsg-argv.sh}" /app/scripts/lane/rsg-argv.sh; do
+        if [ -n "$rsgargv_candidate" ] && [ -f "$rsgargv_candidate" ]; then RSGARGV_SCRIPT="$rsgargv_candidate"; break; fi
+      done
+      if [ -n "$RSGARGV_SCRIPT" ]; then
+        . "$RSGARGV_SCRIPT"
+      else
+        printf 'run-stop-tests: rsg-argv.sh missing (tried BDC_RSGARGV_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/rsg-argv.sh); a command containing a quote character will be refused (fail closed)\n' "${BDC_RSGARGV_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+        RSG_PARSED=()
+        rsg_parse_chain() { RSG_PARSED=(); return 1; }
+      fi
+      # Segment separator element in RST_WORDS (the one-character string ASCII 0x1E; the same value
+      # as RSG_RS in rsg-argv.sh, defined here so the helper-missing path needs no helper).
+      RST_RS=$'\036'
+      RST_WORDS=()
+      # rst_parse_cmd <cmd>   (rc 0 and RST_WORDS filled: one argv word per element, && segments
+      #   separated by the single element RST_RS; rc 1 rejects the command). With the helper this
+      #   is rsg_parse_chain: single-quoted words are one literal argv word each, double quotes,
+      #   backslashes, ; | & ` $ ( ) > < and {{ outside quotes are refused. The chain scanner also
+      #   accepts glob characters outside quotes; the rst charset never did, so they are refused
+      #   here (checked on the command with its quoted spans removed). Without the helper: any
+      #   quote character is refused, otherwise the legacy whitespace split with the legacy
+      #   charset ^[A-Za-z0-9@%+=:,./_-]+$ per word.
+      rst_parse_cmd() {
+        local LC_ALL=C
+        local cmd="${1-}" rest seg w more
+        local -a out=()
+        RST_WORDS=()
+        if [ -n "$RSGARGV_SCRIPT" ]; then
+          rsg_parse_chain "$cmd" || return 1
+          case "$(printf '%s' "$cmd" | sed "s/'[^']*'//g")" in *'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
+          RST_WORDS=("${RSG_PARSED[@]}")
+          return 0
+        fi
+        case "$cmd" in *"'"*|*'"'*|*'\'*) return 1 ;; esac
+        case "$cmd" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1 ;; esac
+        case "${cmd//&&/}" in *'&'*) return 1 ;; esac
+        rest="$cmd"
+        while :; do
+          case "$rest" in
+            *'&&'*) seg="${rest%%&&*}"; rest="${rest#*&&}"; more=1 ;;
+            *) seg="$rest"; rest=""; more=0 ;;
+          esac
+          set -f
+          set -- $seg
+          set +f
+          [ $# -gt 0 ] || return 1
+          for w in "$@"; do
+            [[ "$w" =~ ^[A-Za-z0-9@%+=:,./_-]+$ ]] || return 1
+            out+=("$w")
+          done
+          [ "$more" -eq 1 ] || break
+          out+=("$RST_RS")
+        done
+        RST_WORDS=("${out[@]}")
+        return 0
+      }
+      # rst_has_install_step <word...>   (rc 0 when one parsed segment holds a dependency-install
+      #   step: npm|npm.cmd|pnpm|yarn|bun followed by ci|install|i|add)
+      rst_has_install_step() {
+        local -a a=("$@")
+        local i
+        for ((i = 0; i + 1 < ${#a[@]}; i++)); do
+          case "${a[i]}" in
+            npm|npm.cmd|pnpm|yarn|bun)
+              case "${a[i+1]}" in ci|install|i|add) return 0 ;; esac
+              ;;
+          esac
+        done
+        return 1
+      }
+      rst_is_repo_script() {
+        local p="$1" oldifs seg
+        case "$p" in /*|-*) return 1 ;; esac
+        case "$p" in *.js|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.sh) ;; *) return 1 ;; esac
+        oldifs="$IFS"; IFS=/; set -f; set -- $p; set +f; IFS="$oldifs"
+        for seg in "$@"; do
+          [ "$seg" = ".." ] && return 1
+        done
+        return 0
+      }
+      # rst_argv_looks_runnable <word...>   (rc 0 when the already-parsed argv words of ONE && segment
+      #   name an allowlisted runner with its safe arguments; there is no tokenizing here)
+      rst_argv_looks_runnable() {
+        local runner
+        [ $# -ge 2 ] || return 1
+        runner="$1"
+        shift
+        case "$runner" in
+          node|npm|npx|bun|bunx|pytest|python|python3|go|cargo|bash|sh|make) ;;
+          *) return 1 ;;
+        esac
+        case "$runner" in
+          python|python3)
+            if [ "$1" = "-m" ] && { [ "${2:-}" = "pytest" ] || [ "${2:-}" = "unittest" ]; }; then
+              shift 2
+              rst_has_inline_flag "$@" && return 1
+              return 0
+            fi
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          node|bash|sh)
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          bun)
+            if [ "$1" = "test" ] || [ "$1" = "run" ]; then
+              if [ "$1" = "run" ]; then
+                [ -n "${2:-}" ] || return 1
+                printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
+              fi
+              rst_has_inline_flag "$@" && return 1
+              return 0
+            fi
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          npm)
+            [ "$1" = "test" ] || [ "$1" = "run" ] || return 1
+            if [ "$1" = "run" ]; then
+              [ -n "${2:-}" ] || return 1
+              printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
+            fi
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          npx|bunx)
+            printf '%s' "$1" | grep -qE '^[A-Za-z0-9@/._-]+$' || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          pytest|go|cargo|make)
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+        esac
+        return 1
+      }
+      # rst_command_looks_runnable <cmd>   (rc 0 when the line parses -- through the shared
+      #   quote-aware tokenizer, no shell -- to an allowlisted runner FOLLOWED BY AN ARGUMENT -- a
+      #   bare "node" or "bun" mentioned in prose is not a command (live false positive, run
+      #   f4dabd76) -- with no inline interpreter modes, and is not a dependency-install step).
+      #   Interpreters (node|bun|python|python3|bash|sh) must take a relative repo script path (.js
+      #   .mjs .cjs .ts .tsx .py .sh), not -c/-e/--eval, and a quoted "-e" is refused like a bare
+      #   one because the checks run on the parsed words. python -m pytest|unittest is the only -m
+      #   exception. A single-quoted multi-word argument is one argv word. Round-4 metacharacter
+      #   rejection still applies (see rst_parse_cmd).
+      rst_command_looks_runnable() {
+        local cmd="$1" k=0 total
+        local -a words=() seg=()
+        rst_parse_cmd "$cmd" || return 1
+        words=("${RST_WORDS[@]}")
+        total=${#words[@]}
+        [ "$total" -gt 0 ] || return 1
+        # Preserve an optional "cd safe/subdir &&" prefix and declared chains of test runners.
+        # Every remaining && segment must itself be argv-runnable.
+        if [ "${words[0]}" = "cd" ]; then
+          [ "$total" -ge 4 ] && [ "${words[2]}" = "$RST_RS" ] || return 1
+          printf '%s' "${words[1]}" | grep -qE '^[A-Za-z0-9_./-]+$' || return 1
+          k=3
+        fi
+        while [ "$k" -lt "$total" ]; do
+          seg=()
+          while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RST_RS" ]; do
+            seg+=("${words[k]}")
+            k=$((k + 1))
+          done
+          [ "${#seg[@]}" -gt 0 ] || return 1
+          if rst_has_install_step "${seg[@]}"; then
+            return 1
+          fi
+          rst_argv_looks_runnable "${seg[@]}" || return 1
+          k=$((k + 1))
+        done
+        return 0
+      }
+      # rst_extract_commands   (spec on stdin -> one declared test command per line, deduped,
+      #   first 8). Ladder, in document order:
+      #     A. the template "Stop N (test suite|tests|unit tests|suite ...)" block(s): the
+      #        command line(s) up to "Expected:" (backslash joins continuation lines)
+      #     B. any backticked runner command inside a "Stop conditions" / "Stop Point" /
+      #        "Test scenarios" / "Verification" section, or on any "When:" line
+      #     C. the Section 9 "Tests: <n>/<n> (<command>)" parenthesised group(s)
+      #   Callers filter with rst_command_looks_runnable (drops prose, placeholders,
+      #   install steps).
+      rst_extract_commands() {
+        awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
+          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+          function emit(c) { c = clean(c); if (c != "" && !(c in seen)) { seen[c] = 1; print c } }
+          tstate == 1 {
+            if ($0 ~ /^[ \t]*```/) next
+            line = clean($0)
+            if (line == "") next
+            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0; next }
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
+            else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
+          }
+          tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Tt]est|[Uu]nit|[Ss]uite)/ { tstate = 1; tcmd = ""; next }
+          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition|[Ss]top [Pp]oint|[Tt]est [Ss]cenario|[Tt]est [Pp]lan|[Vv]erification/) ? 1 : 0 }
+          insec || $0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/ {
+            s = $0
+            while (match(s, /`[^`]+`/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          /^[ \t]*Tests:[ \t]/ {
+            s = $0
+            while (match(s, /\([^)]*\)/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          END { if (tstate == 1 && tcmd != "") emit(tcmd) }
+        ' | head -n 8
+      }
+      # rst_rescue_subdir <cmd>   (-> cmd, or "cd <dir> && <cmd>" when the command's first
+      #   relative path does not exist at the worktree root but exists in exactly one
+      #   depth-1 directory -- shopops specs write "node tests/x.js" meaning shopops-api/).
+      #   Works on the parsed argv words, so a quoted multi-word argument is never split
+      #   or mistaken for a path.
+      rst_rescue_subdir() {
+        local cmd="$1" tok p="" d hit="" n=0
+        case "$cmd" in cd\ *|*'&& cd '*) printf '%s' "$cmd"; return 0 ;; esac
+        rst_parse_cmd "$cmd" || { printf '%s' "$cmd"; return 0; }
+        for tok in "${RST_WORDS[@]}"; do
+          case "$tok" in
+            "$RST_RS"|-*|*://*|*'='*|*' '*|*$'\t'*) continue ;;
+            */*) p="${tok#./}"; break ;;
+          esac
+        done
+        if [ -z "$p" ] || [ -e "$p" ]; then printf '%s' "$cmd"; return 0; fi
+        for d in */; do
+          d="${d%/}"
+          case "$d" in node_modules|.git|dist|build) continue ;; esac
+          if [ -e "$d/$p" ]; then hit="$d"; n=$((n + 1)); fi
+        done
+        if [ "$n" -eq 1 ]; then printf 'cd %s && %s' "$hit" "$cmd"; else printf '%s' "$cmd"; fi
+      }
+      # rst_tests_in_diff <base-sha>   (-> one test command per line derived from the test
+      #   files this run created or modified since <base-sha>, plus untracked test files;
+      #   empty when the diff touched no test files). Runner choice: *.test.* / *.spec.* /
+      #   __tests__/ -> vitest if the root package.json declares vitest, jest if jest, else
+      #   bun test; <dir>/tests/test_*.js -> "cd <dir> && node tests/<file>"; *.py -> pytest.
+      #   Fixtures, helpers, run_all.js, snapshots and data files are excluded.
+      rst_tests_in_diff() {
+        local base="$1" files f js_runner="" bun_files="" py_files=""
+        files="$( { git diff --name-only "$base" -- 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u \
+          | grep -E '(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]*\.(js|mjs|cjs|py|sh)$' \
+          | grep -vE '(^|/)(fixtures?|helpers?|__snapshots__|__mocks__|setup)/|(^|/)(run_all|_[^/]*|setup[^/]*|conftest)\.[a-z]+$|\.(json|md|txt|csv|snap|sql|yaml|yml|html)$' || true)"
+        [ -n "$files" ] || return 0
+        if [ -f package.json ]; then
+          if grep -q '"vitest"' package.json; then js_runner="npx vitest run"
+          elif grep -q '"jest"' package.json; then js_runner="npx jest"
+          fi
+        fi
+        [ -n "$js_runner" ] || js_runner="bun test"
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          [ -e "$f" ] || continue
+          case "$f" in
+            *.py) py_files="${py_files:+$py_files }$f" ;;
+            *.test.*|*.spec.*|*__tests__/*) bun_files="${bun_files:+$bun_files }$f" ;;
+            */tests/test_*.js|*/tests/test_*.mjs|*/tests/test_*.cjs) printf 'cd %s && node tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.js|tests/test_*.mjs|tests/test_*.cjs) printf 'node %s\n' "$f" ;;
+            */tests/test_*.sh) printf 'cd %s && bash tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.sh|tests/*.test.sh|tests/*_test.sh) printf 'bash %s\n' "$f" ;;
+            *) ;;
+          esac
+        done <<<"$files"
+        [ -n "$bun_files" ] && printf '%s %s\n' "$js_runner" "$bun_files"
+        [ -n "$py_files" ] && printf 'pytest %s\n' "$py_files"
+        return 0
+      }
+      # rst_repo_test_script   (-> the repo's own canonical test command when the root
+      #   package.json declares a "test" script: "bun run test" when a bun lockfile is
+      #   present, else "npm test"; empty otherwise). Last rung of the ladder: a CODE WO
+      #   whose spec names no command and whose diff touched no test file still gets
+      #   real numbers from the repo's suite instead of N/A.
+      rst_repo_test_script() {
+        [ -f package.json ] || return 0
+        python3 -c 'import json,sys; d=json.load(open("package.json")); s=d.get("scripts",{}); sys.exit(0 if isinstance(s,dict) and s.get("test") else 1)' 2>/dev/null || return 0
+        if [ -f bun.lock ] || [ -f bun.lockb ]; then printf 'bun run test\n'; else printf 'npm test\n'; fi
+      }
+      # rst_parse_counts   (test-runner output on stdin -> "<passed> <total>", or empty)
+      #   Sums every recognised summary line (a chained "a && b && c" command prints
+      #   several). Recognised: shopops run_all "Passed: N  Failed: M  Total: T" and
+      #   per-file "Tests: P/T"; jest "Tests: N failed, M passed, T total"; vitest
+      #   "Tests  N failed | M passed (T)"; bun "N pass" / "M fail"; TAP and node:test
+      #   "# pass N" / "pass N"; mocha "N passing" / "M failing"; pytest "N passed, M
+      #   failed in Xs". Fallback: count "PASS:"/"ok" vs "FAIL:"/"not ok" lines. ANSI
+      #   colour codes are stripped first (vitest).
+      rst_parse_counts() {
+        local esc raw counts
+        esc="$(printf '\033')"
+        # Bun --filter prefixes each workspace test line; normalize parser input only.
+        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g" | sed -E 's/^(@[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)?[A-Za-z0-9_-][A-Za-z0-9_.-]*:test[[:blank:]]+\|[[:blank:]]*//')"
+        counts="$(printf '%s\n' "$raw" | awk '
+          /^[ \t]*Passed: [0-9]+[ \t]+Failed: [0-9]+[ \t]+Total: [0-9]+/ { p += $2; t += $6; hit = 1; next }
+          /^[ \t]*Tests: [0-9]+\/[0-9]+[ \t]*$/ { split($2, a, "/"); p += a[1]; t += a[2]; hit = 1; next }
+          /^[ \t]*Tests:.*[0-9]+ total/ { for (i = 1; i < NF; i++) { if ($(i+1) == "passed," || $(i+1) == "passed") p += $i; if ($(i+1) == "total") t += $i }; hit = 1; next }
+          /^[ \t]*Tests[ \t]+.*[0-9]+ passed.*\([0-9]+\)[ \t]*$/ { for (i = 1; i < NF; i++) { if ($(i+1) == "passed") p += $i }; m = $NF; gsub(/[()]/, "", m); t += m; hit = 1; next }
+          /^[ \t]*[0-9]+ pass[ \t]*$/ { p += $1; t += $1; hit = 1; next }
+          /^[ \t]*[0-9]+ fail[ \t]*$/ { t += $1; hit = 1; next }
+          /(^|[^A-Za-z0-9])pass [0-9]+[ \t]*$/ { p += $NF; t += $NF; hit = 1; next }
+          /(^|[^A-Za-z0-9])fail [0-9]+[ \t]*$/ { t += $NF; hit = 1; next }
+          /^[ \t]*[0-9]+ passing/ { p += $1; t += $1; hit = 1; next }
+          /^[ \t]*[0-9]+ failing/ { t += $1; hit = 1; next }
+          /^=+ .*[0-9]+ (passed|failed).* in [0-9.]+s/ { for (i = 1; i < NF; i++) { w = $(i+1); gsub(/,/, "", w); if (w == "passed") { p += $i; t += $i } else if (w == "failed" || w == "error" || w == "errors") t += $i }; hit = 1; next }
+          END { if (hit) print p, t }
+        ')"
+        if [ -z "$counts" ]; then
+          local pass fail
+          pass="$(printf '%s\n' "$raw" | grep -cE '^(PASS|ok)([: ]|$)' || true)"
+          fail="$(printf '%s\n' "$raw" | grep -cE '^(FAIL|not ok)([: ]|$)' || true)"
+          pass="${pass:-0}"; fail="${fail:-0}"
+          if [ "$pass" -gt 0 ] || [ "$fail" -gt 0 ]; then
+            counts="$pass $((pass + fail))"
+          fi
+        fi
+        printf '%s' "$counts"
+      }
+      # Remove production credentials and switches before any test command is spawned.
+      # Preserve _TEST_ names: CI supplies disposable fixtures; production never uses them.
+      rst_scrub_env() {
+        local name
+        for name in $(env | sed -n 's/=.*//p'); do
+          case "$name" in
+            *_TEST_*) continue ;;
+            OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL|TELEGRAM_*)
+              unset "$name"
+              ;;
+          esac
+        done
+      }
+      # Split declared semicolon segments outside literal single-quoted arguments.
+      # Each resulting segment still passes the existing argv allowlist (no shell eval).
+      rst_split_segments() {
+        local line c part="" quoted=0 i
+        while IFS= read -r line; do
+          part=""; quoted=0
+          for ((i=0; i<${#line}; i++)); do
+            c="${line:i:1}"
+            if [ "$c" = "'" ]; then quoted=$((1 - quoted)); fi
+            if [ "$c" = ";" ] && [ "$quoted" -eq 0 ]; then
+              printf '%s\n' "$part"; part=""
+            else part+="$c"; fi
+          done
+          printf '%s\n' "$part"
+        done
+      }
+      # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
+      #   1500 s budget as the parsed argv words of the shared tokenizer -- no bash -c -- appends
+      #   every command's output to <log> under a "### run-stop-tests:" header, and prints
+      #   "<exit> <passed> <total>" -- exit is the first nonzero exit, counts are summed across
+      #   commands; "<exit>  " (empty counts) when nothing parsed). Optional "cd <dir> &&" is
+      #   performed in-process; remaining && segments run sequentially. pipefail is
+      #   unused (pipes are already rejected).
+      rst_run_commands() {
+        local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
+        local saved_pwd d k total piece piece_counts piece_cmd env_reason="" word needs_postgres
+        local -a words=() segw=()
+        rst_scrub_env
+        saved_pwd="$(pwd)"
+        seg="$(mktemp)"
+        while IFS= read -r cmd; do
+          [ -z "$cmd" ] && continue
+          printf '### run-stop-tests: %s\n' "$cmd" >> "$log"
+          cd "$saved_pwd" || continue
+          : > "$seg"
+          rc=0
+          if ! rst_command_looks_runnable "$cmd"; then
+            printf 'rst_run_commands: refusing non-runnable command\n' > "$seg"
+            rc=1
+          else
+            rst_parse_cmd "$cmd" || true
+            words=("${RST_WORDS[@]}")
+            needs_postgres=0
+            for word in "${words[@]}"; do
+              case "$word" in --postgres|--postgres=*) needs_postgres=1 ;; esac
+            done
+            if [ "$needs_postgres" -eq 1 ] && [ "${BDC_BUILDER_POSTGRES:-}" != "1" ]; then
+              env_reason="postgres capability absent in this lane"
+              printf '### skipped: %s\n' "$env_reason" >> "$log"
+              continue
+            fi
+            total=${#words[@]}
+            k=0
+            if [ "$total" -gt 0 ] && [ "${words[0]}" = "cd" ]; then
+              d="${words[1]}"
+              k=3
+              if ! cd "$d"; then
+                printf 'rst_run_commands: cd %s failed\n' "$d" > "$seg"
+                rc=1
+              fi
+            fi
+            if [ "$rc" -eq 0 ]; then
+              while :; do
+                segw=()
+                while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RST_RS" ]; do
+                  segw+=("${words[k]}")
+                  k=$((k + 1))
+                done
+                set -- "${segw[@]}"
+                if [ $# -eq 0 ]; then rc=1; break; fi
+                # Rewrite npx/npm to bun only after the original argv passed the allowlist.
+                # When the real binary is on PATH, leave the command unchanged.
+                if [ "$1" = "npx" ] && ! command -v "${RST_NPX_BIN:-npx}" >/dev/null 2>&1; then
+                  if command -v bunx >/dev/null 2>&1; then
+                    shift
+                    set -- bunx "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  elif command -v bun >/dev/null 2>&1; then
+                    shift
+                    set -- bun x "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                elif [ "$1" = "npm" ] && ! command -v "${RST_NPM_BIN:-npm}" >/dev/null 2>&1 && command -v bun >/dev/null 2>&1; then
+                  if [ "${2:-}" = "test" ]; then
+                    shift 2
+                    set -- bun run test "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  elif [ "${2:-}" = "run" ] && [ -n "${3:-}" ]; then
+                    shift 2
+                    set -- bun run "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                fi
+                piece="$(mktemp)"
+                piece_cmd="${segw[*]}"
+                timeout "$(rst_timeout)" "$@" > "$piece" 2>&1 < /dev/null
+                rc=$?
+                piece_counts="$(rst_parse_counts < "$piece")"
+                cat "$piece" >> "$seg"
+                printf 'TESTS_COMMAND_RESULT=%s => exit %s, %s/%s\n' "$piece_cmd" "$rc" "${piece_counts%% *}" "${piece_counts##* }" >> "$log"
+                rm -f "$piece"
+                [ "$rc" -ne 0 ] && break
+                k=$((k + 1))
+                [ "$k" -ge "$total" ] && break
+              done
+            fi
+          fi
+          cat "$seg" >> "$log"
+          printf '### exit %s\n' "$rc" >> "$log"
+          [ "$rc" -ne 0 ] && [ "$exit_code" -eq 0 ] && exit_code="$rc"
+          c="$(rst_parse_counts < "$seg")"
+          if [ -n "$c" ]; then p=$((p + ${c%% *})); t=$((t + ${c##* })); hit=1; fi
+        done < "$cmds"
+        cd "$saved_pwd" || true
+        rm -f "$seg"
+        if [ "$hit" -eq 1 ]; then printf '%s %s %s' "$exit_code" "$p" "$t"; else printf '%s  ' "$exit_code"; fi
+        [ -z "$env_reason" ] || printf '\t%s' "$env_reason"
+        return 0
+      }
+      # rst_report <class> <cmd> <exit> <counts> [env_reason] [log_path]
+      #   A declared environment probe wins over blocked reasons; absent capability is
+      #   not repairable, even if another declared command failed or timed out.
+      #   Status law: passed only when the command exited 0 AND passed == total > 0.
+      #   Any nonzero exit, any failing test, or 0 tests ran is "failed". A
+      #   spec-declared command that exited nonzero with no parseable counts is
+      #   also "failed" (the required command failed; do not treat it as an
+      #   unparseable rung). Other unparseable output is "counts_unparsed"
+      #   (fail-closed downstream on CODE/MIXED). A CODE or MIXED spec with no
+      #   runnable test command AND no test files in the diff is
+      #   "no_command_declared" (spec + build defect).
+      rst_report() {
+        local class="$1" cmd="$2" exit_code="$3" counts="$4" env_reason="${5:-}" status line p t reason
+        if [ -n "$env_reason" ]; then
+          line="${counts:-0 0}"
+          line="${line/ /\/} ($cmd) -- ENVIRONMENT UNAVAILABLE: $env_reason"
+          printf 'TESTS_ENV_REASON=%s\nTESTS_STATUS=env_unavailable\nTESTS_LINE=%s\n' "$env_reason" "$line"
+          return 0
+        fi
+        reason="$(rst_failure_reason "$exit_code" "${6:-/dev/null}" "$cmd")"
+        if [ -n "$reason" ]; then
+          printf 'TESTS_STATUS=blocked\nTESTS_LINE=BLOCKED (%s)\nTESTS_BLOCKED_REASON=%s\n' "$reason" "$reason"
+          return 0
+        fi
+        if [ -z "$cmd" ]; then
+          case "$class" in
+            CODE|MIXED) status="no_command_declared"; line="N/A ($class spec declares no executable test command and the diff touched no test files -- Rule 10 defect)" ;;
+            *) status="not_required"; line="N/A ($class class, no test command declared)" ;;
+          esac
+        elif [ -z "$counts" ]; then
+          if [ "$exit_code" -ne 0 ] && [ "${SOURCE:-}" = "spec_declared" ]; then
+            status="failed"
+            line="N/A (spec-declared test command exited $exit_code with no parseable counts: $cmd) -- FAILED"
+          else
+            status="counts_unparsed"
+            line="N/A (test command exited $exit_code but pass/total could not be parsed from its output: $cmd)"
+          fi
+        else
+          p="${counts%% *}"; t="${counts##* }"
+          if [ "$exit_code" -ne 0 ] || [ "$t" -eq 0 ] || [ "$p" -lt "$t" ]; then
+            status="failed"
+            line="$p/$t ($cmd) -- FAILED, exit $exit_code"
+          else
+            status="passed"
+            line="$p/$t ($cmd)"
+          fi
+        fi
+        printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
+      }
+
+      # Project-map values are clamped separately; direct fixture overrides may be <60.
+      rst_timeout() {
+        local value="${RST_TIMEOUT_SECONDS:-1500}"
+        if ! [[ "$value" =~ ^[0-9]+$ ]]; then value=1500; fi
+        value="$(printf '%s' "$value" | sed 's/^0*//')"
+        if [ -z "$value" ]; then value=1500
+        elif [ "${#value}" -gt 4 ] || [ "$value" -gt 1700 ]; then value=1700; fi
+        printf '%s' "$value"
+      }
+      rst_failure_reason() {
+        local rc="$1" log="${2:-/dev/null}" cmd="${3:-}" tool
+        if [ "$rc" -eq 124 ]; then printf 'timeout:%ss' "$(rst_timeout)"; return; fi
+        if grep -q 'outside of the test runner' "$log" && [[ "$(command -v node)" == *bun-node-fallback-bin/* || "$(command -v node)" == */bun ]]; then
+          printf 'runner_mismatch:node-is-bun'; return
+        fi
+        if [ "$rc" -eq 127 ] || grep -q 'failed to run command' "$log"; then
+          tool="$(sed -nE 's/.*failed to run command [^A-Za-z0-9_/.-]*([A-Za-z0-9_/.-]+).*/\1/p' "$log" | head -1)"
+          [ -n "$tool" ] || tool="${cmd%% *}"
+          printf 'missing_tool:%s' "${tool:-unknown}"
+        fi
+      }
+      # Same canonical-block selection and required stage keys as parse-stages.
+      # An absent plan is empty; an ambiguous or invalid declared plan fails closed.
+      rst_stage_plan() {
+        python3 -c '
+      import re, sys
+      spec = sys.stdin.read()
+      candidates = [(m.start(), m.group(1)) for m in re.finditer(r"```ya?ml\s*\n(.*?)\n```", spec, re.S) if re.search(r"^stages:", m.group(1), re.M)]
+      if not candidates:
+          m = re.search(r"^stages:[^\n]*(?:\n(?:[ \t-][^\n]*|))*(?:\n|$)", spec, re.M)
+          if m: candidates = [(0, m.group())]
+      if not candidates: sys.exit(0)
+      markers = [r"^\s*##+\s+Canonical\s+stages\b", r"^\s*##+\s+Stages\b", r"<!--\s*canonical-stages\s*-->", r"<!--\s*stages:\s*canonical\s*-->"]
+      chosen = next((body for marker in markers for offset, body in candidates if re.search(marker, spec[max(0, offset-600):offset], re.I|re.M)), None)
+      if chosen is None:
+          if len(candidates) != 1: sys.exit("stage_plan_invalid: ambiguous canonical stages")
+          chosen = candidates[0][1]
+      import yaml
+      data = yaml.safe_load(chosen)
+      stages = data.get("stages") if isinstance(data, dict) else None
+      if not isinstance(stages, list) or not stages: sys.exit("stage_plan_invalid: empty stages")
+      seen = set()
+      lines = []
+      for st in stages:
+          if not isinstance(st, dict) or any(k not in st for k in ["id","repo","target_branch","in_scope_files","verify_commands","readiness_bar"]): sys.exit("stage_plan_invalid: required key missing")
+          sid, repo, commands = st["id"], st["repo"], st["verify_commands"]
+          if not isinstance(sid,str) or not re.fullmatch(r"[A-Za-z0-9_.-]+",sid) or sid in seen: sys.exit("stage_plan_invalid: invalid or duplicate id")
+          seen.add(sid)
+          if not isinstance(repo,str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",repo): sys.exit("stage_plan_invalid: invalid repo")
+          if not isinstance(commands,list) or not commands: sys.exit("stage_plan_invalid: empty verify_commands")
+          for cmd in commands:
+              if not isinstance(cmd,str) or not cmd.strip() or any(c in cmd for c in "\t\r\n\x00"): sys.exit("stage_plan_invalid: invalid command")
+              lines.append("\t".join([sid,repo,cmd,str(st["target_branch"])]))
+      print("\n".join(lines))' | sed 's/\r$//'
+      }
+      # Shared directory resolution for execution and assertion-guard coverage.
+      rst_stage_dir() {
+        local sid="$1" repo="$2" dir origin
+        dir="$(printf '%s\n' "${RST_STAGE_WORKTREES:-}" | tr ';' '\n' | sed -n "s/^${sid}=//p" | head -1)"
+        origin="$(git remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]##; s/[.]git$//')"
+        if [ -z "$dir" ] && [ "$repo" = "$origin" ]; then dir="$(pwd)"; fi
+        printf '%s\n' "$dir"
+      }
+      # Replays only the persisted plan; no spec extraction occurs in a repair or final run.
+      rst_execute_saved() {
+        local evidence="$1" class="$2" cmds log result rc counts joined report reason="" env_reason="" overall_env_reason="" overall=passed p=0 t=0
+        local sid repo cmd dir stage_status stage_line lines="" blocked="" stage_cmds
+        cmds="$evidence/stop-tests.commands"; log="$evidence/stop-tests.log"
+        if [ -s "$evidence/stop-tests.stages" ]; then
+          stage_cmds="$(mktemp)"
+          while IFS= read -r sid; do
+            repo="$(awk -F '\t' -v id="$sid" '$1==id {print $2; exit}' "$evidence/stop-tests.stages")"
+            awk -F '\t' -v id="$sid" '$1==id {print $3}' "$evidence/stop-tests.stages" > "$stage_cmds"
+            dir="$(rst_stage_dir "$sid" "$repo")"
+            if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+              stage_status=blocked; reason="stage_repo_absent:$repo"; stage_line="$sid: BLOCKED ($reason)"
+            else
+              joined="$(paste -sd ';' "$stage_cmds" | sed 's/;/; /g')"
+              local stage_log
+              stage_log="$(mktemp)"
+              result="$(cd "$dir" && rst_run_commands "$stage_cmds" "$stage_log")"
+              cat "$stage_log" >> "$log"
+              env_reason=""
+              case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
+              rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
+              report="$(SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$stage_log")"
+              stage_status="$(echo "$report" | sed -n 's/^TESTS_STATUS=//p')"
+              reason="$(echo "$report" | sed -n 's/^TESTS_BLOCKED_REASON=//p')"
+              stage_line="$sid: $(echo "$report" | sed -n 's/^TESTS_LINE=//p')"
+              if [ -n "$counts" ]; then p=$((p+${counts%% *})); t=$((t+${counts##* })); fi
+              rm -f "$stage_log"
+            fi
+            if [ "$stage_status" = env_unavailable ]; then
+              overall=env_unavailable
+              [ -n "$overall_env_reason" ] || overall_env_reason="$(echo "$report" | sed -n 's/^TESTS_ENV_REASON=//p')"
+            elif [ "$stage_status" = blocked ]; then
+              [ "$overall" = env_unavailable ] || overall=blocked
+              [ -n "$blocked" ] || blocked="$reason"
+            elif [ "$stage_status" != passed ] && [ "$overall" != blocked ] && [ "$overall" != env_unavailable ]; then overall=failed; fi
+            printf 'TESTS_STAGE_LINE=%s\n' "$stage_line"
+            lines="${lines:+$lines | }$stage_line"
+          done < <(cut -f1 "$evidence/stop-tests.stages" | awk '!seen[$0]++')
+          rm -f "$stage_cmds"
+          [ -z "$overall_env_reason" ] || printf 'TESTS_ENV_REASON=%s\n' "$overall_env_reason"
+          printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\nTESTS_BLOCKED_REASON=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\nTESTS_EXIT=%s\n' "$overall" "$lines" "$blocked" "$p" "$t" "$([ "$overall" = passed ] && echo 0 || echo 1)"
+        else
+          joined="$(paste -sd ';' "$cmds" | sed 's/;/; /g')"
+          local command_log
+          command_log="$(mktemp)"
+          result="$(rst_run_commands "$cmds" "$command_log")"
+          cat "$command_log" >> "$log"
+          env_reason=""
+          case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
+          rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
+          SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$command_log"
+          printf 'TESTS_EXIT=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\n' "$rc" "${counts%% *}" "${counts##* }"
+          rm -f "$command_log"
+        fi
+        printf 'TESTS_CLASS=%s\n' "$class"
+        grep '^TESTS_COMMAND_RESULT=' "$log" || true
+      }
+      # Persist executable functions before the agent runs. Both consumers source this
+      # snapshot, so the embedded rst/trg cores have one byte-identical copy per lane.
+      rst_save_core() {
+        { declare -f $(compgen -A function | grep -E '^(rst_|trg_|_?rsg_)'); declare -p RSGARGV_SCRIPT RST_RS RST_WORDS RSG_US RSG_RS RSG_PARSED; } > "$1/stop-tests.core.sh"
+      }
+      # ---- END rst core ----
+
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one source of truth). It installs
+      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent, retries
+      # once without the frozen lockfile, prints the real install output, and returns nonzero
+      # when the install failed (callers continue; the base compare treats it as base_unrunnable).
+      # Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
+      # per-node copy of the bundled script ($ARCHON_LANE_SCRIPTS_DIR/dprep.sh; works for
+      # standalone CLI and source runs), then the image copy /app/scripts/lane/dprep.sh.
+      # Only when none exists is it logged and the run continues like a failed install.
+      DPREP_SCRIPT=""
+      for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do
+        if [ -n "$dprep_candidate" ] && [ -f "$dprep_candidate" ]; then DPREP_SCRIPT="$dprep_candidate"; break; fi
+      done
+      if [ -n "$DPREP_SCRIPT" ]; then
+        . "$DPREP_SCRIPT"
+      else
+        dprep_ensure_js_deps() {
+          printf 'dprep: dprep.sh missing (tried BDC_DPREP_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/dprep.sh), cannot install JS dependencies (continuing; run-stop-tests reports the real result)\n' "${BDC_DPREP_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}"
+          return 0
+        }
+      fi
+      # ---- END dprep core ----
+
+      # Test overrides refuse outside the tests (override_not_allowed): checked here,
+      # before an overridden BDC_WAG_SCRIPT could be sourced. Only the gate tests set
+      # BDC_WAG_TEST_MODE=1; the harness container never does.
+      WAG_OVR=""
+      for wag_v in $(compgen -v | grep '^BDC_WAG_' || true); do
+        if [ -n "${!wag_v:-}" ]; then WAG_OVR="${WAG_OVR:+$WAG_OVR,}$wag_v"; fi
+      done
+      if [ -n "$(printf '%s' "$WAG_OVR" | tr ',' '\n' | grep -v '^BDC_WAG_TEST_MODE$' || true)" ] && [ "${BDC_WAG_TEST_MODE:-}" != "1" ]; then
+        printf 'stop-command gate: BDC_WAG_* overrides set without BDC_WAG_TEST_MODE=1 (%s); refusing before sourcing anything\n' "$WAG_OVR" >&2
+        printf '{"GATE":"fail","GATE_ALLOW":"no","GATE_REASONS":"0:override_not_allowed:%s","GATE_BASE_SHA":"","GATE_OVERRIDES":"%s"}\n' "$WAG_OVR" "$WAG_OVR"
+        exit 0
+      fi
+      WAG_SCRIPT=""
+      for wag_candidate in "${BDC_WAG_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/wo-author-stop-gate.sh}" /app/scripts/lane/wo-author-stop-gate.sh; do
+        if [ -n "$wag_candidate" ] && [ -f "$wag_candidate" ]; then WAG_SCRIPT="$wag_candidate"; break; fi
+      done
+      if [ -z "$WAG_SCRIPT" ]; then
+        printf 'stop-command-gate: wo-author-stop-gate.sh missing (tried BDC_WAG_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/wo-author-stop-gate.sh); failing closed\n' "${BDC_WAG_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+        printf '%s\n' '{"GATE":"fail","GATE_ALLOW":"no","GATE_REASONS":"0:gate_script_missing:wo-author-stop-gate.sh","GATE_BASE_SHA":"","GATE_OVERRIDES":""}'
+        exit 0
+      fi
+      . "$WAG_SCRIPT"
+      PREVIEW=$dry-run-preview.output
+      wag_main first "$PREVIEW"
+      exit 0
+
+  # stop-command-revise: ONE revise pass, only when the first gate failed (any reason,
+  # including validator_failed). It may fix commands, add the expected-red marker, turn a
+  # live-system stop into a plain-words operator stop, or fix numbered validator
+  # failures. It may not delete a stop, a test scenario or a required section.
+  - id: stop-command-revise
+    persona: major-build-opr
+    provider: codex
+    model: gpt-6.1-sol
+    depends_on: [stop-command-gate]
+    when: "$stop-command-gate.output.GATE == 'fail'"
+    task_class: medium_work
+    prompt: |
+      You are the BDC WO Author stop-command reviser. CWD = bdc-xo repo root. You have
+      file read/write access. You get exactly ONE pass; a second gate then re-checks the
+      spec and fails the run closed if it still fails.
+
+      ## Inputs
+      Dry-run preview (wo_id, spec_path, target_repo): $dry-run-preview.output
+      Stop-command gate result (JSON): $stop-command-gate.output
+
+      GATE_REASONS lists "<n>:<reason>:<command or detail>" entries separated by "; ".
+      The full table is in $ARTIFACTS_DIR/stop-gate-report.md (read it).
+
+      ## What you may change
+      Edit ONLY the spec file at spec_path, and only the lines behind a listed reason:
+      1. Correct a command. Example: bun_path_without_dot_slash -> write the path with a
+         leading ./ (bun test ./path/to/file.test.ts); counts_unparsed -> name a test
+         command that prints pass/fail counts.
+      2. Add the literal marker [expected red before the fix] to a Stop block whose test
+         is meant to fail until the WO is built (red_passed_before_fix means the test
+         already passes, so it is NOT expected red: fix the test or the stop instead).
+         A file it runs that does not exist yet must be listed on the manifest
+         `Files created:` line (red_unlisted_path).
+      3. Turn a stop that needs a live system (staging, a login, live data, a running
+         service) into an operator stop: header `Stop N (operator check): ...`, the
+         command written in plain words with NO backticks, ending
+         `-- recorded by the operator` (templates/README.md rules 10 and 11).
+      4. validator_failed: fix each numbered validator failure quoted in GATE_REASONS in
+         place in the spec file, then run
+         bash scripts/cauldron/validate-wo-spec.sh <spec_path>
+         and fix what it still reports.
+
+      ## What you must not do
+      - Do not delete a stop, a test scenario or a required section to make the gate pass.
+      - Do not weaken an expectation (for example, lowering a count) unless the spec's
+        own text shows the old value was wrong.
+      - Do not touch any other file. Do not commit, push or open a PR.
+      - mixed_unsupported, base_unknown, repo_mismatch, base_mismatch, checkout_failed,
+        commands_over_limit and gate_script_missing need a different spec or a human
+        (the target checks refuse before any checkout, so the final gate has no base
+        commit to re-check against); say so in one line and change nothing for them.
+
+      ## Output
+      One line per reason: `REVISED <n>:<reason>: <what changed>` or
+      `NOT REVISED <n>:<reason>: <why>`.
+
+  # stop-command-gate-final: pass or no_spec from the first gate is printed unchanged.
+  # Otherwise the same gate runs again on the revised spec, at exactly the first gate's
+  # GATE_BASE_SHA (fetched by SHA, never the moved branch tip; base_sha_unavailable if it
+  # cannot be fetched). Same 30-minute budget and output contract as stop-command-gate.
+  - id: stop-command-gate-final
+    depends_on: [stop-command-revise]
+    trigger_rule: all_done
+    timeout: 1800000
+    bash: |
+      set -uo pipefail
+      # ---- BEGIN rst core (byte-identical across lanes; extracted by unit test) ----
+      # POSIX awk only (the container ships mawk, not gawk): no IGNORECASE, no gensub.
+      # rst_class   (spec on stdin -> CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR; default CODE)
+      #   Reads the first "WO Class:" / "Class:" line. Doctrine default is CODE (Rule 14).
+      rst_class() {
+        local c
+        c="$(grep -m1 -E '^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*(CODE|INFRA|MIXED|DOCUMENTATION|DOCS|OPERATOR)' | sed -E 's/^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*//' | grep -oE '^[A-Z]+' | head -1 || true)"
+        case "$c" in
+          CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR) printf '%s' "$c" ;;
+          DOCS) printf 'DOCUMENTATION' ;;
+          *) printf 'CODE' ;;
+        esac
+      }
+      # inline-flag rejection: -c -e --eval -p --print -r --require -i -m
+      rst_has_inline_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            -c|-e|--eval|-p|--print|-r|--require|-i|-m|-c=*|-e=*|--eval=*|-p=*|--print=*|-r=*|--require=*|-i=*|-m=*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      # The command check and the execution consume the words of ONE shared quote-aware
+      # tokenizer, scripts/lane/rsg-argv.sh (rsg_parse_chain, WO-HARNESS-GREP-STOP-EXTRACTION-
+      # SILENT-WAIVE-01), the same file the run-stop-greps node sources. Resolution order:
+      # $BDC_RSGARGV_SCRIPT (tests), then the engine per-node copy
+      # $ARCHON_LANE_SCRIPTS_DIR/rsg-argv.sh, then the image copy /app/scripts/lane/rsg-argv.sh.
+      # When none exists a command that contains a quote character is refused (fail closed) and
+      # a command with no quote character is split on whitespace exactly as before.
+      RSGARGV_SCRIPT=""
+      for rsgargv_candidate in "${BDC_RSGARGV_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/rsg-argv.sh}" /app/scripts/lane/rsg-argv.sh; do
+        if [ -n "$rsgargv_candidate" ] && [ -f "$rsgargv_candidate" ]; then RSGARGV_SCRIPT="$rsgargv_candidate"; break; fi
+      done
+      if [ -n "$RSGARGV_SCRIPT" ]; then
+        . "$RSGARGV_SCRIPT"
+      else
+        printf 'run-stop-tests: rsg-argv.sh missing (tried BDC_RSGARGV_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/rsg-argv.sh); a command containing a quote character will be refused (fail closed)\n' "${BDC_RSGARGV_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+        RSG_PARSED=()
+        rsg_parse_chain() { RSG_PARSED=(); return 1; }
+      fi
+      # Segment separator element in RST_WORDS (the one-character string ASCII 0x1E; the same value
+      # as RSG_RS in rsg-argv.sh, defined here so the helper-missing path needs no helper).
+      RST_RS=$'\036'
+      RST_WORDS=()
+      # rst_parse_cmd <cmd>   (rc 0 and RST_WORDS filled: one argv word per element, && segments
+      #   separated by the single element RST_RS; rc 1 rejects the command). With the helper this
+      #   is rsg_parse_chain: single-quoted words are one literal argv word each, double quotes,
+      #   backslashes, ; | & ` $ ( ) > < and {{ outside quotes are refused. The chain scanner also
+      #   accepts glob characters outside quotes; the rst charset never did, so they are refused
+      #   here (checked on the command with its quoted spans removed). Without the helper: any
+      #   quote character is refused, otherwise the legacy whitespace split with the legacy
+      #   charset ^[A-Za-z0-9@%+=:,./_-]+$ per word.
+      rst_parse_cmd() {
+        local LC_ALL=C
+        local cmd="${1-}" rest seg w more
+        local -a out=()
+        RST_WORDS=()
+        if [ -n "$RSGARGV_SCRIPT" ]; then
+          rsg_parse_chain "$cmd" || return 1
+          case "$(printf '%s' "$cmd" | sed "s/'[^']*'//g")" in *'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
+          RST_WORDS=("${RSG_PARSED[@]}")
+          return 0
+        fi
+        case "$cmd" in *"'"*|*'"'*|*'\'*) return 1 ;; esac
+        case "$cmd" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1 ;; esac
+        case "${cmd//&&/}" in *'&'*) return 1 ;; esac
+        rest="$cmd"
+        while :; do
+          case "$rest" in
+            *'&&'*) seg="${rest%%&&*}"; rest="${rest#*&&}"; more=1 ;;
+            *) seg="$rest"; rest=""; more=0 ;;
+          esac
+          set -f
+          set -- $seg
+          set +f
+          [ $# -gt 0 ] || return 1
+          for w in "$@"; do
+            [[ "$w" =~ ^[A-Za-z0-9@%+=:,./_-]+$ ]] || return 1
+            out+=("$w")
+          done
+          [ "$more" -eq 1 ] || break
+          out+=("$RST_RS")
+        done
+        RST_WORDS=("${out[@]}")
+        return 0
+      }
+      # rst_has_install_step <word...>   (rc 0 when one parsed segment holds a dependency-install
+      #   step: npm|npm.cmd|pnpm|yarn|bun followed by ci|install|i|add)
+      rst_has_install_step() {
+        local -a a=("$@")
+        local i
+        for ((i = 0; i + 1 < ${#a[@]}; i++)); do
+          case "${a[i]}" in
+            npm|npm.cmd|pnpm|yarn|bun)
+              case "${a[i+1]}" in ci|install|i|add) return 0 ;; esac
+              ;;
+          esac
+        done
+        return 1
+      }
+      rst_is_repo_script() {
+        local p="$1" oldifs seg
+        case "$p" in /*|-*) return 1 ;; esac
+        case "$p" in *.js|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.sh) ;; *) return 1 ;; esac
+        oldifs="$IFS"; IFS=/; set -f; set -- $p; set +f; IFS="$oldifs"
+        for seg in "$@"; do
+          [ "$seg" = ".." ] && return 1
+        done
+        return 0
+      }
+      # rst_argv_looks_runnable <word...>   (rc 0 when the already-parsed argv words of ONE && segment
+      #   name an allowlisted runner with its safe arguments; there is no tokenizing here)
+      rst_argv_looks_runnable() {
+        local runner
+        [ $# -ge 2 ] || return 1
+        runner="$1"
+        shift
+        case "$runner" in
+          node|npm|npx|bun|bunx|pytest|python|python3|go|cargo|bash|sh|make) ;;
+          *) return 1 ;;
+        esac
+        case "$runner" in
+          python|python3)
+            if [ "$1" = "-m" ] && { [ "${2:-}" = "pytest" ] || [ "${2:-}" = "unittest" ]; }; then
+              shift 2
+              rst_has_inline_flag "$@" && return 1
+              return 0
+            fi
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          node|bash|sh)
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          bun)
+            if [ "$1" = "test" ] || [ "$1" = "run" ]; then
+              if [ "$1" = "run" ]; then
+                [ -n "${2:-}" ] || return 1
+                printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
+              fi
+              rst_has_inline_flag "$@" && return 1
+              return 0
+            fi
+            rst_is_repo_script "$1" || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          npm)
+            [ "$1" = "test" ] || [ "$1" = "run" ] || return 1
+            if [ "$1" = "run" ]; then
+              [ -n "${2:-}" ] || return 1
+              printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
+            fi
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          npx|bunx)
+            printf '%s' "$1" | grep -qE '^[A-Za-z0-9@/._-]+$' || return 1
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+          pytest|go|cargo|make)
+            rst_has_inline_flag "$@" && return 1
+            return 0
+            ;;
+        esac
+        return 1
+      }
+      # rst_command_looks_runnable <cmd>   (rc 0 when the line parses -- through the shared
+      #   quote-aware tokenizer, no shell -- to an allowlisted runner FOLLOWED BY AN ARGUMENT -- a
+      #   bare "node" or "bun" mentioned in prose is not a command (live false positive, run
+      #   f4dabd76) -- with no inline interpreter modes, and is not a dependency-install step).
+      #   Interpreters (node|bun|python|python3|bash|sh) must take a relative repo script path (.js
+      #   .mjs .cjs .ts .tsx .py .sh), not -c/-e/--eval, and a quoted "-e" is refused like a bare
+      #   one because the checks run on the parsed words. python -m pytest|unittest is the only -m
+      #   exception. A single-quoted multi-word argument is one argv word. Round-4 metacharacter
+      #   rejection still applies (see rst_parse_cmd).
+      rst_command_looks_runnable() {
+        local cmd="$1" k=0 total
+        local -a words=() seg=()
+        rst_parse_cmd "$cmd" || return 1
+        words=("${RST_WORDS[@]}")
+        total=${#words[@]}
+        [ "$total" -gt 0 ] || return 1
+        # Preserve an optional "cd safe/subdir &&" prefix and declared chains of test runners.
+        # Every remaining && segment must itself be argv-runnable.
+        if [ "${words[0]}" = "cd" ]; then
+          [ "$total" -ge 4 ] && [ "${words[2]}" = "$RST_RS" ] || return 1
+          printf '%s' "${words[1]}" | grep -qE '^[A-Za-z0-9_./-]+$' || return 1
+          k=3
+        fi
+        while [ "$k" -lt "$total" ]; do
+          seg=()
+          while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RST_RS" ]; do
+            seg+=("${words[k]}")
+            k=$((k + 1))
+          done
+          [ "${#seg[@]}" -gt 0 ] || return 1
+          if rst_has_install_step "${seg[@]}"; then
+            return 1
+          fi
+          rst_argv_looks_runnable "${seg[@]}" || return 1
+          k=$((k + 1))
+        done
+        return 0
+      }
+      # rst_extract_commands   (spec on stdin -> one declared test command per line, deduped,
+      #   first 8). Ladder, in document order:
+      #     A. the template "Stop N (test suite|tests|unit tests|suite ...)" block(s): the
+      #        command line(s) up to "Expected:" (backslash joins continuation lines)
+      #     B. any backticked runner command inside a "Stop conditions" / "Stop Point" /
+      #        "Test scenarios" / "Verification" section, or on any "When:" line
+      #     C. the Section 9 "Tests: <n>/<n> (<command>)" parenthesised group(s)
+      #   Callers filter with rst_command_looks_runnable (drops prose, placeholders,
+      #   install steps).
+      rst_extract_commands() {
+        awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
+          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+          function emit(c) { c = clean(c); if (c != "" && !(c in seen)) { seen[c] = 1; print c } }
+          tstate == 1 {
+            if ($0 ~ /^[ \t]*```/) next
+            line = clean($0)
+            if (line == "") next
+            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0; next }
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
+            else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
+          }
+          tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Tt]est|[Uu]nit|[Ss]uite)/ { tstate = 1; tcmd = ""; next }
+          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition|[Ss]top [Pp]oint|[Tt]est [Ss]cenario|[Tt]est [Pp]lan|[Vv]erification/) ? 1 : 0 }
+          insec || $0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/ {
+            s = $0
+            while (match(s, /`[^`]+`/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          /^[ \t]*Tests:[ \t]/ {
+            s = $0
+            while (match(s, /\([^)]*\)/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          END { if (tstate == 1 && tcmd != "") emit(tcmd) }
+        ' | head -n 8
+      }
+      # rst_rescue_subdir <cmd>   (-> cmd, or "cd <dir> && <cmd>" when the command's first
+      #   relative path does not exist at the worktree root but exists in exactly one
+      #   depth-1 directory -- shopops specs write "node tests/x.js" meaning shopops-api/).
+      #   Works on the parsed argv words, so a quoted multi-word argument is never split
+      #   or mistaken for a path.
+      rst_rescue_subdir() {
+        local cmd="$1" tok p="" d hit="" n=0
+        case "$cmd" in cd\ *|*'&& cd '*) printf '%s' "$cmd"; return 0 ;; esac
+        rst_parse_cmd "$cmd" || { printf '%s' "$cmd"; return 0; }
+        for tok in "${RST_WORDS[@]}"; do
+          case "$tok" in
+            "$RST_RS"|-*|*://*|*'='*|*' '*|*$'\t'*) continue ;;
+            */*) p="${tok#./}"; break ;;
+          esac
+        done
+        if [ -z "$p" ] || [ -e "$p" ]; then printf '%s' "$cmd"; return 0; fi
+        for d in */; do
+          d="${d%/}"
+          case "$d" in node_modules|.git|dist|build) continue ;; esac
+          if [ -e "$d/$p" ]; then hit="$d"; n=$((n + 1)); fi
+        done
+        if [ "$n" -eq 1 ]; then printf 'cd %s && %s' "$hit" "$cmd"; else printf '%s' "$cmd"; fi
+      }
+      # rst_tests_in_diff <base-sha>   (-> one test command per line derived from the test
+      #   files this run created or modified since <base-sha>, plus untracked test files;
+      #   empty when the diff touched no test files). Runner choice: *.test.* / *.spec.* /
+      #   __tests__/ -> vitest if the root package.json declares vitest, jest if jest, else
+      #   bun test; <dir>/tests/test_*.js -> "cd <dir> && node tests/<file>"; *.py -> pytest.
+      #   Fixtures, helpers, run_all.js, snapshots and data files are excluded.
+      rst_tests_in_diff() {
+        local base="$1" files f js_runner="" bun_files="" py_files=""
+        files="$( { git diff --name-only "$base" -- 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u \
+          | grep -E '(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]*\.(js|mjs|cjs|py|sh)$' \
+          | grep -vE '(^|/)(fixtures?|helpers?|__snapshots__|__mocks__|setup)/|(^|/)(run_all|_[^/]*|setup[^/]*|conftest)\.[a-z]+$|\.(json|md|txt|csv|snap|sql|yaml|yml|html)$' || true)"
+        [ -n "$files" ] || return 0
+        if [ -f package.json ]; then
+          if grep -q '"vitest"' package.json; then js_runner="npx vitest run"
+          elif grep -q '"jest"' package.json; then js_runner="npx jest"
+          fi
+        fi
+        [ -n "$js_runner" ] || js_runner="bun test"
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          [ -e "$f" ] || continue
+          case "$f" in
+            *.py) py_files="${py_files:+$py_files }$f" ;;
+            *.test.*|*.spec.*|*__tests__/*) bun_files="${bun_files:+$bun_files }$f" ;;
+            */tests/test_*.js|*/tests/test_*.mjs|*/tests/test_*.cjs) printf 'cd %s && node tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.js|tests/test_*.mjs|tests/test_*.cjs) printf 'node %s\n' "$f" ;;
+            */tests/test_*.sh) printf 'cd %s && bash tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.sh|tests/*.test.sh|tests/*_test.sh) printf 'bash %s\n' "$f" ;;
+            *) ;;
+          esac
+        done <<<"$files"
+        [ -n "$bun_files" ] && printf '%s %s\n' "$js_runner" "$bun_files"
+        [ -n "$py_files" ] && printf 'pytest %s\n' "$py_files"
+        return 0
+      }
+      # rst_repo_test_script   (-> the repo's own canonical test command when the root
+      #   package.json declares a "test" script: "bun run test" when a bun lockfile is
+      #   present, else "npm test"; empty otherwise). Last rung of the ladder: a CODE WO
+      #   whose spec names no command and whose diff touched no test file still gets
+      #   real numbers from the repo's suite instead of N/A.
+      rst_repo_test_script() {
+        [ -f package.json ] || return 0
+        python3 -c 'import json,sys; d=json.load(open("package.json")); s=d.get("scripts",{}); sys.exit(0 if isinstance(s,dict) and s.get("test") else 1)' 2>/dev/null || return 0
+        if [ -f bun.lock ] || [ -f bun.lockb ]; then printf 'bun run test\n'; else printf 'npm test\n'; fi
+      }
+      # rst_parse_counts   (test-runner output on stdin -> "<passed> <total>", or empty)
+      #   Sums every recognised summary line (a chained "a && b && c" command prints
+      #   several). Recognised: shopops run_all "Passed: N  Failed: M  Total: T" and
+      #   per-file "Tests: P/T"; jest "Tests: N failed, M passed, T total"; vitest
+      #   "Tests  N failed | M passed (T)"; bun "N pass" / "M fail"; TAP and node:test
+      #   "# pass N" / "pass N"; mocha "N passing" / "M failing"; pytest "N passed, M
+      #   failed in Xs". Fallback: count "PASS:"/"ok" vs "FAIL:"/"not ok" lines. ANSI
+      #   colour codes are stripped first (vitest).
+      rst_parse_counts() {
+        local esc raw counts
+        esc="$(printf '\033')"
+        # Bun --filter prefixes each workspace test line; normalize parser input only.
+        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g" | sed -E 's/^(@[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)?[A-Za-z0-9_-][A-Za-z0-9_.-]*:test[[:blank:]]+\|[[:blank:]]*//')"
+        counts="$(printf '%s\n' "$raw" | awk '
+          /^[ \t]*Passed: [0-9]+[ \t]+Failed: [0-9]+[ \t]+Total: [0-9]+/ { p += $2; t += $6; hit = 1; next }
+          /^[ \t]*Tests: [0-9]+\/[0-9]+[ \t]*$/ { split($2, a, "/"); p += a[1]; t += a[2]; hit = 1; next }
+          /^[ \t]*Tests:.*[0-9]+ total/ { for (i = 1; i < NF; i++) { if ($(i+1) == "passed," || $(i+1) == "passed") p += $i; if ($(i+1) == "total") t += $i }; hit = 1; next }
+          /^[ \t]*Tests[ \t]+.*[0-9]+ passed.*\([0-9]+\)[ \t]*$/ { for (i = 1; i < NF; i++) { if ($(i+1) == "passed") p += $i }; m = $NF; gsub(/[()]/, "", m); t += m; hit = 1; next }
+          /^[ \t]*[0-9]+ pass[ \t]*$/ { p += $1; t += $1; hit = 1; next }
+          /^[ \t]*[0-9]+ fail[ \t]*$/ { t += $1; hit = 1; next }
+          /(^|[^A-Za-z0-9])pass [0-9]+[ \t]*$/ { p += $NF; t += $NF; hit = 1; next }
+          /(^|[^A-Za-z0-9])fail [0-9]+[ \t]*$/ { t += $NF; hit = 1; next }
+          /^[ \t]*[0-9]+ passing/ { p += $1; t += $1; hit = 1; next }
+          /^[ \t]*[0-9]+ failing/ { t += $1; hit = 1; next }
+          /^=+ .*[0-9]+ (passed|failed).* in [0-9.]+s/ { for (i = 1; i < NF; i++) { w = $(i+1); gsub(/,/, "", w); if (w == "passed") { p += $i; t += $i } else if (w == "failed" || w == "error" || w == "errors") t += $i }; hit = 1; next }
+          END { if (hit) print p, t }
+        ')"
+        if [ -z "$counts" ]; then
+          local pass fail
+          pass="$(printf '%s\n' "$raw" | grep -cE '^(PASS|ok)([: ]|$)' || true)"
+          fail="$(printf '%s\n' "$raw" | grep -cE '^(FAIL|not ok)([: ]|$)' || true)"
+          pass="${pass:-0}"; fail="${fail:-0}"
+          if [ "$pass" -gt 0 ] || [ "$fail" -gt 0 ]; then
+            counts="$pass $((pass + fail))"
+          fi
+        fi
+        printf '%s' "$counts"
+      }
+      # Remove production credentials and switches before any test command is spawned.
+      # Preserve _TEST_ names: CI supplies disposable fixtures; production never uses them.
+      rst_scrub_env() {
+        local name
+        for name in $(env | sed -n 's/=.*//p'); do
+          case "$name" in
+            *_TEST_*) continue ;;
+            OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL|TELEGRAM_*)
+              unset "$name"
+              ;;
+          esac
+        done
+      }
+      # Split declared semicolon segments outside literal single-quoted arguments.
+      # Each resulting segment still passes the existing argv allowlist (no shell eval).
+      rst_split_segments() {
+        local line c part="" quoted=0 i
+        while IFS= read -r line; do
+          part=""; quoted=0
+          for ((i=0; i<${#line}; i++)); do
+            c="${line:i:1}"
+            if [ "$c" = "'" ]; then quoted=$((1 - quoted)); fi
+            if [ "$c" = ";" ] && [ "$quoted" -eq 0 ]; then
+              printf '%s\n' "$part"; part=""
+            else part+="$c"; fi
+          done
+          printf '%s\n' "$part"
+        done
+      }
+      # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
+      #   1500 s budget as the parsed argv words of the shared tokenizer -- no bash -c -- appends
+      #   every command's output to <log> under a "### run-stop-tests:" header, and prints
+      #   "<exit> <passed> <total>" -- exit is the first nonzero exit, counts are summed across
+      #   commands; "<exit>  " (empty counts) when nothing parsed). Optional "cd <dir> &&" is
+      #   performed in-process; remaining && segments run sequentially. pipefail is
+      #   unused (pipes are already rejected).
+      rst_run_commands() {
+        local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
+        local saved_pwd d k total piece piece_counts piece_cmd env_reason="" word needs_postgres
+        local -a words=() segw=()
+        rst_scrub_env
+        saved_pwd="$(pwd)"
+        seg="$(mktemp)"
+        while IFS= read -r cmd; do
+          [ -z "$cmd" ] && continue
+          printf '### run-stop-tests: %s\n' "$cmd" >> "$log"
+          cd "$saved_pwd" || continue
+          : > "$seg"
+          rc=0
+          if ! rst_command_looks_runnable "$cmd"; then
+            printf 'rst_run_commands: refusing non-runnable command\n' > "$seg"
+            rc=1
+          else
+            rst_parse_cmd "$cmd" || true
+            words=("${RST_WORDS[@]}")
+            needs_postgres=0
+            for word in "${words[@]}"; do
+              case "$word" in --postgres|--postgres=*) needs_postgres=1 ;; esac
+            done
+            if [ "$needs_postgres" -eq 1 ] && [ "${BDC_BUILDER_POSTGRES:-}" != "1" ]; then
+              env_reason="postgres capability absent in this lane"
+              printf '### skipped: %s\n' "$env_reason" >> "$log"
+              continue
+            fi
+            total=${#words[@]}
+            k=0
+            if [ "$total" -gt 0 ] && [ "${words[0]}" = "cd" ]; then
+              d="${words[1]}"
+              k=3
+              if ! cd "$d"; then
+                printf 'rst_run_commands: cd %s failed\n' "$d" > "$seg"
+                rc=1
+              fi
+            fi
+            if [ "$rc" -eq 0 ]; then
+              while :; do
+                segw=()
+                while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RST_RS" ]; do
+                  segw+=("${words[k]}")
+                  k=$((k + 1))
+                done
+                set -- "${segw[@]}"
+                if [ $# -eq 0 ]; then rc=1; break; fi
+                # Rewrite npx/npm to bun only after the original argv passed the allowlist.
+                # When the real binary is on PATH, leave the command unchanged.
+                if [ "$1" = "npx" ] && ! command -v "${RST_NPX_BIN:-npx}" >/dev/null 2>&1; then
+                  if command -v bunx >/dev/null 2>&1; then
+                    shift
+                    set -- bunx "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  elif command -v bun >/dev/null 2>&1; then
+                    shift
+                    set -- bun x "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                elif [ "$1" = "npm" ] && ! command -v "${RST_NPM_BIN:-npm}" >/dev/null 2>&1 && command -v bun >/dev/null 2>&1; then
+                  if [ "${2:-}" = "test" ]; then
+                    shift 2
+                    set -- bun run test "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  elif [ "${2:-}" = "run" ] && [ -n "${3:-}" ]; then
+                    shift 2
+                    set -- bun run "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                fi
+                piece="$(mktemp)"
+                piece_cmd="${segw[*]}"
+                timeout "$(rst_timeout)" "$@" > "$piece" 2>&1 < /dev/null
+                rc=$?
+                piece_counts="$(rst_parse_counts < "$piece")"
+                cat "$piece" >> "$seg"
+                printf 'TESTS_COMMAND_RESULT=%s => exit %s, %s/%s\n' "$piece_cmd" "$rc" "${piece_counts%% *}" "${piece_counts##* }" >> "$log"
+                rm -f "$piece"
+                [ "$rc" -ne 0 ] && break
+                k=$((k + 1))
+                [ "$k" -ge "$total" ] && break
+              done
+            fi
+          fi
+          cat "$seg" >> "$log"
+          printf '### exit %s\n' "$rc" >> "$log"
+          [ "$rc" -ne 0 ] && [ "$exit_code" -eq 0 ] && exit_code="$rc"
+          c="$(rst_parse_counts < "$seg")"
+          if [ -n "$c" ]; then p=$((p + ${c%% *})); t=$((t + ${c##* })); hit=1; fi
+        done < "$cmds"
+        cd "$saved_pwd" || true
+        rm -f "$seg"
+        if [ "$hit" -eq 1 ]; then printf '%s %s %s' "$exit_code" "$p" "$t"; else printf '%s  ' "$exit_code"; fi
+        [ -z "$env_reason" ] || printf '\t%s' "$env_reason"
+        return 0
+      }
+      # rst_report <class> <cmd> <exit> <counts> [env_reason] [log_path]
+      #   A declared environment probe wins over blocked reasons; absent capability is
+      #   not repairable, even if another declared command failed or timed out.
+      #   Status law: passed only when the command exited 0 AND passed == total > 0.
+      #   Any nonzero exit, any failing test, or 0 tests ran is "failed". A
+      #   spec-declared command that exited nonzero with no parseable counts is
+      #   also "failed" (the required command failed; do not treat it as an
+      #   unparseable rung). Other unparseable output is "counts_unparsed"
+      #   (fail-closed downstream on CODE/MIXED). A CODE or MIXED spec with no
+      #   runnable test command AND no test files in the diff is
+      #   "no_command_declared" (spec + build defect).
+      rst_report() {
+        local class="$1" cmd="$2" exit_code="$3" counts="$4" env_reason="${5:-}" status line p t reason
+        if [ -n "$env_reason" ]; then
+          line="${counts:-0 0}"
+          line="${line/ /\/} ($cmd) -- ENVIRONMENT UNAVAILABLE: $env_reason"
+          printf 'TESTS_ENV_REASON=%s\nTESTS_STATUS=env_unavailable\nTESTS_LINE=%s\n' "$env_reason" "$line"
+          return 0
+        fi
+        reason="$(rst_failure_reason "$exit_code" "${6:-/dev/null}" "$cmd")"
+        if [ -n "$reason" ]; then
+          printf 'TESTS_STATUS=blocked\nTESTS_LINE=BLOCKED (%s)\nTESTS_BLOCKED_REASON=%s\n' "$reason" "$reason"
+          return 0
+        fi
+        if [ -z "$cmd" ]; then
+          case "$class" in
+            CODE|MIXED) status="no_command_declared"; line="N/A ($class spec declares no executable test command and the diff touched no test files -- Rule 10 defect)" ;;
+            *) status="not_required"; line="N/A ($class class, no test command declared)" ;;
+          esac
+        elif [ -z "$counts" ]; then
+          if [ "$exit_code" -ne 0 ] && [ "${SOURCE:-}" = "spec_declared" ]; then
+            status="failed"
+            line="N/A (spec-declared test command exited $exit_code with no parseable counts: $cmd) -- FAILED"
+          else
+            status="counts_unparsed"
+            line="N/A (test command exited $exit_code but pass/total could not be parsed from its output: $cmd)"
+          fi
+        else
+          p="${counts%% *}"; t="${counts##* }"
+          if [ "$exit_code" -ne 0 ] || [ "$t" -eq 0 ] || [ "$p" -lt "$t" ]; then
+            status="failed"
+            line="$p/$t ($cmd) -- FAILED, exit $exit_code"
+          else
+            status="passed"
+            line="$p/$t ($cmd)"
+          fi
+        fi
+        printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
+      }
+
+      # Project-map values are clamped separately; direct fixture overrides may be <60.
+      rst_timeout() {
+        local value="${RST_TIMEOUT_SECONDS:-1500}"
+        if ! [[ "$value" =~ ^[0-9]+$ ]]; then value=1500; fi
+        value="$(printf '%s' "$value" | sed 's/^0*//')"
+        if [ -z "$value" ]; then value=1500
+        elif [ "${#value}" -gt 4 ] || [ "$value" -gt 1700 ]; then value=1700; fi
+        printf '%s' "$value"
+      }
+      rst_failure_reason() {
+        local rc="$1" log="${2:-/dev/null}" cmd="${3:-}" tool
+        if [ "$rc" -eq 124 ]; then printf 'timeout:%ss' "$(rst_timeout)"; return; fi
+        if grep -q 'outside of the test runner' "$log" && [[ "$(command -v node)" == *bun-node-fallback-bin/* || "$(command -v node)" == */bun ]]; then
+          printf 'runner_mismatch:node-is-bun'; return
+        fi
+        if [ "$rc" -eq 127 ] || grep -q 'failed to run command' "$log"; then
+          tool="$(sed -nE 's/.*failed to run command [^A-Za-z0-9_/.-]*([A-Za-z0-9_/.-]+).*/\1/p' "$log" | head -1)"
+          [ -n "$tool" ] || tool="${cmd%% *}"
+          printf 'missing_tool:%s' "${tool:-unknown}"
+        fi
+      }
+      # Same canonical-block selection and required stage keys as parse-stages.
+      # An absent plan is empty; an ambiguous or invalid declared plan fails closed.
+      rst_stage_plan() {
+        python3 -c '
+      import re, sys
+      spec = sys.stdin.read()
+      candidates = [(m.start(), m.group(1)) for m in re.finditer(r"```ya?ml\s*\n(.*?)\n```", spec, re.S) if re.search(r"^stages:", m.group(1), re.M)]
+      if not candidates:
+          m = re.search(r"^stages:[^\n]*(?:\n(?:[ \t-][^\n]*|))*(?:\n|$)", spec, re.M)
+          if m: candidates = [(0, m.group())]
+      if not candidates: sys.exit(0)
+      markers = [r"^\s*##+\s+Canonical\s+stages\b", r"^\s*##+\s+Stages\b", r"<!--\s*canonical-stages\s*-->", r"<!--\s*stages:\s*canonical\s*-->"]
+      chosen = next((body for marker in markers for offset, body in candidates if re.search(marker, spec[max(0, offset-600):offset], re.I|re.M)), None)
+      if chosen is None:
+          if len(candidates) != 1: sys.exit("stage_plan_invalid: ambiguous canonical stages")
+          chosen = candidates[0][1]
+      import yaml
+      data = yaml.safe_load(chosen)
+      stages = data.get("stages") if isinstance(data, dict) else None
+      if not isinstance(stages, list) or not stages: sys.exit("stage_plan_invalid: empty stages")
+      seen = set()
+      lines = []
+      for st in stages:
+          if not isinstance(st, dict) or any(k not in st for k in ["id","repo","target_branch","in_scope_files","verify_commands","readiness_bar"]): sys.exit("stage_plan_invalid: required key missing")
+          sid, repo, commands = st["id"], st["repo"], st["verify_commands"]
+          if not isinstance(sid,str) or not re.fullmatch(r"[A-Za-z0-9_.-]+",sid) or sid in seen: sys.exit("stage_plan_invalid: invalid or duplicate id")
+          seen.add(sid)
+          if not isinstance(repo,str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",repo): sys.exit("stage_plan_invalid: invalid repo")
+          if not isinstance(commands,list) or not commands: sys.exit("stage_plan_invalid: empty verify_commands")
+          for cmd in commands:
+              if not isinstance(cmd,str) or not cmd.strip() or any(c in cmd for c in "\t\r\n\x00"): sys.exit("stage_plan_invalid: invalid command")
+              lines.append("\t".join([sid,repo,cmd,str(st["target_branch"])]))
+      print("\n".join(lines))' | sed 's/\r$//'
+      }
+      # Shared directory resolution for execution and assertion-guard coverage.
+      rst_stage_dir() {
+        local sid="$1" repo="$2" dir origin
+        dir="$(printf '%s\n' "${RST_STAGE_WORKTREES:-}" | tr ';' '\n' | sed -n "s/^${sid}=//p" | head -1)"
+        origin="$(git remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]##; s/[.]git$//')"
+        if [ -z "$dir" ] && [ "$repo" = "$origin" ]; then dir="$(pwd)"; fi
+        printf '%s\n' "$dir"
+      }
+      # Replays only the persisted plan; no spec extraction occurs in a repair or final run.
+      rst_execute_saved() {
+        local evidence="$1" class="$2" cmds log result rc counts joined report reason="" env_reason="" overall_env_reason="" overall=passed p=0 t=0
+        local sid repo cmd dir stage_status stage_line lines="" blocked="" stage_cmds
+        cmds="$evidence/stop-tests.commands"; log="$evidence/stop-tests.log"
+        if [ -s "$evidence/stop-tests.stages" ]; then
+          stage_cmds="$(mktemp)"
+          while IFS= read -r sid; do
+            repo="$(awk -F '\t' -v id="$sid" '$1==id {print $2; exit}' "$evidence/stop-tests.stages")"
+            awk -F '\t' -v id="$sid" '$1==id {print $3}' "$evidence/stop-tests.stages" > "$stage_cmds"
+            dir="$(rst_stage_dir "$sid" "$repo")"
+            if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+              stage_status=blocked; reason="stage_repo_absent:$repo"; stage_line="$sid: BLOCKED ($reason)"
+            else
+              joined="$(paste -sd ';' "$stage_cmds" | sed 's/;/; /g')"
+              local stage_log
+              stage_log="$(mktemp)"
+              result="$(cd "$dir" && rst_run_commands "$stage_cmds" "$stage_log")"
+              cat "$stage_log" >> "$log"
+              env_reason=""
+              case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
+              rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
+              report="$(SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$stage_log")"
+              stage_status="$(echo "$report" | sed -n 's/^TESTS_STATUS=//p')"
+              reason="$(echo "$report" | sed -n 's/^TESTS_BLOCKED_REASON=//p')"
+              stage_line="$sid: $(echo "$report" | sed -n 's/^TESTS_LINE=//p')"
+              if [ -n "$counts" ]; then p=$((p+${counts%% *})); t=$((t+${counts##* })); fi
+              rm -f "$stage_log"
+            fi
+            if [ "$stage_status" = env_unavailable ]; then
+              overall=env_unavailable
+              [ -n "$overall_env_reason" ] || overall_env_reason="$(echo "$report" | sed -n 's/^TESTS_ENV_REASON=//p')"
+            elif [ "$stage_status" = blocked ]; then
+              [ "$overall" = env_unavailable ] || overall=blocked
+              [ -n "$blocked" ] || blocked="$reason"
+            elif [ "$stage_status" != passed ] && [ "$overall" != blocked ] && [ "$overall" != env_unavailable ]; then overall=failed; fi
+            printf 'TESTS_STAGE_LINE=%s\n' "$stage_line"
+            lines="${lines:+$lines | }$stage_line"
+          done < <(cut -f1 "$evidence/stop-tests.stages" | awk '!seen[$0]++')
+          rm -f "$stage_cmds"
+          [ -z "$overall_env_reason" ] || printf 'TESTS_ENV_REASON=%s\n' "$overall_env_reason"
+          printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\nTESTS_BLOCKED_REASON=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\nTESTS_EXIT=%s\n' "$overall" "$lines" "$blocked" "$p" "$t" "$([ "$overall" = passed ] && echo 0 || echo 1)"
+        else
+          joined="$(paste -sd ';' "$cmds" | sed 's/;/; /g')"
+          local command_log
+          command_log="$(mktemp)"
+          result="$(rst_run_commands "$cmds" "$command_log")"
+          cat "$command_log" >> "$log"
+          env_reason=""
+          case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
+          rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
+          SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$command_log"
+          printf 'TESTS_EXIT=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\n' "$rc" "${counts%% *}" "${counts##* }"
+          rm -f "$command_log"
+        fi
+        printf 'TESTS_CLASS=%s\n' "$class"
+        grep '^TESTS_COMMAND_RESULT=' "$log" || true
+      }
+      # Persist executable functions before the agent runs. Both consumers source this
+      # snapshot, so the embedded rst/trg cores have one byte-identical copy per lane.
+      rst_save_core() {
+        { declare -f $(compgen -A function | grep -E '^(rst_|trg_|_?rsg_)'); declare -p RSGARGV_SCRIPT RST_RS RST_WORDS RSG_US RSG_RS RSG_PARSED; } > "$1/stop-tests.core.sh"
+      }
+      # ---- END rst core ----
+
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one source of truth). It installs
+      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent, retries
+      # once without the frozen lockfile, prints the real install output, and returns nonzero
+      # when the install failed (callers continue; the base compare treats it as base_unrunnable).
+      # Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
+      # per-node copy of the bundled script ($ARCHON_LANE_SCRIPTS_DIR/dprep.sh; works for
+      # standalone CLI and source runs), then the image copy /app/scripts/lane/dprep.sh.
+      # Only when none exists is it logged and the run continues like a failed install.
+      DPREP_SCRIPT=""
+      for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do
+        if [ -n "$dprep_candidate" ] && [ -f "$dprep_candidate" ]; then DPREP_SCRIPT="$dprep_candidate"; break; fi
+      done
+      if [ -n "$DPREP_SCRIPT" ]; then
+        . "$DPREP_SCRIPT"
+      else
+        dprep_ensure_js_deps() {
+          printf 'dprep: dprep.sh missing (tried BDC_DPREP_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/dprep.sh), cannot install JS dependencies (continuing; run-stop-tests reports the real result)\n' "${BDC_DPREP_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}"
+          return 0
+        }
+      fi
+      # ---- END dprep core ----
+
+      # Test overrides refuse outside the tests (override_not_allowed): checked here,
+      # before an overridden BDC_WAG_SCRIPT could be sourced. Only the gate tests set
+      # BDC_WAG_TEST_MODE=1; the harness container never does.
+      WAG_OVR=""
+      for wag_v in $(compgen -v | grep '^BDC_WAG_' || true); do
+        if [ -n "${!wag_v:-}" ]; then WAG_OVR="${WAG_OVR:+$WAG_OVR,}$wag_v"; fi
+      done
+      if [ -n "$(printf '%s' "$WAG_OVR" | tr ',' '\n' | grep -v '^BDC_WAG_TEST_MODE$' || true)" ] && [ "${BDC_WAG_TEST_MODE:-}" != "1" ]; then
+        printf 'stop-command gate: BDC_WAG_* overrides set without BDC_WAG_TEST_MODE=1 (%s); refusing before sourcing anything\n' "$WAG_OVR" >&2
+        printf '{"GATE":"fail","GATE_ALLOW":"no","GATE_REASONS":"0:override_not_allowed:%s","GATE_BASE_SHA":"","GATE_OVERRIDES":"%s"}\n' "$WAG_OVR" "$WAG_OVR"
+        exit 0
+      fi
+      WAG_SCRIPT=""
+      for wag_candidate in "${BDC_WAG_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/wo-author-stop-gate.sh}" /app/scripts/lane/wo-author-stop-gate.sh; do
+        if [ -n "$wag_candidate" ] && [ -f "$wag_candidate" ]; then WAG_SCRIPT="$wag_candidate"; break; fi
+      done
+      if [ -z "$WAG_SCRIPT" ]; then
+        printf 'stop-command-gate-final: wo-author-stop-gate.sh missing (tried BDC_WAG_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/wo-author-stop-gate.sh); failing closed\n' "${BDC_WAG_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+        printf '%s\n' '{"GATE":"fail","GATE_ALLOW":"no","GATE_REASONS":"0:gate_script_missing:wo-author-stop-gate.sh","GATE_BASE_SHA":"","GATE_OVERRIDES":""}'
+        exit 0
+      fi
+      . "$WAG_SCRIPT"
+      PREVIEW=$dry-run-preview.output
+      FIRST_GATE=$stop-command-gate.output
+      wag_main final "$PREVIEW" "$FIRST_GATE"
+      exit 0
+
+  # stop-command-gate-fail: the run fails closed unless the final gate allowed the commit.
+  # Also covers no_spec, empty or malformed gate output and a skipped or failed gate-final:
+  # resolveOutputRef returns '' for those, and '' is not 'yes' (codex lane repair-gate-fail
+  # pattern).
+  - id: stop-command-gate-fail
+    abort_run_on_failure: true
+    depends_on: [stop-command-gate-final]
+    trigger_rule: all_done
+    when: "$stop-command-gate-final.output.GATE_ALLOW != 'yes'"
+    bash: |
+      set -uo pipefail
+      GATE_OUT=$stop-command-gate-final.output
+      # Parse the gate output as JSON, so an escaped quote inside GATE_REASONS is kept;
+      # output that is empty or not JSON gives an empty value.
+      gate_field() {
+        printf '%s' "$GATE_OUT" | python3 -c 'import json, sys; d = json.loads(sys.stdin.read() or "null"); v = d.get(sys.argv[1], "") if isinstance(d, dict) else ""; print(v if isinstance(v, str) else "")' "$1" 2>/dev/null || true
+      }
+      REASONS=$(gate_field GATE_REASONS)
+      GATE=$(gate_field GATE)
+      echo "stop_command_gate_closed: GATE=${GATE:-missing} reasons=${REASONS:-gate output missing or not JSON}" >&2
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/stop-gate-report.md" ]; then
+        cat "$ARTIFACTS_DIR/stop-gate-report.md" >&2
+      fi
+      exit 1
+
+  # commit-spec: runs only when the final stop-command gate allowed the commit
+  # (GATE_ALLOW yes); otherwise stop-command-gate-fail fails the run closed.
+  # Spec commits regardless of mode -- mode only controls the (dead) Cauldron fire.
   # load_bearing: true (same rationale as bdc-author-wo-batch commit-and-push).
   # Pattern: branch name single-WO (wo/author-<WO_ID>-<timestamp>), 3-attempt
   # push retry with exponential backoff, host-artifact bundle save BEFORE push.
   - id: commit-spec
     persona: overseer
-    depends_on: [dry-run-preview]
+    depends_on: [stop-command-gate-final]
+    when: "$stop-command-gate-final.output.GATE_ALLOW == 'yes'"
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -563,10 +2113,13 @@ nodes:
       git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
         commit -m "feat(wo-author): ${WO_ID} -- authored via bdc-wo-author
 
-      Spec drafted via bdc-wo-author adversarial loop (Author.md 12-section template +
-      Validate.md 12-check gate). Operator reviews then promotes via Notion + Cauldron.
+      Spec drafted by bdc-wo-author run $WORKFLOW_ID from the per-class template
+      (scripts/cauldron/new-wo.sh), passed scripts/cauldron/validate-wo-spec.sh and the
+      stop-command gate (every declared command run against a clean checkout of the
+      target repo). This branch is held: the operator reviews it and lands it with
+      scripts/cauldron/author-wo.sh (held PR plus issue).
 
-      Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+      Drafted-By: gpt-6.1-sol (provider codex) via bdc-wo-author"
 
       # Bundle BEFORE push so a push failure does not destroy the spec.
       save_bundle_to_host
@@ -589,50 +2142,6 @@ nodes:
       echo "SHA=$(git rev-parse HEAD)"
       echo "wo_id=$WO_ID"
       echo "spec_path=$SPEC_PATH"
-
-  # file-notion: creates Notion page (unless --draft-only). Uses trigger_rule:
-  # all_done so the workflow still proceeds when approval-gate is skipped.
-  - id: file-notion
-    persona: xo
-    depends_on: [commit-spec]
-    when: "$dry-run-preview.output !~ 'mode=--draft-only'"
-    task_class: clerical
-    prompt: |
-      File the authored WO to Notion.
-
-      ## Inputs
-      Dry-run preview: $dry-run-preview.output
-      Commit-spec output: $commit-spec.output
-      Author-loop output (for spec body): $author-loop.output
-
-      ## Idempotency Check
-      Before creating, search Notion DB `${INPUT_NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}`
-      for an existing page with WO ID matching the wo_id from commit-spec output.
-      If found, output `IDEMPOTENT_SKIP: page already exists at <existing_url>` and
-      do NOT create a duplicate.
-
-      ## Notion Filing (when no duplicate found)
-      1. Read the spec file at `spec_path` (from commit-spec output) to extract:
-         - Section 1 Objective text (first 300 chars for Notes summary)
-         - Target repo from Section 10 Deploy Target (for Project field)
-      2. Use the Notion MCP `notion-create-pages` tool to create a page in
-         database `${INPUT_NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}` with:
-         - Task: <wo_id>
-         - WO ID: <wo_id>
-         - Status: To Do
-         - Claude Status: QUEUED
-         - Priority: P1 (default)
-         - Builder: Major Build (default)
-         - Execution State: ACTIVE
-         - Project: <target_repo> (or "Infrastructure" if unknown)
-         - Notes: first 300 chars of Section 1 Objective +
-                  " WO file: BDC_XO/<spec_path>" +
-                  " Authored by bdc-wo-author."
-      3. Output `NOTION_URL=<url>` on the created page.
-
-      If Notion MCP is unavailable, output:
-        XO_TODO: File <wo_id> to Notion manually (DB ${INPUT_NOTION_DB_ID}).
-                 Status=To Do, Claude Status=QUEUED, Builder=Major Build.
 
   # fire-cauldron: only runs in --fire mode AND only after approval-gate
   # returned approval (or auto_approve=true skipped the gate).
@@ -720,11 +2229,13 @@ nodes:
       echo "RUN_ID=$RUN_ID"
       echo "RESPONSE=$RESPONSE"
 
-  # build-manifest: trigger_rule all_done so skipped file-notion/fire-cauldron
-  # in non-applicable modes do not block manifest emission.
+  # build-manifest: trigger_rule all_done so a skipped fire-cauldron (every mode
+  # today) does not block manifest emission.
   - id: build-manifest
-    persona: major-build
-    depends_on: [commit-spec, file-notion, fire-cauldron]
+    persona: major-build-opr
+    provider: codex
+    model: gpt-6.1-sol
+    depends_on: [commit-spec, fire-cauldron]
     trigger_rule: all_done
     task_class: clerical
     prompt: |
@@ -736,9 +2247,10 @@ nodes:
       Read-context: $read-context.output
       Author-loop: $author-loop.output
       Dry-run preview: $dry-run-preview.output
+      Stop-command-gate: $stop-command-gate.output
+      Stop-command-gate-final: $stop-command-gate-final.output
       Approval-gate: $approval-gate.output
       Commit-spec: $commit-spec.output
-      File-notion: $file-notion.output
       Fire-cauldron: $fire-cauldron.output
 
       ## Required Manifest Fields
@@ -749,45 +2261,21 @@ nodes:
       - Files modified: none
       - Branch: <BRANCH from commit-spec>
       - Commit SHA: <SHA from commit-spec>
-      - Notion URL: <NOTION_URL from file-notion, or "skipped (--draft-only)">
       - Cauldron run ID: <RUN_ID from fire-cauldron, or "skipped (not --fire)">
-      - Tests: N/A (authoring workflow -- Validate.md 12-check gate IS the test;
-               PR-time codex-review + claude-review catch slips)
+      - Stop-command gate: <GATE and GATE_REASONS from stop-command-gate-final, and
+        GATE_BASE_SHA>
+      - Tests: N/A (authoring workflow -- the validate-wo-spec.sh run and the
+               stop-command gate ARE the test; PR-time review catches slips)
       - Grep assertions (run these against the harness YAML and authored spec):
         - bdc-harness: count of workflow name string in this YAML -> >= 1
-        - bdc-harness: count of `^model[:][ ]sonnet$` (regex, root-level only) -> 1
+        - bdc-harness: count of `^provider[:][ ]codex$` (regex, root-level only) -> 1
+        - bdc-harness: count of `^model[:][ ]gpt-6.1-sol$` (regex, root-level only) -> 1
         - bdc-harness: count of `^policyFile[:]` (regex, root-level only) -> 1
         - bdc-xo: gh api repos/thinmansoftware/bdc-xo/contents/docs/work-orders/<WO_ID>.md --jq .size -> > 0
       - VALIDATION: PASS
 
       Run summary:
-        Adversarial review iterations: <count from $author-loop.output>
-        Validate.md verdict: PASS | BATCH_FAILURE
+        Author-loop iterations: <count from $author-loop.output>
+        Validator verdict: RESULT: PASS | BATCH_FAILURE
+        Stop-command gate: <GATE from stop-command-gate and stop-command-gate-final>
         Duplicate run check: <line from dry-run-preview>
-
-  # flip-notion: flips THIS WO (WO-HARNESS-WO-AUTHOR-WORKFLOW-01) to REVIEW.
-  # Note: this is the META WO -- the WO that built the workflow -- not the WO
-  # that was just authored. The authored WO goes to QUEUED via file-notion.
-  - id: flip-notion
-    persona: xo
-    depends_on: [build-manifest]
-    task_class: clerical
-    prompt: |
-      Flip the META Work Order (WO-HARNESS-WO-AUTHOR-WORKFLOW-01 -- the one that
-      built THIS workflow file) to REVIEW with manifest in Notes property.
-
-      DO NOT flip the WO that was just authored -- that one is at QUEUED (set by
-      file-notion in this same run).
-
-      Required Notion changes for WO-HARNESS-WO-AUTHOR-WORKFLOW-01:
-      - Claude Status -> REVIEW
-      - Status -> Review
-      - Notes -> $build-manifest.output verbatim
-      - claimed_by: Major Build (bdc-wo-author)
-      - claimed_at: today's date
-
-      If Notion MCP unavailable, output:
-        XO_TODO: Flip WO-HARNESS-WO-AUTHOR-WORKFLOW-01 to REVIEW; paste manifest into Notes.
-
-      Manifest:
-      $build-manifest.output
