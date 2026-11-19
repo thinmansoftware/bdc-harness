@@ -143,6 +143,8 @@ EOF_FAIL
 export BDC_WAG_SCRIPT="$GATE_SCRIPT"
 export BDC_WAG_REPO_URL="file://$FIX"
 export BDC_WAG_VALIDATOR="$STUBS/pass.sh"
+# Only the tests set this; without it any BDC_WAG_* override refuses (override_not_allowed).
+export BDC_WAG_TEST_MODE=1
 export BDC_RSGARGV_SCRIPT="$REPO_ROOT/scripts/lane/rsg-argv.sh"
 export BDC_DPREP_SCRIPT="$REPO_ROOT/scripts/lane/dprep.sh"
 unset ARCHON_LANE_SCRIPTS_DIR
@@ -501,6 +503,44 @@ SAVED="$BDC_WAG_SCRIPT"
 BDC_WAG_SCRIPT="$T/missing-gate.sh" ARCHON_LANE_SCRIPTS_DIR="$T/none" run_gate first "$(preview_for WO-T-GREEN-01)"
 assert_eq "Test 9 (extra) a missing gate script fails closed gate_script_missing" "fail|no|yes|gate_script_missing" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o gate_script_missing | head -n 1)"
 export BDC_WAG_SCRIPT="$SAVED"
+
+# Identity from the spec (XO ruling on bdc-xo #6395, comment 7014436700): wo_id comes from
+# the drafted spec's H1, spec_path must be docs/work-orders/<that wo_id>.md, and both must
+# equal the dry-run footer; otherwise identity_mismatch before any checkout.
+no_clone() { printf '%s|%s' "$(printf '%s\n' "$ERR" | grep -c 'checked out' || true)" "$(jfield GATE_BASE_SHA)"; }
+run_gate first "$(printf '=== DRY-RUN PREVIEW ===\nwo_id=WO-T-STALE-01\nspec_path=docs/work-orders/WO-T-GREEN-01.md\ntarget_repo=acme/fixture\n')"
+assert_eq "Test 9 (identity) footer wo_id differs from the spec H1: identity_mismatch before clone" "fail|no|yes|identity_mismatch|0|" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o identity_mismatch | head -n 1)|$(no_clone)"
+cp "$XO/docs/work-orders/WO-T-GREEN-01.md" "$XO/docs/work-orders/copy-of-green.md"
+run_gate first "$(printf '=== DRY-RUN PREVIEW ===\nwo_id=WO-T-GREEN-01\nspec_path=docs/work-orders/copy-of-green.md\ntarget_repo=acme/fixture\n')"
+assert_eq "Test 9 (identity) footer spec_path is not docs/work-orders/<spec wo_id>.md: identity_mismatch before clone" "fail|no|yes|identity_mismatch|0|" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o identity_mismatch | head -n 1)|$(no_clone)"
+code_spec WO-T-RENAMED-01 "Stop 1 (test suite): ok
+  bash tests/ok.sh
+  Expected: 2 passing"
+sed -i 's/^# WO-T-RENAMED-01$/# WO-T-SOMETHING-ELSE-01/' "$XO/docs/work-orders/WO-T-RENAMED-01.md"
+run_gate first "$(preview_for WO-T-RENAMED-01)"
+assert_eq "Test 9 (identity) spec H1 differs from its own file name and the footer: identity_mismatch before clone" "fail|no|yes|identity_mismatch|0|" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o identity_mismatch | head -n 1)|$(no_clone)"
+
+# Test overrides refuse in production (same ruling): any set BDC_WAG_* override refuses
+# with override_not_allowed unless BDC_WAG_TEST_MODE=1 is also set.
+BDC_WAG_TEST_MODE= run_gate first "$(preview_for WO-T-GREEN-01)"
+assert_eq "Test 9 (override) BDC_WAG_* overrides without BDC_WAG_TEST_MODE=1 refuse override_not_allowed before clone" "fail|no|yes|override_not_allowed|0|" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o override_not_allowed | head -n 1)|$(no_clone)"
+assert_contains "Test 9 (override) the refusal names the overrides" "BDC_WAG_REPO_URL" "$(jfield GATE_OVERRIDES)"
+printf 'touch "%s/sourced.marker"\n. "%s"\n' "$T" "$GATE_SCRIPT" > "$T/sentinel-gate.sh"
+rm -f "$T/sourced.marker"
+BDC_WAG_TEST_MODE= BDC_WAG_SCRIPT="$T/sentinel-gate.sh" run_gate first "$(preview_for WO-T-GREEN-01)"
+assert_eq "Test 9 (override) an overridden gate script is refused by the node stub before it is sourced" "fail|no|yes|override_not_allowed|absent" "$(verdict)|$(one_json)|$(jfield GATE_REASONS | grep -o override_not_allowed | head -n 1)|$([ -e "$T/sourced.marker" ] && echo sourced || echo absent)"
+BDC_WAG_TEST_MODE= BDC_WAG_SCRIPT="$T/sentinel-gate.sh" run_gate final "$(preview_for WO-T-GREEN-01)" "$FORCED_FAIL"
+OUT="$(cd "$XO" && BDC_WAG_TEST_MODE= wag_main first "$(preview_for WO-T-GREEN-01)" 2>/dev/null)"
+assert_eq "Test 9 (override) the gate script refuses on its own too (defense behind the stub)" "fail|no|override_not_allowed" "$(verdict)|$(jfield GATE_REASONS | grep -o override_not_allowed | head -n 1)"
+assert_eq "Test 9 (override) stop-command-gate-final refuses an overridden gate script the same way" "fail|no|override_not_allowed|absent" "$(verdict)|$(jfield GATE_REASONS | grep -o override_not_allowed | head -n 1)|$([ -e "$T/sourced.marker" ] && echo sourced || echo absent)"
+
+# stop-command-gate-fail reads GATE_REASONS as JSON, so an escaped quote does not cut it.
+FAIL_NODE="$(node_script stop-command-gate-fail)"
+QJSON='{"GATE":"fail","GATE_ALLOW":"no","GATE_REASONS":"0:validator_failed:exit 1: FAIL 1: section \"Scope IN\" is empty; 1:green_failed:bash tests/bad.sh","GATE_BASE_SHA":"","GATE_OVERRIDES":""}'
+printf '%s\n' "${FAIL_NODE//\$stop-command-gate-final.output/$(shq "$QJSON")}" > "$T/fail-node.sh"
+FAIL_ERR="$(bash "$T/fail-node.sh" 2>&1 >/dev/null)"; FAIL_RC=$?
+assert_eq "Test 9 (gate-fail) stop-command-gate-fail exits 1" "1" "$FAIL_RC"
+assert_contains "Test 9 (gate-fail) the reason line survives an escaped quote" 'reasons=0:validator_failed:exit 1: FAIL 1: section "Scope IN" is empty; 1:green_failed:bash tests/bad.sh' "$FAIL_ERR"
 
 # ---- Test 10 ----
 echo "--- Test 10: operator stops are left alone ---"

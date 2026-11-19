@@ -1202,6 +1202,18 @@ nodes:
       fi
       # ---- END dprep core ----
 
+      # Test overrides refuse outside the tests (override_not_allowed): checked here,
+      # before an overridden BDC_WAG_SCRIPT could be sourced. Only the gate tests set
+      # BDC_WAG_TEST_MODE=1; the harness container never does.
+      WAG_OVR=""
+      for wag_v in $(compgen -v | grep '^BDC_WAG_' || true); do
+        if [ -n "${!wag_v:-}" ]; then WAG_OVR="${WAG_OVR:+$WAG_OVR,}$wag_v"; fi
+      done
+      if [ -n "$(printf '%s' "$WAG_OVR" | tr ',' '\n' | grep -v '^BDC_WAG_TEST_MODE$' || true)" ] && [ "${BDC_WAG_TEST_MODE:-}" != "1" ]; then
+        printf 'stop-command gate: BDC_WAG_* overrides set without BDC_WAG_TEST_MODE=1 (%s); refusing before sourcing anything\n' "$WAG_OVR" >&2
+        printf '{"GATE":"fail","GATE_ALLOW":"no","GATE_REASONS":"0:override_not_allowed:%s","GATE_BASE_SHA":"","GATE_OVERRIDES":"%s"}\n' "$WAG_OVR" "$WAG_OVR"
+        exit 0
+      fi
       WAG_SCRIPT=""
       for wag_candidate in "${BDC_WAG_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/wo-author-stop-gate.sh}" /app/scripts/lane/wo-author-stop-gate.sh; do
         if [ -n "$wag_candidate" ] && [ -f "$wag_candidate" ]; then WAG_SCRIPT="$wag_candidate"; break; fi
@@ -1971,6 +1983,18 @@ nodes:
       fi
       # ---- END dprep core ----
 
+      # Test overrides refuse outside the tests (override_not_allowed): checked here,
+      # before an overridden BDC_WAG_SCRIPT could be sourced. Only the gate tests set
+      # BDC_WAG_TEST_MODE=1; the harness container never does.
+      WAG_OVR=""
+      for wag_v in $(compgen -v | grep '^BDC_WAG_' || true); do
+        if [ -n "${!wag_v:-}" ]; then WAG_OVR="${WAG_OVR:+$WAG_OVR,}$wag_v"; fi
+      done
+      if [ -n "$(printf '%s' "$WAG_OVR" | tr ',' '\n' | grep -v '^BDC_WAG_TEST_MODE$' || true)" ] && [ "${BDC_WAG_TEST_MODE:-}" != "1" ]; then
+        printf 'stop-command gate: BDC_WAG_* overrides set without BDC_WAG_TEST_MODE=1 (%s); refusing before sourcing anything\n' "$WAG_OVR" >&2
+        printf '{"GATE":"fail","GATE_ALLOW":"no","GATE_REASONS":"0:override_not_allowed:%s","GATE_BASE_SHA":"","GATE_OVERRIDES":"%s"}\n' "$WAG_OVR" "$WAG_OVR"
+        exit 0
+      fi
       WAG_SCRIPT=""
       for wag_candidate in "${BDC_WAG_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/wo-author-stop-gate.sh}" /app/scripts/lane/wo-author-stop-gate.sh; do
         if [ -n "$wag_candidate" ] && [ -f "$wag_candidate" ]; then WAG_SCRIPT="$wag_candidate"; break; fi
@@ -1998,8 +2022,13 @@ nodes:
     bash: |
       set -uo pipefail
       GATE_OUT=$stop-command-gate-final.output
-      REASONS=$(printf '%s\n' "$GATE_OUT" | sed -n 's/.*"GATE_REASONS":"\([^"]*\)".*/\1/p' | head -n 1)
-      GATE=$(printf '%s\n' "$GATE_OUT" | sed -n 's/.*"GATE":"\([a-z_]*\)".*/\1/p' | head -n 1)
+      # Parse the gate output as JSON, so an escaped quote inside GATE_REASONS is kept;
+      # output that is empty or not JSON gives an empty value.
+      gate_field() {
+        printf '%s' "$GATE_OUT" | python3 -c 'import json, sys; d = json.loads(sys.stdin.read() or "null"); v = d.get(sys.argv[1], "") if isinstance(d, dict) else ""; print(v if isinstance(v, str) else "")' "$1" 2>/dev/null || true
+      }
+      REASONS=$(gate_field GATE_REASONS)
+      GATE=$(gate_field GATE)
       echo "stop_command_gate_closed: GATE=${GATE:-missing} reasons=${REASONS:-gate output missing or not JSON}" >&2
       if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/stop-gate-report.md" ]; then
         cat "$ARTIFACTS_DIR/stop-gate-report.md" >&2

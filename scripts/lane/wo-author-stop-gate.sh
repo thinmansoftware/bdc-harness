@@ -9,8 +9,13 @@
 #
 # What it does, before a drafted spec may be committed (the full rule is the WO's
 # "Gate algorithm"):
+#   0. refuses any set BDC_WAG_* test override unless BDC_WAG_TEST_MODE=1
+#      (override_not_allowed)
 #   1. reads wo_id, spec_path and target_repo from the dry-run-preview output; no wo_id
-#      is GATE no_spec (the run then fails at stop-command-gate-fail)
+#      is GATE no_spec (the run then fails at stop-command-gate-fail). Every identity
+#      value is then taken from the drafted spec and must equal the footer: the WO id
+#      in its H1 (or WO-ID: line) and its path docs/work-orders/<wo_id>.md
+#      (identity_mismatch), its target_repo: and Base branch: lines (step 2)
 #   1b. refuses a MIXED spec (mixed_unsupported)
 #   2. reads the target repo and base branch from the drafted spec itself (its
 #      target_repo: and Base branch: lines) and refuses, before any checkout, unless
@@ -39,7 +44,10 @@
 # The gate never commits, pushes or opens a PR. Its clone lives under $ARTIFACTS_DIR and
 # is removed on exit (a timeout kill can skip the trap; the leftover stays there).
 #
-# Test overrides (each one set is named in GATE_OVERRIDES and on stderr):
+# Test overrides (each one set is named in GATE_OVERRIDES and on stderr). Any of them
+# refuses (override_not_allowed) unless BDC_WAG_TEST_MODE=1 is also set; only the gate
+# tests set it, the harness container never does. The node stub applies the same rule
+# before it sources an overridden BDC_WAG_SCRIPT.
 #   BDC_WAG_SCRIPT     this file (read by the node stub)
 #   BDC_WAG_REPO_URL   clone URL (default https://github.com/<target_repo>.git)
 #   BDC_WAG_VALIDATOR  validator path (default scripts/cauldron/validate-wo-spec.sh)
@@ -259,6 +267,18 @@ print(b if isinstance(b, str) else "")
 ' "$1"
 }
 
+# wag_spec_wo_id <spec text>   (-> the WO id the spec names for itself: its H1
+#   "# WO-..." (the template's required H1, equal to the file name), else a "WO-ID:"
+#   line; empty when neither holds a WO-[A-Z0-9-]+-[0-9]+ id)
+wag_spec_wo_id() {
+  local id
+  id="$(printf '%s\n' "$1" | sed -n 's/^# *\(WO-[A-Z0-9-]*-[0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)"
+  if [ -z "$id" ]; then
+    id="$(printf '%s\n' "$1" | sed -n 's/^[[:space:]]*WO-ID:[[:space:]]*\(WO-[A-Z0-9-]*-[0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)"
+  fi
+  printf '%s' "$id"
+}
+
 # wag_canon_entry <bare-repo-name>   (-> the entry's "github" owner/repo from
 #   scripts/cauldron/repo-canonical-map.json; rc nonzero when the file, the entry or
 #   the field is missing)
@@ -280,13 +300,20 @@ print(g)
 
 wag_main() {
   local mode="$1" preview="${2:-}" first="${3:-}"
-  local ovr="" wo_id="" spec_path="" target_repo="" spec="" class="" name="" map_out="" map_repo="" base="" spec_base="" spec_target="" canon_repo=""
+  local ovr="" wo_id="" spec_path="" target_repo="" spec="" class="" name="" map_out="" map_repo="" base="" spec_base="" spec_target="" canon_repo="" spec_wo_id=""
   local validator="" vout="" vrc=0 vlines="" url="" sha="" pin_sha="" g1="" reasons="" fatal=0 cmds_status=""
   local report="" art="" cmd="" all_count=0 line="" idx=0 expect="" rescued="" cf="" clog="" result="" rc=0 counts="" env=""
   local rep="" status="" breason="" fr="" p="" t="" first_path="" runner="" verdict=""
   local -a cmds=()
   ovr="$(wag_overrides)"
   if [ -n "$ovr" ]; then echo "wo-author-stop-gate: test overrides set: $ovr" >&2; fi
+  # Test overrides refuse outside the tests: any set BDC_WAG_* other than the switch
+  # itself needs BDC_WAG_TEST_MODE=1, which only the gate tests set.
+  if [ -n "$(printf '%s' "$ovr" | tr ',' '\n' | grep -v '^BDC_WAG_TEST_MODE$' || true)" ] && [ "${BDC_WAG_TEST_MODE:-}" != "1" ]; then
+    echo "wo-author-stop-gate: BDC_WAG_* overrides are set without BDC_WAG_TEST_MODE=1; refusing" >&2
+    wag_emit fail no "0:override_not_allowed:$ovr" "" "$ovr"
+    return 0
+  fi
   art="${ARTIFACTS_DIR:-${TMPDIR:-/tmp}}"
   mkdir -p "$art" 2>/dev/null || true
   report="$art/stop-gate-report.md"
@@ -323,6 +350,19 @@ wag_main() {
     fatal=1
   else
     spec="$(cat "$spec_path")"
+    # Identity from the spec: its H1 names the WO, the spec must live at
+    # docs/work-orders/<that wo_id>.md, and both must equal the dry-run footer.
+    spec_wo_id="$(wag_spec_wo_id "$spec")"
+    if [ -z "$spec_wo_id" ]; then
+      add_reason 0 identity_mismatch "spec has no WO id in its H1 or WO-ID: line (footer wo_id '$wo_id')"
+      fatal=1
+    elif [ "$spec_wo_id" != "$wo_id" ]; then
+      add_reason 0 identity_mismatch "spec WO id '$spec_wo_id' is not the dry-run footer wo_id '$wo_id'"
+      fatal=1
+    elif [ "$spec_path" != "docs/work-orders/$spec_wo_id.md" ]; then
+      add_reason 0 identity_mismatch "footer spec_path '$spec_path' is not docs/work-orders/$spec_wo_id.md"
+      fatal=1
+    fi
   fi
 
   # 1b. Class.
