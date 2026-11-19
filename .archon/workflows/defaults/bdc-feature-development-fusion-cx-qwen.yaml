@@ -264,11 +264,74 @@ nodes:
         done
         return 1
       }
+      rtw_proc_cmdline() {
+        local py
+        py=$(command -v python || command -v python3) || return 1
+        "$py" -I -S - "$proc_root/$1/cmdline" <<'PY'
+      import os, re, sys
+      try:
+          with open(sys.argv[1], 'rb') as stream:
+              data = stream.read(8193)
+      except OSError:
+          print('[unavailable]')
+          raise SystemExit(0)
+      # Keep complete NUL-delimited arguments only. Never log a partial argument.
+      sample = data[:8192]
+      args = [part.decode('utf-8', 'replace') for part in sample.split(b'\0')[:-1]]
+      secrets = [value for key, value in os.environ.items()
+                 if re.search(r'token|secret|password|credential|api.?key|auth', key, re.I)
+                 and len(value) >= 8]
+      def scrub(value):
+          for secret in secrets:
+              value = value.replace(secret, '[REDACTED]')
+          return value
+      def safe_path(value):
+          credential = re.search(r'(?<![A-Za-z0-9])(?:gh[pousr]_|github_pat_|sk-|oat0|eyJ[A-Za-z0-9_-]+\.)', value)
+          return not credential and re.fullmatch(r'/[A-Za-z0-9_./-]+', value) and '..' not in value.split('/')
+      def workspace(value):
+          value = scrub(value)
+          match = re.fullmatch(r'/\.archon/workspaces/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:source|worktrees/(?:archon/)?[A-Za-z0-9_.-]+)', value)
+          return value if match and safe_path(value) else '[REDACTED]'
+      binaries = {'node', 'bun', 'cursor-agent', 'codex', 'claude', 'bash', 'sh', 'setsid', 'python', 'python3'}
+      zero_flags = {'--print', '--trust', '--verbose'}
+      hidden_flags = {'--model', '--mode', '--output-format', '--resume', '--session-id', '--prompt-file', '-p'}
+      path_flags = {'--workspace', '--cwd', '--cd'}
+      out, pending = [], None
+      executable = os.path.basename(args[0]) if args else ''
+      for index, raw in enumerate(args[:64]):
+          value = scrub(raw)
+          if pending:
+              out.append(workspace(value) if pending == 'path' else '[REDACTED]')
+              pending = None
+          elif index == 0:
+              trusted = value in binaries or (safe_path(value) and os.path.basename(value) in binaries and value.startswith(('/opt/cursor-agent/', '/usr/bin/', '/usr/local/bin/', '/bin/')))
+              out.append(value if trusted else '[REDACTED]')
+          elif index == 1 and executable in {'node', 'bun'} and safe_path(value) and value.startswith(('/opt/cursor-agent/', '/app/scripts/')) and value.endswith(('.js', '.mjs', '.cjs', '.ts')):
+              out.append(value)
+          elif value in zero_flags:
+              out.append(value)
+          elif value in path_flags or value in hidden_flags:
+              out.append(value)
+              pending = 'path' if value in path_flags else 'hidden'
+          elif any(value.startswith(flag + '=') for flag in path_flags):
+              flag, path = value.split('=', 1)
+              out.append(flag + '=' + workspace(path))
+          else:
+              # Opaque values include prompts, URLs, credentials and unknown flags.
+              out.append('[REDACTED]')
+              if value.startswith('-') and '=' not in value:
+                  pending = 'hidden'
+      if len(data) > 8192 or (sample and not sample.endswith(b'\0')) or len(args) > 64:
+          out.append('[TRUNCATED]')
+      print((' '.join(out) or '[empty]')[:512])
+      PY
+      }
       rtw_note_unreadable() {
-        local detail
+        local detail cmdline
         detail=$(printf '%s' "$3" | tr '\r\n' '  ' | cut -c1-240)
+        cmdline=$(rtw_proc_cmdline "$1" 2>/dev/null) || cmdline='[unavailable]'
         rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
-        rtw_scan_errors="${rtw_scan_errors:+$rtw_scan_errors; }pid=$1 uid=$2 read_error=${detail:-unavailable}"
+        rtw_scan_errors="${rtw_scan_errors:+$rtw_scan_errors; }pid=$1 uid=$2 read_error=${detail:-unavailable} cmdline=$cmdline"
       }
       rtw_scan_holder() {
         local d pid cwdlink resolved uid start comm reason cwd_error

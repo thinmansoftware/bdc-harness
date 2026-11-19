@@ -15,12 +15,23 @@ function scan(
   prelude: string,
   status?: string,
   refusal = false,
-  options: { expectClear?: boolean; waitLimit?: number } = {}
+  options: {
+    expectClear?: boolean;
+    waitLimit?: number;
+    cmdline?: string[] | Uint8Array;
+    extraEnv?: Record<string, string>;
+  } = {}
 ): string {
   const root = mkdtempSync(join(tmpdir(), 'rtw-scan-6372-'));
   try {
     mkdirSync(join(root, '4545'));
     if (status !== undefined) writeFileSync(join(root, '4545/status'), status);
+    if (options.cmdline !== undefined) {
+      writeFileSync(
+        join(root, '4545/cmdline'),
+        Array.isArray(options.cmdline) ? options.cmdline.join('\0') + '\0' : options.cmdline
+      );
+    }
     const script = join(root, 'scan.sh');
     writeFileSync(
       script,
@@ -38,6 +49,7 @@ function scan(
         ...process.env,
         SCAN_PROC_ROOT: root.replaceAll('\\', '/'),
         RTW_HOLDER_WAIT_SECONDS: String(options.waitLimit ?? 0),
+        ...options.extraEnv,
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -186,4 +198,93 @@ sleep() {
   expect(output).toContain('REFUSED: live process cwd under holder');
   expect(output).toContain('sleep_calls=1');
   expect(output).not.toContain('WAIT_CLEAR');
+});
+
+const cursorNode = '/opt/cursor-agent/.local/share/cursor-agent/versions/2026.11.17-f532c45/node';
+const cursorScript =
+  '/opt/cursor-agent/.local/share/cursor-agent/versions/2026.11.17-f532c45/index.js';
+const workspace =
+  '/.archon/workspaces/thinmansoftware/shopops/worktrees/archon/task-web-worker-12345-abc';
+
+test('cmdline preserves recognized Cursor executable, script and explicit workspace', () => {
+  const output = scan('', undefined, true, {
+    cmdline: [cursorNode, cursorScript, '--workspace', workspace, '--print'],
+  });
+  expect(output).toContain(
+    `cmdline=${cursorNode} ${cursorScript} --workspace ${workspace} --print`
+  );
+});
+
+test('cmdline redacts credential flags, unknown values, URLs and prompts before truncation', () => {
+  const secret = 'synthetic-credential-123456';
+  const output = scan('', undefined, true, {
+    cmdline: [
+      'node',
+      cursorScript,
+      '--api-key',
+      secret,
+      '--token=' + secret,
+      '--header',
+      'Authorization: Bearer ' + secret,
+      'https://user:' + secret + '@example.invalid',
+      'private prompt ' + secret,
+      '--workspace',
+      workspace,
+    ],
+  });
+  expect(output).not.toContain(secret);
+  expect(output).not.toContain('private prompt');
+  expect(output).not.toContain('https://');
+  expect(output).toContain('--workspace ' + workspace);
+  expect(output).toContain('[REDACTED]');
+});
+
+test('even path-like secrets are redacted when supplied to a credential flag', () => {
+  const output = scan('', undefined, true, { cmdline: ['node', '--token', workspace] });
+  expect(output).toContain('cmdline=');
+  expect(output).not.toContain(workspace);
+});
+
+test('cmdline rejects unsafe workspace values and masks known environment secrets in paths', () => {
+  const secret = 'synthetic-env-secret';
+  const output = scan('', undefined, true, {
+    cmdline: [
+      cursorNode,
+      cursorScript,
+      '--workspace',
+      workspace + '?token=' + secret,
+      '--workspace',
+      workspace.replace('shopops', secret),
+    ],
+    extraEnv: { SCAN_TEST_SECRET_TOKEN: secret },
+  });
+  expect(output).toContain('cmdline=');
+  expect(output).not.toContain(secret);
+  expect(output).not.toContain('?token=');
+});
+
+test('cmdline input and redacted output are bounded without exposing partial arguments', () => {
+  const output = scan('', undefined, false, {
+    cmdline: [cursorNode, cursorScript, '--workspace', workspace, 'sensitive-' + 'q'.repeat(20000)],
+  });
+  expect(output).toContain('cmdline=');
+  const context = output.split('cmdline=')[1]?.trim() ?? '';
+  expect(context.length).toBeLessThanOrEqual(512);
+  expect(context).not.toContain('sensitive-');
+  expect(context).not.toContain('qqqq');
+});
+
+test('unavailable cmdline remains a refusal and never changes classification', () => {
+  const output = scan('', undefined, true);
+  expect(output).toContain('REFUSED: process scan incomplete');
+  expect(output).toContain('cmdline=[unavailable]');
+});
+
+test('credential-shaped values inside a workspace path are also redacted', () => {
+  const secret = ['gh', 'p_', 'SYNTHETIC_ONLY'].join('');
+  const output = scan('', undefined, true, {
+    cmdline: ['node', '--workspace', workspace.replace('shopops', secret)],
+  });
+  expect(output).toContain('cmdline=');
+  expect(output).not.toContain(secret);
 });
