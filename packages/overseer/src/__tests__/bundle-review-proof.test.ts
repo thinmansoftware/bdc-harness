@@ -6,7 +6,6 @@ import { buildReviewPrompt, evaluatePullRequest } from '../pr-review-evaluator';
 import {
   ARCHIVE_DIGEST,
   BUNDLE_PATH,
-  PRODUCER_ANCHOR,
   collectBundleCoverage,
   configuredBundleProducer,
   inputInventoriesMatch,
@@ -25,6 +24,14 @@ const source = '.archon/workflows/defaults/lane.yaml';
 const workflow = '.github/workflows/test.yml',
   helper = 'scripts/ci/verified-bundle-proof.py';
 const hash = (s: string | Buffer): string => createHash('sha256').update(s).digest('hex');
+const stamp = '2026-11-18T16:00:00.000Z';
+/** One timestamped receipt line; `sorted` builds it the way the producer does (sort_keys). */
+function receiptLine(proof: Record<string, unknown>, sorted = false): string {
+  const fields = sorted
+    ? Object.fromEntries(Object.entries(proof).sort(([a], [b]) => (a < b ? -1 : 1)))
+    : proof;
+  return `${stamp} BUNDLE_PROOF_V1 ${Buffer.from(JSON.stringify(fields)).toString('base64')}\n`;
+}
 
 function fixture() {
   const blobs = new Map<string, Buffer>();
@@ -52,13 +59,23 @@ function fixture() {
   const t: Inventory = new Map(h);
   t.set(workflow, p.get(workflow)!);
   t.set(helper, p.get(helper)!);
+  // The base (dev) inventory is `anchor`; by default the merge base is the base itself.
+  let mergeBaseSha = base;
   const inventories = new Map([
     [base, anchor],
-    [PRODUCER_ANCHOR, anchor],
     [head, h],
     [producer, p],
     [tested, t],
   ]);
+  // compare/{x}...{y} statuses for the D3 base conditions (WO-HARNESS-BUNDLE-REVIEW-PROOF-REPAIR-01).
+  const compares: Record<string, string> = {
+    [`${base}...dev`]: 'ahead',
+    [`${producer}...${base}`]: 'ahead',
+  };
+  // Per-attempt job lists and per-job logs; absent entries fall back to the defaults below.
+  const jobsByAttempt = new Map<number, Record<string, unknown>[]>();
+  const logsByJob = new Map<number, string>();
+  const reads: string[] = [];
   const proof: Record<string, unknown> = {
     schema: 1,
     phase: 'preinstall',
@@ -90,7 +107,10 @@ function fixture() {
     `diff --git a/${source} b/${source}\n--- a/${source}\n+++ b/${source}\n@@ -1 +1 @@\n-old source\n+new source\n` +
     `diff --git a/${BUNDLE_PATH} b/${BUNDLE_PATH}\n--- a/${BUNDLE_PATH}\n+++ b/${BUNDLE_PATH}\n@@ -1 +1 @@\n-old bundle\n+new bundle\n`;
   const responses: Record<string, Record<string, unknown>> = {
-    'GET /repos/{owner}/{repo}/pulls/{pull_number}': { head: { sha: head }, base: { sha: base } },
+    'GET /repos/{owner}/{repo}/pulls/{pull_number}': {
+      head: { sha: head },
+      base: { sha: base, ref: 'dev' },
+    },
     'GET /repos/{owner}/{repo}': { id: 1233963411 },
     'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}': { id: 273810118, path: workflow },
     'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs': {
@@ -146,8 +166,16 @@ function fixture() {
     },
   };
   const read: ProofRead = async (route, args) => {
-    if (route.endsWith('/compare/{basehead}'))
-      return args.headers ? diff : { merge_base_commit: { sha: base } };
+    reads.push(`${route}${args.headers ? ' [diff]' : ''}`);
+    if (route.endsWith('/compare/{basehead}')) {
+      if (args.headers) return diff;
+      const status = compares[String(args.basehead)];
+      return status ? { status } : { status: 'ahead', merge_base_commit: { sha: mergeBaseSha } };
+    }
+    if (route.endsWith('/attempts/{attempt_number}/jobs')) {
+      const jobs = jobsByAttempt.get(Number(args.attempt_number));
+      if (jobs) return { total_count: jobs.length, jobs };
+    }
     if (route.endsWith('/git/commits/{commit_sha}')) {
       const sha = String(args.commit_sha);
       return {
@@ -168,8 +196,7 @@ function fixture() {
         encoding: 'base64',
         content: blobs.get(String(args.file_sha))!.toString('base64'),
       };
-    if (route.endsWith('/logs'))
-      return `2026-11-18T16:00:00.000Z BUNDLE_PROOF_V1 ${Buffer.from(JSON.stringify(proof)).toString('base64')}\n`;
+    if (route.endsWith('/logs')) return logsByJob.get(Number(args.job_id)) ?? receiptLine(proof);
     if (!(route in responses)) throw new Error('unexpected API read');
     return responses[route];
   };
@@ -182,6 +209,26 @@ function fixture() {
     t,
     proof,
     entry,
+    compares,
+    jobsByAttempt,
+    logsByJob,
+    reads,
+    /** Give the pull request a merge base distinct from its base (dev moved on). */
+    setMergeBase(inventory: Inventory) {
+      mergeBaseSha = 'e'.repeat(40);
+      inventories.set(mergeBaseSha, inventory);
+    },
+    /** The head (and so the tested merge) changes one file; the diff gets its block. */
+    change(path: string, after: string) {
+      const before = anchor.get(path);
+      const next = entry(after);
+      h.set(path, next);
+      t.set(path, next);
+      const old = before ? blobs.get(before.sha)!.toString() : undefined;
+      diff += old
+        ? `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-${old}+${after}`
+        : `diff --git a/${path} b/${path}\nnew file mode 100644\n--- /dev/null\n+++ b/${path}\n@@ -0,0 +1 @@\n+${after}`;
+    },
     get diff() {
       return diff;
     },
@@ -286,14 +333,15 @@ describe('#6357 producer and exhaustive proof guards', () => {
       [script],
       { encoding: 'utf8' }
     );
-    expect(result.stderr).toContain('Ran 12 tests');
+    expect(result.stderr).toContain('Ran 16 tests');
     expect(result.status).toBe(0);
   });
   test('authenticated new producer excludes only bundle and publishes complete provenance', async () => {
     const f = fixture();
     const result = await collectBundleCoverage(f.read, input, producer);
     expect(result.coverage?.notice).toContain('step 3');
-    expect(result.coverage?.notice).toContain(PRODUCER_ANCHOR);
+    // D3: the anchor is the pull request's authenticated base on dev, not a fixed commit.
+    expect(result.coverage?.notice).toContain(`Anchor ${base};`);
     expect(result.diff).toContain('+new source');
     expect(result.diff).not.toContain('+new bundle');
   });
@@ -363,13 +411,8 @@ describe('#6357 producer and exhaustive proof guards', () => {
       }
       if (guard === 'input') f.t.set(source, f.entry('different input\n'));
       if (guard === 'mode') f.t.set(source, { ...f.h.get(source)!, mode: '100755' });
-      if (guard === 'config') {
-        const e = f.entry('preload=[]');
-        f.h.set('bunfig.toml', e);
-        f.t.set('bunfig.toml', e);
-        f.anchor.set('bunfig.toml', e); /* producer absent is a closure mismatch */
-      }
-      // Config is not a changed path relative to comparison scope in this isolated closure test.
+      // D3: a pull request that brings root runtime configuration changes a pre-receipt file.
+      if (guard === 'config') f.change('bunfig.toml', 'preload=[]\n');
       const result = await collectBundleCoverage(read, input, producer);
       expect(result.coverage).toBeUndefined();
       expect(result.diff).toBe(f.diff);
@@ -388,9 +431,10 @@ describe('#6357 producer and exhaustive proof guards', () => {
   });
   test('new lifecycle/preload configuration and producer code changes disable eligibility', () => {
     const f = fixture();
-    expect(producerClosureMatches(f.anchor, f.p, f.t, f.h)).toBe(true);
+    // (mergeBase, base, producer, tested, head); here the merge base is the base.
+    expect(producerClosureMatches(f.anchor, f.anchor, f.p, f.t, f.h)).toBe(true);
     f.h.set('.env.local', f.entry('BUN_OPTIONS=--preload bad'));
-    expect(producerClosureMatches(f.anchor, f.p, f.t, f.h)).toBe(false);
+    expect(producerClosureMatches(f.anchor, f.anchor, f.p, f.t, f.h)).toBe(false);
   });
   for (const corrupt of ['missing', 'duplicate', 'partial'] as const) {
     test(`${corrupt} diff never passes as complete source`, async () => {
@@ -458,6 +502,243 @@ describe('#6357 producer and exhaustive proof guards', () => {
     expect((await collectBundleCoverage(read, input, producer)).coverage).toBeDefined();
     expect(fallbackReads).toBeGreaterThan(0);
   });
+  test('BRP-1 an unfinished Test Suite run returns bundleRunPending before any diff or blob read', async () => {
+    const run = (f: ReturnType<typeof fixture>) =>
+      f.responses['GET /repos/{owner}/{repo}/actions/runs/{run_id}'];
+    const f = fixture();
+    Object.assign(run(f), { status: 'in_progress', conclusion: null });
+    const result = await collectBundleCoverage(f.read, input, producer);
+    expect(result).toEqual({ bundleRunPending: true });
+    expect(f.reads.some(r => r.includes('/git/blobs/'))).toBe(false);
+    expect(f.reads.some(r => r.endsWith('[diff]'))).toBe(false);
+
+    // The bundle path unchanged between merge base and head: never pending.
+    const same = fixture();
+    Object.assign(run(same), { status: 'in_progress', conclusion: null });
+    same.h.set(BUNDLE_PATH, same.anchor.get(BUNDLE_PATH)!);
+    same.t.set(BUNDLE_PATH, same.anchor.get(BUNDLE_PATH)!);
+    same.diff = same.diff.slice(0, same.diff.indexOf(`diff --git a/${BUNDLE_PATH}`));
+    const unchanged = await collectBundleCoverage(same.read, input, producer);
+    expect('bundleRunPending' in unchanged).toBe(false);
+    expect(unchanged).toMatchObject({ bundleProofUnavailable: true });
+
+    // No run at all for the head: proof unavailable, full diff, as today.
+    const none = fixture();
+    none.responses['GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs'] = {
+      total_count: 0,
+      workflow_runs: [],
+    };
+    expect(await collectBundleCoverage(none.read, input, producer)).toEqual({
+      diff: none.diff,
+      bundleProofUnavailable: true,
+    });
+  });
+
+  test('BRP-2 the evaluator defers bundleRunPending as CHECKS_PENDING on Test Suite', async () => {
+    let calls = 0;
+    const result = await evaluatePullRequest(
+      { owner: input.owner, repo: input.repo, pr_number: 1609, head_sha: head },
+      {
+        reviewer: { provider: 'test', model: 'codex' },
+        ladder: ['codex'],
+        fetchEvidence: async () => ({
+          diff: 'x'.repeat(2_000_000),
+          bundleRunPending: true,
+          checks: [{ name: 'docker-build', status: 'completed', conclusion: 'success' }],
+        }),
+        fetchAcceptanceCriteria: async () => null,
+        invokeModel: async () => {
+          calls++;
+          throw new Error('must not invoke');
+        },
+      }
+    );
+    expect(result.verdict).toBe('CHECKS_PENDING');
+    expect(result.error).toBe('checks_pending');
+    expect(result.pendingChecks).toEqual(['Test Suite']);
+    expect(result.findings).toEqual([]);
+    expect(result.acceptance_criteria_available).toBe(false);
+    expect(result.reviewed_head_sha).toBe(head);
+    expect(calls).toBe(0);
+  });
+
+  describe('BRP-3 a carried-forward Ubuntu job from an earlier attempt', () => {
+    const times = { started_at: '2026-11-19T13:39:28Z', completed_at: '2026-11-19T13:56:38Z' };
+    function rerun() {
+      const f = fixture();
+      const template = (
+        f.responses[
+          'GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs'
+        ].jobs as Record<string, unknown>[]
+      )[0];
+      f.responses['GET /repos/{owner}/{repo}/actions/runs/{run_id}'].run_attempt = 2;
+      const ja: Record<string, unknown> = { ...template, ...times, id: 30, run_attempt: 1 };
+      const jl: Record<string, unknown> = { ...template, ...times, id: 31, run_attempt: 2 };
+      f.jobsByAttempt.set(1, [ja]);
+      f.jobsByAttempt.set(2, [jl]);
+      return { f, ja, jl };
+    }
+    test('the copy validates against the attempt-1 job, with the attempt-1 receipt', async () => {
+      const { f } = rerun();
+      const result = await collectBundleCoverage(f.read, input, producer);
+      expect(result.coverage?.notice).toContain('check/job 30');
+      expect(f.reads.filter(r => r.endsWith('/logs'))).toHaveLength(2);
+    });
+    const refusals: [string, (c: ReturnType<typeof rerun>) => void][] = [
+      [
+        'JA step 3 not success',
+        c => {
+          c.ja.steps = [{ ...(c.ja.steps as object[])[0], conclusion: 'failure' }];
+        },
+      ],
+      ['JA conclusion not success', c => (c.ja.conclusion = 'failure')],
+      ['JL not success', c => (c.jl.conclusion = 'failure')],
+      ['JL and JA times differ', c => (c.jl.completed_at = '2026-11-19T14:10:00Z')],
+      [
+        'JA times null',
+        c => {
+          for (const j of [c.ja, c.jl]) Object.assign(j, { started_at: null, completed_at: null });
+        },
+      ],
+      ['two Ubuntu jobs in attempt 1', c => c.f.jobsByAttempt.set(1, [c.ja, { ...c.ja, id: 32 }])],
+      ['receipt attempt 0', c => (c.f.proof.attempt = 0)],
+      ['receipt attempt 3, above the latest attempt', c => (c.f.proof.attempt = 3)],
+      ['receipt attempt not an integer', c => (c.f.proof.attempt = 1.5)],
+    ];
+    for (const [name, mutate] of refusals) {
+      test(`refused: ${name}`, async () => {
+        const c = rerun();
+        mutate(c);
+        const result = await collectBundleCoverage(c.f.read, input, producer);
+        expect(result).toEqual({ diff: c.f.diff, bundleProofUnavailable: true });
+      });
+    }
+  });
+
+  test('BRP-4 dev drift and a workspace script edit are accepted with the base as anchor', async () => {
+    const f = fixture();
+    const smart = 'packages/smart-cauldron/package.json',
+      workspace = 'packages/workflows/package.json';
+    const before = '{"scripts":{"test":"bun test a"}}\n',
+      after = '{"scripts":{"test":"bun test a b"}}\n';
+    const mergeBase: Inventory = new Map(f.anchor);
+    mergeBase.set('bun.lock', f.entry('lock at merge base\n'));
+    mergeBase.set(smart, f.entry('{"name":"smart"}\n'));
+    mergeBase.set(workspace, f.entry(before));
+    // Dev (the base) moved on in bun.lock and one workspace manifest.
+    f.anchor.set('bun.lock', f.entry('lock on dev\n'));
+    f.anchor.set(smart, f.entry('{"name":"smart","version":"2"}\n'));
+    f.anchor.set(workspace, mergeBase.get(workspace)!);
+    // The head keeps the merge-base versions and edits only scripts.test.
+    for (const path of ['bun.lock', smart]) f.h.set(path, mergeBase.get(path)!);
+    f.h.set(workspace, f.entry(after));
+    // The tested merge takes dev's versions plus the head's edit.
+    for (const path of ['bun.lock', smart]) f.t.set(path, f.anchor.get(path)!);
+    f.t.set(workspace, f.h.get(workspace)!);
+    f.setMergeBase(mergeBase);
+    f.diff += `diff --git a/${workspace} b/${workspace}\n--- a/${workspace}\n+++ b/${workspace}\n@@ -1 +1 @@\n-${before}+${after}`;
+    const result = await collectBundleCoverage(f.read, input, producer);
+    expect(result.coverage?.notice).toContain(`Anchor ${base};`);
+    expect(result.diff).toContain('+{"scripts":{"test":"bun test a b"}}');
+  });
+
+  const preReceipt: [string, string][] = [
+    ['root bun.lock', 'bun.lock'],
+    ['added scripts/ci/base64.py', 'scripts/ci/base64.py'],
+    ['root tsconfig.json', 'tsconfig.json'],
+    ['scripts/tsconfig.json', 'scripts/tsconfig.json'],
+    ['added scripts/package.json', 'scripts/package.json'],
+    ['added nested .gitattributes', 'packages/workflows/.gitattributes'],
+  ];
+  for (const [name, path] of preReceipt) {
+    test(`BRP-5 a pull-request change to a pre-receipt file is refused: ${name}`, async () => {
+      const f = fixture();
+      if (['bun.lock', 'tsconfig.json', 'scripts/tsconfig.json'].includes(path)) {
+        // Present on the base and merge base, so this is a modification.
+        const e = f.entry('{"original":true}\n');
+        for (const inventory of [f.anchor, f.h, f.t]) inventory.set(path, e);
+      }
+      f.change(path, 'import os; os.system("forge")\n');
+      const result = await collectBundleCoverage(f.read, input, producer);
+      expect(result).toEqual({ diff: f.diff, bundleProofUnavailable: true });
+    });
+  }
+
+  const offDev: [string, (f: ReturnType<typeof fixture>) => void][] = [
+    [
+      'base ref is not dev',
+      f =>
+        (f.responses['GET /repos/{owner}/{repo}/pulls/{pull_number}'].base = {
+          sha: base,
+          ref: 'main',
+        }),
+    ],
+    ['base...dev diverged', f => (f.compares[`${base}...dev`] = 'diverged')],
+    ['base...dev behind', f => (f.compares[`${base}...dev`] = 'behind')],
+    ['producer...base behind', f => (f.compares[`${producer}...${base}`] = 'behind')],
+  ];
+  for (const [name, mutate] of offDev) {
+    test(`BRP-6 a base that is not on dev is refused: ${name}`, async () => {
+      const f = fixture();
+      mutate(f);
+      expect(await collectBundleCoverage(f.read, input, producer)).toEqual({
+        diff: f.diff,
+        bundleProofUnavailable: true,
+      });
+    });
+  }
+
+  test('BRP-7 D5 log rules: a valid forged line is refused beside an UNAVAILABLE or a genuine line', async () => {
+    // Every field is valid for the fixture run, built the way the producer builds it.
+    const forged = (f: ReturnType<typeof fixture>) => receiptLine(f.proof, true);
+    const alone = fixture();
+    alone.logsByJob.set(30, `${stamp} ##[group]Run tests\n${forged(alone)}`);
+    // (a) Alone it validates: a receipt is authentic only by where its line came from.
+    expect((await collectBundleCoverage(alone.read, input, producer)).coverage).toBeDefined();
+
+    const unavailable = fixture();
+    unavailable.logsByJob.set(
+      30,
+      `${stamp} BUNDLE_PROOF_UNAVAILABLE non_builtin_or_unadmitted_generator_config\n${forged(unavailable)}`
+    );
+    expect(await collectBundleCoverage(unavailable.read, input, producer)).toEqual({
+      diff: unavailable.diff,
+      bundleProofUnavailable: true,
+    });
+
+    const second = fixture();
+    second.logsByJob.set(30, receiptLine(second.proof) + forged(second));
+    expect(await collectBundleCoverage(second.read, input, producer)).toEqual({
+      diff: second.diff,
+      bundleProofUnavailable: true,
+    });
+  });
+
+  const producerDrift: [string, (f: ReturnType<typeof fixture>) => void][] = [
+    [
+      'tested workflow differs from the producer',
+      f => f.t.set(workflow, f.entry('other workflow')),
+    ],
+    ['tested helper differs from the producer', f => f.t.set(helper, f.entry('other helper'))],
+    [
+      'head helper equals neither its merge base nor the producer',
+      f => {
+        f.change(helper, 'rogue helper\n');
+        f.t.set(helper, f.p.get(helper)!);
+      },
+    ],
+  ];
+  for (const [name, mutate] of producerDrift) {
+    test(`BRP-8 refused: ${name}`, async () => {
+      const f = fixture();
+      mutate(f);
+      expect(await collectBundleCoverage(f.read, input, producer)).toEqual({
+        diff: f.diff,
+        bundleProofUnavailable: true,
+      });
+    });
+  }
+
   test('unrecoverably truncated inventory never reaches a model with partial source', async () => {
     const f = fixture();
     await expect(

@@ -64,6 +64,23 @@ def git(root, *args):
     return subprocess.check_output(["/usr/bin/git", "-C", str(root), *args])
 
 
+def merge_parents(root):
+    # actions/checkout fetches the merge commit at depth 1, and git hides a shallow commit's
+    # parents from %P. Read the parent lines from the raw commit object instead, after proving
+    # its bytes hash to HEAD; --no-replace-objects keeps a replace ref from substituting another.
+    raw = git(root, "--no-replace-objects", "cat-file", "commit", "HEAD")
+    if hashlib.sha1(b"commit " + str(len(raw)).encode() + b"\0" + raw).hexdigest() != git(root, "rev-parse", "HEAD").decode().strip():
+        raise ValueError("commit_object_mismatch")
+    parents = []
+    for line in raw.split(b"\n\n", 1)[0].split(b"\n"):
+        if line.startswith(b"parent "):
+            value = line[len(b"parent "):]
+            if not re.fullmatch(rb"[0-9a-f]{40}", value):
+                raise ValueError("unsupported_commit_parent")
+            parents.append(value.decode("ascii"))
+    return parents
+
+
 def assert_no_untracked_config(root, tracked):
     # Newly introduced effective runtime/install/preload config must not be invisible.
     config_names = {"bunfig.toml", ".bunfig.toml", ".npmrc", ".gitattributes", "package.json", "tsconfig.json"}
@@ -100,16 +117,40 @@ def verified_checkout(root):
             }, sort_keys=True))
         tracked.add(path)
     assert_no_untracked_config(root, tracked)
-    return git(root, "rev-parse", "HEAD^{tree}").decode().strip()
+    # The tracked set is returned so later checks use these proven paths, never a re-derivation.
+    return git(root, "rev-parse", "HEAD^{tree}").decode().strip(), frozenset(tracked)
 
 
-def generator_is_builtin_only(root):
+ENV_TEMPLATE = re.compile(r"\.env(\.[A-Za-z0-9_-]+)*\.example")
+
+
+def root_env_entries_are_tracked_templates(root, tracked):
+    # Every root entry named .env* must be a tracked regular file named like a template
+    # (.env.example, .env.staging.example). fullmatch, because `$` also matches before a
+    # trailing newline. Safety rests on: Bun loads env files only from its working directory
+    # (the repo root); the generator environment below has no NODE_ENV, so only Bun's default
+    # names apply (.env, .env.development, .env.local, .env.development.local), never a name
+    # ending .example; and the pinned root bunfig.toml has only a [test] section. The Bun
+    # loading rules come from Bun's documentation, not its source. verified_checkout has
+    # already proven the tracked bytes. Anything else (untracked, tracked .env/.env.local/
+    # .env.development, a directory, a link) makes the generator ineligible.
+    for entry in root.iterdir():
+        name = entry.name
+        if not name.startswith(".env"):
+            continue
+        if (name not in tracked or entry.is_symlink() or not stat.S_ISREG(entry.lstat().st_mode)
+                or not ENV_TEMPLATE.fullmatch(name)):
+            return False
+    return True
+
+
+def generator_is_builtin_only(root, tracked):
     try:
         return (digest((root / "scripts/generate-bundled-defaults.ts").read_bytes()) == BUILTIN_GENERATOR_SHA256
                 and digest((root / "bunfig.toml").read_bytes()) == BUILTIN_BUNFIG_SHA256
                 and digest((root / "package.json").read_bytes()) == BUILTIN_PACKAGE_SHA256
                 and not (root / ".bunfig.toml").exists()
-                and not any(root.glob(".env*")))
+                and root_env_entries_are_tracked_templates(root, tracked))
     except OSError:
         return False
 
@@ -139,9 +180,9 @@ def run_producer(root):
     controlled_node.write_bytes(node_bytes)
     controlled_node.chmod(0o555)
     node_sha = digest(node_bytes)
-    initial_tree = verified_checkout(root)
+    initial_tree, tracked = verified_checkout(root)
     checkout = git(root, "rev-parse", "HEAD").decode().strip()
-    parents = git(root, "show", "-s", "--format=%P", "HEAD").decode().strip().split()
+    parents = merge_parents(root)
     env = {
         "PATH": str(executable.parent) + ":/usr/bin:/bin",
         "HOME": str(home), "BUN_INSTALL": str(home), "CI": "true",
@@ -149,20 +190,20 @@ def run_producer(root):
     }
     # The only repository code allowed before proof is the exact admitted,
     # built-in-only generator. Direct invocation avoids root package lifecycle hooks.
-    eligible_generator = generator_is_builtin_only(root)
+    eligible_generator = generator_is_builtin_only(root, tracked)
     if eligible_generator:
         assert_runtime(executable, runtime_sha)
         assert_runtime(controlled_node, node_sha)
         if shutil.which("bun", path=env["PATH"]) != str(executable):
             raise ValueError("shadowed_runtime")
-        if verified_checkout(root) != initial_tree:
+        if verified_checkout(root)[0] != initial_tree:
             raise ValueError("input_tree_changed")
         if git(root, "rev-parse", "HEAD").decode().strip() != checkout:
             raise ValueError("checkout_changed")
         subprocess.run([str(executable), "run", "scripts/generate-bundled-defaults.ts", "--check"], cwd=root, env=env, check=True)
         assert_runtime(executable, runtime_sha)
         assert_runtime(controlled_node, node_sha)
-        if verified_checkout(root) != initial_tree:
+        if verified_checkout(root)[0] != initial_tree:
             raise ValueError("input_tree_changed")
         if git(root, "rev-parse", "HEAD").decode().strip() != checkout:
             raise ValueError("checkout_changed")
