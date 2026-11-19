@@ -393,7 +393,9 @@ async function baseOpts(deps: CascadeDeps): Promise<RunCascadeOptions> {
 
 describe('PR-detection fixture lifecycle', () => {
   test('fresh roots isolate the same WO and cleanup preserves an untracked sibling', async () => {
-    const deps: CascadeDeps = {};
+    const sentinel = async () => 'sentinel-record';
+    const deps: CascadeDeps = { writeRecord: sentinel };
+    const originalKeys = Object.keys(deps).sort();
     const firstOpts = await baseOpts(deps);
     const secondOpts = await baseOpts(deps);
     const firstRoot = firstOpts.outDir!;
@@ -408,7 +410,10 @@ describe('PR-detection fixture lifecycle', () => {
         token: 'test-token',
         project: 'lspro-react',
       });
-      expect(opts.deps).toBe(deps);
+      expect(typeof opts.deps?.readRunDetail).toBe('function');
+      expect(typeof opts.deps?.listOpenWoPullRequests).toBe('function');
+      expect(opts.deps?.writeRecord).toBe(sentinel);
+      expect(Object.keys(deps).sort()).toEqual(originalKeys);
     }
     expect((await stat(firstRoot)).isDirectory()).toBe(true);
     expect((await stat(secondRoot)).isDirectory()).toBe(true);
