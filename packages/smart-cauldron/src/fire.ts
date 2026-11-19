@@ -11,10 +11,15 @@
 
 import type { FireResult } from './types.js';
 import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
+import {
+  workflowDigest,
+  type CodexOnlyBinding,
+} from '../../workflows/src/reliability/codex-only-binding.js';
 import { posix, win32 } from 'node:path';
 import { workflowDefinitionSchema } from '../../workflows/src/schemas/workflow.js';
 
 interface FireTierOptions {
+  validatedBinding?: CodexOnlyBinding;
   workflowName: string;
   woId: string;
   /** Registered codebase shortname, for example bdc-harness. */
@@ -153,7 +158,7 @@ export async function preflightCodexOnly(
   project: string,
   apiBaseUrl: string,
   token: string
-): Promise<void> {
+): Promise<CodexOnlyBinding> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -236,9 +241,16 @@ export async function preflightCodexOnly(
     }
     // Validate the actual engine definition without importing/executing its DAG.
     // Raw exact provider checks above precede schema trimming/defaults.
-    if (!workflowDefinitionSchema.safeParse(workflow).success) {
+    const parsed = workflowDefinitionSchema.safeParse(workflow);
+    if (!parsed.success) {
       throw new Error('codex_only_workflow_invalid');
     }
+    return {
+      project,
+      codebaseId: target.codebaseId,
+      cwd,
+      workflowDigest: workflowDigest(parsed.data),
+    };
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
@@ -258,7 +270,26 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
   } = opts;
 
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
-  const binding = await resolveCodebaseId(project, apiBaseUrl, token);
+  if (workflowName === CODEX_ONLY_WORKFLOW) {
+    try {
+      const current = await preflightCodexOnly(project, apiBaseUrl, token);
+      if (
+        !opts.validatedBinding ||
+        JSON.stringify(current) !== JSON.stringify(opts.validatedBinding)
+      )
+        throw new Error('codex_only_binding_changed');
+    } catch {
+      return {
+        ok: false,
+        runId: null,
+        conversationId: null,
+        infraError: 'codex_only_binding_changed',
+      };
+    }
+  }
+  const binding = opts.validatedBinding
+    ? { codebaseId: opts.validatedBinding.codebaseId, error: null }
+    : await resolveCodebaseId(project, apiBaseUrl, token);
   if (binding.codebaseId === null) {
     return { ok: false, runId: null, conversationId: null, infraError: binding.error };
   }
@@ -282,7 +313,8 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
         ...authHeaders(token),
       },
       body: JSON.stringify({
-        codebaseId: binding.codebaseId,
+        codebaseId: opts.validatedBinding?.codebaseId ?? binding.codebaseId,
+        ...(opts.validatedBinding ? { codexOnlyBinding: opts.validatedBinding } : {}),
         message: `/workflow run ${workflowName} ${message}`,
       }),
     });

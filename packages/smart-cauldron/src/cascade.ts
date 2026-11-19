@@ -342,13 +342,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
+  let validatedBinding: Awaited<ReturnType<typeof preflightCodexOnly>> | undefined;
   if (codexOnly) {
     const selected = tiers.find(tier => tier.name === 'codex');
     if (!selected) throw new Error('codex_only_invalid_options');
     selected.workflowName = 'bdc-feature-development-codex-only';
     // No dependency override can bypass provider proof. Dry-run makes no remote reads.
     if (!dryRun)
-      await preflightCodexOnly(
+      validatedBinding = await preflightCodexOnly(
         project ?? '',
         apiBaseUrl,
         token ?? process.env.ARCHON_OPERATOR_TOKEN ?? ''
@@ -920,6 +921,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Fire the WO on this tier
       const fireResult: FireResult = await fireImpl({
+        ...(validatedBinding ? { validatedBinding } : {}),
         workflowName: tier.workflowName,
         woId,
         project,

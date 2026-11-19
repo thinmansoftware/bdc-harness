@@ -1,3 +1,7 @@
+import {
+  matchesCodexOnlyBinding,
+  type CodexOnlyBinding,
+} from '../../../workflows/src/reliability/codex-only-binding.js';
 /**
  * REST API routes for the Archon Web UI.
  * Provides conversation, codebase, and SSE streaming endpoints.
@@ -3185,7 +3189,8 @@ export function registerApiRoutes(
   async function validateWorkflowRunTarget(
     message: string,
     codebaseId?: string | null,
-    modelOverride?: ModelOverride
+    modelOverride?: ModelOverride,
+    codexOnlyBinding?: CodexOnlyBinding
   ): Promise<
     | {
         valid: true;
@@ -3195,9 +3200,12 @@ export function registerApiRoutes(
     | { valid: false; error: string; httpStatus?: number }
   > {
     const match = WORKFLOW_RUN_COMMAND.exec(message.trim());
-    if (!match) return { valid: true };
+    if (!match)
+      return codexOnlyBinding
+        ? { valid: false, error: 'codex_only_binding_changed' }
+        : { valid: true };
     const workflowName = match[1];
-    if (workflowName.toLowerCase() === 'bdc-feature-development-codex-only') {
+    if (workflowName.toLowerCase() === 'bdc-feature-development-codex-only' && !codexOnlyBinding) {
       return { valid: false, error: 'Codex-only dispatch is not available yet.' };
     }
 
@@ -3218,6 +3226,15 @@ export function registerApiRoutes(
     if (codebaseId) {
       try {
         const codebase = await codebaseDb.getCodebase(codebaseId);
+        if (
+          codexOnlyBinding &&
+          (!codebase ||
+            ![codebase.name.toLowerCase(), codebase.name.toLowerCase().split('/').pop()].includes(
+              codexOnlyBinding.project.toLowerCase()
+            ))
+        ) {
+          return { valid: false, error: 'codex_only_binding_changed' };
+        }
         cwd = codebase?.default_cwd ?? undefined;
       } catch (error) {
         getLog().warn({ err: error, codebaseId }, 'dispatch_precheck_codebase_lookup_failed');
@@ -3235,7 +3252,7 @@ export function registerApiRoutes(
       // permits worktrees. If discovery is unavailable, that policy cannot be
       // checked, so fail closed before creating a conversation. Preserve the
       // existing graceful-degradation behavior for fires without an override.
-      if (isolationHints) {
+      if (isolationHints || codexOnlyBinding) {
         return {
           valid: false,
           error: `Workflow discovery failed; cannot safely apply --from/--from-branch for "${workflowName}".`,
@@ -3257,6 +3274,13 @@ export function registerApiRoutes(
         valid: false,
         error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
       };
+    }
+    if (
+      codexOnlyBinding &&
+      (!matchesCodexOnlyBinding(codexOnlyBinding, { codebaseId, cwd, workflow }) ||
+        workflow.name !== 'bdc-feature-development-codex-only')
+    ) {
+      return { valid: false, error: 'codex_only_binding_changed' };
     }
     if (workflow.name === 'bdc-feature-development-codex-only') {
       return { valid: false, error: 'Codex-only dispatch is not available yet.' };
@@ -4010,7 +4034,10 @@ export function registerApiRoutes(
   // Accepts optional `message` field for atomic create+send (avoids ghost "Untitled" entries)
   registerOpenApiRoute(createConversationRoute, async c => {
     try {
-      const { codebaseId, message } = getValidatedBody(c, createConversationBodySchema);
+      const { codebaseId, message, codexOnlyBinding } = getValidatedBody(
+        c,
+        createConversationBodySchema
+      );
 
       if (message) {
         const drainRejection = await rejectNewDispatchIfDraining(c);
@@ -4031,7 +4058,12 @@ export function registerApiRoutes(
       // captured here and threaded into dispatch (never re-parsed).
       let dispatchIsolationHints: HandleMessageContext['isolationHints'];
       if (message) {
-        const check = await validateWorkflowRunTarget(message, codebaseId);
+        const check = await validateWorkflowRunTarget(
+          message,
+          codebaseId,
+          undefined,
+          codexOnlyBinding
+        );
         if (!check.valid) {
           return c.json({ accepted: false, dispatched: false, error: check.error }, 400);
         }
