@@ -11,8 +11,15 @@
 
 import type { FireResult } from './types.js';
 import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
+import {
+  workflowDigest,
+  type CodexOnlyBinding,
+} from '../../workflows/src/reliability/codex-only-binding.js';
+import { posix, win32 } from 'node:path';
+import { workflowDefinitionSchema } from '../../workflows/src/schemas/workflow.js';
 
 interface FireTierOptions {
+  validatedBinding?: CodexOnlyBinding;
   workflowName: string;
   woId: string;
   /** Registered codebase shortname, for example bdc-harness. */
@@ -38,6 +45,7 @@ interface FireTierOptions {
 interface CodebaseSummary {
   id: string;
   name: string;
+  default_cwd?: unknown;
 }
 
 interface AtomicConversationResponse {
@@ -73,12 +81,17 @@ function matchesProject(codebaseName: string, project: string): boolean {
   return normalizedName === normalizedProject || shortName === normalizedProject;
 }
 
-async function resolveCodebaseId(
+export async function resolveCodebaseId(
   project: string,
   apiBaseUrl: string,
   token: string,
+  readJson?: (url: string) => Promise<unknown>,
   doFetch: typeof fetch = fetch
-): Promise<{ codebaseId: string | null; error: string | null }> {
+): Promise<{ codebaseId: string | null; error: string | null; defaultCwd?: unknown }> {
+  if (readJson) {
+    const codebases = await readJson(`${apiBaseUrl}/api/codebases`);
+    return selectCodebase(codebases, project);
+  }
   let response: Response;
   try {
     response = await doFetch(`${apiBaseUrl}/api/codebases`, {
@@ -108,10 +121,24 @@ async function resolveCodebaseId(
     };
   }
 
-  const matches = Array.isArray(codebases)
+  return selectCodebase(codebases, project);
+}
+
+function selectCodebase(
+  codebases: unknown,
+  project: string
+): {
+  codebaseId: string | null;
+  error: string | null;
+  defaultCwd?: unknown;
+} {
+  const matches: CodebaseSummary[] = Array.isArray(codebases)
     ? codebases.filter(
         codebase =>
+          codebase !== null &&
+          typeof codebase === 'object' &&
           typeof codebase.id === 'string' &&
+          codebase.id.length > 0 &&
           typeof codebase.name === 'string' &&
           matchesProject(codebase.name, project)
       )
@@ -124,7 +151,116 @@ async function resolveCodebaseId(
     };
   }
 
-  return { codebaseId: matches[0]?.id ?? null, error: null };
+  return { codebaseId: matches[0]?.id ?? null, error: null, defaultCwd: matches[0]?.default_cwd };
+}
+
+const CODEX_ONLY_WORKFLOW = 'bdc-feature-development-codex-only';
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Two authenticated reads with one deadline, including response body consumption. */
+export async function preflightCodexOnly(
+  project: string,
+  apiBaseUrl: string,
+  token: string
+): Promise<CodexOnlyBinding> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error('codex_only_preflight_timeout'));
+      controller.abort();
+    }, 10_000);
+  });
+  const readJson = async (url: string): Promise<unknown> => {
+    let response: Response;
+    try {
+      response = await Promise.race([
+        fetch(url, {
+          headers: authHeaders(token),
+          signal: controller.signal,
+        }),
+        timeout,
+      ]);
+    } catch {
+      throw new Error(
+        controller.signal.aborted ? 'codex_only_preflight_timeout' : 'codex_only_preflight_network'
+      );
+    }
+    if (!response.ok) throw new Error('codex_only_preflight_http');
+    try {
+      return await Promise.race([response.json(), timeout]);
+    } catch {
+      throw new Error(
+        controller.signal.aborted ? 'codex_only_preflight_timeout' : 'codex_only_preflight_json'
+      );
+    }
+  };
+  try {
+    const target = await resolveCodebaseId(project, apiBaseUrl, token, readJson);
+    if (!target.codebaseId) throw new Error('codex_only_project_unresolved');
+    const cwd = target.defaultCwd;
+    if (
+      typeof cwd !== 'string' ||
+      !cwd.trim() ||
+      Array.from(cwd).some(character => character.charCodeAt(0) < 32) ||
+      !(posix.isAbsolute(cwd) || win32.isAbsolute(cwd))
+    ) {
+      throw new Error('codex_only_invalid_cwd');
+    }
+    const body = await readJson(
+      `${apiBaseUrl}/api/workflows/${CODEX_ONLY_WORKFLOW}?cwd=${encodeURIComponent(cwd)}`
+    );
+    if (
+      !isObject(body) ||
+      body.filename !== `${CODEX_ONLY_WORKFLOW}.yaml` ||
+      (body.source !== 'project' && body.source !== 'bundled') ||
+      !isObject(body.workflow)
+    ) {
+      throw new Error('codex_only_workflow_invalid');
+    }
+    const workflow = body.workflow;
+    if (
+      workflow.name !== CODEX_ONLY_WORKFLOW ||
+      !Array.isArray(workflow.nodes) ||
+      !workflow.nodes.length
+    ) {
+      throw new Error('codex_only_workflow_invalid');
+    }
+    const checkProvider = (definition: Record<string, unknown>): void => {
+      if (
+        (definition.provider ?? workflow.provider) !== 'codex' ||
+        ('provider' in definition && definition.provider !== 'codex') ||
+        ('failover_provider' in definition && definition.failover_provider !== 'codex')
+      ) {
+        throw new Error('codex_only_provider_forbidden');
+      }
+    };
+    if (workflow.provider !== 'codex') throw new Error('codex_only_provider_forbidden');
+    checkProvider(workflow);
+    for (const node of workflow.nodes) {
+      if (!isObject(node)) {
+        throw new Error('codex_only_workflow_invalid');
+      }
+      checkProvider(node);
+    }
+    // Validate the actual engine definition without importing/executing its DAG.
+    // Raw exact provider checks above precede schema trimming/defaults.
+    const parsed = workflowDefinitionSchema.safeParse(workflow);
+    if (!parsed.success) {
+      throw new Error('codex_only_workflow_invalid');
+    }
+    return {
+      project,
+      codebaseId: target.codebaseId,
+      cwd,
+      workflowDigest: workflowDigest(parsed.data),
+    };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** Fire a WO and return only after its workflow run row is discoverable. */
@@ -142,7 +278,26 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
   const doFetch = opts.fetchImpl ?? fetch;
 
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
-  const binding = await resolveCodebaseId(project, apiBaseUrl, token, doFetch);
+  if (workflowName === CODEX_ONLY_WORKFLOW) {
+    try {
+      const current = await preflightCodexOnly(project, apiBaseUrl, token);
+      if (
+        !opts.validatedBinding ||
+        JSON.stringify(current) !== JSON.stringify(opts.validatedBinding)
+      )
+        throw new Error('codex_only_binding_changed');
+    } catch {
+      return {
+        ok: false,
+        runId: null,
+        conversationId: null,
+        infraError: 'codex_only_binding_changed',
+      };
+    }
+  }
+  const binding = opts.validatedBinding
+    ? { codebaseId: opts.validatedBinding.codebaseId, error: null }
+    : await resolveCodebaseId(project, apiBaseUrl, token, undefined, doFetch);
   if (binding.codebaseId === null) {
     return { ok: false, runId: null, conversationId: null, infraError: binding.error };
   }
@@ -166,7 +321,8 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
         ...authHeaders(token),
       },
       body: JSON.stringify({
-        codebaseId: binding.codebaseId,
+        codebaseId: opts.validatedBinding?.codebaseId ?? binding.codebaseId,
+        ...(opts.validatedBinding ? { codexOnlyBinding: opts.validatedBinding } : {}),
         message: `/workflow run ${workflowName} ${message}`,
       }),
     });
