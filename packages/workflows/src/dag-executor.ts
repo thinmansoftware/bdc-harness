@@ -2322,6 +2322,7 @@ function resolveDagPromptPersonaBinding(
           model:
             provider === 'claude'
               ? (model ??
+                assistantModels[provider] ??
                 persona.model ??
                 (isReviewNode(node) ? undefined : DEFAULT_CLAUDE_FAILOVER_MODEL))
               : undefined,
