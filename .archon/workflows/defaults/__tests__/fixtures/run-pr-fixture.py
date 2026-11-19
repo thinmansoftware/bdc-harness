@@ -49,7 +49,7 @@ def node(name):
         'implement': 'fixture complete', 'war-council-validator': 'satisfied',
     }.items():
         text = text.replace('$' + ref + '.output', value)
-    return text
+    return 'export PATH="${PR_FIXTURE_BIN:?}:$PATH"\nhash -r\n' + text
 
 
 STUB = '''import json, os, sys
@@ -128,15 +128,36 @@ def fixture(t):
     artifacts = t / 'artifacts'; artifacts.mkdir()
     out = artifacts / 'node-out'; out.mkdir()
     write_lf(out / 'read-spec.out', 'WO_ID=' + WO + '\n')
+    write_lf(out / 'checkout-repair-target.out', 'REPAIR_TARGET=none\n')
     write_lf(out / 'decide-push-target.out', 'pr_required: true\nrepo: fixture/repo\nstaging_gate_required: false\n')
     write_lf(out / 'commit-and-push.out', 'unique_branch=' + unique + '\n')
     bindir = t / 'bin'; bindir.mkdir()
     write_lf(bindir / 'gh', '#!/usr/bin/env bash\nexec python3 "' + (t / 'gh.py').as_posix() + '" "$@"\n')
     (t / 'gh.py').write_text(STUB)
     (bindir / 'gh').chmod(0o755)
+    for tool in ('ssh', 'curl'):
+        write_lf(bindir / tool, '#!/usr/bin/env bash\nexit 97\n')
+        (bindir / tool).chmod(0o755)
     state = t / 'state.json'
     shell_path = str(Path(BASH).parent) + os.pathsep if os.name == 'nt' else ''
     env = dict(os.environ, PATH=str(bindir) + os.pathsep + shell_path + os.environ['PATH'], ARTIFACTS_DIR=str(artifacts), ARCHON_NODE_OUT=str(out), WORKFLOW_ID='fixture-run', WO_ID=WO, USER_MESSAGE=WO, RECORDED_BASE_BRANCH='dev', BASE_BRANCH='dev', PR_FIXTURE_STATE=str(state), CAULDRON_INTERACTIVE='false', TMPDIR=str(t), TEMP=str(t), TMP=str(t))
+    for key in ('GH_TOKEN', 'GITHUB_TOKEN'):
+        env.pop(key, None)
+    for key in list(env):
+        if key in ('BASH_ENV', 'ENV') or key.startswith('BASH_FUNC_'):
+            env.pop(key, None)
+    if os.name == 'nt':
+        converted = cmd([BASH, '-c', 'cygpath -u -p "$FIXTURE_NATIVE_PATH"'], wt, dict(env, FIXTURE_NATIVE_PATH=env['PATH']))
+        env['PATH'] = converted.stdout.strip()
+        env['PR_FIXTURE_BIN'] = cmd([BASH, '-c', 'cygpath -u "$FIXTURE_BIN_NATIVE"'], wt, dict(env, FIXTURE_BIN_NATIVE=str(bindir))).stdout.strip()
+    else:
+        env['PR_FIXTURE_BIN'] = str(bindir)
+    config = t / 'gh-empty'; config.mkdir()
+    env['GH_CONFIG_DIR'] = str(config)
+    for tool in ('gh', 'ssh', 'curl'):
+        probe = cmd([BASH, '-c', 'export PATH="$PR_FIXTURE_BIN:$PATH"; hash -r; actual=$(command -v ' + tool + ') || exit 98; if command -v cygpath >/dev/null; then cygpath -m "$actual"; else printf "%s\\n" "$actual"; fi'], wt, env)
+        assert Path(probe.stdout.strip()).resolve() == (bindir / tool).resolve(), 'Unshimmed fixture tool: ' + tool
+    assert Path(cmd(['git', 'remote', 'get-url', '--push', 'origin'], wt).stdout.strip()).resolve() == bare.resolve()
     return wt, bare, artifacts, state, env, branch, unique, ancestor, head, base
 
 

@@ -140,7 +140,10 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
       // Prior runs report a confirmed teardown unless a test overrides it.
       readRunDetail: async () => ({
         status: 'failed',
-        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        metadata: {
+          teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+          head_branch: 'archon/task-web-worker-1-fixture',
+        },
       }),
       ...deps,
     },
@@ -2516,7 +2519,14 @@ describe('repair holder teardown (conductor)', () => {
     const case1 = await run(async () => {
       reads++;
       firesAtRead.push(reads);
-      return reads >= 3 ? { metadata: { teardown_confirmed_at: '2026-11-01T00:00:00Z' } } : {};
+      return reads >= 3
+        ? {
+            metadata: {
+              teardown_confirmed_at: '2026-11-01T00:00:00Z',
+              head_branch: 'archon/task-web-worker-1-fixture',
+            },
+          }
+        : {};
     }, 2000);
     // 3 teardown-wait polls, then 1 read of the prior run's head_branch for the
     // climb's repair-target lookup (bdc-xo #4638).

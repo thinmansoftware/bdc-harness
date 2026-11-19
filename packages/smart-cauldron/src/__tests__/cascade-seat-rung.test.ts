@@ -45,7 +45,10 @@ function claimStubs(): Pick<
       },
     }),
     readRunDetail: async () => ({
-      metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+      metadata: {
+        teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+        head_branch: 'archon/task-web-worker-1-fixture',
+      },
     }),
     releaseWoLock: async () => {},
   };
