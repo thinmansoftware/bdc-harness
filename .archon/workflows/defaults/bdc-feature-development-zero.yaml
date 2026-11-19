@@ -7413,7 +7413,7 @@ nodes:
   - id: flip-notion
     persona: xo-opr
     depends_on: [stamp-manifest-evidence, manifest-consistency-check, manifest-evidence-check, evidence-repair-verify]
-    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK'"
+    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK' && $evidence-repair-verify.output.state == 'not_applicable' || $manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK' && $evidence-repair-verify.output.state == 'verified'"
     trigger_rule: all_done
     task_class: clerical
     allowed_tools: []
@@ -7452,8 +7452,8 @@ nodes:
   # when the tail chain between them failed, and no-ops on a real build failure.
   - id: flip-notion-on-failure
     persona: xo-opr
-    depends_on: [war-council-validator, flip-notion, manifest-evidence-check]
-    when: "$manifest-evidence-check.output == 'OK'"
+    depends_on: [war-council-validator, flip-notion, manifest-evidence-check, evidence-repair-verify]
+    when: "$manifest-evidence-check.output == 'OK' && $evidence-repair-verify.output.state == 'not_applicable' || $manifest-evidence-check.output == 'OK' && $evidence-repair-verify.output.state == 'verified'"
     trigger_rule: all_done
     task_class: clerical
     allowed_tools: []
