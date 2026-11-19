@@ -12,6 +12,7 @@
 import type { PollResult } from './types.js';
 
 export type GateMisfireKind =
+  | 'evidence_repair_unavailable'
   | 'repair_target_unavailable'
   | 'repair_gate_closed'
   | 'plan_review_record_demand'
@@ -123,6 +124,24 @@ export function classifyGateMisfire(poll: PollResult): GateMisfire | null {
   const raw = poll.rawMetadata;
   const failed = readFailedNodes(raw);
   if (failed.invalid) return null;
+  // This mechanical gate only runs for evidence-only repairs. Any inability
+  // to prove the receipt is an explicit operator handoff, including secondary
+  // terminal/publication failures. A larger model cannot supply missing proof.
+  if (
+    failed.nodes?.some(
+      node => node === 'evidence-repair-verify' || node === 'evidence-repair-final'
+    )
+  ) {
+    return {
+      kind: 'evidence_repair_unavailable',
+      gateNode:
+        failed.nodes.find(
+          node => node === 'evidence-repair-verify' || node === 'evidence-repair-final'
+        ) ?? 'evidence-repair-verify',
+      failedNodes: failed.nodes,
+      reason: 'evidence-only repair proof unavailable; operator handoff required',
+    };
+  }
 
   const error = readError(raw);
   if (error === null) return null;

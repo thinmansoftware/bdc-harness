@@ -63,7 +63,9 @@ echo "PASS: markers present in zero-open assert body"
 # Mailbox pattern (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01): the assert body reads
 # $ARTIFACTS_DIR/implement.env and never interpolates raw narration. Fixture feeds
 # the mailbox file, not an IMPL stub.
-RUNNABLE="$BODY"
+# This is an ordinary source-build fixture, not an evidence-only repair. Supply
+# the new machine node's explicit non-applicable output, as the engine does.
+RUNNABLE="$(printf '%s' "$BODY" | python3 -c 'import shlex,sys; print(sys.stdin.read().replace("$evidence-repair-start.output", shlex.quote("{\"state\":\"not_applicable\"}")))')"
 if printf '%s\n' "$RUNNABLE" | grep -Fq '$implement.output'; then
   echo "FATAL: assert body still interpolates raw \$implement.output"
   exit 1
