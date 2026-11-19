@@ -684,6 +684,14 @@ export async function originatingEvidenceFailure(
         error: failedNode ? eventMessage(failedNode) : (record.reason ?? 'originating run failed'),
       };
     }
+    // A reviewed checkpoint is not the final result of an active owning run.
+    // Keep the existing failed-evidence reasons above; active holds cannot be adjudicated.
+    if (!isRunTerminal(record.status)) {
+      return {
+        reason: ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON,
+        error: `originating run ${record.runId} is ${record.status}; its evidence gate has not finished`,
+      };
+    }
     return null;
   } catch (error) {
     return {
