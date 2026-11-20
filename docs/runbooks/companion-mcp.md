@@ -240,8 +240,29 @@ To enable the MCP slot itself:
 4. Restart the process.
 
 No image rebuild is required for an enablement that only changes config.
+The first enablement of a mailbox slot after this WO needs the image that contains the send limit.
 Dot, Muse, and Duet stay inactive in Dispatch until that separate activation.
 Config alone does not make delivery succeed.
+
+## Send limit
+
+`mailbox_send` accepts a message of at most 4000 UTF-8 bytes. A longer
+message is refused with code `text_too_long`. The message is refused whole
+and is never cut.
+
+Each slot may have at most 10 accepted sends in any rolling 60 minutes, and
+at most 40 accepted sends per UTC day. The cap counts that slot across all
+recipients. A send the limiter accepts is counted even when Dispatch then
+fails, so a retry stays inside the same cap.
+
+A send past either cap is refused with code `send_rate_limited`.
+
+The counters are per slot and live only in process memory. They reset when
+the companion process restarts. Restarts are operator-only. That reset is a
+stated limit.
+
+Changing any of the three numbers (4000, 10, or 40) is a code change and
+needs an image rebuild.
 
 ## Bearer token mint
 

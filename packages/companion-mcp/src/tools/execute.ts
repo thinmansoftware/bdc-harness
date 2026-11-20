@@ -5,6 +5,7 @@ import { BOARD_PREFIX, WIKI_PREFIX, WIKI_SEARCH_MAX } from '../constants';
 import { DispatchClient } from '../dispatch-client';
 import { ToolFailure } from '../errors';
 import { scrubDeep } from '../scrub';
+import { processSendLimiter, type SendLimiter } from '../send-limit';
 import type { TrackedTree } from '../tracked-tree';
 import type { CompanionSlot, ProposalFile } from '../types';
 import { boardRecordPropose, BOARD_RECORD_PROPOSE_TOOL } from './board';
@@ -28,6 +29,7 @@ export interface ToolDeps {
   dispatch: DispatchClient;
   auditLog: string;
   env: Record<string, string | undefined>;
+  sendLimit?: SendLimiter;
 }
 
 function textResult(payload: unknown, isError = false): CallToolResult {
@@ -87,6 +89,15 @@ function readSeats(value: unknown): string[] | null {
     seats.push(item);
   }
   return seats;
+}
+
+function auditArgsForRefusal(args: Record<string, unknown>, code: string): Record<string, unknown> {
+  if (code !== 'text_too_long' && code !== 'send_rate_limited') {
+    return args;
+  }
+  const copy: Record<string, unknown> = { ...args };
+  delete copy.text;
+  return copy;
 }
 
 function readFiles(value: unknown): ProposalFile[] | null {
@@ -151,7 +162,14 @@ async function runKnownTool(
         throw new ToolFailure('refused', 'recipient_not_allowed');
       }
       const correlation = readString(args, 'correlation_id') ?? undefined;
-      const sent = await mailboxSend(deps.dispatch, slot, recipient, text, correlation);
+      const sent = await mailboxSend(
+        deps.dispatch,
+        slot,
+        recipient,
+        text,
+        correlation,
+        deps.sendLimit ?? processSendLimiter
+      );
       return { payload: sent, rowCount: 1 };
     }
     case 'mailbox_list': {
@@ -272,7 +290,7 @@ export async function executeTool(
       appendAudit(deps.auditLog, {
         companionId: slot.companion_id,
         tool: name,
-        args,
+        args: auditArgsForRefusal(args, error.code),
         rowCount: 0,
         outcome: error.outcome,
         error: error.code,
