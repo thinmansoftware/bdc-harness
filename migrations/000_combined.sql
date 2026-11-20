@@ -910,6 +910,8 @@ CREATE TABLE IF NOT EXISTS t3_command_admissions (
   run_id TEXT,
   reply_message_id TEXT,
   effect_started_at TEXT,
+  -- WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01 (migration 070): run outcome marker.
+  outcome_message_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -967,6 +969,22 @@ CREATE TABLE IF NOT EXISTS t3_command_run_custody (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
   ON t3_command_admissions (target_run_id)
   WHERE verb IN ('cancel-own', 'approve') AND state IN ('reserved', 'unknown');
+
+-- WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01 (migration 070): an existing table
+-- re-running this file gets the outcome marker and the backfill in ONE statement.
+-- A fresh table already has the column, so the guard does nothing.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = current_schema()
+       AND table_name = 't3_command_admissions'
+       AND column_name = 'outcome_message_id'
+  ) THEN
+    ALTER TABLE t3_command_admissions ADD COLUMN outcome_message_id TEXT;
+    UPDATE t3_command_admissions SET outcome_message_id = 'pre-outcome-backfill';
+  END IF;
+END $$;
 
 -- WO-GRIMOIRE-PROJECT-RECORD-01 (migration 068)
 ALTER TABLE remote_agent_codebases ADD COLUMN IF NOT EXISTS project_record TEXT;

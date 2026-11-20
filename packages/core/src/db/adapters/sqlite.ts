@@ -743,6 +743,48 @@ export class SqliteAdapter implements IDatabase {
    * so new columns must be added via ALTER TABLE for databases created before
    * the columns were added to createSchema().
    */
+  /**
+   * WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01 (migration 070 parity): add
+   * t3_command_admissions.outcome_message_id and mark every row that exists at
+   * that moment 'pre-outcome-backfill', so fires admitted before the change never
+   * produce an outcome message.
+   *
+   * The authoritative absence check, the ALTER and the backfill run in ONE
+   * BEGIN IMMEDIATE transaction (SQLite DDL is transactional), committed only
+   * after both succeed. ANY failure -- including failing to get the write lock
+   * within busy_timeout -- rolls back and RETHROWS THE ORIGINAL ERROR, so the
+   * adapter constructor throws and the database open is refused. A rollback
+   * failure is logged separately and never replaces the original error. The
+   * read-only check before the lock only skips the lock when the column is
+   * already there; the check inside the lock decides.
+   */
+  private migrateT3OutcomeMarker(): void {
+    const hasMarker = (): boolean =>
+      (this.pragmaAll("PRAGMA table_info('t3_command_admissions')") as { name: string }[]).some(
+        column => column.name === 'outcome_message_id'
+      );
+    if (hasMarker()) return;
+    try {
+      this.db.run('BEGIN IMMEDIATE');
+      if (!hasMarker()) {
+        this.db.run('ALTER TABLE t3_command_admissions ADD COLUMN outcome_message_id TEXT');
+        this.db.run("UPDATE t3_command_admissions SET outcome_message_id = 'pre-outcome-backfill'");
+      }
+      this.db.run('COMMIT');
+    } catch (error: unknown) {
+      try {
+        if (this.db.inTransaction) this.db.run('ROLLBACK');
+      } catch (rollbackError: unknown) {
+        getLog().error(
+          { err: rollbackError as Error },
+          'db.sqlite_migration_t3_outcome_column_rollback_failed'
+        );
+      }
+      getLog().error({ err: error as Error }, 'db.sqlite_migration_t3_outcome_column_failed');
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
   private migrateColumns(): void {
     // WO-GRIMOIRE-PROJECT-RECORD-01 (migration 068): additive and idempotent.
     const codebaseColumns = this.pragmaAll("PRAGMA table_info('remote_agent_codebases')") as {
@@ -751,6 +793,9 @@ export class SqliteAdapter implements IDatabase {
     if (!codebaseColumns.some(column => column.name === 'project_record')) {
       this.db.run('ALTER TABLE remote_agent_codebases ADD COLUMN project_record TEXT');
     }
+    // WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01 (migration 070 parity). Fails closed:
+    // it is deliberately NOT inside any catch that only warns.
+    this.migrateT3OutcomeMarker();
     this.upgradeBoardAuditEvents();
     // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
     // four-verb journals transactionally before any fire_cauldron insert.
@@ -2813,6 +2858,8 @@ export class SqliteAdapter implements IDatabase {
         run_id TEXT,
         reply_message_id TEXT,
         effect_started_at TEXT,
+        -- WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01 (migration 070): run outcome marker.
+        outcome_message_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );

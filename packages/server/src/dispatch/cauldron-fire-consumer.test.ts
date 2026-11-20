@@ -208,6 +208,8 @@ function makeWorld(env: Record<string, string | undefined>): World {
     },
     proveCancel: async (runId, actor) => world.cancelledBy.get(runId) === actor,
     proveApprove: async runId => world.approvedRuns.has(runId),
+    // WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01: no fire here has an ended cascade.
+    getFireOutcome: async () => null,
   };
   return world;
 }

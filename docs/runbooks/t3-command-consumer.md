@@ -50,7 +50,9 @@ Command envelope (a Dispatch `agent_message`):
 }
 ```
 
-Reply (one Dispatch `agent_message`):
+Decision reply (one Dispatch `agent_message` per command; the fire's run
+outcome is a second channel, idempotency key `outcome:<request_id>`, see
+"Run outcome message" below):
 
 - system sender `cauldron-fire`
 - recipient = the submitting actor credential's first `receive_as` entry
@@ -84,7 +86,8 @@ Status codes: 200 ok, 400 invalid, 403 forbidden, 409 conflict, 422
 stale_head, 503 failed_before_effect. (202 `pending` was removed by Amendment 5:
 Dispatch returns the ORIGINAL command row for a same-actor resend of a
 request_id, whatever the body, so a same-actor retry row never exists. The only
-outcome channel for a request is `reply:<original command id>`.)
+DECISION channel for a request is `reply:<original command id>`; an admitted
+fire also gets one run outcome message under `outcome:<request_id>`.)
 
 Amendment 5 additions to the contract:
 
@@ -104,6 +107,89 @@ resume was dispatched) or `approved_not_resumed` (recorded, but the resume was
 not dispatched -- missing conversation, non-web parent or missing workflow).
 `approved_not_resumed` is an OPERATOR FOLLOW-UP: the run sits in the approval
 hand-off state until someone re-runs it from the dashboard.
+
+## Run outcome message
+
+WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01. The decision reply says "fire
+accepted, run X". When that fire's CASCADE has ended, the consumer sends the
+same actor mailbox ONE more `agent_message`: how the fire ended, its last run
+and that run's PR. The bridge posts it into the row's `thread_id` like any
+`t3-command-reply/v1` row.
+
+- When: on every tick, after the claim reconcile and before the command loop
+  (`sendFireOutcomes`). It reads every `fire` admission in state `admitted`
+  whose `outcome_message_id` is null, oldest first, with no limit.
+- What ended means: the fire's cascade record (`cascade_id`, else the request
+  id) has one of these statuses. `frontier-approved` is followed to the resumed
+  cascade (`frontierApproval.resumeCascadeId`, at most 3 hops).
+
+| Cascade status | Outcome sent? |
+|---|---|
+| `planned`, `running`, `pending-frontier-approval` | no, not ended |
+| `frontier-approved` | follow the resumed cascade |
+| `won`, `blocked`, `spec-repair`, `recovery-delegated`, `infra-alert`, `frontier-rejected`, `cancelled`, `gate-misfire`, `refused` | yes |
+
+- Identity: idempotency key `outcome:<request_id>`, system sender
+  `cauldron-fire`, `correlation_id` = the request id. It is sent once per fire:
+  the row's `outcome_message_id` records the message. If the record step fails
+  after the send, the next tick sends again under the same key, Dispatch returns
+  the SAME message, and the marker is then set.
+- Body JSON (no `status` field, so the bridge headline reads the outcome word):
+
+```
+{
+  "schema": "t3-command-reply/v1",
+  "request_id": "...",
+  "verb": "fire",
+  "phase": "outcome",
+  "code": "cascade_won" | "cascade_spec_repair" | ...,   // cascade_ + status, - as _
+  "task_outcome": "won" | "spec-repair" | ...,           // the cascade status
+  "cascade_id": "...",       // the resumed cascade after an approval
+  "cascade_status": "...",
+  "winning_tier": "... | null",
+  "attempts": 2,
+  "run_id": "... | null",    // the LAST attempt's run, never the first
+  "run_status": "... | null",
+  "pr_url": "https://github.com/<owner>/<repo>/pull/<n> | null",
+  "wo_id": "...",
+  "thread_id": "..."
+}
+```
+
+- Fires admitted before this change get none: when the column was added,
+  every existing row was marked `pre-outcome-backfill`.
+- A later merge or close of the PR sends nothing (a separate work order if
+  wanted).
+
+Logs: `cauldron_fire_outcome_pass_failed` (the whole pass),
+`cauldron_fire_outcome_record_unreadable` (a corrupt or mismatched record; that
+fire is skipped and retried next tick), `cauldron_fire_outcome_mailbox_unresolved`,
+`cauldron_fire_outcome_row_failed`.
+
+Limits (documented only; no behaviour for them):
+
+- No order against the decision reply. An outcome can arrive BEFORE the
+  decision when the decision send failed and the cascade ended first, or with no
+  decision at all when the decision was dead-lettered. A fire whose decision was
+  dead-lettered still gets its outcome.
+- `pr_url` can be null even when a PR exists: the link is read only from the
+  run's `open-pr-if-needed` node output (`PR_URL=` line).
+- An `unknown` fire later settled as run becomes `admitted` and then gets its
+  outcome, possibly late.
+- If the harness crashes between a resumed cascade ending and the original
+  record being annotated `frontier-approved`, the original stays pending and no
+  outcome is sent.
+- Fires orphaned at `running` (for example by a restart) never end, get no
+  outcome, and are re-read on every tick.
+- Liveness is conditional: it needs ticks to keep running and record reads and
+  sends to complete. The uncapped pass cannot starve a fire, but a long pass can
+  delay commands, and a hung read or send defeats any timing promise.
+- PostgreSQL: apply `migrations/070_t3_command_outcome.sql` with fail-on-error
+  execution (`psql -v ON_ERROR_STOP=1`); a failure stops the deploy. The
+  PostgreSQL adapter does not run migrations and does not refuse to start
+  without the column; until 070 succeeds, the pass fails each tick and sends
+  nothing. SQLite adds the column itself when the database opens, in one
+  transaction, and refuses to open if that fails.
 
 ## Decision rules (summary)
 
