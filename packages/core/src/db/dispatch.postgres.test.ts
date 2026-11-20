@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
+import { pathToFileURL } from 'url';
 import { createHash, randomUUID } from 'crypto';
 import { PostgresAdapter } from './adapters/postgres';
 import { DispatchNonSystemCapability } from './dispatch-sender-authority';
@@ -640,6 +641,107 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
 });
 
 describe('createCappedSubjectMessage on PostgreSQL', () => {
+  test('separate processes contend on the advisory lock, respect the cap, and dedupe redelivery', async () => {
+    const subject = 'gh:thinmansoftware/shopops#9004';
+    const applicationName = `${schemaName}_racers`;
+    const url = new URL(
+      withSchemaSearchPath(
+        requireLoopbackUrl(process.env.DISPATCH_POSTGRES_PHASE15_TEST_URL),
+        schemaName
+      )
+    );
+    url.searchParams.set('application_name', applicationName);
+    const adapterUrl = pathToFileURL(resolve(import.meta.dir, 'adapters/postgres.ts')).href;
+    const connectionUrl = pathToFileURL(resolve(import.meta.dir, 'connection.ts')).href;
+    const dispatchUrl = pathToFileURL(resolve(import.meta.dir, 'dispatch.ts')).href;
+    function spawnClaim(token: string) {
+      // Each process has its own module-level serialization queue. Only the
+      // PostgreSQL advisory lock can serialize these independent callers.
+      const program = `
+        import { mock } from 'bun:test';
+        const { PostgresAdapter } = await import(${JSON.stringify(adapterUrl)});
+        const db = new PostgresAdapter(process.env.DISPATCH_POSTGRES_PHASE15_TEST_URL);
+        mock.module(${JSON.stringify(connectionUrl)}, () => ({ getDatabase: () => db }));
+        const { createCappedSubjectMessage } = await import(${JSON.stringify(dispatchUrl)});
+        const subject = ${JSON.stringify(subject)};
+        const token = ${JSON.stringify(token)};
+        try {
+          const result = await createCappedSubjectMessage(
+            { kind: 'system', sender: 'overseer' },
+            { correlation_id: crypto.randomUUID(), idempotency_key: crypto.randomUUID(),
+              task_type: 'run_review', recipient: 'taskmaster', body: 'replaced', subject_key: subject },
+            { maxRows: 2, dedupeToken: token, readDedupeToken: body => JSON.parse(body).token,
+              slotKey: slot => 'pg-process:' + subject + ':slot-' + slot,
+              slotBody: slot => JSON.stringify({ token, slot }) }
+          );
+          console.log(JSON.stringify({ claimed: result.claimed, reason: result.reason, slot: result.slot }));
+        } catch {
+          console.log(JSON.stringify({ error: 'child_claim_failed' }));
+          process.exitCode = 1;
+        } finally { await db.close(); }
+      `;
+      const child = Bun.spawn([process.execPath, '-e', program], {
+        cwd: import.meta.dir,
+        env: {
+          PATH: process.env.PATH,
+          SystemRoot: process.env.SystemRoot,
+          ARCHON_LOG_STDERR: '1',
+          DISPATCH_POSTGRES_PHASE15_TEST_URL: url.toString(),
+        },
+        stdout: 'pipe',
+        stderr: 'ignore',
+      });
+      const output = new Response(child.stdout).text();
+      return { child, output };
+    }
+    type Claim = { claimed: boolean; reason?: string; slot?: number };
+    async function finishClaim(run: ReturnType<typeof spawnClaim>): Promise<Claim> {
+      expect(await run.child.exited).toBe(0);
+      return JSON.parse((await run.output).trim()) as Claim;
+    }
+    const runs: ReturnType<typeof spawnClaim>[] = [];
+    try {
+      await db.withTransaction(async query => {
+        await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+          `dispatch:capped-subject:${subject}:taskmaster`,
+        ]);
+        runs.push(...['h1', 'h2', 'h3', 'h4'].map(spawnClaim));
+        const deadline = Date.now() + 10000;
+        let waiting = 0;
+        while (Date.now() < deadline) {
+          const locks = await db.query<{ n: string }>(
+            `SELECT COUNT(*) AS n FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+             WHERE l.locktype = 'advisory' AND NOT l.granted AND a.application_name = $1`,
+            [applicationName]
+          );
+          waiting = Number(locks.rows[0]?.n ?? 0);
+          if (waiting === runs.length) break;
+          await Bun.sleep(20);
+        }
+        // Removing pg_advisory_xact_lock from the fence makes this fail even
+        // if SERIALIZABLE retries happen to preserve the cap in a given run.
+        expect(waiting).toBe(4);
+      });
+      const results = await Promise.all(runs.map(finishClaim));
+      expect(results.filter(result => result.claimed)).toHaveLength(2);
+      expect(results.filter(result => result.reason === 'cap_exhausted')).toHaveLength(2);
+      expect(await rowsFor(subject)).toBe(2);
+      const winningToken = ['h1', 'h2', 'h3', 'h4'][results.findIndex(result => result.claimed)]!;
+      const replay = spawnClaim(winningToken);
+      runs.push(replay);
+      expect(await finishClaim(replay)).toMatchObject({
+        claimed: false,
+        reason: 'duplicate_unit_of_work',
+      });
+      expect(await rowsFor(subject)).toBe(2);
+    } finally {
+      for (const run of runs) {
+        if (run.child.exitCode === null) run.child.kill();
+      }
+      await Promise.all(runs.map(run => run.child.exited));
+    }
+  }, 30000);
+
   /**
    * PR #740 round 6 [major]: on postgres the fence originally relied on
    * SELECT ... FOR UPDATE, which locks only the rows a SELECT returns. It

@@ -16,6 +16,8 @@ export interface IndependentReviewFinding {
   readonly scope: string;
   readonly severity: 'blocker' | 'major' | 'minor' | 'note';
   readonly summary: string;
+  /** Only an explicit mechanical signal may authorize a remediation proposal. */
+  readonly remediation?: 'mechanical' | 'judgment';
 }
 
 export interface IndependentReviewArtifact {
