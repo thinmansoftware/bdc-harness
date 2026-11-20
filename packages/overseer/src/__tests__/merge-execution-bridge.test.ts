@@ -520,6 +520,13 @@ describe('merge execution bridge', () => {
       'mergeable_state_not_clean',
     ],
   ])('records honest skip for %s', async (id, evidence, recent, reason) => {
+    // bdc-harness dev merges docs-only PRs by default (WO-HARNESS-MERGE-MANAGER-RECOVERY-01); this
+    // case pins the skip path, so it names an explicit skip policy for that base.
+    if (id === 'docs') {
+      process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
+        'thinmansoftware/bdc-harness': { dev: { unattended: true, docs_only: 'skip' } },
+      });
+    }
     const h = harness([verdict(id)], evidence, recent);
     await runMergeExecutionBridgeOnce({
       store: h.store,

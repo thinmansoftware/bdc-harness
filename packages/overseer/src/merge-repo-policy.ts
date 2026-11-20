@@ -17,8 +17,10 @@ export type MergeRepoPolicy = Readonly<Record<string, Readonly<Record<string, Re
 
 // AGD The shipped policy declares candidacy per repo; production-effect classification remains separate.
 export const DEFAULT_MERGE_REPO_POLICY: MergeRepoPolicy = Object.freeze({
+  // bdc-harness dev merges eligible docs-only PRs under the same gates as code (John,
+  // 2026-11-20, bdc-xo PR 6405 comment 7044640550; WO-HARNESS-MERGE-MANAGER-RECOVERY-01).
   'thinmansoftware/bdc-harness': Object.freeze({
-    dev: Object.freeze({ unattended: true, docsOnly: 'skip' }),
+    dev: Object.freeze({ unattended: true, docsOnly: 'merge' }),
     staging: Object.freeze({ unattended: true, docsOnly: 'skip' }),
     main: Object.freeze({ unattended: false, docsOnly: 'skip' }),
   }),

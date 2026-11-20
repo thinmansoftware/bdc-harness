@@ -1,3 +1,7 @@
+import type {
+  CreateAuthenticatedMessageData,
+  DispatchSenderContext,
+} from '@archon/core/db/dispatch';
 import { createLogger } from '@archon/paths';
 import {
   assembleQualifiedMergeEvidence,
@@ -148,6 +152,183 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
    * Optional logger. Tests inject a spy. Production uses the module logger.
    */
   readonly log?: MergeManagerLogger;
+  /**
+   * Operator-mailbox sender for the merge notice (WO-HARNESS-MERGE-MANAGER-RECOVERY-01).
+   * Production passes createAuthenticatedMessage (overseer-runtime.ts); absent sends no
+   * mailbox notice and logs merge-coordinator.merge_notice_failed.
+   */
+  readonly createMessage?: OperatorMessageSender;
+}
+
+// ------------------------------------------------------------------ merge notices
+// WO-HARNESS-MERGE-MANAGER-RECOVERY-01: every confirmed merge, by the bridge or by this
+// manager, posts a PR receipt and one operator-mailbox message carrying the full merge SHA.
+// Notices are sent once, in the same tick; a failed send is logged and not retried. A
+// failure on one channel never stops the other, and no notice path can call merge.
+
+export type OperatorMessageSender = (
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData
+) => Promise<unknown>;
+
+export const MERGE_NOTICE_FAILED_LOG = 'merge-coordinator.merge_notice_failed' as const;
+export const MERGE_RECEIPT_COMMENT_MARKER = '<!-- merge-manager-receipt -->';
+const OVERSEER_SYSTEM_SENDER: DispatchSenderContext = { kind: 'system', sender: 'overseer' };
+
+/** Printable ASCII only, '@' defused, capped: safe inside a PR comment or mailbox body. */
+export function sanitizeNoticeField(value: string, max = 300): string {
+  return value
+    .replace(/@/g, '(at)')
+    .replace(/[^\x20-\x7e]/g, '')
+    .slice(0, max);
+}
+
+export function mergeReceiptIdempotencyKey(
+  ref: PullRequestRef,
+  mergeSha: string | undefined,
+  headSha: string
+): string {
+  return `overseer:merge-receipt:${ref.owner}/${ref.repo}#${ref.number}@${
+    mergeSha && mergeSha.length > 0 ? mergeSha : `unknown-merge-sha-head-${headSha}`
+  }`;
+}
+
+/** Declarative operator-mailbox text for a confirmed merge (no instruction, so the content guard admits it). */
+export function mergeReceiptMailboxBody(input: {
+  readonly ref: PullRequestRef;
+  readonly prUrl: string;
+  readonly baseBranch: string;
+  readonly headSha: string;
+  readonly mergeSha: string | undefined;
+  readonly path: 'merge bridge' | 'merge manager';
+}): string {
+  const ownerRepo = sanitizeNoticeField(`${input.ref.owner}/${input.ref.repo}`);
+  return [
+    `Merged: ${sanitizeNoticeField(input.prUrl)} (${ownerRepo}#${input.ref.number}) into ${sanitizeNoticeField(input.baseBranch)}.`,
+    `Merge commit: ${sanitizeNoticeField(input.mergeSha ?? 'unknown')}`,
+    `Head: ${sanitizeNoticeField(input.headSha)}`,
+    `Path: the ${input.path}, after an exact-head Overseer approval with required checks green.`,
+    'No action is needed.',
+  ].join('\n');
+}
+
+/** One operator-mailbox message. Never throws; a failure is logged with the channel. */
+export async function sendOperatorMergeNotice(
+  createMessage: OperatorMessageSender | undefined,
+  notice: {
+    readonly idempotencyKey: string;
+    readonly body: string;
+    readonly priority: 'normal' | 'blocker';
+    readonly logFields: Record<string, unknown>;
+  },
+  logger: Pick<MergeManagerLogger, 'warn'>
+): Promise<boolean> {
+  if (!createMessage) {
+    logger.warn(
+      { ...notice.logFields, channel: 'operator_mailbox', error: 'sender_unavailable' },
+      MERGE_NOTICE_FAILED_LOG
+    );
+    return false;
+  }
+  try {
+    await createMessage(OVERSEER_SYSTEM_SENDER, {
+      correlation_id: notice.idempotencyKey,
+      idempotency_key: notice.idempotencyKey,
+      task_type: 'agent_message',
+      recipient: 'operator',
+      priority: notice.priority,
+      body: notice.body,
+    });
+    return true;
+  } catch (error) {
+    logger.warn(
+      {
+        ...notice.logFields,
+        channel: 'operator_mailbox',
+        error: sanitizeNoticeField(error instanceof Error ? error.message : String(error)),
+      },
+      MERGE_NOTICE_FAILED_LOG
+    );
+    return false;
+  }
+}
+
+/**
+ * The runtime manager's merge notices: one PR receipt (deduped on its key line, like the
+ * bridge's) and one operator-mailbox message. Called only after a confirmed merge.
+ */
+async function postManagerMergeNotices(
+  deps: MergeManagerDeps,
+  record: WatchedRunRecord,
+  evidence: QualifiedMergeEvidence,
+  mergeSha: string | undefined
+): Promise<void> {
+  const logger = deps.log ?? log;
+  const ref: PullRequestRef = {
+    owner: evidence.owner,
+    repo: evidence.repository,
+    number: evidence.pr_number,
+  };
+  const prUrl = `https://github.com/${evidence.owner}/${evidence.repository}/pull/${evidence.pr_number}`;
+  const logFields = {
+    runId: record.runId,
+    woId: record.woId,
+    prUrl,
+    headSha: evidence.head_sha,
+    mergeSha: mergeSha ?? null,
+  };
+  const keyField = (value: string): string =>
+    sanitizeNoticeField(value).replace(/[^A-Za-z0-9._:-]/g, '_');
+  const keyLine = `<!-- merge-manager-receipt-key run=${keyField(record.runId)} head=${keyField(
+    evidence.head_sha
+  )} -->`;
+  try {
+    if (!deps.commentOnPullRequest) throw new Error('comment_channel_unavailable');
+    const author = deps.commentAuthorLogin?.trim().toLowerCase();
+    const existing =
+      deps.listPullRequestComments && author ? await deps.listPullRequestComments(ref) : [];
+    const already = existing.some(
+      comment =>
+        comment.authorLogin.trim().toLowerCase() === author &&
+        comment.body.split(/\r?\n/).some(line => line.trim() === keyLine)
+    );
+    if (!already) {
+      await deps.commentOnPullRequest({
+        ...ref,
+        body: [
+          MERGE_RECEIPT_COMMENT_MARKER,
+          keyLine,
+          `Merged by the merge manager (unattended): run ${sanitizeNoticeField(record.runId, 80)} at head ${sanitizeNoticeField(evidence.head_sha.slice(0, 8))}, base ${sanitizeNoticeField(evidence.base_branch)}. Merge commit ${sanitizeNoticeField(mergeSha ?? 'unknown')}.`,
+        ].join('\n'),
+      });
+    }
+  } catch (error) {
+    logger.warn(
+      {
+        ...logFields,
+        channel: 'pr_comment',
+        error: sanitizeNoticeField(error instanceof Error ? error.message : String(error)),
+      },
+      MERGE_NOTICE_FAILED_LOG
+    );
+  }
+  await sendOperatorMergeNotice(
+    deps.createMessage,
+    {
+      idempotencyKey: mergeReceiptIdempotencyKey(ref, mergeSha, evidence.head_sha),
+      body: mergeReceiptMailboxBody({
+        ref,
+        prUrl,
+        baseBranch: evidence.base_branch,
+        headSha: evidence.head_sha,
+        mergeSha,
+        path: 'merge manager',
+      }),
+      priority: 'normal',
+      logFields,
+    },
+    logger
+  );
 }
 
 export type MergeManagerResult =
@@ -1277,6 +1458,9 @@ export function createMergeManager(
         merged_sha: execution.merged ? (execution.sha ?? null) : null,
       })
     );
+    if (execution.merged) {
+      await postManagerMergeNotices(deps, record, evidence, execution.sha);
+    }
     return { status: 'executed', receipt, execution };
   };
 }
