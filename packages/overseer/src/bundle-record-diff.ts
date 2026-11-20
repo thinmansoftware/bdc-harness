@@ -39,7 +39,7 @@ export type BundleExportName = (typeof BUNDLE_EXPORTS)[number]['name'];
 export type ParsedBundle = Map<BundleExportName, Map<string, string>>;
 
 /** The generator's fixed header (renderFile), one entry per line, ending with its blank line. */
-const HEADER_LINES = [
+export const HEADER_LINES = [
   '/**',
   ' * AUTO-GENERATED -- DO NOT EDIT.',
   ' *',
@@ -161,6 +161,11 @@ export function parseBundle(bytes: Uint8Array): ParsedBundle {
       while (lines[at] !== '};') {
         if (at >= lines.length) throw new BundleRecordError('unknown_line');
         const [key, value] = parseRecordLine(lines[at]);
+        // Keys follow the generator's file-name grammar; anything else (a newline, a space, a
+        // capital letter) is rejected before it can reach a prompt, a notice or a review body.
+        if (sourcePathCandidates(name, key).length === 0) {
+          throw new BundleRecordError('invalid_key');
+        }
         if (records.has(key)) throw new BundleRecordError('duplicate_key');
         records.set(key, value);
         at++;
@@ -202,9 +207,13 @@ export function bundleRecordScope(exportName: string, key: string): string {
   return `${BUNDLE_PATH}#${exportName}/${key}`;
 }
 
-/** Most line edits one record may need before the diff fails closed. */
+/**
+ * Most line edits one record's minimal diff may need. Past this, or past the total work budget,
+ * the record is shown as a whole-record replacement (every old line removed, every new line
+ * added): still complete, never truncated. Only the prompt byte cap (R4) can then fail the review.
+ */
 const MAX_EDIT_DISTANCE = 2_000;
-/** Total diff work (comparisons and steps) across all records before the diff fails closed. */
+/** Total minimal-diff work (comparisons and steps) across all records. */
 const MAX_DIFF_WORK = 50_000_000;
 const CONTEXT_LINES = 3;
 
@@ -220,8 +229,11 @@ function splitLines(text: string): string[] {
   return text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
 }
 
-/** Myers shortest edit script (the LCS of the two line lists), bounded in distance and work. */
-function editScript(a: string[], b: string[], budget: Budget): Op[] {
+/**
+ * Myers shortest edit script (the LCS of the two line lists), bounded in distance and work.
+ * Returns null when a bound is reached; the caller then shows a whole-record replacement.
+ */
+function editScript(a: string[], b: string[], budget: Budget): Op[] | null {
   if (a.length === 0) return b.map(line => ({ kind: '+', line }));
   if (b.length === 0) return a.map(line => ({ kind: '-', line }));
   const n = a.length;
@@ -242,7 +254,7 @@ function editScript(a: string[], b: string[], budget: Budget): Op[] {
         y++;
         budget.remaining--;
       }
-      if (--budget.remaining < 0) throw new BundleRecordError('diff_too_large');
+      if (--budget.remaining < 0) return null;
       v[offset + k] = x;
       if (x >= n && y >= m) {
         trace.push(v.slice(offset - d, offset + d + 1));
@@ -251,7 +263,7 @@ function editScript(a: string[], b: string[], budget: Budget): Op[] {
     }
     trace.push(v.slice(offset - d, offset + d + 1));
   }
-  throw new BundleRecordError('diff_too_large');
+  return null;
 }
 
 function backtrack(a: string[], b: string[], trace: Int32Array[]): Op[] {
@@ -303,9 +315,17 @@ function unifiedDiff(before: string, after: string, budget: Budget): string {
     suffix++;
   }
   budget.remaining -= prefix + suffix;
+  const oldMiddle = a.slice(prefix, a.length - suffix);
+  const newMiddle = b.slice(prefix, b.length - suffix);
+  const middle = (budget.remaining > 0 ? editScript(oldMiddle, newMiddle, budget) : null) ??
+    // Whole-record replacement: complete evidence when the minimal diff is over its bounds.
+    [
+      ...oldMiddle.map(line => ({ kind: '-' as const, line })),
+      ...newMiddle.map(line => ({ kind: '+' as const, line })),
+    ];
   const ops: Op[] = [
     ...a.slice(0, prefix).map(line => ({ kind: ' ' as const, line })),
-    ...editScript(a.slice(prefix, a.length - suffix), b.slice(prefix, b.length - suffix), budget),
+    ...middle,
     ...a.slice(a.length - suffix).map(line => ({ kind: ' ' as const, line })),
   ];
   const oldAt = new Int32Array(ops.length + 1);
@@ -344,8 +364,8 @@ function compareAscii(a: string, b: string): number {
 
 /**
  * Decode the merge-base and head bundle blobs and diff every changed record. Throws
- * BundleRecordError on any parse failure, when no record content changed, or when the diff work
- * exceeds its cap (`diff_too_large`); it never truncates.
+ * BundleRecordError on any parse failure or when no record content changed. It never truncates:
+ * a record whose minimal diff is over its bounds is shown as a whole-record replacement.
  */
 export function decodeBundleRecordDiff(before: Uint8Array, after: Uint8Array): BundleRecordDiff {
   const old = parseBundle(before);
