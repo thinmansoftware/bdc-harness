@@ -43,8 +43,11 @@ mock.module('@archon/git', () => ({
 
 // --- Mock dag-executor ---
 const mockExecuteDagWorkflow = mock(async (): Promise<string | undefined> => undefined);
+const fixturePreparedCodexHandle = {};
 mock.module('./dag-executor', () => ({
   executeDagWorkflow: mockExecuteDagWorkflow,
+  preparedDagBindingPolicy: (handle: unknown) =>
+    handle === fixturePreparedCodexHandle ? 'codex-only-v1' : null,
 }));
 
 // --- Mock logger functions ---
@@ -245,6 +248,62 @@ describe('executeWorkflow', () => {
       else process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE = previousPath;
       await rm(cwd, { recursive: true, force: true });
     }
+  });
+
+  it('prepared Codex-only seat cutoff refuses before reroute or override', async () => {
+    setSeatUsageReaderForTests(async seats =>
+      Object.fromEntries(
+        seats.map(seat => [
+          seat,
+          {
+            seat,
+            limit_source: 'measured',
+            windows: [
+              {
+                name: seat === 'codex' ? 'primary' : 'five_hour',
+                used_percent: 100,
+                remaining_percent: 0,
+                resets_at: '2030-01-01T00:00:00Z',
+              },
+            ],
+            seven_day: 'NOT_APPLICABLE',
+            gate_windows: [seat === 'codex' ? 'primary' : 'five_hour'],
+            probed_at: new Date().toISOString(),
+            endpoint: 'fixture',
+            note: 'fixture',
+          },
+        ])
+      )
+    );
+    const store = makeStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv',
+      '/tmp',
+      { ...makeWorkflow(), provider: 'codex' },
+      'test',
+      'db',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      fixturePreparedCodexHandle as never
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('codex_only_seat_refused');
+    expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    expect(
+      JSON.stringify((store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls)
+    ).not.toContain('"provider":"claude"');
+    expect(
+      (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.some(
+        call => (call[0] as { event_type: string }).event_type === 'node_failover'
+      )
+    ).toBe(false);
   });
 
   // -------------------------------------------------------------------------

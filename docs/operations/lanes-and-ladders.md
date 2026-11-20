@@ -37,11 +37,18 @@ Do not reconnect broken router entries "to try them." Keep the multi-tier vision
 do not make dark lanes live entry points.
 # Bounded supervised Codex-only dispatch
 
-`--entry codex --codex-only` selects the existing
+This route remains closed. The API, orchestrator, common executor and cascade
+unconditionally refuse reserved Codex-only dispatch. The behavior below is
+foundation code, not an admitted live operator route. Source acceptance and
+separate enabling authorization are still required; a capability identifier or
+passing source tests do not open these gates.
+
+The foundation defines `--entry codex --codex-only` as selecting the existing
 `bdc-feature-development-codex-only` workflow for one supervised attempt. The
-PowerShell wrapper accepts `-Workflow codex -CodexOnly` (or the existing Codex
-workflow alias). The option does not rebind the global ladder. Omitted/false
-requests retain their existing request identity and escalation behavior.
+PowerShell wrapper parses `-Workflow codex -CodexOnly` (or the existing Codex
+workflow alias), but its up-front refusal remains. The option does not rebind
+the global ladder. Omitted/false requests retain their existing request identity
+and escalation behavior.
 
 Before live admission, two authenticated reads resolve the unique target
 codebase and its absolute `default_cwd`, then read the registered workflow in

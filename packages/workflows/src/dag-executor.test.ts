@@ -15934,7 +15934,11 @@ describe('v2 binding-only preparation', () => {
     await mkdir(join(cwd, 'artifacts'), { recursive: true });
     await mkdir(join(cwd, 'logs'), { recursive: true });
     clearAgentRegistryCache();
-    captured.mockClear();
+    captured.mockReset();
+    captured.mockImplementation(async function* () {
+      yield { type: 'assistant' as const, content: '<promise>COMPLETE</promise>' };
+      yield { type: 'result' as const, sessionId: 'binding-only-fake-transport' };
+    });
     mockLoadContext.mockClear();
     mockLogFn.mockClear();
     deps = createMockDeps();
@@ -16102,6 +16106,80 @@ describe('v2 binding-only preparation', () => {
     expect(Object.isFrozen(prepared)).toBe(true);
     expect(Object.keys(prepared)).toEqual([]);
   });
+
+  it('v1 prepared lease loss records refusal and starts no later node or resume', async () => {
+    workflow.nodes = [
+      { id: 'first', prompt: 'Work.' },
+      { id: 'later', prompt: 'Never.', depends_on: ['first'] },
+    ];
+    const prepared = await prepareDagBindings(
+      cwd,
+      workflow,
+      'codex',
+      'workflow-choice',
+      config,
+      undefined,
+      'codex-only-v1'
+    );
+    const record = makeWorkflowRun('prepared-lease-loss', {
+      metadata: { codex_only_dispatch: { version: 'codex-only-v1' } },
+    });
+    (deps.store.getRunAuthority as ReturnType<typeof mock>).mockResolvedValue({ runId: record.id });
+    (deps.store.claimRunLease as ReturnType<typeof mock>).mockImplementation(async lease => lease);
+    (deps.store.heartbeatRunLease as ReturnType<typeof mock>).mockResolvedValue(false);
+    (deps.store.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue(record);
+    (deps.store.getWorkflowRunStatus as ReturnType<typeof mock>).mockResolvedValue('running');
+    deps.runLeaseTiming = { heartbeatIntervalMs: 5 };
+    const resumed = mock(async () => record);
+    deps.store.resumeWorkflowRun = resumed;
+    captured.mockImplementation(async function* () {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      yield { type: 'assistant' as const, content: 'Finished first.' };
+      yield { type: 'result' as const, sessionId: 'lease-fixture' };
+    });
+    await run(prepared, undefined, record);
+    const events = (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data: Record<string, unknown> }
+    );
+    expect(events.filter(event => event.event_type === 'run_lease_lost')).toHaveLength(1);
+    expect(events.find(event => event.event_type === 'run_lease_lost')?.data.reason).toBe(
+      'renewal_refused'
+    );
+    expect(
+      events.some(event => event.event_type === 'node_started' && event.step_name === 'later')
+    ).toBe(false);
+    expect(deps.store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(resumed).not.toHaveBeenCalled();
+  });
+
+  for (const mutation of ['none', 'registry', 'definition'] as const) {
+    it(`v1 prepared dispatch freshness: ${mutation}`, async () => {
+      await persona('Original role.');
+      workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned' }];
+      const prepared = await prepareDagBindings(
+        cwd,
+        workflow,
+        'codex',
+        'workflow-choice',
+        config,
+        undefined,
+        'codex-only-v1'
+      );
+      if (mutation === 'registry') await persona('Changed role.');
+      if (mutation === 'definition') workflow.nodes[0].id = 'changed';
+      captured.mockClear();
+      if (mutation === 'none') {
+        await run(prepared);
+        expect(captured).toHaveBeenCalledTimes(1);
+      } else {
+        await expect(run(prepared)).rejects.toThrow(
+          mutation === 'registry' ? 'registry_changed' : 'changed inputs'
+        );
+        expect(captured).not.toHaveBeenCalled();
+        expect(deps.getAgentProvider).not.toHaveBeenCalled();
+      }
+    });
+  }
 
   it('uses a fresh snapshot despite ordinary stale cache and consumes it after disk changes', async () => {
     workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned' }];
@@ -16723,7 +16801,7 @@ describe('v2 binding-only preparation', () => {
       0,
       1,
       '',
-      'codex-only-v1',
+      'codex-only-v0', // v1 is the selected valid policy; unknown versions still refuse.
       'CODEX-ONLY-V2',
       {},
       [],

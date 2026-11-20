@@ -3358,3 +3358,69 @@ describe('binding-v2 generic result closed admission', () => {
     });
   }
 });
+
+describe('v1 validated workflow context remains closed and avoids discovery', () => {
+  for (const mutation of ['none', 'definition', 'registry'] as const) {
+    test(`validated context before dispatch: ${mutation}`, async () => {
+      const fs = await import('node:fs/promises');
+      const { join } = await import('node:path');
+      const { tmpdir } = await import('node:os');
+      const { captureValidatedWorkflow, workflowDigest } =
+        await import('@archon/workflows/reliability/codex-only-binding');
+      const cwd = await fs.mkdtemp(join(tmpdir(), 'validated-context-'));
+      await fs.mkdir(join(cwd, '.archon', 'agents'), { recursive: true });
+      const workflow = makeTestWorkflow({
+        name: 'bdc-feature-development-codex-only',
+        provider: 'codex',
+        nodes: [{ id: 'work', prompt: 'Original.' }],
+      });
+      const message = '/workflow run bdc-feature-development-codex-only WO-TEST';
+      const handle = await captureValidatedWorkflow(
+        {
+          project: 'harness',
+          codebaseId: 'codebase-1',
+          cwd,
+          workflowDigest: workflowDigest(workflow),
+        },
+        workflow,
+        message
+      );
+      mockGetOrCreateConversation.mockReset();
+      mockGetCodebase.mockReset();
+      mockExecuteWorkflow.mockClear();
+      mockSendQuery.mockClear();
+      mockDiscoverWorkflowsWithConfig.mockClear();
+      mockGetOrCreateConversation.mockResolvedValue(
+        makeConversation({ codebase_id: 'codebase-1' })
+      );
+      mockGetCodebase.mockResolvedValue({
+        ...makeCodebaseForSync(),
+        id: 'codebase-1',
+        name: 'harness',
+        default_cwd: cwd,
+      });
+      const platform = makePlatform();
+      try {
+        if (mutation === 'definition') workflow.nodes[0].id = 'changed';
+        if (mutation === 'registry')
+          await fs.writeFile(
+            join(cwd, '.archon', 'agents', 'owned.md'),
+            '---\nname: owned\ntools: [Read]\n---\nChanged.\n'
+          );
+        await handleMessage(platform, 'conv-1', message, { validatedWorkflow: handle });
+        expect(mockDiscoverWorkflowsWithConfig).not.toHaveBeenCalled();
+        expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+        expect(mockSendQuery).not.toHaveBeenCalled();
+        expect(
+          JSON.stringify((platform.sendMessage as ReturnType<typeof mock>).mock.calls)
+        ).toContain(
+          mutation === 'none'
+            ? 'Codex-only dispatch is not available yet'
+            : 'codex_only_binding_changed'
+        );
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+});

@@ -2445,7 +2445,7 @@ export interface PreparedDagBindings {
 
 type DagBindingRole = 'primary' | 'availability' | 'quota' | 'approval-rejection';
 interface PreparedDagBindingState {
-  identityPolicy: 'codex-only-v2' | undefined;
+  identityPolicy: 'codex-only-v1' | 'codex-only-v2' | undefined;
   inputs: {
     cwd: string;
     workflow: DagBindingWorkflow;
@@ -2460,6 +2460,12 @@ interface PreparedDagBindingState {
 }
 const preparedDagBindingStates = new WeakMap<PreparedDagBindings, PreparedDagBindingState>();
 
+export function preparedDagBindingPolicy(
+  handle: PreparedDagBindings
+): 'codex-only-v1' | 'codex-only-v2' | null {
+  return preparedDagBindingStates.get(handle)?.identityPolicy ?? null;
+}
+
 function assertPreparedCodexProvider(provider: string | undefined): void {
   if (provider !== undefined && provider !== 'codex') {
     throw new Error('prepared_dag_bindings: restricted bindings require exact logical codex');
@@ -2473,9 +2479,14 @@ export async function prepareDagBindings(
   workflowModel: string | undefined,
   config: WorkflowConfig,
   modelOverride?: ModelOverride,
-  identityPolicy?: 'codex-only-v2'
+  identityPolicy?: 'codex-only-v1' | 'codex-only-v2',
+  validatedRegistry?: AgentRegistry
 ): Promise<PreparedDagBindings> {
-  if (identityPolicy !== undefined && identityPolicy !== 'codex-only-v2') {
+  if (
+    identityPolicy !== undefined &&
+    identityPolicy !== 'codex-only-v1' &&
+    identityPolicy !== 'codex-only-v2'
+  ) {
     throw new Error('prepared_dag_bindings: invalid identity_policy');
   }
   const inputs = structuredClone({
@@ -2509,7 +2520,9 @@ export async function prepareDagBindings(
       assertProvider(override.provider);
     }
   }
-  const registry = structuredClone(await loadAgentRegistry(join(cwd, '.archon', 'agents')));
+  const registry = structuredClone(
+    validatedRegistry ?? (await loadAgentRegistry(join(cwd, '.archon', 'agents')))
+  );
   const state: PreparedDagBindingState = { identityPolicy, inputs, registry, bindings: new Map() };
   const defaults = dagWorkflowLevelOptions(inputs.workflow);
   for (const [index, owner] of inputs.workflow.nodes.entries()) {
@@ -8299,6 +8312,15 @@ export const executeDagWorkflow: typeof executeDagWorkflowInternal = async (...a
       })
     ) {
       throw new Error('prepared_dag_bindings: unrecognized handle or changed inputs');
+    }
+    if (
+      state.identityPolicy === 'codex-only-v1' &&
+      !isDeepStrictEqual(
+        state.registry,
+        await loadAgentRegistry(join(resolvePath(cwd, '.archon', 'agents')))
+      )
+    ) {
+      throw new Error('prepared_dag_bindings: registry_changed');
     }
     // Execute isolated input copies so caller mutation during lease acquisition cannot
     // change the inspected workflow or provider configuration after validation.

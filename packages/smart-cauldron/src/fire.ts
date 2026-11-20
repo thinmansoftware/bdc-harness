@@ -164,7 +164,8 @@ function isObject(value: unknown): value is Record<string, unknown> {
 export async function preflightCodexOnly(
   project: string,
   apiBaseUrl: string,
-  token: string
+  token: string,
+  transport: typeof fetch = fetch
 ): Promise<CodexOnlyBinding> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -178,7 +179,7 @@ export async function preflightCodexOnly(
     let response: Response;
     try {
       response = await Promise.race([
-        fetch(url, {
+        transport(url, {
           headers: authHeaders(token),
           signal: controller.signal,
         }),
@@ -280,7 +281,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
   if (workflowName === CODEX_ONLY_WORKFLOW) {
     try {
-      const current = await preflightCodexOnly(project, apiBaseUrl, token);
+      const current = await preflightCodexOnly(project, apiBaseUrl, token, doFetch);
       if (
         !opts.validatedBinding ||
         JSON.stringify(current) !== JSON.stringify(opts.validatedBinding)
