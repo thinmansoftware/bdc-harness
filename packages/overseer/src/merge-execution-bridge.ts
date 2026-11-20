@@ -702,9 +702,18 @@ async function postRetryExhaustedNotices(
   const logger = options.logger ?? log;
   const reason = sanitizeNoticeField(input.reason);
   const headSha = sanitizeNoticeField(verdict.head_sha);
-  const prUrl = sanitizeNoticeField(input.prUrl ?? pr?.htmlUrl ?? 'unknown');
+  // A run-less verdict can exhaust before its pull request was read (pr_context_fetch_failed);
+  // its pull request is still named by the verdict itself.
+  const runless = pr?.pr ? null : runlessPullRef(verdict);
+  const ref =
+    pr?.pr ??
+    (runless ? { owner: runless.owner, repo: runless.repo, number: runless.prNumber } : undefined);
+  const prUrl = sanitizeNoticeField(
+    input.prUrl ??
+      pr?.htmlUrl ??
+      (ref ? `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}` : 'unknown')
+  );
   const logFields = { verdictId: verdict.id, woId: verdict.wo_id, prUrl, reason };
-  const ref = pr?.pr;
   if (ref && options.github.commentOnPullRequest) {
     const keyField = (value: string): string =>
       sanitizeReceiptField(value).replace(/[^A-Za-z0-9._:-]/g, '_');

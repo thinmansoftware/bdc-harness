@@ -618,6 +618,33 @@ describe('WO-HARNESS-MERGE-MANAGER-RECOVERY-01', () => {
     } finally {
       captured.restore();
     }
+
+    // A run-less verdict that exhausts before its pull request was read still names its PR.
+    const runless = bridgeHarness({
+      rows: [
+        verdict('t2-runless', {
+          run_id: `pr-discovery:${OWNER}/${REPO}#${PR_NUMBER}`,
+          wo_id: `gh:${OWNER}/${REPO}#${PR_NUMBER}`,
+          merge_attempts: 2,
+        }),
+      ],
+      evidence: () => {
+        throw new Error('pull request read failed');
+      },
+      retryMaxAttempts: 3,
+    });
+    await runMergeExecutionBridgeOnce(runless.options);
+    expect(runless.outcomes.map(o => o.reason)).toEqual([
+      'transient_exhausted:pr_context_fetch_failed',
+    ]);
+    expect(
+      runless.comments.filter(c => c.body.includes('<!-- merge-manager-exhausted -->'))
+    ).toHaveLength(1);
+    expect(runless.messages).toHaveLength(1);
+    expect(runless.messages[0]!.data.idempotency_key).toBe(
+      `overseer:merge-exhausted:${OWNER}/${REPO}#${PR_NUMBER}@${HEAD}`
+    );
+    expect(runless.messages[0]!.data.body).toContain(PR_URL);
   });
 
   test('Test 3: Fail closed on guard and persistence failures', async () => {
@@ -798,6 +825,23 @@ describe('WO-HARNESS-MERGE-MANAGER-RECOVERY-01', () => {
       1
     );
     expect(m.mergePullRequest).not.toHaveBeenCalled();
+
+    // Replay of a confirmed merge against the real dispatch store: the second notice carries the
+    // same idempotency key, so the operator mailbox holds one message and the PR one receipt.
+    await withIsolatedDatabase(async () => {
+      const real = managerHarness(dispatch.createAuthenticatedMessage);
+      expect((await real.manager(RUN_RECORD)).status).toBe('executed');
+      expect((await real.manager(RUN_RECORD)).status).toBe('executed');
+      const rows = await connection.getDatabase().query<{
+        id: string;
+        body: string;
+      }>('SELECT id, body FROM agent_dispatch_messages WHERE idempotency_key = $1', [`overseer:merge-receipt:${OWNER}/${REPO}#42@${MERGE_SHA}`]);
+      expect(rows.rows).toHaveLength(1);
+      expect(rows.rows[0]!.body).toContain(MERGE_SHA);
+      expect(
+        real.comments.filter(c => c.body.includes('<!-- merge-manager-receipt -->'))
+      ).toHaveLength(1);
+    });
 
     // Runtime merge manager path, mailbox send fails: logged, PR receipt still posted.
     const capturedManager = captureRootLogLines();
