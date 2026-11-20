@@ -5,6 +5,7 @@ import { createMergeManager, PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overs
 import type { MergeManagerDeps } from '@archon/overseer/merge-manager';
 import type { OverseerRunStoreDeps } from '@archon/overseer';
 import { getOverseerWatchRunById, listOriginatingRunCandidates } from '@archon/core/db/overseer';
+import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
 import { findOriginatingRunForPullRequest } from '@archon/overseer/originating-run-lookup';
 import { DEFAULT_WATCH_INTERVAL_MS } from '@archon/overseer/watch';
 import {
@@ -22,6 +23,8 @@ export function createRuntimeMergeManager(
 ): ReturnType<typeof createMergeManager> {
   return createMergeManager({
     ...deps,
+    // Merge notices to the operator mailbox (WO-HARNESS-MERGE-MANAGER-RECOVERY-01).
+    createMessage: deps.createMessage ?? createAuthenticatedMessage,
     findOriginatingRun:
       deps.findOriginatingRun ??
       ((input): ReturnType<typeof findOriginatingRunForPullRequest> =>

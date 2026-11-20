@@ -215,7 +215,22 @@ describe('merge queue notes: every queued pull request is labelled and commented
     q.evidence.set(107, { baseBranch: 'main' });
     q.evidence.set(108, { changedFilePaths: ['docs/operations/note.md'] });
 
-    await q.sweep();
+    // bdc-harness dev merges docs-only PRs by default (WO-HARNESS-MERGE-MANAGER-RECOVERY-01); 108 pins
+    // the policy-skip case, so this test names an explicit docs-only skip policy for bdc-harness.
+    const previousPolicy = process.env.MERGE_MANAGER_REPO_POLICY;
+    process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
+      'thinmansoftware/bdc-harness': {
+        dev: { unattended: true, docs_only: 'skip' },
+        staging: { unattended: true, docs_only: 'skip' },
+        main: { unattended: false, docs_only: 'skip' },
+      },
+    });
+    try {
+      await q.sweep();
+    } finally {
+      if (previousPolicy === undefined) delete process.env.MERGE_MANAGER_REPO_POLICY;
+      else process.env.MERGE_MANAGER_REPO_POLICY = previousPolicy;
+    }
 
     // 102 to 108 are not eligible; 109 is, and still gets its note (the head 101 has its own).
     expect([...q.comments.keys()].sort()).toEqual([101, 109]);

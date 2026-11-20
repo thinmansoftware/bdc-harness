@@ -1,4 +1,5 @@
 import { createLogger } from '@archon/paths';
+import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
 import {
   claimOverseerVerdict,
   claimVerdictForMergeExecution,
@@ -510,6 +511,9 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
         recordOutcome: recordVerdictMergeOutcome,
       },
       readWoSpec: readWoSpecForMergeHold,
+      // Merge and retry-exhaustion notices to the operator mailbox
+      // (WO-HARNESS-MERGE-MANAGER-RECOVERY-01).
+      createMessage: createAuthenticatedMessage,
     });
 }
 

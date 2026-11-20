@@ -50,6 +50,38 @@ The comment is three lines: the marker `<!-- merge-policy-skip:v1 -->`, a key li
 
 The interactive Duty Officer reads this marker: an approved, green, unmerged pull request carrying `merge-policy-skip:v1` was skipped on purpose, so the Duty Officer does not nudge the merge manager or report a stall, and cues the owner or the XO to merge it by hand once (skill file `Duty-Officer/SKILL.md`, rule under "A PR is stale, superseded, or unmerged?").
 
+## Recovery and merge notices (WO-HARNESS-MERGE-MANAGER-RECOVERY-01, bdc-xo#6406)
+
+**Head-scoped review-conflict lookup.** The last check before a merge reads the review requests and receipts for the pull request (`loadReviewConflictAtHead` in `packages/overseer/src/adapters/github-real-deps.ts`). Each read returns at most 500 rows, and a full page counts as unproven (`review_conflict_at_head:lookup_failed`). The three subject-keyed reads now keep only rows whose body contains the exact head SHA (`listMessages` `body_contains`), so rows for older heads cannot fill the page. Before this, shopops PR 1191 (1362 review requests, about 110 for its current head) failed the lookup on every tick. Every row read is still checked against the exact head, and a page that is still full at the head stays `lookup_failed`. A failed lookup is logged as `overseer.github_real_deps.review_conflict_lookup_failed`. The log names the repo, PR and head, and the cause: `threw`, with the sanitized error name and message, or `truncated`, with the read (`requests`, `pr_review_log`, `operator`, `legacy_pr_review_log`, `legacy_operator`) and its row count.
+
+```sh
+ssh hetzner-prod 'docker logs archon-app-1 --since 1h 2>&1 | grep review_conflict_lookup_failed'
+```
+
+**Bounded retry and exhaustion.** Transient reasons are retried with the backoff below. A retry attempt reads the pull request, approval, holds and review conflict again at the exact head. A hold releases the claim without using an attempt. A deferral that does not persist releases the claim and logs `merge-coordinator.claim_released` with reason `merge_defer_failed:<reason>`; it is never a silent defer. When the attempt cap is reached, the bridge records `transient_exhausted:<reason>` and sends two notices, for every transient reason:
+- one PR comment, marked `<!-- merge-manager-exhausted -->` with a key line `<!-- merge-manager-exhausted-key verdict=<id> head=<sha> -->`;
+- one operator-mailbox message (priority blocker, idempotency key `overseer:merge-exhausted:<owner>/<repo>#<n>@<headSha>`).
+
+Both give the PR URL, exact head, attempts, last reason and next human action. The verdict is final and is not retried.
+
+**Merge notices.** Every confirmed merge sends one PR receipt and one operator-mailbox message, from both the bridge and the runtime merge manager (`createRuntimeMergeManager`). The receipt now carries the full 40-character merge SHA.
+- The bridge receipt keeps its marker and key line.
+- The manager's receipt uses the same marker with key line `<!-- merge-manager-receipt-key run=<run id> head=<sha> -->`.
+- The mailbox message (recipient `operator`, sender `system:overseer`, idempotency key `overseer:merge-receipt:<owner>/<repo>#<n>@<mergeSha>`) states the PR, base, head and merge SHA.
+- An ambiguous merge transport result is not a confirmed merge and sends no notice.
+
+How notices behave:
+- They are sent once, in the same tick, and not retried after a restart.
+- A failed send logs `merge-coordinator.merge_notice_failed` with `channel` (`pr_comment` or `operator_mailbox`).
+- A failure on one channel does not stop the other.
+- No notice path calls merge.
+
+The mailbox sender is `createAuthenticatedMessage`, wired in `packages/overseer/src/service.ts` (bridge) and `packages/server/src/overseer-runtime.ts` (manager). Read the messages with the operator mailbox reader:
+
+```sh
+ssh hetzner-prod "TOKEN=\$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN); curl -s 'http://localhost:3090/api/dispatch/messages?recipient=operator&status=queued' -H \"x-archon-operator-token: \$TOKEN\""
+```
+
 ## Hourly merge ceiling and the `merge-queued` label
 
 The merge manager reserves one merge slot per merge in durable storage before it merges. There is no global ceiling by default. `OVERSEER_MAX_MERGES_PER_HOUR` is an optional non-negative integer throttle: the number of merges in a rolling 60 minutes, counted across every repository and every kind of pull request (specs, diary rows and code alike). It is a separate budget from GitHub API calls. Unset or empty means no ceiling. A value that is not a non-negative integer falls back to four. Zero prevents merges. When a configured ceiling is full, a green, approved pull request is not stuck, it is queued: the verdict claim is released with `rate_ceiling_deferred` and each later pass tries again.
@@ -91,6 +123,7 @@ A squash merge lands the head the Overseer approved. If the PR branch still exis
 
 | Repository | Base | Unattended | Docs-only |
 | --- | --- | --- | --- |
+| `thinmansoftware/bdc-harness` | `dev` | yes | merge |
 | `thinmansoftware/lspro-react` | `dev` | yes | skip |
 | `thinmansoftware/lspro-react` | `staging` | yes | skip |
 | `thinmansoftware/lspro-react` | `main` | no | skip |
@@ -99,6 +132,18 @@ A squash merge lands the head the Overseer approved. If the PR branch still exis
 | `thinmansoftware/comicstoreos-provisioner` | `main` | yes | skip |
 
 `release/lspro`, `release/ce`, `main` and `master` are production lanes and are never unattended candidates: `release/*` has no entry at all.
+
+**Docs-only pull requests to bdc-harness `dev` merge (John, 2026-11-20, bdc-xo PR 6405 comment 7044640550).** They are no longer skipped with `spec_only` and a policy-skip comment. They go through the merge manager under exactly the code-PR rule:
+- independent Overseer approval at the current commit;
+- required checks green;
+- every hold and review gate in `merge-holds.ts`: `merge-hold`, `run:blocked`, `owner:reworking`, a draft and a `FALLBACK:` title;
+- the spec-declared merge hold;
+- the active-run deferral;
+- the review conflict check at the exact head.
+
+Every other base keeps its docs-only value, and production bases stay excluded.
+
+**The code default alone has no live effect yet.** The live `MERGE_MANAGER_REPO_POLICY` names `thinmansoftware/bdc-harness` with `dev` docs-only `skip`, and the environment value wins for each repository it names. Changing that value is the ask-first host step below. It needs John's word at the time of action, with a backup, a readback and a way back. It is not covered by the harness rebuild exception (WO Stop 7).
 
 The provisioner row (WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01, bdc-xo#5581) holds ONLY while merging to its `main` deploys nothing but the staging Vercel project `comicstoreos-provisioner-staging` (evidence: bdc-xo#5576 comment 6810214724, read 2026-11-11 23:58Z: one linked Vercel project, the GitHub "Production" deployments point at the staging project, no workflow runs `vercel deploy`, `--prod`, `ssh` or `docker push`). If a production provisioner project, domain or workflow ever deploys from `main`, first move that base to `COVERED_PRODUCTION_BASES` in `packages/overseer/src/m09-promotion-gate.ts` and set its entry to `unattended: false`; the guard test `production_bases_match_merge_policy` fails when the two tables disagree.
 

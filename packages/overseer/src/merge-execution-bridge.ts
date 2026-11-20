@@ -51,6 +51,12 @@ import {
   ORIGINATING_RUN_FAILED_HOLD_REASON,
   ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON,
   ORIGINATING_RUN_UNREADABLE_HOLD_REASON,
+  MERGE_NOTICE_FAILED_LOG,
+  mergeReceiptIdempotencyKey,
+  mergeReceiptMailboxBody,
+  sanitizeNoticeField,
+  sendOperatorMergeNotice,
+  type OperatorMessageSender,
 } from './merge-manager';
 import type { OriginatingRun, OriginatingRunLookupInput } from './originating-run-lookup';
 import { resolveRequiredContexts } from './adapters/required-contexts';
@@ -152,6 +158,12 @@ export interface MergeExecutionBridgeOptions {
     repo: string;
     number: number;
   }): Promise<MergedSibling | null>;
+  /**
+   * Operator-mailbox sender for merge and retry-exhaustion notices
+   * (WO-HARNESS-MERGE-MANAGER-RECOVERY-01). Production passes createAuthenticatedMessage
+   * (service.ts); absent sends no mailbox notice and logs merge-coordinator.merge_notice_failed.
+   */
+  createMessage?: OperatorMessageSender;
 }
 
 export interface MinimalCompareClient {
@@ -640,7 +652,8 @@ async function postMergeReceiptComment(
         return;
       }
     }
-    const mergeShort = sanitizeReceiptField((input.mergeSha ?? 'unknown').slice(0, 8));
+    // The full 40-character merge SHA (WO-HARNESS-MERGE-MANAGER-RECOVERY-01).
+    const mergeCommit = sanitizeReceiptField(input.mergeSha ?? 'unknown');
     const baseBranch = sanitizeReceiptField(
       input.baseBranch && input.baseBranch.length > 0 ? input.baseBranch : 'unknown'
     );
@@ -650,7 +663,7 @@ async function postMergeReceiptComment(
     const body = [
       RECEIPT_MARKER,
       expectedReceiptKey,
-      `Merged by the merge manager (unattended): Overseer verdict ${verdict.id.slice(0, 8)} APPROVED at head ${verdict.head_sha.slice(0, 8)}, checks green, base ${baseBranch}, policy ${policyLabel}. Merge commit ${mergeShort}.`,
+      `Merged by the merge manager (unattended): Overseer verdict ${verdict.id.slice(0, 8)} APPROVED at head ${verdict.head_sha.slice(0, 8)}, checks green, base ${baseBranch}, policy ${policyLabel}. Merge commit ${mergeCommit}.`,
     ].join('\n');
     await options.github.commentOnPullRequest({ ...pr.pr, body });
   } catch (error) {
@@ -658,7 +671,101 @@ async function postMergeReceiptComment(
       { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
       'merge-coordinator.receipt_comment_failed'
     );
+    (options.logger ?? log).warn(
+      {
+        verdictId: verdict.id,
+        prUrl: pr.htmlUrl,
+        channel: 'pr_comment',
+        error: sanitizeNoticeField(error instanceof Error ? error.message : String(error)),
+      },
+      MERGE_NOTICE_FAILED_LOG
+    );
   }
+}
+
+const EXHAUSTED_MARKER = '<!-- merge-manager-exhausted -->';
+const EXHAUSTED_KEY_PREFIX = '<!-- merge-manager-exhausted-key';
+
+/**
+ * WO-HARNESS-MERGE-MANAGER-RECOVERY-01: when the bounded retry gives up, say so once on the
+ * pull request and once in the operator mailbox, with the PR URL, exact head, attempts,
+ * reason and the next human action. The terminal outcome is already recorded, so the
+ * verdict is never listed again; the comment is also deduped on its key line and the
+ * mailbox message on its idempotency key. Never throws, and never calls merge.
+ */
+async function postRetryExhaustedNotices(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence | undefined,
+  input: { reason: string; attempts: number; prUrl?: string }
+): Promise<void> {
+  const logger = options.logger ?? log;
+  const reason = sanitizeNoticeField(input.reason);
+  const headSha = sanitizeNoticeField(verdict.head_sha);
+  const prUrl = sanitizeNoticeField(input.prUrl ?? pr?.htmlUrl ?? 'unknown');
+  const logFields = { verdictId: verdict.id, woId: verdict.wo_id, prUrl, reason };
+  const ref = pr?.pr;
+  if (ref && options.github.commentOnPullRequest) {
+    const keyField = (value: string): string =>
+      sanitizeReceiptField(value).replace(/[^A-Za-z0-9._:-]/g, '_');
+    const keyLine = `${EXHAUSTED_KEY_PREFIX} verdict=${keyField(verdict.id)} head=${keyField(
+      verdict.head_sha
+    )} -->`;
+    try {
+      const author = options.github.commentAuthorLogin?.trim().toLowerCase();
+      const existing =
+        options.github.listPullRequestComments && author
+          ? await options.github.listPullRequestComments(ref)
+          : [];
+      const already = existing.some(
+        comment =>
+          comment.authorLogin.trim().toLowerCase() === author &&
+          comment.body.split(/\r?\n/).some(line => line.trim() === keyLine)
+      );
+      if (!already) {
+        await options.github.commentOnPullRequest({
+          ...ref,
+          body: [
+            EXHAUSTED_MARKER,
+            keyLine,
+            `The merge manager stopped retrying this pull request after ${input.attempts} attempts at head ${headSha}. Last reason: ${reason}. It will not retry this verdict; a person checks the cause and decides the next step (details in the operator mailbox).`,
+          ].join('\n'),
+        });
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          ...logFields,
+          channel: 'pr_comment',
+          error: sanitizeNoticeField(error instanceof Error ? error.message : String(error)),
+        },
+        MERGE_NOTICE_FAILED_LOG
+      );
+    }
+  } else {
+    logger.warn(
+      { ...logFields, channel: 'pr_comment', error: 'no_pull_request' },
+      MERGE_NOTICE_FAILED_LOG
+    );
+  }
+  const subject = ref ? `${ref.owner}/${ref.repo}#${ref.number}` : `verdict ${verdict.id}`;
+  await sendOperatorMergeNotice(
+    options.createMessage,
+    {
+      idempotencyKey: `overseer:merge-exhausted:${
+        ref ? `${ref.owner}/${ref.repo}#${ref.number}` : `verdict-${verdict.id}`
+      }@${verdict.head_sha}`,
+      priority: 'blocker',
+      body: [
+        `Merge retries exhausted: ${prUrl} (${sanitizeNoticeField(subject)}) was not merged after ${input.attempts} attempts.`,
+        `Head: ${headSha}`,
+        `Last reason: ${reason}`,
+        'Next action: a person reads the cause in the archon-app-1 logs (merge-coordinator.merge_deferred, and overseer.github_real_deps.review_conflict_lookup_failed for a lookup failure), fixes it, and decides whether the pull request is merged by hand or reviewed again at a new head. The merge manager will not retry this verdict.',
+      ].join('\n'),
+      logFields,
+    },
+    logger
+  );
 }
 
 /**
@@ -915,6 +1022,8 @@ async function mergeClaimedVerdict(
   queuePosition: number
 ): Promise<'stop' | 'ceiling_full' | undefined> {
   let rateLimitDeferred = false;
+  // The pull request once resolved, for the retry-exhaustion notice.
+  const resolved: { pr?: PullRequestEvidence } = {};
   const skip = async (
     reason: string,
     prUrl?: string,
@@ -939,6 +1048,7 @@ async function mergeClaimedVerdict(
       );
       return;
     }
+    let exhaustedAttempts: number | null = null;
     if (classifyMergeSkip(reason) === 'transient' && options.store.deferVerdictClaim) {
       const retryMaxAttempts = configuredNonNegativeInteger(
         options.retryMaxAttempts,
@@ -976,9 +1086,15 @@ async function mergeClaimedVerdict(
             },
             'merge-coordinator.merge_deferred'
           );
+          return;
         }
-        return;
+        // A deferral that did not persist is an error, never a silent successful defer
+        // (WO-HARNESS-MERGE-MANAGER-RECOVERY-01). The throw reaches the catch in
+        // runMergeExecutionBridgeOnce, which releases the slot and the claim and logs
+        // merge-coordinator.claim_released, so the verdict is claimable again next tick.
+        throw new Error(`merge_defer_failed:${reason}`);
       }
+      exhaustedAttempts = attempts + 1;
       reason = `transient_exhausted:${reason}`;
     }
     await options.store.recordOutcome({
@@ -987,6 +1103,13 @@ async function mergeClaimedVerdict(
       reason,
       prUrl,
     });
+    if (exhaustedAttempts !== null) {
+      await postRetryExhaustedNotices(options, verdict, resolved.pr, {
+        reason,
+        attempts: exhaustedAttempts,
+        prUrl,
+      });
+    }
     const skipFields = {
       verdictId: verdict.id,
       runId: verdict.run_id,
@@ -1028,6 +1151,7 @@ async function mergeClaimedVerdict(
   const target = await resolveMergeTarget(options, verdict, repoPolicy, skip);
   if (!target) return rateLimitDeferred ? 'stop' : undefined;
   const { pr, basePolicy } = target;
+  resolved.pr = pr;
   if (!pr.exists || !pr.pr) {
     await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
     return undefined;
@@ -1492,11 +1616,37 @@ async function mergeClaimedVerdict(
     }
   }
   const ownerRepo = pr.pr !== undefined ? `${pr.pr.owner}/${pr.pr.repo}` : 'unknown';
+  const mergeSha = merged.mergeSha ?? merged.sha;
   await postMergeReceiptComment(options, verdict, pr, {
-    mergeSha: merged.mergeSha ?? merged.sha,
+    mergeSha,
     baseBranch: pr.baseBranch,
     policyLabel: `${ownerRepo}:${pr.baseBranch ?? 'unknown'}`,
   });
+  // One operator-mailbox message per confirmed merge (WO-HARNESS-MERGE-MANAGER-RECOVERY-01).
+  // The ambiguous-transport outcome above is not a confirmed merge and sends no notice.
+  await sendOperatorMergeNotice(
+    options.createMessage,
+    {
+      idempotencyKey: mergeReceiptIdempotencyKey(pr.pr, mergeSha, verdict.head_sha),
+      body: mergeReceiptMailboxBody({
+        ref: pr.pr,
+        prUrl: pr.htmlUrl ?? `https://github.com/${ownerRepo}/pull/${pr.pr.number}`,
+        baseBranch: pr.baseBranch ?? 'unknown',
+        headSha: verdict.head_sha,
+        mergeSha,
+        path: 'merge bridge',
+      }),
+      priority: 'normal',
+      logFields: {
+        verdictId: verdict.id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+        headSha: verdict.head_sha,
+        mergeSha: mergeSha ?? null,
+      },
+    },
+    options.logger ?? log
+  );
   return undefined;
 }
 

@@ -2712,6 +2712,7 @@ type ReviewConflictListFn = (filters: {
   recipient: string;
   subject_key: string;
   limit: number;
+  body_contains: string;
 }) => Promise<ReviewConflictRequestRow[]>;
 
 type ReviewConflictLegacyListFn = (filters: {
@@ -2731,28 +2732,48 @@ type ReviewConflictLegacyListFn = (filters: {
  * Receipts written before the 2026-09-07 subject_key cutover have no
  * subject_key, so they are also read by correlation prefix for this exact head,
  * the way listPriorReviewWork reads legacy history.
+ *
+ * HEAD-SCOPED (WO-HARNESS-MERGE-MANAGER-RECOVERY-01). The subject-keyed reads keep
+ * only rows whose raw body contains the exact head SHA. Rows for older heads used
+ * to fill the 500-row page (shopops PR 1191 had 1362 review requests; about 110
+ * were for its current head), so every lookup came back truncated and the
+ * approved PR was stranded. The filter drops no row reviewConflictFromMessages
+ * would keep: bodyAtHead keeps a row only when JSON.parse(body).headSha equals
+ * input.headSha, and JSON writes a string's ASCII letters and digits literally, so
+ * that row's raw body contains the SHA text. bodyAtHead still runs on every row
+ * read. A page that is still full at the head stays lookup_failed (fail closed).
  */
 export async function loadReviewConflictAtHead(
   input: PullRequestRef & { headSha: string },
   list: ReviewConflictListFn,
-  listLegacy: ReviewConflictLegacyListFn
+  listLegacy: ReviewConflictLegacyListFn,
+  logger: { warn(obj: Record<string, unknown>, msg: string): void } = log
 ): Promise<ReviewConflictAtHead | null> {
   const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
+  const where = {
+    owner: input.owner,
+    repo: input.repo,
+    prNumber: input.number,
+    headSha: input.headSha,
+  };
   try {
     const requests = await list({
       recipient: REVIEW_REQUEST_RECIPIENT,
       subject_key: subjectKey,
       limit: REVIEW_CONFLICT_PAGE_LIMIT,
+      body_contains: input.headSha,
     });
     const pr = await list({
       recipient: PR_REVIEW_LOG_RECIPIENT,
       subject_key: subjectKey,
       limit: REVIEW_CONFLICT_PAGE_LIMIT,
+      body_contains: input.headSha,
     });
     const operator = await list({
       recipient: 'operator',
       subject_key: subjectKey,
       limit: REVIEW_CONFLICT_PAGE_LIMIT,
+      body_contains: input.headSha,
     });
     const correlationPrefix = `pr-review:${input.owner}/${input.repo}#${input.number}@${input.headSha}`;
     const legacyLog = await listLegacy({
@@ -2767,18 +2788,56 @@ export async function loadReviewConflictAtHead(
     });
     // The reads have no pagination. A full page may hide older rows for this
     // head, so a full page is not proof of "no conflict".
-    const truncated = [requests, pr, operator, legacyLog, legacyOperator].some(
-      rows => rows.length >= REVIEW_CONFLICT_PAGE_LIMIT
-    );
-    return reviewConflictFromMessages(
+    const reads: [string, readonly unknown[]][] = [
+      ['requests', requests],
+      ['pr_review_log', pr],
+      ['operator', operator],
+      ['legacy_pr_review_log', legacyLog],
+      ['legacy_operator', legacyOperator],
+    ];
+    const full = reads.find(([, rows]) => rows.length >= REVIEW_CONFLICT_PAGE_LIMIT);
+    const result = reviewConflictFromMessages(
       input,
       [...pr, ...operator, ...legacyLog, ...legacyOperator],
       requests,
-      { truncated }
+      { truncated: full !== undefined }
     );
-  } catch {
+    if (result === 'lookup_failed' && full !== undefined) {
+      logger.warn(
+        { ...where, cause: 'truncated', read: full[0], rowCount: full[1].length },
+        'overseer.github_real_deps.review_conflict_lookup_failed'
+      );
+    }
+    return result;
+  } catch (error) {
+    logger.warn(
+      {
+        ...where,
+        cause: 'threw',
+        errorName: error instanceof Error ? sanitizeLookupError(error.name) : 'unknown',
+        errorMessage: sanitizeLookupError(error instanceof Error ? error.message : String(error)),
+      },
+      'overseer.github_real_deps.review_conflict_lookup_failed'
+    );
     return 'lookup_failed';
   }
+}
+
+/**
+ * A lookup error for the log: printable ASCII only, likely credentials replaced, at
+ * most 300 characters. The error object itself (stack, cause, query parameters) is
+ * never logged.
+ */
+function sanitizeLookupError(text: string): string {
+  return text
+    .replace(/[^\x20-\x7e]/g, '')
+    .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '[redacted]')
+    .replace(
+      /\b(?:bearer|token|password|passwd|secret|apikey|api_key)\b\s*[=:]?\s*\S+/gi,
+      '[redacted]'
+    )
+    .replace(/:\/\/[^/\s@]+@/g, '://[redacted]@')
+    .slice(0, 300);
 }
 
 /**

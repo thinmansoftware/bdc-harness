@@ -1045,6 +1045,13 @@ export async function listMessages(filters: {
    * oldest-first queued page is not filled with fenced history rows.
    */
   created_at_gte?: string;
+  /**
+   * Keep only rows whose raw body text contains this literal substring
+   * (WO-HARNESS-MERGE-MANAGER-RECOVERY-01). The review-conflict lookup passes the exact
+   * head SHA so rows for older heads of the same pull request cannot fill the page.
+   * A necessary-condition filter: callers still parse and check the body.
+   */
+  body_contains?: string;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -1083,6 +1090,10 @@ export async function listMessages(filters: {
   if (filters.created_at_gte !== undefined) {
     params.push(filters.created_at_gte);
     clauses.push(`created_at >= $${params.length}`);
+  }
+  if (filters.body_contains !== undefined) {
+    params.push(`%${escapeLikeLiteral(filters.body_contains)}%`);
+    clauses.push(`body LIKE $${params.length} ESCAPE '\\'`);
   }
   if (filters.status === 'queued') {
     params.push(nowIso());

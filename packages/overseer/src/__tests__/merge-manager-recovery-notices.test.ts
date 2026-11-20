@@ -871,12 +871,8 @@ describe('WO-HARNESS-MERGE-MANAGER-RECOVERY-01', () => {
 
     // A docs-only PR to a production base of another repo: skipped, no approve or merge call.
     const shopops = bridgeHarness({
-      rows: [
-        verdict('t5-shopops', {
-          run_id: `pr-discovery:${OWNER}/shopops#7`,
-          wo_id: `gh:${OWNER}/shopops#7`,
-        }),
-      ],
+      rows: [verdict('t5-shopops')],
+      runRepo: 'shopops',
       evidence: () =>
         green({
           changedFilePaths: docs,
