@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
 import {
@@ -147,6 +147,19 @@ function captureLogs(): { lines: string[]; restore: () => void } {
   });
   return { lines, restore: () => write.mockRestore() };
 }
+
+// bdc-harness dev merges docs-only PRs by default (WO-HARNESS-MERGE-MANAGER-RECOVERY-01). These
+// cases pin the skip comment, so they name an explicit skip policy for bdc-harness; the other
+// repositories keep their default values.
+beforeEach(() => {
+  process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
+    'thinmansoftware/bdc-harness': {
+      dev: { unattended: true, docs_only: 'skip' },
+      staging: { unattended: true, docs_only: 'skip' },
+      main: { unattended: false, docs_only: 'skip' },
+    },
+  });
+});
 
 afterEach(() => {
   delete process.env.MERGE_MANAGER_REPO_POLICY;
