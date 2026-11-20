@@ -235,6 +235,10 @@ GATE_AWK="$(tr -d '\r' < "$GATE_SCRIPT" | awk '
   c { print }')"
 assert_eq "Test 4 (b) the lane awk body was found (non-empty)" "yes" "$([ "$(printf '%s\n' "$LANE_AWK" | wc -l)" -gt 20 ] && echo yes || echo no)"
 assert_eq "Test 4 (b) gate uncapped awk program is byte-identical to rst_extract_commands" "$LANE_AWK" "$GATE_AWK"
+# bdc-xo#6395: the block-local backtick extractor uses the same RUNNER rule.
+RUNNER_ALL="$(tr -d '\r' < "$GATE_SCRIPT" | awk '/^wag_extract_all\(\) \{/ { f = 1; next } f && /^  awk -v RUNNER=/ { print; exit }')"
+RUNNER_BT="$(tr -d '\r' < "$GATE_SCRIPT" | awk '/^wag_block_backticks\(\) \{/ { f = 1; next } f && /^  awk -v RUNNER=/ { print; exit }')"
+assert_eq "Test 4 (c) wag_block_backticks RUNNER rule equals wag_extract_all's (non-empty)" "yes|$RUNNER_ALL" "$([ -n "$RUNNER_BT" ] && echo yes || echo no)|$RUNNER_BT"
 
 # Load the cores in this shell for the helper-level checks.
 eval "$CANON"
@@ -378,6 +382,39 @@ code_spec WO-T-RED-H-01 "Stop 1 (test suite): runner missing, marked $M
   Expected: passes after the fix" "tests/new.sh"
 PATH="$NOCARGO_PATH" run_gate first "$(preview_for WO-T-RED-H-01)"
 assert_eq "Test 8 (h) marked command whose runner is not on PATH fails red_runner_missing" "fail|no|1:red_runner_missing:cargo test tests/new.sh" "$(verdict)|$(jfield GATE_REASONS)"
+
+# bdc-xo#6395 (intake run bbf788da, WO-HARNESS-BUNDLE-REVIEW-01 Stop 2): the marked
+# Stop block holds a prose line and then the command in BACKTICKS, and the gate runs
+# the bare command found on the manifest's Tests: line. The block's own extraction
+# joins prose and command into one string, so the exact-equality check never matched
+# and the marker was ignored. The backticked command is a complete command declared
+# by that block, so the marker must apply to it, by exact equality, in that block only.
+code_spec WO-T-RED-I-01 "Stop 1 (test suite): $M
+  $M The following new test file is created by this WO; its cases must exercise the behaviour.
+  \`bash tests/new.sh\`
+  Expected: 1 passing / 1 total" "tests/new.sh
+Tests: 1/1 (bash tests/new.sh)"
+run_gate first "$(preview_for WO-T-RED-I-01)"
+assert_eq "Test 8 (i) #6395 shape: marked block, prose then a backticked command for a missing listed file, passes red_new_file" "pass|yes|red_new_file" "$(verdict)|$(grep -o 'red_new_file' "$REPORT" | head -n 1)"
+
+code_spec WO-T-RED-J-01 "Stop 1 (test suite): $M
+  $M The existing failing test is the red before the fix; it must exercise the behaviour.
+  \`bash tests/bad.sh\`
+  Expected: 0 passing before the fix" "none
+Tests: 0/1 (bash tests/bad.sh)"
+run_gate first "$(preview_for WO-T-RED-J-01)"
+assert_eq "Test 8 (j) #6395 shape: marked block, prose then a backticked failing command, reads red_confirmed" "pass|yes|red_confirmed" "$(verdict)|$(grep -o 'red_confirmed' "$REPORT" | head -n 1)"
+
+code_spec WO-T-RED-K-01 "Stop 1 (test suite): unmarked
+  bash tests/bad.sh
+  Expected: 1 passing
+
+Stop 2 (test suite): $M
+  $M A different, longer command; prose first, then the backticked command.
+  \`bash tests/bad.sh extra\`
+  Expected: 0 passing before the fix"
+run_gate first "$(preview_for WO-T-RED-K-01)"
+assert_contains "Test 8 (k) #6395 scope: a marked block's backticked command never waives an unmarked shorter command" "1:green_failed:bash tests/bad.sh" "$(jfield GATE_REASONS)"
 
 # Marker scope (review App, PR 1618 review 5977808481): a marker applies only to the
 # COMPLETE extracted command of its own declaring Stop block (or its own When: line):
