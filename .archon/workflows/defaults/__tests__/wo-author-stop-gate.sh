@@ -235,6 +235,10 @@ GATE_AWK="$(tr -d '\r' < "$GATE_SCRIPT" | awk '
   c { print }')"
 assert_eq "Test 4 (b) the lane awk body was found (non-empty)" "yes" "$([ "$(printf '%s\n' "$LANE_AWK" | wc -l)" -gt 20 ] && echo yes || echo no)"
 assert_eq "Test 4 (b) gate uncapped awk program is byte-identical to rst_extract_commands" "$LANE_AWK" "$GATE_AWK"
+# bdc-xo#6395: the block-local backtick extractor uses the same RUNNER rule.
+RUNNER_ALL="$(tr -d '\r' < "$GATE_SCRIPT" | awk '/^wag_extract_all\(\) \{/ { f = 1; next } f && /^  awk -v RUNNER=/ { print; exit }')"
+RUNNER_BT="$(tr -d '\r' < "$GATE_SCRIPT" | awk '/^wag_block_backticks\(\) \{/ { f = 1; next } f && /^  awk -v RUNNER=/ { print; exit }')"
+assert_eq "Test 4 (c) wag_block_backticks RUNNER rule equals wag_extract_all's (non-empty)" "yes|$RUNNER_ALL" "$([ -n "$RUNNER_BT" ] && echo yes || echo no)|$RUNNER_BT"
 
 # Load the cores in this shell for the helper-level checks.
 eval "$CANON"

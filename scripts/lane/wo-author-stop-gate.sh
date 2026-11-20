@@ -203,12 +203,32 @@ wag_marked_sources() {
   ' "$1"
 }
 
+# wag_block_backticks   (marked source record on stdin -> every backticked span in it
+#   whose text matches the runner rule, cleaned like wag_extract_all's emit. A Stop
+#   block's test-block reader joins every line up to Expected: into ONE string, so a
+#   prose line before a backticked command hides that command (bdc-xo#6395). The
+#   RUNNER literal is the one in wag_extract_all; the gate test asserts they are equal.)
+wag_block_backticks() {
+  awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
+    function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+    {
+      s = $0
+      while (match(s, /`[^`]+`/)) {
+        g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+        if (g ~ RUNNER) { g = clean(g); if (g != "" && !(g in seen)) { seen[g] = 1; print g } }
+      }
+    }
+  '
+}
+
 # wag_marked_red <cmd> <spec-file>   (rc 0 when ANY source occurrence of the command
 #   carries the expected-red marker. The marker applies only to the COMPLETE commands
 #   that its own declaring source yields: each marked Stop block (with its governing
 #   heading) or marked When: line is run through the same extraction rule as the whole
-#   spec (wag_extract_all | rst_split_segments), and the command must EQUAL one of
-#   them. A substring never matches, and a marker never reaches another block.)
+#   spec (wag_extract_all | rst_split_segments), together with the block's own
+#   backticked runner commands (wag_block_backticks | rst_split_segments, bdc-xo#6395),
+#   and the command must EQUAL one of them. A substring never matches, and a marker
+#   never reaches another block.)
 wag_marked_red() {
   local want="$1" rec="" line c rs
   rs="$(printf '\036')"
@@ -217,7 +237,7 @@ wag_marked_red() {
       while IFS= read -r c; do
         if [ -n "$c" ] && [ "$c" = "$want" ]; then return 0; fi
       done <<EOF_WAG_MARKED
-$(printf '%s' "$rec" | wag_extract_all | rst_split_segments)
+$(printf '%s' "$rec" | wag_extract_all | rst_split_segments; printf '%s' "$rec" | wag_block_backticks | rst_split_segments)
 EOF_WAG_MARKED
       rec=""
       continue
