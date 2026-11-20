@@ -20,6 +20,15 @@ export function configuredBundleProducer(
   const pin = env.OVERSEER_BUNDLE_PRODUCER_COMMIT;
   return env.OVERSEER_BUNDLE_EXCLUSION_ENABLED === '1' && pin && SHA.test(pin) ? pin : null;
 }
+/**
+ * Actual bundle record review (WO-HARNESS-BUNDLE-REVIEW-01): OFF unless the flag is exactly '1'.
+ * It does not depend on an admitted producer; turning it off restores today's behavior.
+ */
+export function bundleRecordDiffEnabled(
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  return env.OVERSEER_BUNDLE_RECORD_DIFF_ENABLED === '1';
+}
 export type ProofRead = (route: string, params: Record<string, unknown>) => Promise<unknown>;
 export interface Entry {
   sha: string;
@@ -30,6 +39,11 @@ export interface BundleCoverage {
   notice: string;
   baseSha: string;
   producer: string;
+  /**
+   * How the bundle was covered. `actual_review`: the decoded bundle records reached the model.
+   * Never set on the proof path; every consumer treats an absent mode as `proof_only`.
+   */
+  mode?: 'actual_review' | 'proof_only';
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -199,7 +213,7 @@ async function onDevAndAfterProducer(
   return ok(dev) && ok(admitted);
 }
 
-async function tree(
+export async function tree(
   read: ProofRead,
   commit: string
 ): Promise<{ entries: Inventory; treeSha: string; parents: string[] }> {
@@ -258,10 +272,15 @@ async function tree(
 function sha256(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
-async function blob(read: ProofRead, sha: string): Promise<Buffer> {
-  const result = object(
-    await read('GET /repos/{owner}/{repo}/git/blobs/{file_sha}', { file_sha: sha })
+export async function blob(read: ProofRead, sha: string): Promise<Buffer> {
+  return verifiedBlobBytes(
+    await read('GET /repos/{owner}/{repo}/git/blobs/{file_sha}', { file_sha: sha }),
+    sha
   );
+}
+/** The bytes of one blob API response, only when they hash (git sha1) to the requested sha. */
+export function verifiedBlobBytes(response: unknown, sha: string): Buffer {
+  const result = object(response);
   requireProof(result.encoding === 'base64' && result.sha === sha);
   const bytes = Buffer.from(string(result.content).replace(/\s/g, ''), 'base64');
   requireProof(bytes.length <= 32_000_000);

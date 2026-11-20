@@ -52,10 +52,23 @@ import {
 } from '../pr-review-check-ingest';
 import type { SubmitOutcome } from '../pr-review-submit.ts';
 import {
+  BUNDLE_PATH,
+  blob,
+  bundleRecordDiffEnabled,
   collectBundleCoverage,
   configuredBundleProducer,
+  reconcileDiff,
+  tree,
+  verifiedBlobBytes,
   type BundleCoverage,
+  type ProofRead,
 } from '../bundle-review-proof';
+import {
+  BundleRecordError,
+  bundleSourceMismatches,
+  decodeBundleRecordDiff,
+} from '../bundle-record-diff';
+import type { IndependentReviewFinding } from '../independent-review-evidence';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -504,6 +517,14 @@ export interface ExactHeadPullRequestEvidence {
   bundleProofUnavailable?: boolean;
   /** The bundle changed and its Test Suite run is unfinished: defer as checks_pending. */
   bundleRunPending?: boolean;
+  /** Actual bundle record review: the decoded record diffs (untrusted PR data). */
+  bundleRecordEvidence?: string;
+  /** Actual bundle record review: one finding scope per changed record. */
+  bundleRecordScopes?: string[];
+  /** Actual bundle record review: deterministic source-mismatch blockers. */
+  bundleRecordFindings?: IndependentReviewFinding[];
+  /** Actual bundle record review could not be assembled; the review is INDETERMINATE. */
+  bundleRecordParseError?: string;
   coverage?: BundleCoverage;
   diff: string;
   checks: { name: string; status: string; conclusion: string | null }[];
@@ -564,6 +585,154 @@ function bindRepoMethod<K extends BoundReposMethodName>(
   const fn = repos?.[method];
   if (typeof fn !== 'function') return undefined;
   return fn.bind(repos) as NonNullable<NonNullable<RealGitHubOctokitLike['repos']>[K]>;
+}
+
+interface BundleRecordReview {
+  diff: string;
+  coverage: BundleCoverage;
+  evidence: string;
+  scopes: string[];
+  findings: IndependentReviewFinding[];
+  bundleRunPending: boolean;
+}
+
+/**
+ * Actual bundle record review (WO-HARNESS-BUNDLE-REVIEW-01). Returns null when the pull request
+ * does not change the bundle. Otherwise it parses the authenticated merge-base and head bundle
+ * blobs, authenticates every other diff block, replaces only the raw bundle block with the decoded
+ * record diffs, and runs the source-match gate. An admitted producer's proof, when it verifies, is
+ * supporting evidence only. Any failure throws BundleRecordError (rate limits are rethrown as-is);
+ * nothing here falls back to the proof-only diff.
+ */
+async function collectBundleRecordReview(
+  read: ProofRead,
+  input: { owner: string; repo: string; prNumber: number; headSha: string; baseSha: string },
+  producer: string | null
+): Promise<BundleRecordReview | null> {
+  const blobRoute = 'GET /repos/{owner}/{repo}/git/blobs/{file_sha}';
+  const compareRoute = 'GET /repos/{owner}/{repo}/compare/{basehead}';
+  const blobs = new Map<string, Promise<unknown>>();
+  // The bundle blobs are about 8 MB each; read every blob once for this collection.
+  const cached: ProofRead = (route, parameters) => {
+    if (route !== blobRoute) return read(route, parameters);
+    const sha = String(parameters.file_sha);
+    let response = blobs.get(sha);
+    if (!response) {
+      response = read(route, parameters);
+      blobs.set(sha, response);
+    }
+    return response;
+  };
+  const step = async <T>(reason: string, run: () => Promise<T>): Promise<T> => {
+    try {
+      return await run();
+    } catch (error) {
+      if (classifyRateLimitError(error) || error instanceof BundleRecordError) throw error;
+      throw new BundleRecordError(reason);
+    }
+  };
+  const { headSha, baseSha } = input;
+  const basehead = `${baseSha}...${headSha}`;
+  const mergeBase = await step('merge_base_unavailable', async () => {
+    const comparison = (await cached(compareRoute, { basehead })) as {
+      merge_base_commit?: { sha?: unknown };
+    } | null;
+    const sha = comparison?.merge_base_commit?.sha;
+    if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/.test(sha)) throw new Error('merge_base');
+    return sha;
+  });
+  const [before, head] = await step('tree_unavailable', () =>
+    Promise.all([tree(cached, mergeBase), tree(cached, headSha)])
+  );
+  const beforeEntry = before.entries.get(BUNDLE_PATH);
+  const afterEntry = head.entries.get(BUNDLE_PATH);
+  if (beforeEntry?.sha === afterEntry?.sha && beforeEntry?.mode === afterEntry?.mode) return null;
+  if (!beforeEntry || !afterEntry) throw new BundleRecordError('bundle_added_or_removed');
+  const bundleBytes = async (sha: string): Promise<Buffer> => {
+    let response: unknown;
+    try {
+      response = await cached(blobRoute, { file_sha: sha });
+    } catch (error) {
+      if (classifyRateLimitError(error)) throw error;
+      throw new BundleRecordError('bundle_blob_missing');
+    }
+    try {
+      return verifiedBlobBytes(response, sha);
+    } catch {
+      throw new BundleRecordError('bundle_blob_unauthenticated');
+    }
+  };
+  const beforeBytes = await bundleBytes(beforeEntry.sha);
+  const afterBytes = await bundleBytes(afterEntry.sha);
+  const decoded = decodeBundleRecordDiff(beforeBytes, afterBytes);
+  const whole = await step('diff_unavailable', async () => {
+    const body = await cached(compareRoute, {
+      basehead,
+      headers: { accept: 'application/vnd.github.diff' },
+    });
+    if (typeof body !== 'string' || !body.startsWith('diff --git ')) throw new Error('diff');
+    return body;
+  });
+  const blocks = await step('diff_unauthenticated', () =>
+    reconcileDiff(cached, whole, before.entries, head.entries)
+  );
+  const bundleHeader = `diff --git a/${BUNDLE_PATH} b/${BUNDLE_PATH}\n`;
+  const bundleIndexes = blocks.flatMap((text, index) =>
+    text.startsWith(bundleHeader) ? [index] : []
+  );
+  if (bundleIndexes.length !== 1) throw new BundleRecordError('bundle_block_missing');
+  // The raw bundle block is dropped only now, after the parse and the authentication succeeded.
+  const retained = blocks
+    .filter((_, index) => index !== bundleIndexes[0])
+    .join('')
+    .replace(/^(Binary files .+ differ|GIT binary patch)$/gm, '$&\n[binary or patch unavailable]');
+  const mismatches = await step('head_source_unavailable', () =>
+    bundleSourceMismatches(decoded.changes, new Set(head.entries.keys()), async path => {
+      const entry = head.entries.get(path);
+      if (!entry) throw new Error('head_source_missing');
+      return (await blob(cached, entry.sha)).toString('utf8');
+    })
+  );
+  let proof: 'not configured' | 'not verified' | 'pending' | 'verified' = 'not configured';
+  let proofNotice = '';
+  if (producer) {
+    try {
+      const result = await collectBundleCoverage(cached, input, producer);
+      if ('bundleRunPending' in result) proof = 'pending';
+      else if (result.coverage) {
+        proof = 'verified';
+        proofNotice = result.coverage.notice;
+      } else proof = 'not verified';
+    } catch (error) {
+      if (classifyRateLimitError(error)) throw error;
+      proof = 'not verified';
+    }
+  }
+  const count = (kind: string): number => decoded.changes.filter(c => c.kind === kind).length;
+  const sourceMatch =
+    mismatches.length === 0
+      ? 'every added or changed record equals its normalized head source and no removed record has a head source'
+      : `${mismatches.length} record(s) differ from their head source (${proof === 'verified' ? 'not blocking: the admitted-producer proof verified' : 'blocking'})`;
+  const notice =
+    `Review coverage: actual bundle record review of ${BUNDLE_PATH}; its raw diff block was replaced by the decoded records after a strict parse of the authenticated bundle blobs. ` +
+    `Reviewed bundle records: ${decoded.keys.join(', ')}. ` +
+    `Added ${count('added')}, removed ${count('removed')}, changed ${count('changed')}. ` +
+    `Merge base ${mergeBase}; base ${baseSha}; head ${headSha}; bundle blob before ${beforeEntry.sha} after ${afterEntry.sha}. ` +
+    `Source match: ${sourceMatch}. ` +
+    `Admitted-producer proof: ${proof === 'verified' ? `verified. Supporting evidence: ${proofNotice}` : `${proof}.`}`;
+  return {
+    diff: retained,
+    coverage: {
+      notice,
+      baseSha,
+      producer: proof === 'verified' && producer ? producer : '',
+      mode: 'actual_review',
+    },
+    evidence: decoded.evidence,
+    scopes: decoded.scopes,
+    findings: proof === 'verified' ? [] : mismatches,
+    bundleRunPending: proof === 'pending',
+  };
 }
 
 /**
@@ -678,9 +847,45 @@ export function createRealFetchExactHeadPullRequestEvidence(
     let coverage: BundleCoverage | undefined;
     let bundleProofUnavailable: boolean | undefined;
     let bundleRunPending: boolean | undefined;
+    let recordReview: BundleRecordReview | null = null;
+    let bundleRecordParseError: string | undefined;
+    // Actual bundle record review: OFF unless OVERSEER_BUNDLE_RECORD_DIFF_ENABLED=1. It does not
+    // depend on an admitted producer. A failure never throws (a throw becomes TRANSPORT_ERROR or
+    // evidence_error); it is recorded and the evaluator returns a terminal INDETERMINATE.
+    if (
+      bundleRecordDiffEnabled() &&
+      input.owner === 'thinmansoftware' &&
+      input.repo === 'bdc-harness'
+    ) {
+      try {
+        if (!octokit.request) throw new BundleRecordError('request_unavailable');
+        const request = octokit.request.bind(octokit);
+        recordReview = await collectBundleRecordReview(
+          async (route, parameters) =>
+            (await request(route, { owner: input.owner, repo: input.repo, ...parameters })).data,
+          { ...input, baseSha },
+          configuredBundleProducer()
+        );
+      } catch (error) {
+        if (classifyRateLimitError(error)) throw error;
+        bundleRecordParseError =
+          error instanceof BundleRecordError ? error.reason : 'evidence_unavailable';
+      }
+    }
+    if (recordReview) {
+      diff = recordReview.diff;
+      coverage = recordReview.coverage;
+      if (recordReview.bundleRunPending) bundleRunPending = true;
+    }
     // OFF until a separate operator GO admits an immutable producer commit.
     const admittedProducer = configuredBundleProducer();
-    if (admittedProducer && input.owner === 'thinmansoftware' && input.repo === 'bdc-harness') {
+    if (
+      !recordReview &&
+      bundleRecordParseError === undefined &&
+      admittedProducer &&
+      input.owner === 'thinmansoftware' &&
+      input.repo === 'bdc-harness'
+    ) {
       try {
         if (!octokit.request) throw new Error('proof_api_unavailable');
         const request = octokit.request.bind(octokit);
@@ -785,6 +990,14 @@ export function createRealFetchExactHeadPullRequestEvidence(
       ...(coverage ? { coverage } : {}),
       ...(bundleProofUnavailable ? { bundleProofUnavailable } : {}),
       ...(bundleRunPending ? { bundleRunPending } : {}),
+      ...(recordReview
+        ? {
+            bundleRecordEvidence: recordReview.evidence,
+            bundleRecordScopes: recordReview.scopes,
+            bundleRecordFindings: recordReview.findings,
+          }
+        : {}),
+      ...(bundleRecordParseError !== undefined ? { bundleRecordParseError } : {}),
       checks: checkRuns.map((run, index) => ({
         id: run.id,
         name: run.name?.trim() || `check-${index + 1}`,

@@ -592,12 +592,19 @@ async function submitThroughWiring(repo: Repo, options: SubmitOptions) {
   const deps = createRealSubmitDeps('review-app[bot]', {
     octokit: repo.octokit as never,
     patOctokit: null,
+    // The wiring omits the work-order id; carry it so acceptance criteria are composed. The model
+    // seam is always a stub: no real judge binary runs in this file.
     evaluate: (request, evaluatorDeps) =>
-      evaluatePullRequest(request, {
-        ...evaluatorDeps,
-        recordRungOutage: undefined,
-        ...options.evaluatorOverrides,
-      }),
+      evaluatePullRequest(
+        { ...request, wo_id: input.wo_id },
+        {
+          ...evaluatorDeps,
+          recordRungOutage: undefined,
+          ladder: ['review-model'],
+          invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout: reply('APPROVE') }),
+          ...options.evaluatorOverrides,
+        }
+      ),
     recordApprovalVerdict: async () => {},
     createReceiptMessage: async () => ({}) as never,
   });
