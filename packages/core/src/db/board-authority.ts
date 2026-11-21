@@ -3,9 +3,12 @@ import { getDatabase } from './connection';
 import {
   createBoardPrincipalResolver,
   isBoardPrincipalRegistryConfigured,
+  isEligibleXoSuccessor,
 } from './board-principal-registry';
 
 const DEFAULT_LEASE_DURATION_MS = 5 * 60 * 1000;
+const DEFAULT_HANDOFF_RESERVATION_MS = 15 * 60 * 1000;
+const MAX_HANDOFF_RESERVATION_MS = 60 * 60 * 1000;
 
 export type BoardSeat = 'john' | 'general' | 'xo';
 
@@ -53,12 +56,41 @@ export interface XoLease {
 interface XoLeaseRow extends XoLease {
   readonly id: number;
   readonly holder_token_hash: string;
+  readonly handoff_successor_principal_id?: string | null;
+  readonly handoff_reserved_until?: string | null;
+  readonly handoff_directed_by?: string | null;
 }
 
 export interface XoLeaseResult {
   readonly ok: boolean;
   readonly lease?: XoLease;
-  readonly reason?: 'active_xo_lease_exists' | 'stale_xo_lease_token' | 'no_valid_xo_lease';
+  readonly reason?:
+    | 'active_xo_lease_exists'
+    | 'stale_xo_lease_token'
+    | 'no_valid_xo_lease'
+    | 'xo_lease_reserved_for_successor'
+    | 'xo_lease_handed_off';
+}
+
+export interface XoLeaseHandoffResult {
+  readonly ok: boolean;
+  readonly reason?:
+    | 'handoff_requires_john_seat'
+    | 'invalid_reservation_ms'
+    | 'ineligible_successor_principal'
+    | 'no_active_xo_lease'
+    | 'stale_xo_lease_token'
+    | 'successor_already_holds_lease';
+  readonly handed_off_lease_id?: string;
+  readonly fencing_token?: number;
+  readonly successor_principal_id?: string;
+  readonly reserved_until?: string;
+}
+
+export interface DirectedXoLeaseReservation {
+  readonly successor_principal_id: string;
+  readonly reserved_until: string;
+  readonly directed_by: string;
 }
 
 export interface BoardAuditEventInput {
@@ -181,6 +213,23 @@ export async function acquireXoLease(input: {
       return { ok: false, reason: 'active_xo_lease_exists' };
     }
 
+    if (
+      existing &&
+      !isActive(existing, now) &&
+      isReservedForOtherPrincipal(existing, input.principal.principal_id, now)
+    ) {
+      await insertAuditWithQuery(txQuery, {
+        event_type: 'xo_lease_acquire_rejected',
+        actor_principal_id: input.principal.principal_id,
+        actor_seat_id: input.principal.seat_id,
+        xo_lease_id: existing.lease_id,
+        xo_fencing_token: existing.fencing_token,
+        details: { reason: 'xo_lease_reserved_for_successor' },
+        created_at: now,
+      });
+      return { ok: false, reason: 'xo_lease_reserved_for_successor' };
+    }
+
     if (!existing) {
       await txQuery(
         `INSERT INTO board_xo_leases (
@@ -211,7 +260,10 @@ export async function acquireXoLease(input: {
              acquired_at = $6,
              renewed_at = NULL,
              expires_at = $7,
-             released_at = NULL
+             released_at = NULL,
+             handoff_successor_principal_id = NULL,
+             handoff_reserved_until = NULL,
+             handoff_directed_by = NULL
          WHERE id = 1 AND (released_at IS NOT NULL OR expires_at <= $6)`,
         [
           randomUUID(),
@@ -273,6 +325,20 @@ export async function renewXoLease(input: {
     const existing = (await txQuery<XoLeaseRow>('SELECT * FROM board_xo_leases WHERE id = 1'))
       .rows[0];
     if (
+      isDirectedHandoffForHolder(existing, now, input.holder_id, tokenHash, input.fencing_token)
+    ) {
+      await insertAuditWithQuery(txQuery, {
+        event_type: 'xo_lease_renew_rejected',
+        actor_principal_id: input.principal.principal_id,
+        actor_seat_id: input.principal.seat_id,
+        xo_lease_id: existing?.lease_id ?? null,
+        xo_fencing_token: existing?.fencing_token ?? null,
+        details: { reason: 'xo_lease_handed_off' },
+        created_at: now,
+      });
+      return { ok: false, reason: 'xo_lease_handed_off' };
+    }
+    if (
       !existing ||
       !isActive(existing, now) ||
       existing.holder_id !== input.holder_id ||
@@ -326,6 +392,20 @@ export async function releaseXoLease(input: {
     const existing = (await txQuery<XoLeaseRow>('SELECT * FROM board_xo_leases WHERE id = 1'))
       .rows[0];
     if (
+      isDirectedHandoffForHolder(existing, now, input.holder_id, tokenHash, input.fencing_token)
+    ) {
+      await insertAuditWithQuery(txQuery, {
+        event_type: 'xo_lease_release_rejected',
+        actor_principal_id: input.principal.principal_id,
+        actor_seat_id: input.principal.seat_id,
+        xo_lease_id: existing?.lease_id ?? null,
+        xo_fencing_token: existing?.fencing_token ?? null,
+        details: { reason: 'xo_lease_handed_off' },
+        created_at: now,
+      });
+      return { ok: false, reason: 'xo_lease_handed_off' };
+    }
+    if (
       !existing ||
       !isActive(existing, now) ||
       existing.holder_id !== input.holder_id ||
@@ -365,6 +445,122 @@ export async function releaseXoLease(input: {
   });
 }
 
+export async function directXoLeaseHandoff(input: {
+  readonly principal: BoardPrincipal;
+  readonly expected_fencing_token: number;
+  readonly successor_principal_id: string;
+  readonly reservation_ms?: number;
+  readonly isEligibleSuccessor?: (principalId: string) => boolean;
+}): Promise<XoLeaseHandoffResult> {
+  if (input.principal.seat_id !== 'john') {
+    return { ok: false, reason: 'handoff_requires_john_seat' };
+  }
+  const reservationMs = input.reservation_ms ?? DEFAULT_HANDOFF_RESERVATION_MS;
+  if (!isValidReservationMs(reservationMs)) {
+    return { ok: false, reason: 'invalid_reservation_ms' };
+  }
+  const eligible = input.isEligibleSuccessor ?? isEligibleXoSuccessor;
+  if (!eligible(input.successor_principal_id)) {
+    return { ok: false, reason: 'ineligible_successor_principal' };
+  }
+
+  const db = getDatabase();
+  const now = await databaseNow();
+  const reservedUntil = addMillisecondsIso(now, reservationMs);
+
+  return db.withTransaction(async txQuery => {
+    const existing = (await txQuery<XoLeaseRow>('SELECT * FROM board_xo_leases WHERE id = 1'))
+      .rows[0];
+    if (!existing || !isActive(existing, now)) {
+      return { ok: false, reason: 'no_active_xo_lease' };
+    }
+    if (existing.fencing_token !== input.expected_fencing_token) {
+      return { ok: false, reason: 'stale_xo_lease_token' };
+    }
+    if (existing.principal_id === input.successor_principal_id) {
+      return { ok: false, reason: 'successor_already_holds_lease' };
+    }
+
+    const updated = await txQuery(
+      `UPDATE board_xo_leases
+       SET released_at = $1,
+           handoff_successor_principal_id = $2,
+           handoff_reserved_until = $3,
+           handoff_directed_by = $4
+       WHERE id = 1
+         AND released_at IS NULL
+         AND expires_at > $1
+         AND fencing_token = $5`,
+      [
+        now,
+        input.successor_principal_id,
+        reservedUntil,
+        input.principal.principal_id,
+        input.expected_fencing_token,
+      ]
+    );
+    if (updated.rowCount === 0) {
+      const reread = (await txQuery<XoLeaseRow>('SELECT * FROM board_xo_leases WHERE id = 1'))
+        .rows[0];
+      if (!reread || !isActive(reread, now)) {
+        return { ok: false, reason: 'no_active_xo_lease' };
+      }
+      return { ok: false, reason: 'stale_xo_lease_token' };
+    }
+
+    await insertAuditWithQuery(txQuery, {
+      event_type: 'xo_lease_handoff_directed',
+      actor_principal_id: input.principal.principal_id,
+      actor_seat_id: input.principal.seat_id,
+      xo_lease_id: existing.lease_id,
+      xo_fencing_token: existing.fencing_token,
+      details: {
+        from_principal_id: existing.principal_id,
+        successor_principal_id: input.successor_principal_id,
+        reserved_until: reservedUntil,
+      },
+      created_at: now,
+    });
+    return {
+      ok: true,
+      handed_off_lease_id: existing.lease_id,
+      fencing_token: existing.fencing_token,
+      successor_principal_id: input.successor_principal_id,
+      reserved_until: reservedUntil,
+    };
+  });
+}
+
+export async function getDirectedXoLeaseReservation(): Promise<DirectedXoLeaseReservation | null> {
+  const now = await databaseNow();
+  const result = await getDatabase().query<{
+    handoff_successor_principal_id: string | null;
+    handoff_reserved_until: string | null;
+    handoff_directed_by: string | null;
+  }>(
+    `SELECT handoff_successor_principal_id, handoff_reserved_until, handoff_directed_by
+     FROM board_xo_leases
+     WHERE id = 1
+       AND released_at IS NOT NULL
+       AND handoff_successor_principal_id IS NOT NULL
+       AND handoff_reserved_until > $1`,
+    [now]
+  );
+  const row = result.rows[0];
+  if (
+    !row?.handoff_successor_principal_id ||
+    !row.handoff_reserved_until ||
+    !row.handoff_directed_by
+  ) {
+    return null;
+  }
+  return {
+    successor_principal_id: row.handoff_successor_principal_id,
+    reserved_until: row.handoff_reserved_until,
+    directed_by: row.handoff_directed_by,
+  };
+}
+
 async function databaseNow(): Promise<string> {
   const db = getDatabase();
   const sql =
@@ -389,6 +585,35 @@ function isTestEnvironment(): boolean {
 
 function isActive(row: XoLeaseRow, now: string): boolean {
   return row.released_at === null && row.expires_at > now;
+}
+
+function isValidReservationMs(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0 && value <= MAX_HANDOFF_RESERVATION_MS;
+}
+
+function isReservedForOtherPrincipal(row: XoLeaseRow, principalId: string, now: string): boolean {
+  const successor = row.handoff_successor_principal_id;
+  const reservedUntil = row.handoff_reserved_until;
+  if (!successor || !reservedUntil || !(reservedUntil > now)) return false;
+  return principalId !== successor;
+}
+
+function isDirectedHandoffForHolder(
+  existing: XoLeaseRow | undefined,
+  now: string,
+  holderId: string,
+  tokenHash: string,
+  fencingToken: number
+): boolean {
+  return (
+    !!existing &&
+    !isActive(existing, now) &&
+    existing.released_at !== null &&
+    !!existing.handoff_successor_principal_id &&
+    existing.holder_id === holderId &&
+    existing.holder_token_hash === tokenHash &&
+    existing.fencing_token === fencingToken
+  );
 }
 
 function normalizeLease(row: XoLeaseRow): XoLease {
