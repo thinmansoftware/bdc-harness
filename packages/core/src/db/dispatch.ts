@@ -866,6 +866,27 @@ function foldedInLine(olders: DispatchMessage[]): string {
 }
 
 /**
+ * The surviving row's body, telling a reader what was folded into it. A JSON
+ * object body (Duty Officer escalations, handoffs) gains a `folded_in` field so
+ * it stays valid JSON; any other body gains the "Folded in:" line.
+ */
+function bodyWithFoldedIn(body: string, olders: DispatchMessage[]): string {
+  if (olders.length === 0) return body;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return JSON.stringify({
+        ...(parsed as Record<string, unknown>),
+        folded_in: { count: olders.length, ids: olders.map(row => row.id) },
+      });
+    }
+  } catch {
+    // Not JSON: fall through to the plain-text line.
+  }
+  return `${body}\n${foldedInLine(olders)}`;
+}
+
+/**
  * The open row that would suppress this send under the cooldown, or null.
  * Read-only: the Taskmaster expectation recovery uses it to tell a suppressed
  * retry (no row carries its key, by design) from a crashed one.
@@ -929,21 +950,31 @@ async function createCollapsedSystemMessage(
       );
       return suppressor;
     }
-    const body = open.length > 0 ? `${data.body}\n${foldedInLine(open)}` : data.body;
+    // Only rows of the same or a lower priority are folded in: an open blocker is
+    // never retired by a newer normal or heartbeat row; it stays open on its own.
+    const sendRank = PRIORITY_RANK[data.priority ?? 'normal'] ?? PRIORITY_RANK.normal;
+    const foldable = open.filter(
+      row => (PRIORITY_RANK[row.priority] ?? PRIORITY_RANK.normal) >= sendRank
+    );
+    const body = bodyWithFoldedIn(data.body, foldable);
     const newer = await createAuthenticatedMessageWithQuery(query, {
       bound,
       data: { ...data, body },
     });
-    for (const older of open) {
+    for (const older of foldable) {
       const superseded = await supersedeRepeatByNewer(
         { older_id: older.id, newer_id: newer.id, actor: group.senderPrincipalId },
         query
       );
       if (!superseded) throw new Error('dispatch_repeat_supersede_lost_race');
     }
-    if (open.length > 0) {
+    if (foldable.length > 0) {
       log.info(
-        { newerId: newer.id, foldedIds: open.map(row => row.id), sender: group.senderPrincipalId },
+        {
+          newerId: newer.id,
+          foldedIds: foldable.map(row => row.id),
+          sender: group.senderPrincipalId,
+        },
         'dispatch.repeat_collapsed'
       );
     }
@@ -2627,8 +2658,9 @@ export async function releaseDispatchEscalationClaim(data: {
 export async function ensureXoEscalationHandoffs(activatedAt: string): Promise<number> {
   if (!Number.isFinite(Date.parse(activatedAt))) return 0;
   // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: a source whose subject already has an
-  // open system:dispatch row in the xo mailbox younger than the cooldown would
-  // only be suppressed by the collapse wrapper and, writing no handoff row, be
+  // open blocker system:dispatch row in the xo mailbox younger than the cooldown
+  // (handoffs are always blocker, and only a same-or-higher priority row
+  // suppresses) would only be suppressed by the collapse wrapper and, writing no handoff row, be
   // reselected on every pass. Excluding it here keeps those sources from
   // starving the LIMIT; newest first so fresh blockers are handed off first.
   const cooldownHours = dispatchRepeatCooldownHours();
@@ -2641,6 +2673,7 @@ export async function ensureXoEscalationHandoffs(activatedAt: string): Promise<n
          WHERE recent.sender_principal_id = 'system:dispatch' AND recent.recipient = 'xo'
            AND recent.status = 'queued' AND recent.acknowledged_at IS NULL
            AND recent.addressed_at IS NULL AND recent.route_disposition IS NULL
+           AND recent.priority = 'blocker'
            AND recent.created_at > $2
            AND ((source.subject_key IS NOT NULL AND recent.subject_key = source.subject_key)
              OR (source.subject_key IS NULL AND recent.subject_key IS NULL

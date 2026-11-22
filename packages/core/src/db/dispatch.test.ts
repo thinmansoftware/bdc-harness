@@ -4192,7 +4192,10 @@ describe('mailbox lifecycle (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', () => {
 
   test('Test 5: the dispatch handoff honours the cooldown and supersedes after it', async () => {
     const activatedAt = new Date(Date.now() - 48 * HOUR).toISOString();
-    const existing = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice('handoff-existing'));
+    const existing = await createAuthenticatedMessage(
+      SYSTEM_DISPATCH,
+      notice('handoff-existing', { priority: 'blocker' })
+    );
     await backdate(existing.id, 2);
     const source = await createMessage({
       correlation_id: 'corr-handoff-source',
@@ -4225,9 +4228,62 @@ describe('mailbox lifecycle (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', () => {
     expect((await getMessage(open[0] ?? ''))?.idempotency_key).toBe(`xo-handoff:${source.id}`);
   });
 
+  test('Test 5: an open normal xo row does not hold back a blocker handoff; the handoff folds it in', async () => {
+    const activatedAt = new Date(Date.now() - 48 * HOUR).toISOString();
+    const normal = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice('handoff-normal'));
+    await backdate(normal.id, 2);
+    const source = await createMessage({
+      correlation_id: 'corr-handoff-normal-source',
+      idempotency_key: 'handoff-normal-source',
+      task_type: 'agent_message',
+      sender: 'claude',
+      sender_principal_id: 'claude',
+      recipient: 'codex',
+      priority: 'blocker',
+      subject_key: SUBJECT,
+      repeat_reason: 'lifecycle test repeat',
+      body: 'blocker for codex',
+    });
+    expect(await ensureXoEscalationHandoffs(activatedAt)).toBe(1);
+    const open = await openRowsFor('system:dispatch', 'xo', SUBJECT);
+    expect(open).toHaveLength(1);
+    const handoff = await getMessage(open[0] ?? '');
+    expect(handoff?.idempotency_key).toBe(`xo-handoff:${source.id}`);
+    // The handoff body is JSON and stays JSON: the fold is a field, not a text line.
+    const body = JSON.parse(handoff?.body ?? '') as {
+      kind: string;
+      folded_in: { count: number; ids: string[] };
+    };
+    expect(body.kind).toBe('xo_escalation_handoff');
+    expect(body.folded_in).toEqual({ count: 1, ids: [normal.id] });
+    expect((await getMessage(normal.id))?.route_disposition).toBe('superseded');
+  });
+
+  test('Test 5: an older open blocker is never retired by a newer normal repeat', async () => {
+    const blocker = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      notice('keep-blocker', { priority: 'blocker' })
+    );
+    await backdate(blocker.id, 30);
+    const normal = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      withCollapse(notice('later-normal'))
+    );
+    expect(normal.id).not.toBe(blocker.id);
+    expect(normal.body).not.toContain('Folded in:');
+    const kept = await getMessage(blocker.id);
+    expect([kept?.status, kept?.route_disposition]).toEqual(['queued', null]);
+    expect((await openRowsFor('system:taskmaster', 'xo', SUBJECT)).sort()).toEqual(
+      [blocker.id, normal.id].sort()
+    );
+  });
+
   test('Test 5: suppressed handoff sources do not starve an eligible older source', async () => {
     const activatedAt = new Date(Date.now() - 48 * HOUR).toISOString();
-    const blocked = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice('starve-open'));
+    const blocked = await createAuthenticatedMessage(
+      SYSTEM_DISPATCH,
+      notice('starve-open', { priority: 'blocker' })
+    );
     await backdate(blocked.id, 1);
     const eligibleSubject = 'gh:thinmansoftware/bdc-xo#4927';
     const eligible = await createMessage({
