@@ -900,6 +900,31 @@ describe('duty officer clock', () => {
     if (previousGithub !== undefined) process.env.GITHUB_TOKEN = previousGithub;
   });
 
+  test('Test 5: the escalation to xo asks the dispatch DAL to collapse repeats (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', async () => {
+    const queued = [message({ id: 'collapse-one', subject_key: 'gh:thinmansoftware/bdc-xo#1538' })];
+    const deps = fakeDeps(queued);
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+
+    await tickDutyOfficerClock(deps);
+
+    const createCall = (
+      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0];
+    expect(createCall?.[0]).toEqual({ kind: 'system', sender: 'dispatch' });
+    expect(createCall?.[1]).toEqual(
+      expect.objectContaining({
+        recipient: 'xo',
+        subject_key: 'gh:thinmansoftware/bdc-xo#1538',
+        collapse_repeats: true,
+      })
+    );
+    // A suppressed repeat returns the existing row; the source still completes.
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'collapse-one', status: 'done', task_outcome: 'succeeded' })
+    );
+  });
+
   test('startDutyOfficerClock is a no-op in test env and when disabled', async () => {
     const deps = fakeDeps([message({ id: 'never' })]);
     const originalNodeEnv = process.env.NODE_ENV;

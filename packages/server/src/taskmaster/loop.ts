@@ -3289,6 +3289,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
               // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
               subject_key: dispatchSubjectKey,
               repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
+              // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: nudges collapse in the
+              // recipient's mailbox (cooldown, then supersede). Other verbs
+              // keep their own dedupe and are not collapsed here.
+              collapse_repeats: proposal.type === 'nudge',
             }
           );
         } catch (sendError) {
@@ -3297,8 +3301,23 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           dispatchSendRejected = true;
           throw sendError;
         }
-        const registerExpectation =
-          dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
+        // A suppressed nudge returns the existing open row for the subject; that
+        // row already carries its own expectation. Supervising it again under
+        // this journal's correlation id would only chase a reply that cannot
+        // arrive and end EXHAUSTED, so the skip is logged and nothing is added.
+        const suppressedNudge =
+          proposal.type === 'nudge' &&
+          typeof dispatched.idempotency_key === 'string' &&
+          dispatched.idempotency_key !== proposal.idempotencyKey;
+        if (suppressedNudge) {
+          log.info(
+            { journalId: journalRow.id, existingId: dispatched.id, threadRef: proposal.threadRef },
+            'taskmaster.nudge_repeat_suppressed'
+          );
+        }
+        const registerExpectation = suppressedNudge
+          ? undefined
+          : (dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined));
         await registerExpectation?.({
           // Deterministic identity -- see the cascade branch above.
           action_ref: journalRow.id,

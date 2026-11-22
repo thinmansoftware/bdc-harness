@@ -5566,19 +5566,22 @@ export function registerApiRoutes(
         : dispatchDb.DEFAULT_WORKER_STALE_AFTER_MS;
       // mailboxDepthByPrincipal supplies the exclusive cutover buckets, including
       // surfaced_unacked and surfaced_acked, over the full table rather than this page.
-      const [workers, messages, mailbox] = await Promise.all([
+      // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01 (bdc-xo#2170 item 2): queue counts and
+      // the per-mailbox {unread, acked, addressed} split come from whole-table
+      // GROUP BYs; the 500-row page is kept only for the two report lists below.
+      const [workers, messages, depth, counts] = await Promise.all([
         dispatchDb.listWorkers(staleAfterMs),
         dispatchDb.listMessages({ limit: 500 }),
         dispatchDb.mailboxDepthByPrincipal(),
+        dispatchDb.dispatchStatusCounts(),
       ]);
-      const queue: Record<dispatchDb.DispatchMessageStatus, number> = {
-        queued: 0,
-        claimed: 0,
-        done: 0,
-        failed: 0,
-        cancelled: 0,
-      };
-      for (const message of messages) queue[message.status] += 1;
+      const queue = counts.queue;
+      const mailbox: dispatchDb.MailboxDepthResult = { ...depth };
+      for (const [principal, value] of Object.entries(depth)) {
+        if (principal === 'cutover_at' || value === null || typeof value !== 'object') continue;
+        const receipts = counts.recipients[principal] ?? { unread: 0, acked: 0, addressed: 0 };
+        mailbox[principal] = { ...value, ...receipts };
+      }
       const item = (
         message: dispatchDb.DispatchMessage
       ): {

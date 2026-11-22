@@ -8,6 +8,8 @@ import { createHash } from 'crypto';
 import { SqliteAdapter } from './adapters/sqlite';
 import { setBoardPrincipalResolverForTests } from './board-authority';
 import { DispatchNonSystemCapability } from './dispatch-sender-authority';
+import { rootLogger } from '@archon/paths';
+import { assessDispatchMessageBody } from '../utils/dispatch-content-guard';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
@@ -56,6 +58,8 @@ import {
   normalizeDispatchSubjectKey,
   mailboxDepthByPrincipal,
   supersedeMessage,
+  supersedeRepeatByNewer,
+  dispatchRepeatCooldownHours,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
   type XoLeaseBind,
@@ -890,8 +894,9 @@ describe('dispatch db', () => {
     );
     expect((await addressMessage({ id: astraMessage.id, principal_id: ' Astra ' })).ok).toBe(true);
     const stored = await getMessage(astraMessage.id);
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: addressing is terminal (status done).
     expect(stored).toMatchObject({
-      status: 'queued',
+      status: 'done',
       acknowledged_by: 'astra',
       addressed_by: 'astra',
     });
@@ -1934,8 +1939,9 @@ describe('dispatch db', () => {
     );
     expect(repeats.every(result => result.ok)).toBe(true);
     const stored = await getMessage(message.id);
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: addressing is terminal (status done).
     expect(stored).toMatchObject({
-      status: 'queued',
+      status: 'done',
       acknowledged_by: 'operator',
       addressed_by: 'operator',
     });
@@ -1975,8 +1981,9 @@ describe('dispatch db', () => {
         'SELECT status, acknowledged_by, addressed_at, addressed_by FROM agent_dispatch_messages WHERE id = $1',
         [messageId]
       );
+      // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: addressing is terminal (status done).
       expect(stored.rows[0]).toMatchObject({
-        status: 'queued',
+        status: 'done',
         acknowledged_by: 'operator',
         addressed_by: 'operator',
       });
@@ -3739,6 +3746,618 @@ describe('dispatch db', () => {
         )
       ).rejects.toThrow('capped_subject_fence_invalid');
     });
+  });
+});
+
+/**
+ * WO-HARNESS-XO-MAILBOX-LIFECYCLE-01 (bdc-xo#5180): terminal state on address,
+ * supersede-on-repeat, the emitter cooldown and the outcome-notice guard, on a
+ * real SQLite database.
+ */
+describe('mailbox lifecycle (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', () => {
+  const HOUR = 3_600_000;
+  const SUBJECT = 'gh:thinmansoftware/bdc-xo#1538';
+  const SYSTEM_DISPATCH = { kind: 'system', sender: 'dispatch' } as const;
+  const SYSTEM_TASKMASTER = { kind: 'system', sender: 'taskmaster' } as const;
+  let priorCooldown: string | undefined;
+
+  beforeEach(() => {
+    process.env.BUN_ENV = 'test';
+    setBoardPrincipalResolverForTests(async () => ({
+      principal_id: 'claude',
+      seat_id: 'xo',
+      roles: ['motion_notifier', 'petition_eligible'],
+    }));
+    priorCooldown = process.env.DISPATCH_REPEAT_COOLDOWN_HOURS;
+    process.env.DISPATCH_REPEAT_COOLDOWN_HOURS = '24';
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-dispatch-lifecycle-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+
+  afterEach(async () => {
+    if (priorCooldown === undefined) delete process.env.DISPATCH_REPEAT_COOLDOWN_HOURS;
+    else process.env.DISPATCH_REPEAT_COOLDOWN_HOURS = priorCooldown;
+    setBoardPrincipalResolverForTests(undefined);
+    delete process.env.BUN_ENV;
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  function withCollapse(data: CreateAuthenticatedMessageData): CreateAuthenticatedMessageData {
+    return { ...data, collapse_repeats: true };
+  }
+
+  function notice(key: string, overrides: Partial<CreateAuthenticatedMessageData> = {}) {
+    return {
+      correlation_id: `corr-${key}`,
+      idempotency_key: key,
+      task_type: 'agent_message' as const,
+      recipient: 'xo',
+      body: `notice ${key}`,
+      subject_key: SUBJECT,
+      repeat_reason: 'lifecycle test repeat',
+      ...overrides,
+    };
+  }
+
+  async function backdate(id: string, hoursAgo: number): Promise<void> {
+    await db.query('UPDATE agent_dispatch_messages SET created_at = $2 WHERE id = $1', [
+      id,
+      new Date(Date.now() - hoursAgo * HOUR).toISOString(),
+    ]);
+  }
+
+  async function snapshot(id: string): Promise<string> {
+    const result = await db.query<Record<string, unknown>>(
+      'SELECT * FROM agent_dispatch_messages WHERE id = $1',
+      [id]
+    );
+    return JSON.stringify(result.rows[0] ?? null);
+  }
+
+  async function openRowsFor(
+    senderPrincipal: string,
+    recipient: string,
+    subject: string
+  ): Promise<string[]> {
+    const result = await db.query<{ id: string }>(
+      `SELECT id FROM agent_dispatch_messages
+       WHERE sender_principal_id = $1 AND recipient = $2 AND subject_key = $3
+         AND status = 'queued' AND acknowledged_at IS NULL AND addressed_at IS NULL
+         AND route_disposition IS NULL`,
+      [senderPrincipal, recipient, subject]
+    );
+    return result.rows.map(row => row.id);
+  }
+
+  async function seedXoLease(): Promise<XoLeaseBind> {
+    const bind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-lifecycle',
+      fencing_token: 21,
+      holder_token_hash: createHash('sha256').update('holder-lifecycle').digest('hex'),
+      holder_principal_id: 'xo',
+    };
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, NULL, $5, NULL)`,
+      [
+        bind.lease_id,
+        bind.holder_token_hash,
+        bind.fencing_token,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    return bind;
+  }
+
+  function captureLogLines(): { lines: string[]; restore: () => void } {
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+    const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+      streamSymbol
+    ];
+    const lines: string[] = [];
+    const write = spyOn(stream, 'write').mockImplementation(line => {
+      lines.push(String(line));
+    });
+    return { lines, restore: () => write.mockRestore() };
+  }
+
+  test('Test 1: addressing is terminal for the xo mailbox with a valid lease bind', async () => {
+    const bind = await seedXoLease();
+    const message = await createMessage({
+      correlation_id: 'corr-terminal',
+      idempotency_key: 'idem-terminal',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'Terminal on address.',
+    });
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).ok).toBe(true);
+    expect((await addressMessage({ id: message.id, principal_id: 'xo', bind })).ok).toBe(true);
+
+    const stored = await getMessage(message.id);
+    expect(stored?.status).toBe('done');
+    expect(stored?.addressed_at).not.toBeNull();
+    expect(stored?.completed_at).toBe(stored?.addressed_at ?? 'missing');
+    const queued = await listMessages({ recipient: 'xo', status: 'queued' });
+    expect(queued.map(row => row.id)).not.toContain(message.id);
+    // A status-only read with no addressed filter no longer sees it either.
+    const raw = await db.query<{ id: string }>(
+      "SELECT id FROM agent_dispatch_messages WHERE recipient = 'xo' AND status = 'queued'"
+    );
+    expect(raw.rows.map(row => row.id)).not.toContain(message.id);
+  });
+
+  test('Test 2: unread and acknowledged-not-addressed rows stay queued and keep their depth buckets', async () => {
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    await db.query('INSERT INTO dispatch_receipt_cutover (id, applied_at) VALUES (1, $1)', [
+      new Date(Date.now() - 60_000).toISOString(),
+    ]);
+    const make = (key: string) =>
+      createMessage({
+        correlation_id: `corr-${key}`,
+        idempotency_key: key,
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'operator',
+        body: `depth ${key}`,
+      });
+    const unread = await make('depth-unread');
+    const acked = await make('depth-acked');
+    const addressed = await make('depth-addressed');
+    expect((await acknowledgeMessage({ id: acked.id, principal_id: 'operator' })).ok).toBe(true);
+    expect((await acknowledgeMessage({ id: addressed.id, principal_id: 'operator' })).ok).toBe(
+      true
+    );
+    expect((await addressMessage({ id: addressed.id, principal_id: 'operator' })).ok).toBe(true);
+
+    expect((await getMessage(unread.id))?.status).toBe('queued');
+    expect((await getMessage(acked.id))?.status).toBe('queued');
+    const depth = (await mailboxDepthByPrincipal()).operator as import('./dispatch').MailboxDepth;
+    expect(depth.unread).toBe(1);
+    expect(depth.acked_open).toBe(1);
+  });
+
+  test('Test 3: a repeated address on a done row stays idempotent for its own principal', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-repeat-address',
+      idempotency_key: 'idem-repeat-address',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Address me twice.',
+    });
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+    expect((await addressMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+    expect((await getMessage(message.id))?.status).toBe('done');
+    const before = await snapshot(message.id);
+
+    const again = await addressMessage({ id: message.id, principal_id: 'operator' });
+    expect(again.ok).toBe(true);
+    expect(await snapshot(message.id)).toBe(before);
+    // An acknowledgement retry on the addressed row is ok too (completeCommandMessage).
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+
+    // A different principal is refused, never with not_queued.
+    const otherAddress = await addressMessage({ id: message.id, principal_id: 'claude' });
+    expect(otherAddress).toEqual({ ok: false, reason: 'wrong_recipient' });
+    const otherAck = await acknowledgeMessage({
+      id: message.id,
+      principal_id: 'operator',
+      acting_principal_id: 'claude',
+    });
+    expect(otherAck).toEqual({ ok: false, reason: 'actor_mismatch' });
+    expect(await snapshot(message.id)).toBe(before);
+  });
+
+  test('Test 4: supersede-on-repeat keeps the newest and spares acknowledged and seat rows', async () => {
+    const olders: DispatchMessage[] = [];
+    for (const [index, hoursAgo] of [30, 29, 28].entries()) {
+      const row = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice(`older-${index}`));
+      await backdate(row.id, hoursAgo);
+      olders.push(row);
+    }
+    const ackedSystem = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice('acked-system'));
+    await db.query(
+      "UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = 'xo' WHERE id = $1",
+      [ackedSystem.id, new Date().toISOString()]
+    );
+    await backdate(ackedSystem.id, 27);
+    const seat = await createMessage({
+      ...notice('seat-row'),
+      sender: 'codex',
+      sender_principal_id: 'codex',
+    });
+    await backdate(seat.id, 26);
+    const ackedBefore = await snapshot(ackedSystem.id);
+    const seatBefore = await snapshot(seat.id);
+
+    const newest = await createAuthenticatedMessage(
+      SYSTEM_DISPATCH,
+      withCollapse(notice('newest'))
+    );
+
+    for (const older of olders) {
+      const stored = await getMessage(older.id);
+      expect(stored?.status).toBe('done');
+      expect(stored?.route_disposition).toBe('superseded');
+      expect(stored?.completed_at).not.toBeNull();
+      expect(JSON.parse(stored?.result_body ?? '{}')).toEqual({
+        reason: 'repeat',
+        superseded_by: newest.id,
+      });
+    }
+    const newestStored = await getMessage(newest.id);
+    expect(newestStored?.status).toBe('queued');
+    expect(newestStored?.route_disposition).toBeNull();
+    expect(newestStored?.body).toBe(
+      `notice newest\nFolded in: 3 earlier open notice(s) for this subject (${olders
+        .map(row => row.id)
+        .join(', ')}).`
+    );
+    expect(assessDispatchMessageBody('agent_message', newestStored?.body ?? '').allowed).toBe(true);
+    expect(await openRowsFor('system:dispatch', 'xo', SUBJECT)).toEqual([newest.id]);
+    expect(await snapshot(ackedSystem.id)).toBe(ackedBefore);
+    expect(await snapshot(seat.id)).toBe(seatBefore);
+  });
+
+  test('Test 4: supersedeRepeatByNewer touches only an open system row of the same group', async () => {
+    const supersede = supersedeRepeatByNewer;
+    const older = await createAuthenticatedMessage(SYSTEM_TASKMASTER, notice('helper-older'));
+    const acked = await createAuthenticatedMessage(SYSTEM_TASKMASTER, notice('helper-acked'));
+    await db.query(
+      "UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = 'xo' WHERE id = $1",
+      [acked.id, new Date().toISOString()]
+    );
+    const seat = await createMessage({
+      ...notice('helper-seat'),
+      sender: 'codex',
+      sender_principal_id: 'codex',
+    });
+    const otherSubject = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      notice('helper-other-subject', { subject_key: 'gh:thinmansoftware/bdc-xo#2170' })
+    );
+    const otherRecipient = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      notice('helper-other-recipient', { recipient: 'operator' })
+    );
+    const otherSender = await createAuthenticatedMessage(
+      SYSTEM_DISPATCH,
+      notice('helper-other-sender')
+    );
+    const newer = await createAuthenticatedMessage(SYSTEM_TASKMASTER, notice('helper-newer'));
+    const untouched = [acked, seat, otherSubject, otherRecipient, otherSender];
+    const before = await Promise.all(untouched.map(row => snapshot(row.id)));
+
+    expect(
+      await supersede({ older_id: older.id, newer_id: newer.id, actor: 'taskmaster' })
+    ).toBeNull();
+    expect((await getMessage(older.id))?.status).toBe('queued');
+    for (const row of untouched) {
+      expect(
+        await supersede({ older_id: row.id, newer_id: newer.id, actor: 'system:taskmaster' })
+      ).toBeNull();
+    }
+    expect(await Promise.all(untouched.map(row => snapshot(row.id)))).toEqual(before);
+
+    const done = await supersede({
+      older_id: older.id,
+      newer_id: newer.id,
+      actor: 'system:taskmaster',
+    });
+    expect(done?.status).toBe('done');
+    expect(done?.route_disposition).toBe('superseded');
+    expect(JSON.parse(done?.result_body ?? '{}')).toEqual({
+      reason: 'repeat',
+      superseded_by: newer.id,
+    });
+    expect((await getMessage(newer.id))?.status).toBe('queued');
+    expect(
+      await supersede({ older_id: older.id, newer_id: newer.id, actor: 'system:taskmaster' })
+    ).toBeNull();
+  });
+
+  test('Test 12: no collapsed mailbox row ends cancelled and every pointer names a real row', async () => {
+    process.env.DISPATCH_REPEAT_COOLDOWN_HOURS = '0';
+    for (const context of [SYSTEM_DISPATCH, SYSTEM_TASKMASTER]) {
+      for (let index = 0; index < 4; index += 1) {
+        await createAuthenticatedMessage(
+          context,
+          withCollapse(notice(`t12-${context.sender}-${index}`))
+        );
+      }
+    }
+    const cancelled = await db.query<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE status = 'cancelled'"
+    );
+    expect(Number(cancelled.rows[0]?.n)).toBe(0);
+    const superseded = await db.query<{ id: string; status: string; result_body: string }>(
+      "SELECT id, status, result_body FROM agent_dispatch_messages WHERE route_disposition = 'superseded'"
+    );
+    expect(superseded.rows).toHaveLength(6);
+    for (const row of superseded.rows) {
+      expect(row.status).toBe('done');
+      const pointer = (JSON.parse(row.result_body) as { superseded_by: string }).superseded_by;
+      expect(await getMessage(pointer)).not.toBeNull();
+    }
+    expect(await openRowsFor('system:dispatch', 'xo', SUBJECT)).toHaveLength(1);
+    expect(await openRowsFor('system:taskmaster', 'xo', SUBJECT)).toHaveLength(1);
+  });
+
+  test('Test 5: a repeat inside the cooldown writes nothing and records the skip', async () => {
+    const existing = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice('cool-existing'));
+    await backdate(existing.id, 2);
+    const logs = captureLogLines();
+    let returned: DispatchMessage;
+    try {
+      returned = await createAuthenticatedMessage(
+        SYSTEM_DISPATCH,
+        withCollapse(notice('cool-repeat'))
+      );
+    } finally {
+      logs.restore();
+    }
+    expect(returned.id).toBe(existing.id);
+    const count = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE subject_key = $1',
+      [SUBJECT]
+    );
+    expect(Number(count.rows[0]?.n)).toBe(1);
+    expect((await getMessage(existing.id))?.status).toBe('queued');
+    expect(logs.lines.some(line => line.includes('dispatch.repeat_suppressed'))).toBe(true);
+  });
+
+  test('Test 5: a Taskmaster nudge inside the cooldown is suppressed the same way', async () => {
+    const existing = await createAuthenticatedMessage(SYSTEM_TASKMASTER, notice('nudge-existing'));
+    await backdate(existing.id, 2);
+    const returned = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      withCollapse(notice('nudge-repeat'))
+    );
+    expect(returned.id).toBe(existing.id);
+    expect(await openRowsFor('system:taskmaster', 'xo', SUBJECT)).toEqual([existing.id]);
+  });
+
+  test('Test 5: an open normal row never suppresses a blocker; the blocker is written and folds it in', async () => {
+    const nudge = await createAuthenticatedMessage(SYSTEM_TASKMASTER, notice('prio-nudge'));
+    await backdate(nudge.id, 2);
+    const blocker = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      withCollapse({ ...notice('prio-exhausted'), priority: 'blocker' })
+    );
+    expect(blocker.id).not.toBe(nudge.id);
+    expect(blocker.priority).toBe('blocker');
+    expect(blocker.body).toContain(
+      `Folded in: 1 earlier open notice(s) for this subject (${nudge.id}).`
+    );
+    const old = await getMessage(nudge.id);
+    expect([old?.status, old?.route_disposition]).toEqual(['done', 'superseded']);
+    expect(await openRowsFor('system:taskmaster', 'xo', SUBJECT)).toEqual([blocker.id]);
+    // The reverse still suppresses: an open blocker holds back a later normal repeat.
+    const normal = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      withCollapse(notice('prio-normal-after'))
+    );
+    expect(normal.id).toBe(blocker.id);
+  });
+
+  test('Test 5: a repeat after the cooldown writes one row and supersedes the old one', async () => {
+    const existing = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice('late-existing'));
+    await backdate(existing.id, 30);
+    const fresh = await createAuthenticatedMessage(
+      SYSTEM_DISPATCH,
+      withCollapse(notice('late-repeat'))
+    );
+    expect(fresh.id).not.toBe(existing.id);
+    const old = await getMessage(existing.id);
+    expect(old?.status).toBe('done');
+    expect(old?.route_disposition).toBe('superseded');
+    expect(await openRowsFor('system:dispatch', 'xo', SUBJECT)).toEqual([fresh.id]);
+  });
+
+  test('Test 5: with the cooldown at 0 every send writes a row', async () => {
+    process.env.DISPATCH_REPEAT_COOLDOWN_HOURS = '0';
+    const ids: string[] = [];
+    for (let index = 0; index < 3; index += 1) {
+      ids.push(
+        (await createAuthenticatedMessage(SYSTEM_DISPATCH, withCollapse(notice(`zero-${index}`))))
+          .id
+      );
+    }
+    expect(new Set(ids).size).toBe(3);
+    expect(await openRowsFor('system:dispatch', 'xo', SUBJECT)).toEqual([ids[2]]);
+  });
+
+  test('Test 5: DISPATCH_REPEAT_COOLDOWN_HOURS parsing keeps 0 and defaults the rest to 24', () => {
+    const parse = dispatchRepeatCooldownHours;
+    expect(parse({})).toBe(24);
+    expect(parse({ DISPATCH_REPEAT_COOLDOWN_HOURS: '' })).toBe(24);
+    expect(parse({ DISPATCH_REPEAT_COOLDOWN_HOURS: '0' })).toBe(0);
+    expect(parse({ DISPATCH_REPEAT_COOLDOWN_HOURS: '1.5' })).toBe(1.5);
+    expect(parse({ DISPATCH_REPEAT_COOLDOWN_HOURS: '-1' })).toBe(24);
+    expect(parse({ DISPATCH_REPEAT_COOLDOWN_HOURS: 'abc' })).toBe(24);
+    expect(parse({ DISPATCH_REPEAT_COOLDOWN_HOURS: 'Infinity' })).toBe(24);
+  });
+
+  test('Test 5: the dispatch handoff honours the cooldown and supersedes after it', async () => {
+    const activatedAt = new Date(Date.now() - 48 * HOUR).toISOString();
+    const existing = await createAuthenticatedMessage(
+      SYSTEM_DISPATCH,
+      notice('handoff-existing', { priority: 'blocker' })
+    );
+    await backdate(existing.id, 2);
+    const source = await createMessage({
+      correlation_id: 'corr-handoff-source',
+      idempotency_key: 'handoff-cool-source',
+      task_type: 'agent_message',
+      sender: 'claude',
+      sender_principal_id: 'claude',
+      recipient: 'codex',
+      priority: 'blocker',
+      subject_key: SUBJECT,
+      repeat_reason: 'lifecycle test repeat',
+      body: 'blocker for codex',
+    });
+
+    expect(await ensureXoEscalationHandoffs(activatedAt)).toBe(0);
+    expect(await ensureXoEscalationHandoffs(activatedAt)).toBe(0);
+    const handoffKey = await db.query<{ id: string }>(
+      'SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1',
+      [`xo-handoff:${source.id}`]
+    );
+    expect(handoffKey.rows).toHaveLength(0);
+
+    await backdate(existing.id, 30);
+    expect(await ensureXoEscalationHandoffs(activatedAt)).toBe(1);
+    const old = await getMessage(existing.id);
+    expect(old?.status).toBe('done');
+    expect(old?.route_disposition).toBe('superseded');
+    const open = await openRowsFor('system:dispatch', 'xo', SUBJECT);
+    expect(open).toHaveLength(1);
+    expect((await getMessage(open[0] ?? ''))?.idempotency_key).toBe(`xo-handoff:${source.id}`);
+  });
+
+  test('Test 5: an open normal xo row does not hold back a blocker handoff; the handoff folds it in', async () => {
+    const activatedAt = new Date(Date.now() - 48 * HOUR).toISOString();
+    const normal = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice('handoff-normal'));
+    await backdate(normal.id, 2);
+    const source = await createMessage({
+      correlation_id: 'corr-handoff-normal-source',
+      idempotency_key: 'handoff-normal-source',
+      task_type: 'agent_message',
+      sender: 'claude',
+      sender_principal_id: 'claude',
+      recipient: 'codex',
+      priority: 'blocker',
+      subject_key: SUBJECT,
+      repeat_reason: 'lifecycle test repeat',
+      body: 'blocker for codex',
+    });
+    expect(await ensureXoEscalationHandoffs(activatedAt)).toBe(1);
+    const open = await openRowsFor('system:dispatch', 'xo', SUBJECT);
+    expect(open).toHaveLength(1);
+    const handoff = await getMessage(open[0] ?? '');
+    expect(handoff?.idempotency_key).toBe(`xo-handoff:${source.id}`);
+    // The handoff body is JSON and stays JSON: the fold is a field, not a text line.
+    const body = JSON.parse(handoff?.body ?? '') as {
+      kind: string;
+      folded_in: { count: number; ids: string[] };
+    };
+    expect(body.kind).toBe('xo_escalation_handoff');
+    expect(body.folded_in).toEqual({ count: 1, ids: [normal.id] });
+    expect((await getMessage(normal.id))?.route_disposition).toBe('superseded');
+  });
+
+  test('Test 5: an older open blocker is never retired by a newer normal repeat', async () => {
+    const blocker = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      notice('keep-blocker', { priority: 'blocker' })
+    );
+    await backdate(blocker.id, 30);
+    const normal = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      withCollapse(notice('later-normal'))
+    );
+    expect(normal.id).not.toBe(blocker.id);
+    expect(normal.body).not.toContain('Folded in:');
+    const kept = await getMessage(blocker.id);
+    expect([kept?.status, kept?.route_disposition]).toEqual(['queued', null]);
+    expect((await openRowsFor('system:taskmaster', 'xo', SUBJECT)).sort()).toEqual(
+      [blocker.id, normal.id].sort()
+    );
+  });
+
+  test('Test 5: suppressed handoff sources do not starve an eligible older source', async () => {
+    const activatedAt = new Date(Date.now() - 48 * HOUR).toISOString();
+    const blocked = await createAuthenticatedMessage(
+      SYSTEM_DISPATCH,
+      notice('starve-open', { priority: 'blocker' })
+    );
+    await backdate(blocked.id, 1);
+    const eligibleSubject = 'gh:thinmansoftware/bdc-xo#4927';
+    const eligible = await createMessage({
+      correlation_id: 'corr-starve-eligible',
+      idempotency_key: 'starve-eligible',
+      task_type: 'agent_message',
+      sender: 'claude',
+      sender_principal_id: 'claude',
+      recipient: 'codex',
+      priority: 'blocker',
+      subject_key: eligibleSubject,
+      body: 'eligible blocker',
+    });
+    await backdate(eligible.id, 40);
+    for (let index = 0; index < 100; index += 1) {
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id, recipient,
+          body, status, created_at, priority, fencing_token, subject_key)
+         VALUES ($1, $2, $3, 'agent_message', 'claude', 'claude', 'codex', 'starved', 'queued',
+                 $4, 'blocker', 0, $5)`,
+        [
+          `starve-${index}`,
+          `corr-starve-${index}`,
+          `starve-key-${index}`,
+          new Date(Date.now() - (30 - index / 10) * HOUR).toISOString(),
+          SUBJECT,
+        ]
+      );
+    }
+    await ensureXoEscalationHandoffs(activatedAt);
+    expect(await openRowsFor('system:dispatch', 'xo', eligibleSubject)).toHaveLength(1);
+    expect(await openRowsFor('system:dispatch', 'xo', SUBJECT)).toEqual([blocked.id]);
+  });
+
+  test('outcome notices skip addressed and superseded done rows but keep the ordinary path', async () => {
+    const activatedAt = new Date(Date.now() - HOUR).toISOString();
+    const make = (key: string) =>
+      createMessage({
+        correlation_id: `corr-${key}`,
+        idempotency_key: key,
+        task_type: 'agent_message',
+        sender: 'codex',
+        sender_principal_id: 'codex',
+        recipient: 'operator',
+        body: `outcome ${key}`,
+      });
+    const addressed = await make('outcome-addressed');
+    const superseded = await make('outcome-superseded');
+    const ordinary = await make('outcome-ordinary');
+    const now = new Date().toISOString();
+    await db.query(
+      `UPDATE agent_dispatch_messages SET status = 'done', completed_at = $2,
+         acknowledged_at = $2, acknowledged_by = 'operator', addressed_at = $2, addressed_by = 'operator'
+       WHERE id = $1`,
+      [addressed.id, now]
+    );
+    await db.query(
+      `UPDATE agent_dispatch_messages SET status = 'done', completed_at = $2,
+         route_disposition = 'superseded', route_disposed_at = $2,
+         result_body = '{"reason":"repeat","superseded_by":"x"}'
+       WHERE id = $1`,
+      [superseded.id, now]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET status = 'done', completed_at = $2 WHERE id = $1",
+      [ordinary.id, now]
+    );
+
+    await reconcileDispatchOutcomeNotices(activatedAt);
+    const notices = await db.query<{ idempotency_key: string }>(
+      "SELECT idempotency_key FROM agent_dispatch_messages WHERE idempotency_key LIKE 'outcome-notice:%'"
+    );
+    expect(notices.rows.map(row => row.idempotency_key)).toEqual([`outcome-notice:${ordinary.id}`]);
   });
 });
 

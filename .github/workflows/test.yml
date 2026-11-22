@@ -63,6 +63,9 @@ jobs:
       - name: Overseer operator commands
         run: bun test --timeout 30000 ./scripts/overseer/re-enqueue-review.test.ts
 
+      - name: Dispatch mailbox lifecycle script (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)
+        run: bun test --timeout 30000 ./scripts/dispatch/mailbox-lifecycle.test.ts
+
       - name: Zero-tier fences and first-10 measurement (Spec Stop 6)
         run: bun run test:zero-tier-fences
 

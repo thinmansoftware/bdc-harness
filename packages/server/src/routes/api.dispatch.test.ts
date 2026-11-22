@@ -909,6 +909,66 @@ describe('dispatch API', () => {
     ]);
   });
 
+  test('Test 7: dispatch status counts the whole table and splits each mailbox by receipt (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', async () => {
+    const app = makeApp('secret-token');
+    const make = (key: string) =>
+      createMessage({
+        correlation_id: `status-${key}`,
+        idempotency_key: `status-${key}`,
+        task_type: 'agent_message',
+        sender: 'claude',
+        recipient: 'xo',
+        body: `status row ${key}`,
+      });
+    for (let index = 0; index < 3; index += 1) await make(`unread-${index}`);
+    const now = new Date().toISOString();
+    for (let index = 0; index < 2; index += 1) {
+      const row = await make(`acked-${index}`);
+      await db.query(
+        "UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = 'xo' WHERE id = $1",
+        [row.id, now]
+      );
+    }
+    for (let index = 0; index < 4; index += 1) {
+      const row = await make(`addressed-${index}`);
+      await db.query(
+        `UPDATE agent_dispatch_messages SET status = 'done', completed_at = $2,
+           acknowledged_at = $2, acknowledged_by = 'xo', addressed_at = $2, addressed_by = 'xo'
+         WHERE id = $1`,
+        [row.id, now]
+      );
+    }
+    // More rows than the 500-row page, all older than the xo rows, so a page
+    // count would miss the xo rows entirely.
+    await db.query(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 520)
+       INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status,
+          created_at, priority, fencing_token)
+       SELECT 'filler-' || i, 'filler-' || i, 'filler-' || i, 'run_review', 'claude', 'codex',
+              'filler', 'done', '2020-01-01T00:00:00.000Z', 'normal', 0
+       FROM n`
+    );
+    const grouped = await db.query<{ status: string; n: number }>(
+      'SELECT status, COUNT(*) AS n FROM agent_dispatch_messages GROUP BY status'
+    );
+
+    const response = await app.request('/api/dispatch/status', {
+      headers: { 'x-archon-operator-token': 'secret-token' },
+    });
+    expect(response.status).toBe(200);
+    const status = (await response.json()) as {
+      queue: Record<string, number>;
+      mailbox: Record<string, unknown>;
+    };
+    for (const row of grouped.rows) expect(status.queue[row.status]).toBe(Number(row.n));
+    expect(status.queue.done).toBe(524);
+    expect(status.queue.queued).toBe(5);
+    expect(status.mailbox.xo).toEqual(
+      expect.objectContaining({ unread: 3, acked: 2, addressed: 4 })
+    );
+  });
+
   test('acknowledges a mailbox message without changing its queue status', async () => {
     const message = await createMessage({
       ...VALID_BODY,
@@ -992,7 +1052,8 @@ describe('dispatch API', () => {
     ]);
   });
 
-  test('addresses an acknowledged mailbox message without changing its queue status', async () => {
+  // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: addressing is terminal, so the row leaves queued.
+  test('addresses an acknowledged mailbox message and moves it to status done', async () => {
     const message = await createMessage({
       ...VALID_BODY,
       idempotency_key: 'address-success',
@@ -1012,7 +1073,7 @@ describe('dispatch API', () => {
     });
     expect(response.status).toBe(200);
     expect((await response.json()) as { status: string; addressed_by: string }).toMatchObject({
-      status: 'queued',
+      status: 'done',
       addressed_by: 'operator',
     });
   });
@@ -1528,7 +1589,8 @@ describe('dispatch API', () => {
     };
     expect(addressed.addressed_by).toBe('xo');
     expect(addressed.addressed_at).not.toBeNull();
-    expect(addressed.status).toBe('queued');
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: addressing is terminal (status done).
+    expect(addressed.status).toBe('done');
     const afterAddress = await storedReceipt(message.id);
 
     const repeat = await app.request(`/api/dispatch/messages/${message.id}/address`, {
@@ -1540,7 +1602,7 @@ describe('dispatch API', () => {
     const repeated = await storedReceipt(message.id);
     expect(repeated.addressed_at).toBe(afterAddress.addressed_at);
     expect(repeated.addressed_by).toBe('xo');
-    expect(repeated.status).toBe('queued');
+    expect(repeated.status).toBe('done');
   });
 
   test('xo seat ack: the body may name the holder but no other principal', async () => {
