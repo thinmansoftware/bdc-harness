@@ -57,8 +57,20 @@ function promptText(n: AnyNode): string {
   return typeof loop?.prompt === 'string' ? loop.prompt : '';
 }
 
-function outputs(id: string, output: string): Map<string, NodeOutput> {
-  return new Map<string, NodeOutput>([[id, { state: 'completed', output }]]);
+// WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01: the gate chain runs only for a new spec, so
+// every case below also carries the deterministic disposition of a new spec.
+const NEW_DISPOSITION = '{"result":"new","wo_id":"WO-FIXTURE-01"}';
+const UNCHANGED_DISPOSITION = '{"result":"existing_spec_unchanged","wo_id":"WO-FIXTURE-01"}';
+
+function outputs(
+  id: string,
+  output: string,
+  disposition: string = NEW_DISPOSITION
+): Map<string, NodeOutput> {
+  return new Map<string, NodeOutput>([
+    [id, { state: 'completed', output }],
+    ['spec-disposition', { state: 'completed', output: disposition }],
+  ]);
 }
 
 const PASS_JSON =
@@ -136,6 +148,10 @@ describe('WO-HARNESS-WO-AUTHOR-INTAKE-REPAIR-01', () => {
     const fail = node('stop-command-gate-fail');
 
     expect(gate.depends_on).toEqual(['dry-run-preview']);
+    expect(node('dry-run-preview').depends_on).toEqual(['spec-disposition']);
+    expect(node('spec-disposition').depends_on).toEqual(['author-loop']);
+    expect(typeof node('classify-intake').bash).toBe('string');
+    expect(node('normalize-intake').depends_on).toEqual(['classify-intake']);
     expect(gate.timeout).toBe(1800000);
     expect(final.timeout).toBe(1800000);
     expect(typeof gate.bash).toBe('string');
@@ -179,6 +195,15 @@ describe('WO-HARNESS-WO-AUTHOR-INTAKE-REPAIR-01', () => {
       // Exactly one of commit-spec and stop-command-gate-fail runs, for every output.
       expect(c.result, `commit for ${json}`).toBe(allowed);
       expect(f.result, `fail for ${json}`).toBe(!allowed);
+      // The positively identified unchanged path: neither commit nor fail runs, whatever
+      // the (stale) gate output says.
+      const u = outputs('stop-command-gate-final', json, UNCHANGED_DISPOSITION);
+      expect(evaluateCondition(commitWhen, u).result, `unchanged commit for ${json}`).toBe(false);
+      expect(evaluateCondition(failWhen, u).result, `unchanged fail for ${json}`).toBe(false);
+    }
+    for (const json of [FAIL_JSON, VALIDATOR_FAIL_JSON]) {
+      const u = outputs('stop-command-gate', json, UNCHANGED_DISPOSITION);
+      expect(evaluateCondition(reviseWhen, u).result, `unchanged revise for ${json}`).toBe(false);
     }
     // gate-final skipped or never recorded: no output at all.
     expect(evaluateCondition(failWhen, new Map()).result).toBe(true);

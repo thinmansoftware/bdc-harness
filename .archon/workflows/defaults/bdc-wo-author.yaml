@@ -50,6 +50,30 @@
 #   words with no backticks and are never run.
 #   Gate tests: bash .archon/workflows/defaults/__tests__/wo-author-stop-gate.sh
 #   Wiring tests: bun test ./packages/workflows/src/wo-author-intake-provider.test.ts
+#
+# Draft-only safety (WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01, after run da35fd53 revised and
+# pushed an already-merged spec):
+#   - classify-intake (bash, before the model normalize step) decides intake_source, mode,
+#     auto_approve, requested_wo_id and wo_id_hint with deterministic code. A GitHub issue is
+#     the intake only when the whole message is one issue reference (mode flags and
+#     --project <name> allowed around it) or an explicit --issue <ref>; a reference inside
+#     prose is context and is never fetched. A malformed --issue fails the run closed.
+#     read-context fails the run if normalize-intake changed intake_source or wo_id_hint.
+#   - classify-intake also runs the pre-author existence check: the spec path exists when it
+#     is tracked at HEAD, present on origin/main, or present on disk.
+#   - spec-disposition (bash, after author-loop) prints one JSON object whose "result" is
+#     new, existing_spec_unchanged, wo_id_mismatch (the run aborts before any gate),
+#     no_spec or malformed_*. The gate chain and commit-spec run only for result new;
+#     stop-command-gate-fail stands down only for existing_spec_unchanged, so missing or
+#     malformed results still fail the run closed.
+#   - classify-intake records the specs on disk before authoring
+#     ($ARTIFACTS_DIR/wo-author-pre-inventory.txt). spec-disposition also returns
+#     existing_spec_unchanged when the footer's spec_path was in that inventory, is tracked
+#     at HEAD or is on origin/main (an auto-generated ID that names an existing spec).
+#   - commit-spec refuses before `git checkout -b` on any of those, or when the inventory
+#     is missing, whatever the gates printed: `commit-spec: refused existing_spec_unchanged
+#     <wo_id>`, exit 1.
+#   Safety tests: bun test ./packages/workflows/src/wo-author-draft-only-safety.test.ts
 
 name: bdc-wo-author
 description: |
@@ -59,8 +83,10 @@ description: |
   stop-command gate -> one revise pass -> final gate -> commit-spec).
   Replaces informal handoff via chat/VS Code.
   Inputs:
-    USER_MESSAGE: free-text description, or "@<repo>#<N>" for GitHub issue,
-                  or "--spec <repo-relative-path>" for an existing draft file.
+    USER_MESSAGE: free-text description, or a message that is only "@<repo>#<N>" (or
+                  "--issue <ref>") for GitHub issue intake; a reference inside prose is context only.
+                  "--spec <repo-relative-path>" names an existing spec, so the run ends existing_spec_unchanged.
+                  An existing spec on bdc-xo main is never revised or republished by this intake, in any mode, and --spec has no republish path; change an existing spec only by a pull request on that spec file in bdc-xo, opened with merge-hold, with an amendment row, read by the Board desk or the General as the change requires.
                   Mode flags inline: --draft-only | --queue (default) | --fire
                   Auto-approve flag: --auto-approve, "fire it", "fire now"
     MODE: optional explicit mode override (--draft-only|--queue|--fire); USER_MESSAGE wins
@@ -69,7 +95,8 @@ description: |
         spec (fails the run closed when the spec fails the validator or its
         commands do not behave as declared), and commits the spec to a held
         wo/author- branch on bdc-xo. Writes no Notion page. --fire is dead and
-        fail-closed (see the header comment).
+        fail-closed (see the header comment). A run whose spec already exists
+        ends existing_spec_unchanged: no revise, commit, branch, push or PR.
   Repo: thinmansoftware/bdc-xo (operator selects bdc-xo codebase when firing).
   NOT for: Doctrine-only WOs (use bdc-doctrine-update). Existing WOs already in
         REVIEW status. Batch authoring (use bdc-author-wo-batch).
@@ -113,6 +140,162 @@ nodes:
       fi
       echo "preflight-github-auth PASS"
 
+  # classify-intake (WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01): deterministic intake
+  # classification, requested_wo_id and wo_id_hint selection, and the pre-author existence
+  # check. normalize-intake copies these values; read-context fails the run if it does not.
+  - id: classify-intake
+    persona: xo
+    depends_on: [preflight-github-auth]
+    abort_run_on_failure: true
+    bash: |
+      set -uo pipefail
+      # The trigger message is read through a quoted heredoc: quotes, dollar signs and
+      # backticks in it are data, never shell. The delimiter carries this run's id (the
+      # engine substitutes the run id before the message), so a message cannot contain
+      # the closing line.
+      MSG=$(cat <<'BDC_WO_AUTHOR_MSG_$WORKFLOW_ID'
+      $USER_MESSAGE
+      BDC_WO_AUTHOR_MSG_$WORKFLOW_ID
+      )
+      DEFAULT_ORG=bluedevilcollectibles
+      ISSUE_RE='^@?([A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+#[0-9]+$'
+      WO_RE='WO-[A-Z][A-Z0-9-]+-[0-9]+'
+      intake_fail() {
+        printf 'INTAKE_FAILURE: %s\n' "$1"
+        printf 'intake_source=intake_failure\n'
+        exit 1
+      }
+
+      FLAT=$(printf '%s' "$MSG" | tr '\r\n\t' '   ')
+      set -f
+      read -r -a TOKS <<< "$FLAT"
+      set +f
+      MODE=""; AUTO=false
+      ISSUE=""; ISSUE_FLAG=0; SPEC=""; SPEC_FLAG=0; NOTION=""; NOTION_FLAG=0
+      REST=()
+      i=0
+      while [ "$i" -lt "${#TOKS[@]}" ]; do
+        t=${TOKS[$i]}
+        case "$t" in
+          --draft-only|--queue|--fire) MODE=$t ;;
+          --auto-approve) AUTO=true ;;
+          [Ff][Ii][Rr][Ee])
+            nxt=$(printf '%s' "${TOKS[$((i + 1))]:-}" | tr '[:upper:]' '[:lower:]')
+            if [ "$nxt" = it ] || [ "$nxt" = now ]; then AUTO=true; i=$((i + 1)); else REST+=("$t"); fi ;;
+          --project) i=$((i + 1)) ;;
+          --issue) ISSUE_FLAG=1; i=$((i + 1)); ISSUE=${TOKS[$i]:-} ;;
+          --spec) SPEC_FLAG=1; i=$((i + 1)); SPEC=${TOKS[$i]:-} ;;
+          --notion) NOTION_FLAG=1; i=$((i + 1)); NOTION=${TOKS[$i]:-} ;;
+          *) REST+=("$t") ;;
+        esac
+        i=$((i + 1))
+      done
+      if printf '%s' "$FLAT" | grep -qiE '(^|[^[:alnum:]])fire (it|now)([^[:alnum:]]|$)'; then AUTO=true; fi
+      # Mode: the last mode flag in the message wins, then INPUT_MODE, then --queue.
+      [ -n "$MODE" ] || MODE=${INPUT_MODE:-}
+      case "$MODE" in --draft-only|--queue|--fire) ;; *) MODE=--queue ;; esac
+
+      REST_TEXT="${REST[*]:-}"
+      REQUESTED=$(printf '%s\n' "$REST_TEXT" | grep -oE "$WO_RE" | head -n 1 || true)
+      [ -n "$REQUESTED" ] || REQUESTED=auto-generate
+
+      SOURCE=chat_message; ISSUE_REF=""; SPEC_REF=""; NOTION_REF=""
+      if [ "$SPEC_FLAG" = 1 ]; then
+        case "$SPEC" in ''|/*|*..*) intake_fail "--spec needs a repo-relative path (got '$SPEC')" ;; esac
+        printf '%s' "$SPEC" | grep -qE '^[A-Za-z0-9._/-]+[.]md$' || intake_fail "--spec path is not a .md path: $SPEC"
+        SOURCE=spec_file; SPEC_REF=$SPEC
+      elif [ "$NOTION_FLAG" = 1 ]; then
+        [ -n "$NOTION" ] || intake_fail "--notion needs a page id"
+        SOURCE=notion_stub; NOTION_REF=$NOTION
+      elif [ "$ISSUE_FLAG" = 1 ]; then
+        printf '%s' "$ISSUE" | grep -qE "$ISSUE_RE" || intake_fail "--issue needs an issue reference such as owner/repo#N (got '$ISSUE')"
+        SOURCE=github_issue; ISSUE_REF=$ISSUE
+      elif [ "${#REST[@]}" -eq 1 ] && printf '%s' "${REST[0]}" | grep -qE "$ISSUE_RE"; then
+        # The whole message (apart from flags) is one issue reference.
+        SOURCE=github_issue; ISSUE_REF=${REST[0]}
+      fi
+
+      ISSUE_TEXT=""
+      if [ "$SOURCE" = github_issue ]; then
+        ref=${ISSUE_REF#@}
+        num=${ref##*#}
+        path=${ref%#*}
+        case "$path" in
+          */*) owner=${path%%/*}; repo=${path#*/} ;;
+          *) owner=$DEFAULT_ORG; repo=$path ;;
+        esac
+        ISSUE_REF="$owner/$repo#$num"
+        if ! ISSUE_TEXT=$(gh api "repos/$owner/$repo/issues/$num" --jq '.title + "\n\n" + (.body // "")' 2>&1); then
+          intake_fail "issue fetch failed for $ISSUE_REF: $(printf '%s\n' "$ISSUE_TEXT" | head -n 1)"
+        fi
+      fi
+
+      HINT=$REQUESTED
+      if [ "$SOURCE" = spec_file ]; then
+        base=$(basename "$SPEC_REF" .md)
+        if printf '%s' "$base" | grep -qxE "$WO_RE"; then HINT=$base; REQUESTED=$base; fi
+      elif [ "$SOURCE" = github_issue ] && [ "$HINT" = auto-generate ]; then
+        from_issue=$(printf '%s\n' "$ISSUE_TEXT" | grep -oE "$WO_RE" | head -n 1 || true)
+        [ -z "$from_issue" ] || HINT=$from_issue
+      fi
+
+      # Pre-author inventory: every spec file on disk before author-loop runs. A spec that
+      # was on disk before this run counts as existing even when its ID is only derived
+      # later (auto-generate); a spec this run writes is not in it.
+      [ -n "${ARTIFACTS_DIR:-}" ] || intake_fail "ARTIFACTS_DIR is not set; cannot record the pre-author inventory"
+      mkdir -p "$ARTIFACTS_DIR" || intake_fail "cannot create ARTIFACTS_DIR"
+      INVENTORY="$ARTIFACTS_DIR/wo-author-pre-inventory.txt"
+      if [ -d docs/work-orders ]; then
+        find docs/work-orders -maxdepth 1 -type f -name '*.md' | LC_ALL=C sort > "$INVENTORY" || intake_fail "cannot write the pre-author inventory"
+      else
+        : > "$INVENTORY" || intake_fail "cannot write the pre-author inventory"
+      fi
+
+      # Pre-author existence check. Deterministic: it decides the unchanged disposition,
+      # not author-loop's IDEMPOTENT_SKIP text.
+      CHECK_PATH=""
+      if [ "$SOURCE" = spec_file ]; then
+        CHECK_PATH=$SPEC_REF
+      elif [ "$HINT" != auto-generate ]; then
+        CHECK_PATH="docs/work-orders/$HINT.md"
+      fi
+      EXISTING=no; EXISTING_PATH=""; EXISTING_REASON=none
+      if [ -n "$CHECK_PATH" ]; then
+        if git cat-file -e "HEAD:$CHECK_PATH" 2>/dev/null; then
+          EXISTING=yes; EXISTING_REASON=tracked_at_head
+        else
+          # Refresh exactly the ref checked below; a failed refresh fails closed, so a
+          # stale or missing cached origin/main never reads as "new".
+          git fetch -q origin "+refs/heads/main:refs/remotes/origin/main" >/dev/null 2>&1 \
+            || intake_fail "cannot refresh origin/main to check $CHECK_PATH; failing closed"
+          if git cat-file -e "refs/remotes/origin/main:$CHECK_PATH" 2>/dev/null; then
+            EXISTING=yes; EXISTING_REASON=on_origin_main
+          elif [ -f "$CHECK_PATH" ]; then
+            EXISTING=yes; EXISTING_REASON=on_disk
+          fi
+        fi
+        [ "$EXISTING" = no ] || EXISTING_PATH=$CHECK_PATH
+      fi
+
+      echo "=== CLASSIFY-INTAKE OUTPUT ==="
+      printf 'intake_source=%s\n' "$SOURCE"
+      printf 'mode=%s\n' "$MODE"
+      printf 'auto_approve=%s\n' "$AUTO"
+      printf 'issue_ref=%s\n' "$ISSUE_REF"
+      printf 'spec_ref=%s\n' "$SPEC_REF"
+      printf 'notion_ref=%s\n' "$NOTION_REF"
+      printf 'requested_wo_id=%s\n' "$REQUESTED"
+      printf 'wo_id_hint=%s\n' "$HINT"
+      printf 'existing_spec=%s\n' "$EXISTING"
+      printf 'existing_spec_path=%s\n' "$EXISTING_PATH"
+      printf 'existing_reason=%s\n' "$EXISTING_REASON"
+      printf 'pre_inventory_count=%s\n' "$(wc -l < "$INVENTORY" | tr -d ' ')"
+      if [ -n "$ISSUE_TEXT" ]; then
+        echo ""
+        echo "=== FETCHED ISSUE ==="
+        printf '%s\n' "$ISSUE_TEXT"
+      fi
+
   # normalize-intake: single prompt node handles all four intake sources.
   # See WO spec Section 8 + plan Ambiguity #2 resolution: prompt node, not bash, so
   # that the --notion <page-id> path can use the Notion MCP tool without
@@ -123,7 +306,7 @@ nodes:
     # pin below is what runs (codex lane plan node pattern).
     provider: codex
     model: gpt-6.1-sol
-    depends_on: [preflight-github-auth]
+    depends_on: [classify-intake]
     task_class: medium_work
     prompt: |
       You are the BDC WO Author intake normalizer. Your job is to detect the
@@ -135,23 +318,28 @@ nodes:
       USER_MESSAGE: $USER_MESSAGE
       INPUT_MODE: $INPUT_MODE
 
-      ## Intake Detection (priority order)
+      ## Deterministic classification (binding)
 
-      1. **--spec <path>** in USER_MESSAGE: fetch via `gh api repos/thinmansoftware/bdc-xo/contents/<path>?ref=main`,
-         base64-decode .content. intake_source=spec_file
-      2. **--notion <page-id>** in USER_MESSAGE: use Notion MCP `notion-fetch` against the page ID.
-         Extract title + body as the description. intake_source=notion_stub
-      3. **<owner>/<repo>#<N>** or just **<repo>#<N>** in USER_MESSAGE: fetch via
-         `gh api repos/<owner-or-default-org>/<repo>/issues/<N>` (default org:
-         bluedevilcollectibles). Use title + body. intake_source=github_issue
-      4. Otherwise: treat USER_MESSAGE itself as the description.
-         intake_source=chat_message
+      The classify-intake node already decided the intake source, the mode, the
+      auto-approve flag and the WO ID hint, with deterministic code:
 
-      ## Mode Flag Extraction (USER_MESSAGE wins over INPUT_MODE default)
+      $classify-intake.output
 
-      Scan USER_MESSAGE for: `--draft-only`, `--queue`, `--fire`. Last match wins.
-      If none present, use INPUT_MODE (default `--queue`).
-      Also scan for: `--auto-approve`, "fire it", "fire now". Set auto_approve=true if any present.
+      Copy intake_source, mode, auto_approve and wo_id_hint into your output exactly as
+      they appear above. Do not re-detect or change them: read-context fails the run
+      when your values differ. An issue, PR or spec that the message only mentions in its
+      prose is context, never the intake.
+
+      ## Content to normalize
+
+      - intake_source=spec_file: fetch spec_ref via `gh api repos/thinmansoftware/bdc-xo/contents/<spec_ref>?ref=main`,
+        base64-decode .content.
+      - intake_source=notion_stub: use Notion MCP `notion-fetch` against notion_ref (read only).
+        Extract title + body as the description.
+      - intake_source=github_issue: the FETCHED ISSUE block above is the content (title,
+        then body). Do not fetch it again and do not fetch anything else.
+      - intake_source=chat_message: USER_MESSAGE itself is the description. Do not fetch
+        any issue, PR, spec or page that it mentions.
 
       ## Target Repo Hint Extraction
 
@@ -160,12 +348,6 @@ nodes:
       `bdc-xo`, `pricing-monolith`, `arena`. Emit the first match as target_repo_hint.
       If none found, emit `target_repo_hint=unknown` -- the author-loop will choose
       the target repo and write it on the spec's own `target_repo:` line.
-
-      ## WO ID Hint Extraction
-
-      If USER_MESSAGE or fetched content contains a `WO-[A-Z][A-Z0-9-]+-[0-9]+`
-      string, emit it as wo_id_hint. Otherwise emit `wo_id_hint=auto-generate`
-      and the author-loop will derive a deterministic ID from the Objective.
 
       ## Required Output
 
@@ -198,13 +380,25 @@ nodes:
   - id: read-context
     persona: xo
     depends_on: [normalize-intake]
+    abort_run_on_failure: true
     bash: |
       set -euo pipefail
-      # Extract wo_id_hint from normalize-intake output. If present, find
-      # existing WOs that share the prefix family.
       INTAKE_OUT=$normalize-intake.output
-      WO_HINT=$(printf '%s\n' "$INTAKE_OUT" | sed -n 's/^wo_id_hint=//p' | head -n 1)
-      TARGET_HINT=$(printf '%s\n' "$INTAKE_OUT" | sed -n 's/^target_repo_hint=//p' | head -n 1)
+      CLASSIFY_OUT=$classify-intake.output
+      # WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01: intake_source and wo_id_hint are decided
+      # by classify-intake; the model normalize step may only copy them.
+      kv_line() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
+      for key in intake_source wo_id_hint; do
+        want=$(kv_line "$CLASSIFY_OUT" "$key")
+        got=$(kv_line "$INTAKE_OUT" "$key")
+        if [ -z "$want" ] || [ "$want" != "$got" ]; then
+          echo "normalize_overrode_classification: $key classify-intake=${want:-missing} normalize-intake=${got:-missing}" >&2
+          exit 1
+        fi
+      done
+      # Find existing WOs that share the prefix family of the deterministic hint.
+      WO_HINT=$(kv_line "$CLASSIFY_OUT" wo_id_hint)
+      TARGET_HINT=$(kv_line "$INTAKE_OUT" target_repo_hint)
 
       # Derive prefix: WO-HARNESS-FOO-BAR-01 -> HARNESS-FOO
       PREFIX=""
@@ -273,6 +467,9 @@ nodes:
         ### Intake (normalized)
         $normalize-intake.output
 
+        ### Deterministic classification (binding)
+        $classify-intake.output
+
         ### Prior Art Context
         $read-context.output
 
@@ -283,10 +480,12 @@ nodes:
 
         ## PHASE 1 -- AUTHOR FROM THE CLASS TEMPLATE
 
-        **1a. Idempotency check**: Parse wo_id_hint from intake. If it is a real
-        WO ID (not "auto-generate") AND `docs/work-orders/<wo_id>.md` already
-        exists on disk, SKIP authoring -- emit `IDEMPOTENT_SKIP: <wo_id> already
-        exists on disk` and proceed directly to PHASE 3 commit.
+        **1a. Existing spec (binding, decided before this loop)**: read existing_spec,
+        wo_id_hint and requested_wo_id from the deterministic classification above. If
+        existing_spec=yes, do NOT author, edit, format or revise any file: emit
+        `IDEMPOTENT_SKIP: <wo_id_hint> already exists` and the footer below with
+        wo_id=<wo_id_hint>, then stop. An existing spec is changed only by a pull
+        request on that spec file in bdc-xo, never by this intake.
 
         **1b. Derive WO_ID** (if hint was "auto-generate"):
         - Extract a concise 2-3 word noun phrase from the Objective sentence.
@@ -295,6 +494,10 @@ nodes:
         - Example: "Add pull-list export to ShopOps" -> WO-SHOPOPS-PULLLIST-EXPORT-01
         - Deterministic from Objective: running twice with same description
           MUST produce same ID (idempotency req from spec Section 8 Q8).
+        - When requested_wo_id is a real WO ID, wo_id MUST equal it; spec-disposition
+          ends the run wo_id_mismatch otherwise.
+        - If docs/work-orders/<WO_ID>.md already exists (on disk or tracked), do not
+          overwrite it: emit IDEMPOTENT_SKIP for that ID and the footer, then stop.
 
         **1c. Choose the class and the target repo.**
         - Class: exactly one of CODE, INFRA, OPERATOR-EXECUTION, DOCUMENTATION-ONLY.
@@ -393,16 +596,101 @@ nodes:
           critique: <specific gaps that could not be resolved>
         ```
 
+  # spec-disposition (WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01): one JSON object whose
+  # "result" gates every revision and publication node. new: the gate chain runs.
+  # existing_spec_unchanged: from the pre-author check, never from IDEMPOTENT_SKIP text; no
+  # gate, revise, commit, branch or push, and the run ends successfully. wo_id_mismatch:
+  # the run aborts here. no_spec, malformed_* and origin_main_unavailable (origin/main
+  # could not be refreshed): the run fails closed.
+  - id: spec-disposition
+    persona: major-build
+    depends_on: [author-loop]
+    abort_run_on_failure: true
+    bash: |
+      set -uo pipefail
+      CLASSIFY=$classify-intake.output
+      AUTHOR_OUT=$author-loop.output
+      kv() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
+      REQ=$(kv "$CLASSIFY" requested_wo_id)
+      EXISTING=$(kv "$CLASSIFY" existing_spec)
+      EXISTING_PATH=$(kv "$CLASSIFY" existing_spec_path)
+      WO_ID=$(kv "$AUTHOR_OUT" wo_id)
+      SPEC_PATH=$(kv "$AUTHOR_OUT" spec_path)
+      emit() {
+        printf '{"result":"%s","wo_id":"%s","requested_wo_id":"%s","spec_path":"%s","existing_spec_path":"%s","reason":"%s"}\n' \
+          "$1" "$WO_ID" "$REQ" "$SPEC_PATH" "$EXISTING_PATH" "$2"
+      }
+      safe() { printf '%s' "$1" | grep -qxE "$2"; }
+      if ! { [ "$EXISTING" = yes ] || [ "$EXISTING" = no ]; } \
+        || ! safe "$REQ" 'auto-generate|WO-[A-Z0-9-]+' \
+        || { [ -n "$EXISTING_PATH" ] && ! safe "$EXISTING_PATH" '[A-Za-z0-9._/-]+'; }; then
+        WO_ID=""; SPEC_PATH=""; REQ=""; EXISTING_PATH=""
+        emit malformed_classification "classify-intake output missing or malformed"
+        exit 0
+      fi
+      if [ -z "$WO_ID" ]; then
+        SPEC_PATH=""
+        if printf '%s\n' "$AUTHOR_OUT" | grep -q '^BATCH_FAILURE:'; then
+          emit no_spec "author-loop emitted BATCH_FAILURE"
+        else
+          emit malformed_author_output "author-loop footer has no wo_id"
+        fi
+        exit 0
+      fi
+      if ! safe "$WO_ID" 'WO-[A-Z0-9-]+' || ! safe "$SPEC_PATH" "docs/work-orders/${WO_ID}[.]md"; then
+        WO_ID=""; SPEC_PATH=""
+        emit malformed_author_output "footer wo_id or spec_path is not a work-order spec path"
+        exit 0
+      fi
+      if [ "$REQ" != auto-generate ] && [ "$WO_ID" != "$REQ" ]; then
+        emit wo_id_mismatch "requested $REQ, author-loop footer $WO_ID"
+        echo "wo_id_mismatch: requested_wo_id=$REQ footer wo_id=$WO_ID; stopping before any gate, revise or commit" >&2
+        exit 1
+      fi
+      if [ "$EXISTING" = yes ]; then
+        emit existing_spec_unchanged "pre-author check found $EXISTING_PATH"
+        exit 0
+      fi
+      # The footer's spec_path (covers an auto-generated ID the pre-author check could not
+      # know): existing when it was in the pre-author inventory, is tracked at HEAD, or is
+      # present on origin/main. A missing inventory fails closed.
+      INVENTORY="${ARTIFACTS_DIR:-}/wo-author-pre-inventory.txt"
+      if [ -z "${ARTIFACTS_DIR:-}" ] || [ ! -f "$INVENTORY" ]; then
+        emit malformed_classification "pre-author inventory missing"
+        exit 0
+      fi
+      FOUND=""
+      if grep -qxF -- "$SPEC_PATH" "$INVENTORY"; then
+        FOUND="on disk before authoring"
+      elif git cat-file -e "HEAD:$SPEC_PATH" 2>/dev/null; then
+        FOUND="tracked at HEAD"
+      else
+        # Refresh exactly the ref checked; a failed refresh fails closed.
+        if ! git fetch -q origin "+refs/heads/main:refs/remotes/origin/main" >/dev/null 2>&1; then
+          emit origin_main_unavailable "cannot refresh origin/main to check $SPEC_PATH"
+          exit 0
+        fi
+        if git cat-file -e "refs/remotes/origin/main:$SPEC_PATH" 2>/dev/null; then FOUND="present on origin/main"; fi
+      fi
+      if [ -n "$FOUND" ]; then
+        EXISTING_PATH=$SPEC_PATH
+        emit existing_spec_unchanged "footer spec_path $FOUND"
+        exit 0
+      fi
+      emit new "no existing spec found before authoring"
+
   # dry-run-preview: ALWAYS runs. Emits the preview block that operator sees
   # before the stop-command gate and commit. Cross-checks: existing spec on
   # disk (idempotency), active Cauldron runs for same WO_ID (duplicate run
   # detection per spec Scenario 3).
   - id: dry-run-preview
     persona: major-build
-    depends_on: [author-loop]
+    depends_on: [spec-disposition]
     bash: |
       set -euo pipefail
       AUTHOR_OUT=$author-loop.output
+      DISPOSITION_JSON=$spec-disposition.output
+      DISPOSITION=$(printf '%s\n' "$DISPOSITION_JSON" | sed -n 's/.*"result":"\([a-z_]*\)".*/\1/p' | head -n 1)
 
       # Parse footer block from author-loop output. Author-loop emits these
       # under "=== AUTHOR-LOOP RESULT ===" header.
@@ -451,6 +739,7 @@ nodes:
       # Emit preview block (always shown -- read by the stop-command gate)
       echo "=== DRY-RUN PREVIEW ==="
       echo "wo_id=$WO_ID"
+      echo "disposition=${DISPOSITION:-missing}"
       echo "spec_path=$SPEC_PATH"
       echo "spec_on_disk=$SPEC_OK"
       echo "target_repo=$TARGET_REPO"
@@ -461,6 +750,9 @@ nodes:
       echo "$DUPLICATE_INFO"
       echo ""
       echo "Mode behavior:"
+      if [ "$DISPOSITION" = existing_spec_unchanged ]; then
+        echo "  - existing_spec_unchanged: the spec already exists; no revise, commit, branch, push or PR in any mode"
+      else
       case "$MODE" in
         --draft-only)
           echo "  - Commit spec to bdc-xo feature branch + open PR"
@@ -482,6 +774,7 @@ nodes:
           echo "  - WARN: unknown mode '$MODE' -- defaulting to --queue behavior"
           ;;
       esac
+      fi
 
   # approval-gate: only runs in --fire mode AND when auto_approve != true.
   # In other modes, the `when:` condition skips this node and downstream
@@ -510,6 +803,7 @@ nodes:
   # timeout kill can skip the cleanup trap, and any leftover clone stays in $ARTIFACTS_DIR.
   - id: stop-command-gate
     depends_on: [dry-run-preview]
+    when: "$spec-disposition.output.result == 'new'"
     timeout: 1800000
     bash: |
       set -uo pipefail
@@ -1237,7 +1531,7 @@ nodes:
     provider: codex
     model: gpt-6.1-sol
     depends_on: [stop-command-gate]
-    when: "$stop-command-gate.output.GATE == 'fail'"
+    when: "$stop-command-gate.output.GATE == 'fail' && $spec-disposition.output.result == 'new'"
     task_class: medium_work
     prompt: |
       You are the BDC WO Author stop-command reviser. CWD = bdc-xo repo root. You have
@@ -1291,6 +1585,7 @@ nodes:
   - id: stop-command-gate-final
     depends_on: [stop-command-revise]
     trigger_rule: all_done
+    when: "$spec-disposition.output.result == 'new'"
     timeout: 1800000
     bash: |
       set -uo pipefail
@@ -2010,7 +2305,8 @@ nodes:
       wag_main final "$PREVIEW" "$FIRST_GATE"
       exit 0
 
-  # stop-command-gate-fail: the run fails closed unless the final gate allowed the commit.
+  # stop-command-gate-fail: the run fails closed unless the final gate allowed the commit,
+  # or spec-disposition positively identified existing_spec_unchanged.
   # Also covers no_spec, empty or malformed gate output and a skipped or failed gate-final:
   # resolveOutputRef returns '' for those, and '' is not 'yes' (codex lane repair-gate-fail
   # pattern).
@@ -2018,7 +2314,7 @@ nodes:
     abort_run_on_failure: true
     depends_on: [stop-command-gate-final]
     trigger_rule: all_done
-    when: "$stop-command-gate-final.output.GATE_ALLOW != 'yes'"
+    when: "$stop-command-gate-final.output.GATE_ALLOW != 'yes' && $spec-disposition.output.result != 'existing_spec_unchanged'"
     bash: |
       set -uo pipefail
       GATE_OUT=$stop-command-gate-final.output
@@ -2044,7 +2340,7 @@ nodes:
   - id: commit-spec
     persona: overseer
     depends_on: [stop-command-gate-final]
-    when: "$stop-command-gate-final.output.GATE_ALLOW == 'yes'"
+    when: "$stop-command-gate-final.output.GATE_ALLOW == 'yes' && $spec-disposition.output.result == 'new'"
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -2060,6 +2356,33 @@ nodes:
 
       if [ ! -f "$SPEC_PATH" ]; then
         echo "ERROR: spec file $SPEC_PATH does not exist on disk -- author-loop did not write it." >&2
+        exit 1
+      fi
+
+      # WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01: refuse before any git mutation when the spec
+      # already existed, whatever author-loop or either gate printed. A spec this run wrote
+      # and has not committed is neither tracked at HEAD nor on origin/main, so a genuinely
+      # new spec still commits and pushes.
+      CLASSIFY=$classify-intake.output
+      PRE_EXISTING=$(printf '%s\n' "$CLASSIFY" | sed -n 's/^existing_spec=//p' | head -n 1)
+      REFUSE_REASON=""
+      INVENTORY="${ARTIFACTS_DIR:-}/wo-author-pre-inventory.txt"
+      if [ "$PRE_EXISTING" != "no" ]; then
+        REFUSE_REASON="pre-author check existing_spec=${PRE_EXISTING:-missing}"
+      elif [ -z "${ARTIFACTS_DIR:-}" ] || [ ! -f "$INVENTORY" ]; then
+        REFUSE_REASON="pre-author inventory missing"
+      elif grep -qxF -- "$SPEC_PATH" "$INVENTORY"; then
+        REFUSE_REASON="spec_path was on disk before authoring"
+      elif git cat-file -e "HEAD:$SPEC_PATH" 2>/dev/null; then
+        REFUSE_REASON="spec_path is tracked at HEAD"
+      elif ! git fetch -q origin "+refs/heads/main:refs/remotes/origin/main" >/dev/null 2>&1; then
+        REFUSE_REASON="cannot refresh origin/main to check spec_path"
+      elif git cat-file -e "refs/remotes/origin/main:$SPEC_PATH" 2>/dev/null; then
+        REFUSE_REASON="spec_path is present on origin/main"
+      fi
+      if [ -n "$REFUSE_REASON" ]; then
+        echo "commit-spec: refused existing_spec_unchanged $WO_ID"
+        echo "commit-spec: $REFUSE_REASON ($SPEC_PATH); no checkout, commit, branch or push" >&2
         exit 1
       fi
 
@@ -2170,6 +2493,14 @@ nodes:
         exit 0
       fi
 
+      # WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01: never fire for a spec this run did not
+      # newly author (existing_spec_unchanged, mismatch, missing or malformed result).
+      DISPOSITION_JSON=$spec-disposition.output
+      if ! printf '%s\n' "$DISPOSITION_JSON" | grep -q '"result":"new"'; then
+        echo "fire-cauldron: spec-disposition result is not new; not firing"
+        exit 0
+      fi
+
       # Guard 2: approval required (unless auto_approve)
       if [ "$AUTO_APPROVE" != "true" ]; then
         if ! printf '%s\n' "$APPROVAL" | grep -iqE 'approved|^yes|fire'; then
@@ -2243,6 +2574,8 @@ nodes:
       and the WO that was just authored.
 
       ## Inputs
+      Classify-intake: $classify-intake.output
+      Spec-disposition: $spec-disposition.output
       Normalize-intake: $normalize-intake.output
       Read-context: $read-context.output
       Author-loop: $author-loop.output
@@ -2253,8 +2586,15 @@ nodes:
       Commit-spec: $commit-spec.output
       Fire-cauldron: $fire-cauldron.output
 
+      ## Unchanged runs
+      When Spec-disposition's result is existing_spec_unchanged, the manifest says so:
+      Result: existing_spec_unchanged; Branch: none; Commit SHA: none; Files created: none.
+      Never report a newly authored artifact for that result.
+
       ## Required Manifest Fields
-      - WO: <wo_id from commit-spec, or "BATCH_FAILURE" if author-loop failed>
+      - WO: <wo_id from commit-spec or Spec-disposition, or "BATCH_FAILURE" if author-loop
+        failed>, followed by "(requested_wo_id: <requested_wo_id from Classify-intake>)"
+      - Result: <result from Spec-disposition: new | existing_spec_unchanged | other>
       - Mode: <--draft-only | --queue | --fire>
       - Intake source: <chat_message | github_issue | notion_stub | spec_file>
       - Files created: docs/work-orders/<WO_ID>.md (only one file -- the spec)
