@@ -177,10 +177,11 @@ order with the count, the first and last id and the ids.
 
 ### Procedure
 
-1. After the merge and the harness rebuild, on the host inside `archon-app-1`:
+1. After the merge and the harness rebuild, run it inside `archon-app-1` (the image
+   copies the script to `/app/scripts/dispatch/`):
 
    ```bash
-   bun scripts/dispatch/mailbox-lifecycle.ts --recipient xo
+   ssh hetzner-prod 'docker exec archon-app-1 bun run /app/scripts/dispatch/mailbox-lifecycle.ts --recipient xo'
    ```
 
    For K3, take `df -P` on the host first, write the evidence file, and add
@@ -191,8 +192,7 @@ order with the count, the first and last id and the ids.
    run (within 15 minutes of a fresh evidence file if K3 is included):
 
    ```bash
-   bun scripts/dispatch/mailbox-lifecycle.ts --recipient xo --execute \
-     --confirm <confirm_token> --out-dir /.archon/mailbox-lifecycle
+   ssh hetzner-prod 'docker exec archon-app-1 bun run /app/scripts/dispatch/mailbox-lifecycle.ts --recipient xo --execute --confirm <confirm_token> --out-dir /.archon/mailbox-lifecycle'
    ```
 
    The script recomputes the set and refuses (exit 2, nothing changed) if its
