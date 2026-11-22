@@ -342,6 +342,10 @@ COPY scripts/worktree-copy-proof.ts ./scripts/
 # Operator command: re-enqueue one exact head whose newest review row failed
 # (docs/operations/overseer-re-review.md; WO-HARNESS-OVERSEER-REREVIEW-FAILED-HEAD-COMMAND-01).
 COPY scripts/overseer/re-enqueue-review.ts ./scripts/overseer/
+# Operator command: one-time XO mailbox cleanup, dry run by default
+# (docs/operations/dispatch-mailbox-lifecycle.md; WO-HARNESS-XO-MAILBOX-LIFECYCLE-01).
+# Its imports, packages/core/src/db/, are already in the image above.
+COPY scripts/dispatch/mailbox-lifecycle.ts ./scripts/dispatch/
 
 # Evidence-only repair helper run by the bdc-feature-development lanes as
 # /app/scripts/evidence-repair.ts (bdc-harness PR 1609). Its one non-builtin import,
