@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 import { parseWorkflow } from './loader';
 import { evaluateCondition } from './condition-evaluator';
 import { substituteWorkflowVariables } from './executor-shared';
@@ -150,6 +151,8 @@ function pushCount(): number {
 }
 
 beforeEach(() => {
+  clearRegistry();
+  registerBuiltinProviders();
   const dir = mkdtempSync(join(tmpdir(), 'wo-author-safety-'));
   fx = {
     dir,
@@ -212,6 +215,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearRegistry();
   rmSync(fx.dir, { recursive: true, force: true });
 });
 
