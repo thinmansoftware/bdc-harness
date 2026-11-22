@@ -1,4 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { randomUUID } from 'crypto';
+import { getDatabase } from '@archon/core/db/connection';
+import {
+  createAuthenticatedMessage,
+  getMessage,
+  type DispatchMessage,
+} from '@archon/core/db/dispatch';
 import {
   checkEvidence,
   checkExpectations,
@@ -1412,6 +1419,196 @@ describe('escalation reaches a human (bdc-xo#2007)', () => {
     const body = renderEscalationBody({ ...base, evidence_json: 'not json' });
     expect(body).toContain('unparseable evidence spec');
     expect(body).toContain('EXHAUSTED');
+  });
+});
+
+/**
+ * WO-HARNESS-XO-MAILBOX-LIFECYCLE-01 (bdc-xo#5180): the expectation retry and
+ * the EXHAUSTED send ask the dispatch DAL to collapse repeats. Decisions D1
+ * (a suppressed retry still spends its attempt) and D2 (EXHAUSTED carries the
+ * subject of the chased item) of bdc-xo#5180 comment 7082526569.
+ */
+describe('mailbox lifecycle: Taskmaster repeat collapse', () => {
+  const chased = {
+    id: 'original',
+    correlation_id: 'c1',
+    idempotency_key: 'tm:nudge:original',
+    task_type: 'agent_message',
+    recipient: 'xo',
+    body: 'work',
+    priority: 'normal',
+    subject_key: 'gh:thinmansoftware/bdc-xo#1538' as string | null,
+  };
+
+  test('D1: a suppressed retry still spends its attempt and the expectation reaches EXHAUSTED', async () => {
+    let row = { ...base };
+    const sends: { key: string; collapse: unknown }[] = [];
+    const deps = {
+      listDueExpectations: async () => (row.status === 'escalated' ? [] : [row]),
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      // Every retry is suppressed by the open, unread original, so no row ever
+      // carries a retry key; the suppressing row is the attempt's effect.
+      findEffectByIdempotencyKey: async () => null,
+      findRepeatSuppressor: async () => ({ id: 'original' }),
+      getMessage: async () => chased as never,
+      createTask: async (_context: never, data: Record<string, unknown>) => {
+        sends.push({ key: String(data.idempotency_key), collapse: data.collapse_repeats });
+        return { id: 'original', idempotency_key: chased.idempotency_key } as never;
+      },
+      claimRedispatchAttempt: async (_id: string, expected: number) => {
+        if (row.retries !== expected || row.retries >= row.max_retries) return null;
+        row = { ...row, retries: row.retries + 1, status: 'failed' };
+        return row.retries;
+      },
+      claimRecoveryReplay: async () => true,
+      claimEscalation: async () => true,
+      markEscalated: async () => {
+        row = { ...row, status: 'escalated' };
+        return true;
+      },
+      retryDelayMs: 0,
+    };
+    for (let tick = 0; tick < 4; tick += 1) await checkExpectations(new Date(), deps as never);
+    expect(sends.map(send => send.key)).toEqual([
+      'tm:expectation:expectation-1:retry:1',
+      'tm:expectation:expectation-1:retry:2',
+      'tm:expectation:expectation-1:escalate',
+    ]);
+    expect(sends.every(send => send.collapse === true)).toBe(true);
+  });
+
+  test('D2: the EXHAUSTED send carries the chased subject_key and asks for collapse', async () => {
+    const cases: { original: typeof chased | null; subject: string | undefined }[] = [
+      { original: chased, subject: 'gh:thinmansoftware/bdc-xo#1538' },
+      { original: { ...chased, subject_key: null }, subject: undefined },
+      { original: null, subject: undefined },
+    ];
+    for (const item of cases) {
+      const sent: Record<string, unknown>[] = [];
+      await checkExpectations(new Date(), {
+        listDueExpectations: async () => [
+          { ...base, id: 'exp-d2', on_absence: 'escalate', max_retries: 0 },
+        ],
+        checkEvidence: async () => ({ ok: false, pointer: null }),
+        markFailed: async () => true,
+        claimEscalation: async () => true,
+        markEscalated: async () => true,
+        getMessage: async () => item.original as never,
+        createTask: async (_context: never, data: Record<string, unknown>) => {
+          sent.push(data);
+          return { id: 'd' } as never;
+        },
+      } as never);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.subject_key ?? undefined).toBe(item.subject);
+      expect(sent[0]?.collapse_repeats).toBe(true);
+      expect(sent[0]?.recipient).toBe('xo');
+      if (item.subject) expect(sent[0]?.repeat_reason).toBe('expectation:exp-d2:exhausted');
+    }
+  });
+});
+
+describe('Test 6: EXHAUSTED rows collapse per chased subject (real database)', () => {
+  let priorCooldown: string | undefined;
+  const run = randomUUID().slice(0, 8);
+
+  beforeEach(() => {
+    priorCooldown = process.env.DISPATCH_REPEAT_COOLDOWN_HOURS;
+    process.env.DISPATCH_REPEAT_COOLDOWN_HOURS = '24';
+  });
+
+  afterEach(() => {
+    if (priorCooldown === undefined) delete process.env.DISPATCH_REPEAT_COOLDOWN_HOURS;
+    else process.env.DISPATCH_REPEAT_COOLDOWN_HOURS = priorCooldown;
+  });
+
+  async function chasedOriginal(key: string, subject: string | null): Promise<DispatchMessage> {
+    // Sent to an owner mailbox other than xo, as an expectation's nudge is.
+    return createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: `tm-t6-${run}-${key}`,
+        idempotency_key: `t6-original-${run}-${key}`,
+        task_type: 'agent_message',
+        recipient: 'astra',
+        body: `nudge ${key}`,
+        ...(subject ? { subject_key: subject, repeat_reason: 'tm:nudge:follow-up' } : {}),
+      }
+    );
+  }
+
+  async function exhaust(expectationId: string, dispatchRef: string): Promise<DispatchMessage> {
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [
+        {
+          ...base,
+          id: expectationId,
+          dispatch_ref: dispatchRef,
+          on_absence: 'escalate',
+          max_retries: 0,
+          status: 'escalating',
+        },
+      ],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markEscalated: async () => true,
+    });
+    const found = await getDatabase().query<{ id: string }>(
+      'SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1',
+      [`tm:expectation:${expectationId}:escalate`]
+    );
+    const message = await getMessage(found.rows[0]?.id ?? 'missing');
+    if (!message) throw new Error(`exhausted row missing for ${expectationId}`);
+    return message;
+  }
+
+  async function backdate(id: string, hoursAgo: number): Promise<void> {
+    await getDatabase().query('UPDATE agent_dispatch_messages SET created_at = $2 WHERE id = $1', [
+      id,
+      new Date(Date.now() - hoursAgo * 3_600_000).toISOString(),
+    ]);
+  }
+
+  test('two expectations exhausting on one subject leave one open row that names the folded one', async () => {
+    const subject = `gh:thinmansoftware/bdc-xo#${String(100_000 + Math.floor(Math.random() * 800_000))}`;
+    const originalA = await chasedOriginal('a', subject);
+    const originalB = await chasedOriginal('b', subject);
+    const older = await exhaust(`t6-${run}-a`, originalA.id);
+    expect(older.subject_key).toBe(subject);
+    await backdate(older.id, 30);
+    const newer = await exhaust(`t6-${run}-b`, originalB.id);
+
+    const open = await getDatabase().query<{ id: string }>(
+      `SELECT id FROM agent_dispatch_messages
+       WHERE recipient = 'xo' AND sender_principal_id = 'system:taskmaster' AND subject_key = $1
+         AND status = 'queued' AND acknowledged_at IS NULL AND addressed_at IS NULL
+         AND route_disposition IS NULL AND body LIKE 'Taskmaster expectation EXHAUSTED%'`,
+      [subject]
+    );
+    expect(open.rows.map(row => row.id)).toEqual([newer.id]);
+    const folded = await getMessage(older.id);
+    expect(folded?.status).toBe('done');
+    expect(folded?.route_disposition).toBe('superseded');
+    expect(JSON.parse(folded?.result_body ?? '{}')).toEqual({
+      reason: 'repeat',
+      superseded_by: newer.id,
+    });
+    expect(
+      newer.body.endsWith(`\nFolded in: 1 earlier open notice(s) for this subject (${older.id}).`)
+    ).toBe(true);
+  });
+
+  test('an EXHAUSTED row whose chased item has no subject_key is not collapsed with another expectation', async () => {
+    const originalC = await chasedOriginal('c', null);
+    const originalD = await chasedOriginal('d', null);
+    const first = await exhaust(`t6-${run}-c`, originalC.id);
+    await backdate(first.id, 30);
+    const second = await exhaust(`t6-${run}-d`, originalD.id);
+    expect(first.subject_key).toBeNull();
+    expect(second.subject_key).toBeNull();
+    expect((await getMessage(first.id))?.status).toBe('queued');
+    expect((await getMessage(first.id))?.route_disposition).toBeNull();
+    expect(second.body).not.toContain('Folded in:');
   });
 });
 
