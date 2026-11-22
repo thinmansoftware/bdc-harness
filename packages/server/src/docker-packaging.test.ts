@@ -274,4 +274,45 @@ describe('production Docker packaging', () => {
     expect(uncovered).toEqual([]);
     for (const path of notInHarnessImage.keys()) expect(referenced.has(path)).toBe(true);
   });
+
+  it('copies every /app/scripts/ file an operations runbook tells the operator to run', async () => {
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01 (bdc-xo#5180): the cleanup script was documented but not
+    // copied, so `docker exec archon-app-1 bun run /app/scripts/dispatch/...` could not run it.
+    const root = join(import.meta.dir, '..', '..', '..');
+    const dockerfile = await readFile(join(root, 'Dockerfile'), 'utf8');
+    const production = dockerfile.split('AS production')[1] ?? '';
+    expect(production).not.toBe('');
+    const covered = new Set<string>();
+    const coveredDirs: string[] = [];
+    for (const raw of production.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line.startsWith('COPY ') || line.includes('--from=')) continue;
+      const parts = line.split(/\s+/).slice(1);
+      const dest = parts.pop() ?? '';
+      for (const source of parts) {
+        if (!source.startsWith('scripts/')) continue;
+        if (source.endsWith('/')) {
+          if (dest === `./${source}`) coveredDirs.push(`/app/${source}`);
+          continue;
+        }
+        if (dest === `./${source.slice(0, source.lastIndexOf('/') + 1)}`) {
+          covered.add(`/app/${source}`);
+        }
+      }
+    }
+    const opsDir = join(root, 'docs', 'operations');
+    const referenced = new Set<string>();
+    for (const name of (await readdir(opsDir)).filter(file => file.endsWith('.md'))) {
+      const text = await readFile(join(opsDir, name), 'utf8');
+      for (const match of text.matchAll(/\/app\/scripts\/[A-Za-z0-9_./-]+/g)) {
+        const path = match[0].replace(/\.+$/, '');
+        if (!path.endsWith('/')) referenced.add(path);
+      }
+    }
+    expect(referenced.has('/app/scripts/dispatch/mailbox-lifecycle.ts')).toBe(true);
+    const uncovered = [...referenced]
+      .filter(path => !covered.has(path) && !coveredDirs.some(dir => path.startsWith(dir)))
+      .sort();
+    expect(uncovered).toEqual([]);
+  });
 });
