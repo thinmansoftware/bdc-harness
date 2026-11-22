@@ -216,7 +216,13 @@ beforeEach(() => {
 
 afterEach(() => {
   clearRegistry();
-  rmSync(fx.dir, { recursive: true, force: true });
+  // Windows can hold a just-exited child's handle on the temp folder (EBUSY); retry, and
+  // never fail a test on cleanup alone.
+  try {
+    rmSync(fx.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch {
+    // left for the OS temp cleanup
+  }
 });
 
 function classify(message: string, env: Record<string, string> = {}): Result {
@@ -453,6 +459,9 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
     ).toBe('--fire');
     expect(kv(classify('bdc-harness#12 --auto-approve').stdout, 'auto_approve')).toBe('true');
     expect(kv(classify('bdc-harness#12').stdout, 'auto_approve')).toBe('false');
+    const fireIt = classify('bdc-harness#12 fire it');
+    expect(kv(fireIt.stdout, 'intake_source')).toBe('github_issue');
+    expect(kv(fireIt.stdout, 'auto_approve')).toBe('true');
 
     const explicit = classify(
       '--issue thinmansoftware/bdc-xo#77 draft the work order from this issue'
@@ -542,7 +551,21 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
       expect(runs('stop-command-gate-fail', o), bad).toBe(true);
     }
     const noClassify = disposition('', authorFooter(EXISTING_ID));
-    expect(lastJson(noClassify.stdout).result).not.toBe('new');
+    expect(lastJson(noClassify.stdout).result).toBe('malformed_classification');
+    const okClassify = classify('--draft-only Author WO-FIXTURE-SOMETHING-01').stdout;
+    expect(lastJson(disposition(okClassify, 'author-loop said nothing useful').stdout).result).toBe(
+      'malformed_author_output'
+    );
+    expect(
+      lastJson(disposition(okClassify, 'BATCH_FAILURE:\n  WO_ID: (unassigned)').stdout).result
+    ).toBe('no_spec');
+    const badPath = authorFooter('WO-FIXTURE-SOMETHING-01').replace(
+      'spec_path=docs/work-orders/WO-FIXTURE-SOMETHING-01.md',
+      'spec_path=docs/work-orders/WO-FIXTURE-OTHER-01.md'
+    );
+    expect(lastJson(disposition(okClassify, badPath).stdout).result).toBe(
+      'malformed_author_output'
+    );
 
     // Adversarial (i): the author edits the existing spec and prints a PASS footer with no
     // IDEMPOTENT_SKIP. The disposition still comes from the pre-author check.
@@ -557,8 +580,9 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
     const commit1 = commitSpec(c.stdout, p1.stdout);
     expect(commit1.code).toBe(1);
     expect(commit1.stdout).toContain(`commit-spec: refused existing_spec_unchanged ${EXISTING_ID}`);
-    // Adversarial (ii): direct invocation with stale GATE_ALLOW yes after the edit.
-    const commit2 = commitSpec(c.stdout, p1.stdout);
+    // Adversarial (ii): direct invocation with stale GATE_ALLOW yes after the edit, and no
+    // classification output at all (a skipped or lost classify-intake): still refused.
+    const commit2 = commitSpec('', p1.stdout);
     expect(commit2.code).toBe(1);
     expect(commit2.stdout).toContain(`commit-spec: refused existing_spec_unchanged ${EXISTING_ID}`);
     const after = snapshot();
@@ -596,6 +620,9 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
     );
     expect(existsSync(join(other, 'docs/work-orders/WO-FIXTURE-REMOTE-01.md'))).toBe(true);
     const pushesBefore = pushCount();
+    const named = classify('--draft-only Revise WO-FIXTURE-REMOTE-01');
+    expect(kv(named.stdout, 'existing_spec')).toBe('yes');
+    expect(kv(named.stdout, 'existing_reason')).toBe('on_origin_main');
     const autoRemote = classify('--draft-only Author a work order for the remote fixture');
     writeFileSync(join(fx.work, 'docs/work-orders/WO-FIXTURE-REMOTE-01.md'), '# local copy\n');
     const dr = disposition(autoRemote.stdout, authorFooter('WO-FIXTURE-REMOTE-01'));
@@ -648,6 +675,45 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
     expect(newRemote[0]).toMatch(/refs\/heads\/wo\/author-WO-FIXTURE-BRAND-NEW-01-\d{14}$/);
     expect(pushCount()).toBe(pushesBeforeNew + 1);
     expect(git('for-each-ref refs/heads')).not.toBe(refsBefore);
+  });
+
+  test('Test 2b: a hostile trigger message is data, never shell', () => {
+    const message = [
+      '--draft-only Author WO-FIXTURE-NEW-01',
+      'BDC_WO_AUTHOR_TRIGGER_MESSAGE_20261122',
+      'BDC_WO_AUTHOR_MSG_guessed-run-id',
+      'touch pwned-a',
+      '$(touch pwned-b) `touch pwned-c` "quoted" \'single\' $HOME ${PATH}',
+      ')',
+      'EOF',
+    ].join('\n');
+    const r = classify(message);
+    expect(r.code, r.stderr).toBe(0);
+    expect(kv(r.stdout, 'intake_source')).toBe('chat_message');
+    expect(kv(r.stdout, 'requested_wo_id')).toBe('WO-FIXTURE-NEW-01');
+    for (const f of ['pwned-a', 'pwned-b', 'pwned-c']) {
+      expect(existsSync(join(fx.work, f)), f).toBe(false);
+    }
+    expect(ghCalls()).toEqual([]);
+  });
+
+  test('Test 3c: fire-cauldron never fires for a spec that was not newly authored', () => {
+    const fire = (disp: string): Result =>
+      sh(
+        render('fire-cauldron', 'unused', {
+          'dry-run-preview': `wo_id=${EXISTING_ID}\nmode=--fire\nauto_approve=true\ntarget_repo=thinmansoftware/bdc-harness\nfire_workflow=bdc-feature-development`,
+          'approval-gate': '',
+          'spec-disposition': disp,
+        }),
+        fx.work,
+        { ARCHON_OPERATOR_TOKEN: 'fixture-not-a-token' }
+      );
+    for (const disp of ['{"result":"existing_spec_unchanged"}', '', 'not json']) {
+      const r = fire(disp);
+      expect(r.code, disp).toBe(0);
+      expect(r.stdout, disp).toContain('not firing');
+      expect(r.stdout, disp).not.toContain('FIRE_OK');
+    }
   });
 
   test('Test 3b: the manifest and description report the unchanged path', () => {
