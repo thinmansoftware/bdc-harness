@@ -467,6 +467,11 @@ async function escalateToXo(
     ...(subjectKey
       ? { subject_key: subjectKey, repeat_reason: `duty_officer_clock:${claimed.id}` }
       : {}),
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: an open, unread escalation for the
+    // same subject younger than DISPATCH_REPEAT_COOLDOWN_HOURS suppresses this
+    // one (the DAL returns the existing row and logs the skip); an older one is
+    // superseded by it. Escalations and handoffs share sender system:dispatch.
+    collapse_repeats: true,
   });
 }
 

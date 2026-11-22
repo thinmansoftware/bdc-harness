@@ -10,7 +10,6 @@ import { setBoardPrincipalResolverForTests } from './board-authority';
 import { DispatchNonSystemCapability } from './dispatch-sender-authority';
 import { rootLogger } from '@archon/paths';
 import { assessDispatchMessageBody } from '../utils/dispatch-content-guard';
-import * as dispatchModule from './dispatch';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
@@ -59,6 +58,8 @@ import {
   normalizeDispatchSubjectKey,
   mailboxDepthByPrincipal,
   supersedeMessage,
+  supersedeRepeatByNewer,
+  dispatchRepeatCooldownHours,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
   type XoLeaseBind,
@@ -3785,17 +3786,6 @@ describe('mailbox lifecycle (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', () => {
     cleanupDb(currentDbPath);
   });
 
-  /** New DAL surface of this WO, read through the module so the file loads before it exists. */
-  function lifecycle(): {
-    supersedeRepeatByNewer: (
-      data: { older_id: string; newer_id: string; actor: string },
-      query?: DispatchQueryExecutor
-    ) => Promise<DispatchMessage | null>;
-    dispatchRepeatCooldownHours: (env: Record<string, string | undefined>) => number;
-  } {
-    return dispatchModule as unknown as ReturnType<typeof lifecycle>;
-  }
-
   function withCollapse(data: CreateAuthenticatedMessageData): CreateAuthenticatedMessageData {
     return { ...data, collapse_repeats: true };
   }
@@ -4022,7 +4012,7 @@ describe('mailbox lifecycle (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', () => {
   });
 
   test('Test 4: supersedeRepeatByNewer touches only an open system row of the same group', async () => {
-    const supersede = lifecycle().supersedeRepeatByNewer;
+    const supersede = supersedeRepeatByNewer;
     const older = await createAuthenticatedMessage(SYSTEM_TASKMASTER, notice('helper-older'));
     const acked = await createAuthenticatedMessage(SYSTEM_TASKMASTER, notice('helper-acked'));
     await db.query(
@@ -4167,7 +4157,7 @@ describe('mailbox lifecycle (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', () => {
   });
 
   test('Test 5: DISPATCH_REPEAT_COOLDOWN_HOURS parsing keeps 0 and defaults the rest to 24', () => {
-    const parse = lifecycle().dispatchRepeatCooldownHours;
+    const parse = dispatchRepeatCooldownHours;
     expect(parse({})).toBe(24);
     expect(parse({ DISPATCH_REPEAT_COOLDOWN_HOURS: '' })).toBe(24);
     expect(parse({ DISPATCH_REPEAT_COOLDOWN_HOURS: '0' })).toBe(0);

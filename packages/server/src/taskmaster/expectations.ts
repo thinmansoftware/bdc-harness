@@ -2,6 +2,7 @@ import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
 import {
   createAuthenticatedMessage,
+  findRepeatSuppressor,
   getMessage,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
@@ -215,6 +216,13 @@ export interface ExpectationDeps {
   findEffectByIdempotencyKey?: (
     key: string
   ) => Promise<{ id: string; status: string; createdAt: string } | null>;
+  /**
+   * WO-HARNESS-XO-MAILBOX-LIFECYCLE-01 (decision D1): the open row that the
+   * dispatch cooldown would let suppress this retry, or null. A suppressed
+   * retry writes no row under its key, so the key probe alone would mistake it
+   * for a crashed attempt and replay it every tick instead of counting it.
+   */
+  findRepeatSuppressor?: (data: CreateAuthenticatedMessageData) => Promise<{ id: string } | null>;
   checkEvidence?: (spec: EvidenceSpec) => Promise<EvidenceResult>;
   retryDelayMs?: number;
 }
@@ -554,6 +562,59 @@ export async function defaultFindEffectByIdempotencyKey(
   return row ? { id: row.id, status: row.status, createdAt: row.created_at } : null;
 }
 
+/** The dispatch payload for one redispatch attempt. */
+function redispatchData(
+  expectation: taskmasterDb.TmExpectation,
+  original: DispatchMessage,
+  attempt: number
+): CreateAuthenticatedMessageData {
+  return {
+    correlation_id: original.correlation_id,
+    idempotency_key: redispatchKey(expectation.id, attempt),
+    task_type: original.task_type,
+    recipient: original.recipient,
+    body: original.body,
+    priority: original.priority,
+    subject_key: original.subject_key,
+    repeat_reason: `expectation:${expectation.id}:retry:${String(attempt)}`,
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01 (D1): a retry to a mailbox whose
+    // original is still open and unread inside the cooldown is suppressed.
+    collapse_repeats: true,
+  };
+}
+
+/** Default suppressor probe: the dispatch DAL, as the taskmaster system sender. */
+function defaultFindRepeatSuppressor(
+  data: CreateAuthenticatedMessageData
+): Promise<{ id: string } | null> {
+  return findRepeatSuppressor({ kind: 'system', sender: 'taskmaster' }, data);
+}
+
+/**
+ * Would this retry be suppressed by the dispatch cooldown? An unreadable probe
+ * answers no, so the caller falls back to the replay, which the DAL itself
+ * suppresses again if it must.
+ */
+async function retryIsSuppressed(
+  expectation: taskmasterDb.TmExpectation,
+  original: DispatchMessage,
+  attempt: number,
+  deps: ExpectationDeps
+): Promise<boolean> {
+  try {
+    const suppressor = await (deps.findRepeatSuppressor ?? defaultFindRepeatSuppressor)(
+      redispatchData(expectation, original, attempt)
+    );
+    return suppressor !== null;
+  } catch (error) {
+    log.warn(
+      { err: error as Error, expectationId: expectation.id, attempt },
+      'taskmaster.expectation_suppressor_probe_failed'
+    );
+    return false;
+  }
+}
+
 /** Send (or idempotently replay) one redispatch attempt. Returns the key used. */
 async function sendRedispatch(
   expectation: taskmasterDb.TmExpectation,
@@ -561,22 +622,19 @@ async function sendRedispatch(
   attempt: number,
   deps: ExpectationDeps
 ): Promise<string> {
-  const key = redispatchKey(expectation.id, attempt);
-  const data: CreateAuthenticatedMessageData = {
-    correlation_id: original.correlation_id,
-    idempotency_key: key,
-    task_type: original.task_type,
-    recipient: original.recipient,
-    body: original.body,
-    priority: original.priority,
-    subject_key: original.subject_key,
-    repeat_reason: `expectation:${expectation.id}:retry:${String(attempt)}`,
-  };
-  await (deps.createTask ?? createAuthenticatedMessage)(
+  const data = redispatchData(expectation, original, attempt);
+  const sent = (await (deps.createTask ?? createAuthenticatedMessage)(
     { kind: 'system', sender: 'taskmaster' },
     data
-  );
-  return key;
+  )) as DispatchMessage | null | undefined;
+  // A suppressed retry returns the existing open row; the attempt stays spent.
+  if (sent?.idempotency_key !== undefined && sent.idempotency_key !== data.idempotency_key) {
+    log.info(
+      { expectationId: expectation.id, attempt, existingId: sent.id },
+      'taskmaster.expectation_retry_suppressed'
+    );
+  }
+  return data.idempotency_key;
 }
 
 /**
@@ -749,39 +807,57 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
           );
           continue;
         }
-        // MOVE THE DEADLINE WITH THE REPLAY, NOT AFTER IT.
-        //
-        // Recovery only runs once due_at has elapsed, so replaying without
-        // advancing it left the row instantly overdue: the next tick would call
-        // the just-recovered dispatch a failure and burn another retry, or
-        // escalate, without ever granting the configured response interval.
-        // This also serves as the exclusive claim for the replay -- two ticks
-        // seeing the same unsent attempt cannot both send, and a tick racing a
-        // concurrent markMet loses here and sends nothing.
-        const recoveryDueAt = new Date(
-          now.getTime() + (deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)
-        ).toISOString();
-        const claimedRecovery = await (
-          deps.claimRecoveryReplay ?? taskmasterDb.claimRecoveryReplay
-        )(expectation.id, expectation.retries, recoveryDueAt, expectation.due_at);
-        if (claimedRecovery === false) {
+        // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01 (D1): a retry the dispatch cooldown
+        // suppressed wrote no row under its key BY DESIGN. It is a spent
+        // attempt, not a crashed one: skip the replay and fall through to the
+        // deadline decision, so the next retry (or the escalation) follows,
+        // instead of replaying it every tick until the cooldown runs out.
+        const suppressed = await retryIsSuppressed(
+          expectation,
+          original,
+          expectation.retries,
+          deps
+        );
+        if (suppressed) {
+          log.info(
+            { expectationId: expectation.id, attempt: expectation.retries },
+            'taskmaster.expectation_retry_counted_as_suppressed'
+          );
+        } else {
+          // MOVE THE DEADLINE WITH THE REPLAY, NOT AFTER IT.
+          //
+          // Recovery only runs once due_at has elapsed, so replaying without
+          // advancing it left the row instantly overdue: the next tick would call
+          // the just-recovered dispatch a failure and burn another retry, or
+          // escalate, without ever granting the configured response interval.
+          // This also serves as the exclusive claim for the replay -- two ticks
+          // seeing the same unsent attempt cannot both send, and a tick racing a
+          // concurrent markMet loses here and sends nothing.
+          const recoveryDueAt = new Date(
+            now.getTime() + (deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)
+          ).toISOString();
+          const claimedRecovery = await (
+            deps.claimRecoveryReplay ?? taskmasterDb.claimRecoveryReplay
+          )(expectation.id, expectation.retries, recoveryDueAt, expectation.due_at);
+          if (claimedRecovery === false) {
+            log.warn(
+              { expectationId: expectation.id, idempotencyKey: claimedKey },
+              'taskmaster.expectation_recovery_claim_lost'
+            );
+            continue;
+          }
+          await sendRedispatch(expectation, original, expectation.retries, deps);
           log.warn(
-            { expectationId: expectation.id, idempotencyKey: claimedKey },
-            'taskmaster.expectation_recovery_claim_lost'
+            {
+              expectationId: expectation.id,
+              idempotencyKey: claimedKey,
+              attempt: expectation.retries,
+              dueAt: recoveryDueAt,
+            },
+            'taskmaster.expectation_redispatch_recovered'
           );
           continue;
         }
-        await sendRedispatch(expectation, original, expectation.retries, deps);
-        log.warn(
-          {
-            expectationId: expectation.id,
-            idempotencyKey: claimedKey,
-            attempt: expectation.retries,
-            dueAt: recoveryDueAt,
-          },
-          'taskmaster.expectation_redispatch_recovered'
-        );
-        continue;
       }
     }
 
@@ -902,6 +978,22 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         continue;
       }
     }
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01 (decision D2): the EXHAUSTED row
+    // carries the subject_key of the item the expectation chases (the original
+    // dispatched row), so it collapses per subject. Without one it keeps no
+    // subject_key and is grouped per expectation by its correlation id. An
+    // unreadable original is treated as having no subject: it must never be
+    // the thing that strands the escalation.
+    let chasedSubject: string | null = null;
+    try {
+      const chased = await (deps.getMessage ?? getMessage)(expectation.dispatch_ref);
+      chasedSubject = chased?.subject_key ?? null;
+    } catch (error) {
+      log.warn(
+        { err: error as Error, expectationId: expectation.id },
+        'taskmaster.expectation_chased_subject_unreadable'
+      );
+    }
     // If this send throws, the row stays 'escalating' and a later tick replays
     // it under this same deterministic key. Nothing is lost and nothing is
     // duplicated.
@@ -936,16 +1028,22 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         // and the loop did not close.
         recipient: 'xo',
         priority: 'blocker',
-        // NO subject_key. normalizeDispatchSubjectKey accepts exactly three
-        // shapes -- wo:WO-..., digest:YYYY-MM-DD, gh:owner/repo#N -- and THROWS
-        // on anything else. An expectation id is none of them, so setting one
-        // here would make createAuthenticatedMessage throw at the moment of
-        // escalation and leave the row stuck in 'escalating' forever. That is
-        // the same shape of defect as the one this WO is fixing, and the same
-        // shape as the M-129 hardening that silently killed every digest send
-        // from 2026-08-25 onward. The idempotency_key already dedupes the
-        // replay, which is the only thing subject_key would have bought here.
+        // NEVER the expectation id as a subject_key. normalizeDispatchSubjectKey
+        // accepts exactly three shapes -- wo:WO-..., digest:YYYY-MM-DD,
+        // gh:owner/repo#N -- and THROWS on anything else, which would leave the
+        // row stuck in 'escalating' forever (the M-129 digest defect shape).
+        // The chased row's subject_key was already normalized when it was
+        // stored, so it is safe to carry.
+        ...(chasedSubject
+          ? {
+              subject_key: chasedSubject,
+              repeat_reason: `expectation:${expectation.id}:exhausted`,
+            }
+          : {}),
         body: renderEscalationBody(expectation),
+        // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: collapse with open repeats of
+        // the same subject in the xo mailbox (cooldown, then supersede).
+        collapse_repeats: true,
       }
     );
     // Confirmed sent: close the row.

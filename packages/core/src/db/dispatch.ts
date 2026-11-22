@@ -431,6 +431,13 @@ export interface CreateAuthenticatedMessageData {
   motion_revision_sha?: string | null;
   subject_key?: string | null;
   repeat_reason?: string | null;
+  /**
+   * WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: collapse repeats of the same subject in
+   * a mailbox. Honoured only for a fixed system sender writing to an active
+   * mailbox principal (drain_on_start or notify_only); ignored otherwise. See
+   * createCollapsedSystemMessage.
+   */
+  collapse_repeats?: boolean;
 }
 
 function bindSenderContext(context: DispatchSenderContext): {
@@ -741,10 +748,253 @@ export async function createAuthenticatedMessage(
       ? withOverseerControlPlaneImmediateTransaction(db, enqueue)
       : db.withTransaction(enqueue);
   }
+  if (data.collapse_repeats === true && 'kind' in context && context.kind === 'system') {
+    return createCollapsedSystemMessage(bound, data);
+  }
   return createAuthenticatedMessageWithQuery((sql, params) => db.query(sql, params), {
     bound,
     data,
   });
+}
+
+const DISPATCH_REPEAT_COOLDOWN_DEFAULT_HOURS = 24;
+const HOUR_MS = 3_600_000;
+
+/**
+ * DISPATCH_REPEAT_COOLDOWN_HOURS (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01). Unset or
+ * empty gives 24. A finite number >= 0 is used as given, so 0 disables the
+ * cooldown and every collapsing send writes a row. Anything else gives 24.
+ * Deliberately not `Number(x) || 24`, which would turn 0 into 24.
+ */
+export function dispatchRepeatCooldownHours(
+  env: Record<string, string | undefined> = process.env
+): number {
+  const raw = env.DISPATCH_REPEAT_COOLDOWN_HOURS;
+  if (raw === undefined || raw.trim() === '') return DISPATCH_REPEAT_COOLDOWN_DEFAULT_HOURS;
+  const hours = Number(raw);
+  return Number.isFinite(hours) && hours >= 0 ? hours : DISPATCH_REPEAT_COOLDOWN_DEFAULT_HOURS;
+}
+
+/** One mailbox repeat group: recipient, sender principal and subject. */
+interface RepeatGroup {
+  recipient: string;
+  senderPrincipalId: string;
+  /** The subject: subject_key when set, else correlation_id. */
+  subjectKey: string | null;
+  correlationId: string;
+}
+
+/**
+ * The repeat group for a send, or null when collapse does not apply: only a
+ * fixed system sender (system:*) writing to an active mailbox principal. A
+ * worker_poll recipient (review queues, duty-officer) is never collapsed,
+ * because its rows are work items a worker claims, not notices a person reads.
+ */
+async function resolveRepeatGroup(
+  query: DispatchQueryExecutor,
+  bound: { sender: string; sender_principal_id: string | null },
+  data: CreateAuthenticatedMessageData
+): Promise<RepeatGroup | null> {
+  const senderPrincipalId = bound.sender_principal_id;
+  if (!senderPrincipalId?.startsWith('system:')) return null;
+  const assessment = await assessDispatchRecipientWithQuery(query, data.recipient);
+  if (!assessment.ok || !isMailboxDeliveryMode(assessment.delivery_mode)) return null;
+  return {
+    recipient: assessment.canonical_principal,
+    senderPrincipalId,
+    subjectKey: data.subject_key == null ? null : normalizeDispatchSubjectKey(data.subject_key),
+    correlationId: data.correlation_id,
+  };
+}
+
+/** Open (queued, unread, unaddressed, undisposed) rows of one group, oldest first. */
+async function listOpenRepeats(
+  query: DispatchQueryExecutor,
+  group: RepeatGroup
+): Promise<DispatchMessage[]> {
+  const subjectClause =
+    group.subjectKey === null ? 'subject_key IS NULL AND correlation_id = $3' : 'subject_key = $3';
+  const order =
+    getDatabase().dialect === 'postgres'
+      ? 'ORDER BY created_at ASC, seq ASC'
+      : 'ORDER BY created_at ASC, COALESCE(seq, rowid) ASC';
+  const result = await query<DispatchMessageRow>(
+    `SELECT * FROM agent_dispatch_messages
+     WHERE recipient = $1 AND sender_principal_id = $2 AND ${subjectClause}
+       AND status = 'queued' AND acknowledged_at IS NULL AND addressed_at IS NULL
+       AND route_disposition IS NULL
+     ${order}`,
+    [group.recipient, group.senderPrincipalId, group.subjectKey ?? group.correlationId]
+  );
+  return result.rows.map(normalizeMessage);
+}
+
+/** The newest open row younger than the cooldown, or null (rows are oldest first). */
+function newestInsideCooldown(
+  rows: DispatchMessage[],
+  cooldownHours: number
+): DispatchMessage | null {
+  if (!(cooldownHours > 0)) return null;
+  const cutoff = Date.now() - cooldownHours * HOUR_MS;
+  let found: DispatchMessage | null = null;
+  for (const row of rows) {
+    const created = Date.parse(row.created_at);
+    if (Number.isFinite(created) && created > cutoff) found = row;
+  }
+  return found;
+}
+
+function foldedInLine(olders: DispatchMessage[]): string {
+  return `Folded in: ${String(olders.length)} earlier open notice(s) for this subject (${olders
+    .map(row => row.id)
+    .join(', ')}).`;
+}
+
+/**
+ * The open row that would suppress this send under the cooldown, or null.
+ * Read-only: the Taskmaster expectation recovery uses it to tell a suppressed
+ * retry (no row carries its key, by design) from a crashed one.
+ */
+export async function findRepeatSuppressor(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData
+): Promise<DispatchMessage | null> {
+  const bound = bindSenderContext(context);
+  const query: DispatchQueryExecutor = (sql, params) => getDatabase().query(sql, params);
+  const group = await resolveRepeatGroup(query, bound, data);
+  if (!group) return null;
+  return newestInsideCooldown(await listOpenRepeats(query, group), dispatchRepeatCooldownHours());
+}
+
+/**
+ * Collapse wrapper (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01). In one transaction:
+ * idempotency check; cooldown lookup over the open rows of the same recipient,
+ * sender and subject (subject_key, else correlation_id); then either nothing is
+ * written and the EXISTING open row is returned (a row younger than
+ * DISPATCH_REPEAT_COOLDOWN_HOURS exists), or the new row is inserted with a
+ * "Folded in:" line naming the older open rows, and each of those is superseded
+ * by supersedeRepeatByNewer (status done, route_disposition superseded; never
+ * cancelled). Not for callers inside an outer transaction: SQLite refuses
+ * nested transactions, and none of the emitters runs in one.
+ */
+async function createCollapsedSystemMessage(
+  bound: { sender: string; sender_principal_id: string | null },
+  data: CreateAuthenticatedMessageData
+): Promise<DispatchMessage> {
+  const db = getDatabase();
+  const cooldownHours = dispatchRepeatCooldownHours();
+  const run = async (query: DispatchQueryExecutor): Promise<DispatchMessage> => {
+    const existing = await findIdempotentMessage(query, data.idempotency_key, bound);
+    const existingRow = existing.rows[0];
+    if (existingRow) return normalizeMessage(existingRow);
+    const group = await resolveRepeatGroup(query, bound, data);
+    if (!group) return createAuthenticatedMessageWithQuery(query, { bound, data });
+    if (db.dialect === 'postgres') {
+      await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+        `dispatch:repeat:${group.recipient}:${group.senderPrincipalId}:${group.subjectKey ?? `corr:${group.correlationId}`}`,
+      ]);
+    }
+    const open = await listOpenRepeats(query, group);
+    const suppressor = newestInsideCooldown(open, cooldownHours);
+    if (suppressor) {
+      log.info(
+        {
+          suppressedKey: data.idempotency_key,
+          existingId: suppressor.id,
+          recipient: group.recipient,
+          sender: group.senderPrincipalId,
+          subjectKey: group.subjectKey,
+          cooldownHours,
+        },
+        'dispatch.repeat_suppressed'
+      );
+      return suppressor;
+    }
+    const body = open.length > 0 ? `${data.body}\n${foldedInLine(open)}` : data.body;
+    const newer = await createAuthenticatedMessageWithQuery(query, {
+      bound,
+      data: { ...data, body },
+    });
+    for (const older of open) {
+      const superseded = await supersedeRepeatByNewer(
+        { older_id: older.id, newer_id: newer.id, actor: group.senderPrincipalId },
+        query
+      );
+      if (!superseded) throw new Error('dispatch_repeat_supersede_lost_race');
+    }
+    if (open.length > 0) {
+      log.info(
+        { newerId: newer.id, foldedIds: open.map(row => row.id), sender: group.senderPrincipalId },
+        'dispatch.repeat_collapsed'
+      );
+    }
+    return newer;
+  };
+  return withRetriedMailboxTransaction(() => db.withTransaction(run, MAILBOX_TRANSACTION_OPTIONS));
+}
+
+const defaultDispatchQuery: DispatchQueryExecutor = (sql, params) =>
+  getDatabase().query(sql, params);
+
+/**
+ * Retire an OLDER open mailbox repeat in favour of a NEWER row of the same group
+ * (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01). The older row becomes status done with
+ * completed_at set, route_disposition superseded and result_body
+ * {"reason":"repeat","superseded_by":<newer id>}; it stays readable and is
+ * NEVER cancelled (cancellation means cancellation only). The newer row is not
+ * touched. Only an older row still queued, never acknowledged or addressed, not
+ * already disposed, from a system:* sender, and matching the newer row's
+ * recipient, sender and subject (subject_key, else correlation_id) is changed;
+ * anything else returns null. The actor must start with system:.
+ */
+export async function supersedeRepeatByNewer(
+  data: { older_id: string; newer_id: string; actor: string },
+  query?: DispatchQueryExecutor
+): Promise<DispatchMessage | null> {
+  if (!data.actor.startsWith('system:') || data.older_id === data.newer_id) return null;
+  const execute: DispatchQueryExecutor = query ?? defaultDispatchQuery;
+  const now = nowIso();
+  const update = await execute(
+    `UPDATE agent_dispatch_messages
+     SET status = 'done',
+         route_disposition = 'superseded',
+         route_disposed_at = $3,
+         completed_at = $3,
+         result_body = $4,
+         lease_owner = NULL,
+         lease_expires_at = NULL
+     WHERE id = $1
+       AND status = 'queued'
+       AND acknowledged_at IS NULL
+       AND addressed_at IS NULL
+       AND route_disposition IS NULL
+       AND sender_principal_id LIKE 'system:%'
+       AND EXISTS (
+         SELECT 1 FROM agent_dispatch_messages newer
+         WHERE newer.id = $2
+           AND newer.recipient = agent_dispatch_messages.recipient
+           AND newer.sender_principal_id = agent_dispatch_messages.sender_principal_id
+           AND (
+             (newer.subject_key IS NOT NULL
+               AND newer.subject_key = agent_dispatch_messages.subject_key)
+             OR (newer.subject_key IS NULL AND agent_dispatch_messages.subject_key IS NULL
+               AND newer.correlation_id = agent_dispatch_messages.correlation_id)
+           )
+       )`,
+    [
+      data.older_id,
+      data.newer_id,
+      now,
+      JSON.stringify({ reason: 'repeat', superseded_by: data.newer_id }),
+    ]
+  );
+  if (update.rowCount !== 1) return null;
+  const message = await readMessageInTransaction(execute, data.older_id);
+  log.info(
+    { olderId: data.older_id, newerId: data.newer_id, actor: data.actor },
+    'dispatch.repeat_superseded'
+  );
+  return message;
 }
 
 /**
@@ -1528,7 +1778,15 @@ async function validateMailboxActor(
   ) {
     return { ok: false, reason: 'wrong_mode' };
   }
-  if (message.status !== 'queued') return { ok: false, reason: 'not_queued' };
+  if (message.status !== 'queued') {
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: addressing is terminal (status done),
+    // so an addressed row must still pass for its own principal. Otherwise the
+    // receipt UPDATE's own final re-read, and every retried acknowledge or
+    // address (completeCommandMessage relies on that), would turn ok into
+    // not_queued. Any other non-queued status is still refused.
+    if (message.status === 'done' && message.addressed_at !== null) return null;
+    return { ok: false, reason: 'not_queued' };
+  }
   return null;
 }
 
@@ -1538,6 +1796,11 @@ export async function disposeMessageByMachine(
     actor: string;
     disposition: 'expired' | 'auto_surfaced';
     requireNoReceipt?: boolean;
+    /**
+     * Evidence note stored as result_body (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01,
+     * the K3 disk-alert class). Omitted: result_body is left as it is.
+     */
+    note?: string;
   },
   transactionQuery?: DispatchQueryExecutor
 ): Promise<DispatchMailboxResult> {
@@ -1557,13 +1820,15 @@ export async function disposeMessageByMachine(
     const update = await query(
       data.requireNoReceipt
         ? `UPDATE agent_dispatch_messages
-           SET route_disposition = $2, route_disposed_at = $3
+           SET route_disposition = $2, route_disposed_at = $3,
+               result_body = COALESCE($4, result_body)
            WHERE id = $1 AND route_disposition IS NULL
              AND acknowledged_at IS NULL AND addressed_at IS NULL AND status = 'queued'`
         : `UPDATE agent_dispatch_messages
-           SET route_disposition = $2, route_disposed_at = $3
+           SET route_disposition = $2, route_disposed_at = $3,
+               result_body = COALESCE($4, result_body)
            WHERE id = $1 AND route_disposition IS NULL`,
-      [data.id, data.disposition, now]
+      [data.id, data.disposition, now, data.note ?? null]
     );
     const finalMessage = await readMessageInTransaction(query, data.id);
     if (!finalMessage) return { ok: false, reason: 'not_found' };
@@ -1735,6 +2000,63 @@ export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
   return { cutover_at: cutoverAt, ...principals };
 }
 
+export interface RecipientReceiptCounts {
+  /** No acknowledgement, no address, no route disposition (same as MailboxDepth.unread). */
+  unread: number;
+  /** Acknowledged, not addressed, no route disposition. */
+  acked: number;
+  /** addressed_at set. */
+  addressed: number;
+}
+
+export interface DispatchStatusCounts {
+  queue: Record<DispatchMessageStatus, number>;
+  recipients: Record<string, RecipientReceiptCounts>;
+}
+
+/**
+ * Whole-table counts for /api/dispatch/status (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01,
+ * bdc-xo#2170 item 2): the status GROUP BY and, per resolved recipient, the
+ * receipt split derived from the timestamp columns. Separate from
+ * mailboxDepthByPrincipal, whose exact shape is pinned by its own contract.
+ */
+export async function dispatchStatusCounts(): Promise<DispatchStatusCounts> {
+  const db = getDatabase();
+  const statuses = await db.query<{ status: DispatchMessageStatus; n: number | string }>(
+    'SELECT status, COUNT(*) AS n FROM agent_dispatch_messages GROUP BY status'
+  );
+  const queue: Record<DispatchMessageStatus, number> = {
+    queued: 0,
+    claimed: 0,
+    done: 0,
+    failed: 0,
+    cancelled: 0,
+  };
+  for (const row of statuses.rows) queue[row.status] = Number(row.n);
+  const receipts = await db.query<{
+    recipient: string;
+    unread: number | string;
+    acked: number | string;
+    addressed: number | string;
+  }>(
+    `SELECT LOWER(TRIM(COALESCE(resolved_recipient, recipient))) AS recipient,
+       SUM(CASE WHEN acknowledged_at IS NULL AND addressed_at IS NULL AND route_disposition IS NULL THEN 1 ELSE 0 END) AS unread,
+       SUM(CASE WHEN acknowledged_at IS NOT NULL AND addressed_at IS NULL AND route_disposition IS NULL THEN 1 ELSE 0 END) AS acked,
+       SUM(CASE WHEN addressed_at IS NOT NULL THEN 1 ELSE 0 END) AS addressed
+     FROM agent_dispatch_messages
+     GROUP BY LOWER(TRIM(COALESCE(resolved_recipient, recipient)))`
+  );
+  const recipients: Record<string, RecipientReceiptCounts> = {};
+  for (const row of receipts.rows) {
+    recipients[row.recipient] = {
+      unread: Number(row.unread),
+      acked: Number(row.acked),
+      addressed: Number(row.addressed),
+    };
+  }
+  return { queue, recipients };
+}
+
 export async function acknowledgeMessage(data: {
   id: string;
   /** The mailbox principal the row must be addressed to (validated below). */
@@ -1832,10 +2154,15 @@ export async function addressMessage(data: {
       }
 
       const leasePredicate = xoLeaseBindPredicate(principalId, data.bind);
+      // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: addressing is terminal. The same
+      // UPDATE moves the row to status done with completed_at = addressed_at,
+      // so an addressed row leaves every status-queued reader.
       const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET addressed_at = $2,
-           addressed_by = $3
+           addressed_by = $3,
+           status = 'done',
+           completed_at = $2
        WHERE id = $1
          AND status = 'queued'
          AND acknowledged_by = $3
@@ -2280,6 +2607,26 @@ export async function releaseDispatchEscalationClaim(data: {
 
 export async function ensureXoEscalationHandoffs(activatedAt: string): Promise<number> {
   if (!Number.isFinite(Date.parse(activatedAt))) return 0;
+  // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: a source whose subject already has an
+  // open system:dispatch row in the xo mailbox younger than the cooldown would
+  // only be suppressed by the collapse wrapper and, writing no handoff row, be
+  // reselected on every pass. Excluding it here keeps those sources from
+  // starving the LIMIT; newest first so fresh blockers are handed off first.
+  const cooldownHours = dispatchRepeatCooldownHours();
+  const params: unknown[] = [activatedAt];
+  let cooldownClause = '';
+  if (cooldownHours > 0) {
+    params.push(new Date(Date.now() - cooldownHours * HOUR_MS).toISOString());
+    cooldownClause = `
+       AND NOT EXISTS (SELECT 1 FROM agent_dispatch_messages recent
+         WHERE recent.sender_principal_id = 'system:dispatch' AND recent.recipient = 'xo'
+           AND recent.status = 'queued' AND recent.acknowledged_at IS NULL
+           AND recent.addressed_at IS NULL AND recent.route_disposition IS NULL
+           AND recent.created_at > $2
+           AND ((source.subject_key IS NOT NULL AND recent.subject_key = source.subject_key)
+             OR (source.subject_key IS NULL AND recent.subject_key IS NULL
+               AND recent.correlation_id = source.correlation_id)))`;
+  }
   const rows = await getDatabase().query<DispatchMessageRow>(
     `SELECT source.* FROM agent_dispatch_messages source
      WHERE source.created_at >= $1 AND source.priority = 'blocker'
@@ -2290,27 +2637,31 @@ export async function ensureXoEscalationHandoffs(activatedAt: string): Promise<n
        AND (source.route_disposition IS NULL OR source.route_disposition <> 'superseded')
        AND NOT EXISTS (SELECT 1 FROM agent_dispatch_messages handoff
          WHERE handoff.idempotency_key = 'xo-handoff:' || source.id
-           AND handoff.sender_principal_id = 'system:dispatch') LIMIT 100`,
-    [activatedAt]
+           AND handoff.sender_principal_id = 'system:dispatch')${cooldownClause}
+     ORDER BY source.created_at DESC LIMIT 100`,
+    params
   );
   let created = 0;
   for (const row of rows.rows) {
     const source = normalizeMessage(row);
+    const idempotencyKey = `xo-handoff:${source.id}`;
     try {
-      await createAuthenticatedMessage(
+      const handoff = await createAuthenticatedMessage(
         { kind: 'system', sender: 'dispatch' },
         {
           correlation_id: source.correlation_id,
-          idempotency_key: `xo-handoff:${source.id}`,
+          idempotency_key: idempotencyKey,
           task_type: 'agent_message',
           recipient: 'xo',
           priority: 'blocker',
           subject_key: source.subject_key,
           repeat_reason: source.subject_key ? 'system XO escalation handoff' : null,
           body: JSON.stringify({ source_id: source.id, kind: 'xo_escalation_handoff' }),
+          collapse_repeats: true,
         }
       );
-      created++;
+      // A suppressed send returns the existing open row and does not count.
+      if (handoff.idempotency_key === idempotencyKey) created++;
     } catch {
       log.warn(
         { sourceId: source.id, failureClass: 'handoff_create_rejected' },
@@ -2360,6 +2711,11 @@ async function attemptDispatchOutcomeNotice(
     source.created_at < new Date(activatedAt).toISOString() ||
     source.sender === 'dispatch' ||
     source.sender_principal_id == null ||
+    // WO-HARNESS-XO-MAILBOX-LIFECYCLE-01: an addressed row (terminal done) and
+    // a superseded or otherwise disposed row are mailbox closures, not work
+    // outcomes; a blocker notice for each would recreate the flood.
+    source.addressed_at !== null ||
+    source.route_disposition !== null ||
     !(['done', 'failed'] as DispatchMessageStatus[]).includes(source.status) ||
     (scope === 'chief-success' && !chiefReply) ||
     (source.task_outcome === 'succeeded' && !chiefReply)
@@ -2421,6 +2777,8 @@ export async function reconcileDispatchOutcomeNotices(
      AND source.sender <> 'dispatch'
      AND source.sender_principal_id IS NOT NULL
      AND source.status IN ('done', 'failed')
+     AND source.addressed_at IS NULL
+     AND source.route_disposition IS NULL
      AND ${outcomePredicate}
      AND NOT EXISTS (SELECT 1 FROM agent_dispatch_messages notice
        WHERE notice.idempotency_key = 'outcome-notice:' || source.id
