@@ -597,6 +597,11 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
     expect(kv(auto.stdout, 'existing_spec')).toBe('no');
     writeFileSync(join(fx.work, EXISTING_PATH), '# overwritten by a template copy\n');
     const da = disposition(auto.stdout, authorFooter(EXISTING_ID));
+    expect(lastJson(da.stdout).result).toBe('existing_spec_unchanged');
+    const daOut = { 'spec-disposition': da.stdout.trim().split('\n').pop() ?? '' };
+    expect(runs('stop-command-gate', daOut)).toBe(false);
+    expect(runs('stop-command-revise', { ...daOut, 'stop-command-gate': FAIL_JSON })).toBe(false);
+    expect(runs('commit-spec', { ...daOut, 'stop-command-gate-final': PASS_JSON })).toBe(false);
     const pa = preview(auto.stdout, authorFooter(EXISTING_ID), da.stdout);
     const ca = commitSpec(auto.stdout, pa.stdout);
     expect(ca.code).toBe(1);
@@ -626,6 +631,7 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
     const autoRemote = classify('--draft-only Author a work order for the remote fixture');
     writeFileSync(join(fx.work, 'docs/work-orders/WO-FIXTURE-REMOTE-01.md'), '# local copy\n');
     const dr = disposition(autoRemote.stdout, authorFooter('WO-FIXTURE-REMOTE-01'));
+    expect(lastJson(dr.stdout).result).toBe('existing_spec_unchanged');
     const cr = commitSpec(
       autoRemote.stdout,
       preview(autoRemote.stdout, authorFooter('WO-FIXTURE-REMOTE-01'), dr.stdout).stdout
@@ -637,6 +643,33 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
     expect(pushCount()).toBe(pushesBefore);
     rmSync(join(fx.work, 'docs/work-orders/WO-FIXTURE-REMOTE-01.md'));
     git('reset -q --hard origin/main');
+
+    // An untracked spec already on disk before this run, reached through an auto-generated
+    // ID: the pre-author inventory makes it existing, and commit-spec refuses it too.
+    writeFileSync(join(fx.work, 'docs/work-orders/WO-FIXTURE-DISKONLY-01.md'), '# disk only\n');
+    const autoDisk = classify('--draft-only Author a work order for the disk-only fixture');
+    expect(kv(autoDisk.stdout, 'existing_spec')).toBe('no');
+    const dd = disposition(autoDisk.stdout, authorFooter('WO-FIXTURE-DISKONLY-01'));
+    expect(lastJson(dd.stdout).result).toBe('existing_spec_unchanged');
+    const cd = commitSpec(
+      autoDisk.stdout,
+      preview(autoDisk.stdout, authorFooter('WO-FIXTURE-DISKONLY-01'), dd.stdout).stdout
+    );
+    expect(cd.code).toBe(1);
+    expect(cd.stdout).toContain(
+      'commit-spec: refused existing_spec_unchanged WO-FIXTURE-DISKONLY-01'
+    );
+    rmSync(join(fx.work, 'docs/work-orders/WO-FIXTURE-DISKONLY-01.md'));
+    // A missing pre-author inventory fails closed in both places.
+    const noInv = sh(
+      render('spec-disposition', 'unused', {
+        'classify-intake': autoDisk.stdout,
+        'author-loop': authorFooter('WO-FIXTURE-WHATEVER-01'),
+      }),
+      fx.work,
+      { ARTIFACTS_DIR: join(fx.dir, 'empty-artifacts') }
+    );
+    expect(lastJson(noInv.stdout).result).toBe('malformed_classification');
 
     // A genuinely new spec still reaches its gate and, with GATE_ALLOW yes, commits and
     // pushes exactly one new wo/author branch.

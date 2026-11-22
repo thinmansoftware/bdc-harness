@@ -66,9 +66,13 @@
 #     no_spec or malformed_*. The gate chain and commit-spec run only for result new;
 #     stop-command-gate-fail stands down only for existing_spec_unchanged, so missing or
 #     malformed results still fail the run closed.
-#   - commit-spec refuses before `git checkout -b` when the pre-author check found the spec,
-#     or the footer's spec_path is tracked at HEAD or present on origin/main, whatever the
-#     gates printed: `commit-spec: refused existing_spec_unchanged <wo_id>`, exit 1.
+#   - classify-intake records the specs on disk before authoring
+#     ($ARTIFACTS_DIR/wo-author-pre-inventory.txt). spec-disposition also returns
+#     existing_spec_unchanged when the footer's spec_path was in that inventory, is tracked
+#     at HEAD or is on origin/main (an auto-generated ID that names an existing spec).
+#   - commit-spec refuses before `git checkout -b` on any of those, or when the inventory
+#     is missing, whatever the gates printed: `commit-spec: refused existing_spec_unchanged
+#     <wo_id>`, exit 1.
 #   Safety tests: bun test ./packages/workflows/src/wo-author-draft-only-safety.test.ts
 
 name: bdc-wo-author
@@ -235,6 +239,18 @@ nodes:
         [ -z "$from_issue" ] || HINT=$from_issue
       fi
 
+      # Pre-author inventory: every spec file on disk before author-loop runs. A spec that
+      # was on disk before this run counts as existing even when its ID is only derived
+      # later (auto-generate); a spec this run writes is not in it.
+      [ -n "${ARTIFACTS_DIR:-}" ] || intake_fail "ARTIFACTS_DIR is not set; cannot record the pre-author inventory"
+      mkdir -p "$ARTIFACTS_DIR" || intake_fail "cannot create ARTIFACTS_DIR"
+      INVENTORY="$ARTIFACTS_DIR/wo-author-pre-inventory.txt"
+      if [ -d docs/work-orders ]; then
+        find docs/work-orders -maxdepth 1 -type f -name '*.md' | LC_ALL=C sort > "$INVENTORY" || intake_fail "cannot write the pre-author inventory"
+      else
+        : > "$INVENTORY" || intake_fail "cannot write the pre-author inventory"
+      fi
+
       # Pre-author existence check. Deterministic: it decides the unchanged disposition,
       # not author-loop's IDEMPOTENT_SKIP text.
       CHECK_PATH=""
@@ -268,6 +284,7 @@ nodes:
       printf 'existing_spec=%s\n' "$EXISTING"
       printf 'existing_spec_path=%s\n' "$EXISTING_PATH"
       printf 'existing_reason=%s\n' "$EXISTING_REASON"
+      printf 'pre_inventory_count=%s\n' "$(wc -l < "$INVENTORY" | tr -d ' ')"
       if [ -n "$ISSUE_TEXT" ]; then
         echo ""
         echo "=== FETCHED ISSUE ==="
@@ -626,6 +643,28 @@ nodes:
       fi
       if [ "$EXISTING" = yes ]; then
         emit existing_spec_unchanged "pre-author check found $EXISTING_PATH"
+        exit 0
+      fi
+      # The footer's spec_path (covers an auto-generated ID the pre-author check could not
+      # know): existing when it was in the pre-author inventory, is tracked at HEAD, or is
+      # present on origin/main. A missing inventory fails closed.
+      INVENTORY="${ARTIFACTS_DIR:-}/wo-author-pre-inventory.txt"
+      if [ -z "${ARTIFACTS_DIR:-}" ] || [ ! -f "$INVENTORY" ]; then
+        emit malformed_classification "pre-author inventory missing"
+        exit 0
+      fi
+      FOUND=""
+      if grep -qxF -- "$SPEC_PATH" "$INVENTORY"; then
+        FOUND="on disk before authoring"
+      elif git cat-file -e "HEAD:$SPEC_PATH" 2>/dev/null; then
+        FOUND="tracked at HEAD"
+      else
+        git fetch -q origin main >/dev/null 2>&1 || true
+        if git cat-file -e "refs/remotes/origin/main:$SPEC_PATH" 2>/dev/null; then FOUND="present on origin/main"; fi
+      fi
+      if [ -n "$FOUND" ]; then
+        EXISTING_PATH=$SPEC_PATH
+        emit existing_spec_unchanged "footer spec_path $FOUND"
         exit 0
       fi
       emit new "no existing spec found before authoring"
@@ -2317,8 +2356,13 @@ nodes:
       CLASSIFY=$classify-intake.output
       PRE_EXISTING=$(printf '%s\n' "$CLASSIFY" | sed -n 's/^existing_spec=//p' | head -n 1)
       REFUSE_REASON=""
+      INVENTORY="${ARTIFACTS_DIR:-}/wo-author-pre-inventory.txt"
       if [ "$PRE_EXISTING" != "no" ]; then
         REFUSE_REASON="pre-author check existing_spec=${PRE_EXISTING:-missing}"
+      elif [ -z "${ARTIFACTS_DIR:-}" ] || [ ! -f "$INVENTORY" ]; then
+        REFUSE_REASON="pre-author inventory missing"
+      elif grep -qxF -- "$SPEC_PATH" "$INVENTORY"; then
+        REFUSE_REASON="spec_path was on disk before authoring"
       elif git cat-file -e "HEAD:$SPEC_PATH" 2>/dev/null; then
         REFUSE_REASON="spec_path is tracked at HEAD"
       else
