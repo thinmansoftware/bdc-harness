@@ -671,6 +671,33 @@ describe('WO-HARNESS-WO-AUTHOR-DRAFT-ONLY-SAFETY-01', () => {
     );
     expect(lastJson(noInv.stdout).result).toBe('malformed_classification');
 
+    // origin/main cannot be refreshed: every existence check fails closed instead of
+    // reading a stale or missing cached ref as "new".
+    const originUrl = git('remote get-url origin');
+    git(`remote set-url origin "${join(fx.dir, 'missing.git').replace(/\\/g, '/')}"`);
+    const offlineNamed = classify('--draft-only Author WO-FIXTURE-OFFLINE-01');
+    expect(offlineNamed.code).not.toBe(0);
+    expect(offlineNamed.stdout).toContain('cannot refresh origin/main');
+    const offlineAuto = classify('--draft-only Author a work order for the offline fixture');
+    expect(offlineAuto.code, offlineAuto.stderr).toBe(0);
+    writeFileSync(join(fx.work, 'docs/work-orders/WO-FIXTURE-OFFLINE-01.md'), '# offline\n');
+    const doff = disposition(offlineAuto.stdout, authorFooter('WO-FIXTURE-OFFLINE-01'));
+    expect(lastJson(doff.stdout).result).toBe('origin_main_unavailable');
+    const offOut = { 'spec-disposition': doff.stdout.trim().split('\n').pop() ?? '' };
+    expect(runs('stop-command-gate', offOut)).toBe(false);
+    expect(runs('commit-spec', { ...offOut, 'stop-command-gate-final': PASS_JSON })).toBe(false);
+    expect(runs('stop-command-gate-fail', offOut)).toBe(true);
+    const coff = commitSpec(
+      offlineAuto.stdout,
+      preview(offlineAuto.stdout, authorFooter('WO-FIXTURE-OFFLINE-01'), doff.stdout).stdout
+    );
+    expect(coff.code).toBe(1);
+    expect(coff.stdout).toContain(
+      'commit-spec: refused existing_spec_unchanged WO-FIXTURE-OFFLINE-01'
+    );
+    rmSync(join(fx.work, 'docs/work-orders/WO-FIXTURE-OFFLINE-01.md'));
+    git(`remote set-url origin "${originUrl}"`);
+
     // A genuinely new spec still reaches its gate and, with GATE_ALLOW yes, commits and
     // pushes exactly one new wo/author branch.
     const refsBefore = git('for-each-ref refs/heads');

@@ -261,13 +261,18 @@ nodes:
       fi
       EXISTING=no; EXISTING_PATH=""; EXISTING_REASON=none
       if [ -n "$CHECK_PATH" ]; then
-        git fetch -q origin main >/dev/null 2>&1 || true
         if git cat-file -e "HEAD:$CHECK_PATH" 2>/dev/null; then
           EXISTING=yes; EXISTING_REASON=tracked_at_head
-        elif git cat-file -e "refs/remotes/origin/main:$CHECK_PATH" 2>/dev/null; then
-          EXISTING=yes; EXISTING_REASON=on_origin_main
-        elif [ -f "$CHECK_PATH" ]; then
-          EXISTING=yes; EXISTING_REASON=on_disk
+        else
+          # Refresh exactly the ref checked below; a failed refresh fails closed, so a
+          # stale or missing cached origin/main never reads as "new".
+          git fetch -q origin "+refs/heads/main:refs/remotes/origin/main" >/dev/null 2>&1 \
+            || intake_fail "cannot refresh origin/main to check $CHECK_PATH; failing closed"
+          if git cat-file -e "refs/remotes/origin/main:$CHECK_PATH" 2>/dev/null; then
+            EXISTING=yes; EXISTING_REASON=on_origin_main
+          elif [ -f "$CHECK_PATH" ]; then
+            EXISTING=yes; EXISTING_REASON=on_disk
+          fi
         fi
         [ "$EXISTING" = no ] || EXISTING_PATH=$CHECK_PATH
       fi
@@ -595,7 +600,8 @@ nodes:
   # "result" gates every revision and publication node. new: the gate chain runs.
   # existing_spec_unchanged: from the pre-author check, never from IDEMPOTENT_SKIP text; no
   # gate, revise, commit, branch or push, and the run ends successfully. wo_id_mismatch:
-  # the run aborts here. no_spec and malformed_*: the run fails closed.
+  # the run aborts here. no_spec, malformed_* and origin_main_unavailable (origin/main
+  # could not be refreshed): the run fails closed.
   - id: spec-disposition
     persona: major-build
     depends_on: [author-loop]
@@ -659,7 +665,11 @@ nodes:
       elif git cat-file -e "HEAD:$SPEC_PATH" 2>/dev/null; then
         FOUND="tracked at HEAD"
       else
-        git fetch -q origin main >/dev/null 2>&1 || true
+        # Refresh exactly the ref checked; a failed refresh fails closed.
+        if ! git fetch -q origin "+refs/heads/main:refs/remotes/origin/main" >/dev/null 2>&1; then
+          emit origin_main_unavailable "cannot refresh origin/main to check $SPEC_PATH"
+          exit 0
+        fi
         if git cat-file -e "refs/remotes/origin/main:$SPEC_PATH" 2>/dev/null; then FOUND="present on origin/main"; fi
       fi
       if [ -n "$FOUND" ]; then
@@ -2365,11 +2375,10 @@ nodes:
         REFUSE_REASON="spec_path was on disk before authoring"
       elif git cat-file -e "HEAD:$SPEC_PATH" 2>/dev/null; then
         REFUSE_REASON="spec_path is tracked at HEAD"
-      else
-        git fetch -q origin main >/dev/null 2>&1 || true
-        if git cat-file -e "refs/remotes/origin/main:$SPEC_PATH" 2>/dev/null; then
-          REFUSE_REASON="spec_path is present on origin/main"
-        fi
+      elif ! git fetch -q origin "+refs/heads/main:refs/remotes/origin/main" >/dev/null 2>&1; then
+        REFUSE_REASON="cannot refresh origin/main to check spec_path"
+      elif git cat-file -e "refs/remotes/origin/main:$SPEC_PATH" 2>/dev/null; then
+        REFUSE_REASON="spec_path is present on origin/main"
       fi
       if [ -n "$REFUSE_REASON" ]; then
         echo "commit-spec: refused existing_spec_unchanged $WO_ID"
