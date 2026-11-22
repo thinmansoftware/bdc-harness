@@ -4129,6 +4129,29 @@ describe('mailbox lifecycle (WO-HARNESS-XO-MAILBOX-LIFECYCLE-01)', () => {
     expect(await openRowsFor('system:taskmaster', 'xo', SUBJECT)).toEqual([existing.id]);
   });
 
+  test('Test 5: an open normal row never suppresses a blocker; the blocker is written and folds it in', async () => {
+    const nudge = await createAuthenticatedMessage(SYSTEM_TASKMASTER, notice('prio-nudge'));
+    await backdate(nudge.id, 2);
+    const blocker = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      withCollapse({ ...notice('prio-exhausted'), priority: 'blocker' })
+    );
+    expect(blocker.id).not.toBe(nudge.id);
+    expect(blocker.priority).toBe('blocker');
+    expect(blocker.body).toContain(
+      `Folded in: 1 earlier open notice(s) for this subject (${nudge.id}).`
+    );
+    const old = await getMessage(nudge.id);
+    expect([old?.status, old?.route_disposition]).toEqual(['done', 'superseded']);
+    expect(await openRowsFor('system:taskmaster', 'xo', SUBJECT)).toEqual([blocker.id]);
+    // The reverse still suppresses: an open blocker holds back a later normal repeat.
+    const normal = await createAuthenticatedMessage(
+      SYSTEM_TASKMASTER,
+      withCollapse(notice('prio-normal-after'))
+    );
+    expect(normal.id).toBe(blocker.id);
+  });
+
   test('Test 5: a repeat after the cooldown writes one row and supersedes the old one', async () => {
     const existing = await createAuthenticatedMessage(SYSTEM_DISPATCH, notice('late-existing'));
     await backdate(existing.id, 30);

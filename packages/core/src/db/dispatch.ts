@@ -829,17 +829,32 @@ async function listOpenRepeats(
   return result.rows.map(normalizeMessage);
 }
 
-/** The newest open row younger than the cooldown, or null (rows are oldest first). */
+const PRIORITY_RANK: Readonly<Record<DispatchMessagePriority, number>> = {
+  blocker: 0,
+  normal: 1,
+  heartbeat: 2,
+};
+
+/**
+ * The newest open row younger than the cooldown that may suppress a send of
+ * `priority`, or null (rows are oldest first). Only a row of the same or a
+ * higher priority suppresses: a blocker is never swallowed by an open normal
+ * row (its escalation would never start); it is written and folds the older
+ * rows in instead.
+ */
 function newestInsideCooldown(
   rows: DispatchMessage[],
-  cooldownHours: number
+  cooldownHours: number,
+  priority: DispatchMessagePriority
 ): DispatchMessage | null {
   if (!(cooldownHours > 0)) return null;
   const cutoff = Date.now() - cooldownHours * HOUR_MS;
+  const sendRank = PRIORITY_RANK[priority] ?? PRIORITY_RANK.normal;
   let found: DispatchMessage | null = null;
   for (const row of rows) {
     const created = Date.parse(row.created_at);
-    if (Number.isFinite(created) && created > cutoff) found = row;
+    const rowRank = PRIORITY_RANK[row.priority] ?? PRIORITY_RANK.normal;
+    if (Number.isFinite(created) && created > cutoff && rowRank <= sendRank) found = row;
   }
   return found;
 }
@@ -863,7 +878,11 @@ export async function findRepeatSuppressor(
   const query: DispatchQueryExecutor = (sql, params) => getDatabase().query(sql, params);
   const group = await resolveRepeatGroup(query, bound, data);
   if (!group) return null;
-  return newestInsideCooldown(await listOpenRepeats(query, group), dispatchRepeatCooldownHours());
+  return newestInsideCooldown(
+    await listOpenRepeats(query, group),
+    dispatchRepeatCooldownHours(),
+    data.priority ?? 'normal'
+  );
 }
 
 /**
@@ -895,7 +914,7 @@ async function createCollapsedSystemMessage(
       ]);
     }
     const open = await listOpenRepeats(query, group);
-    const suppressor = newestInsideCooldown(open, cooldownHours);
+    const suppressor = newestInsideCooldown(open, cooldownHours, data.priority ?? 'normal');
     if (suppressor) {
       log.info(
         {
