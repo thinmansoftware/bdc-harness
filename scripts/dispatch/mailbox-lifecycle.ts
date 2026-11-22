@@ -19,8 +19,10 @@
  *   k1_collapse_dispatch / k2_collapse_system
  *                       open rows (queued, unread, unaddressed, undisposed)
  *                       from a system:* sender, grouped by recipient, sender
- *                       and subject (subject_key, else correlation_id). The
- *                       newest of each group stays open; the rest are
+ *                       and subject (subject_key, else correlation_id). Each
+ *                       row is folded into the newest later row of the same
+ *                       or a higher priority (an older blocker followed only
+ *                       by normal rows stays open); folded rows are
  *                       superseded by supersedeRepeatByNewer (status done,
  *                       route_disposition superseded, never cancelled). K1 is
  *                       sender system:dispatch (Duty Officer escalations and
@@ -159,8 +161,13 @@ interface OpenRow {
   subject_key: string | null;
   correlation_id: string;
   created_at: string;
+  priority: string;
   head: string;
 }
+
+/** Same ranking as the runtime collapse in packages/core/src/db/dispatch.ts. */
+const PRIORITY_RANK: Readonly<Record<string, number>> = { blocker: 0, normal: 1, heartbeat: 2 };
+const rankOf = (priority: string): number => PRIORITY_RANK[priority] ?? PRIORITY_RANK.normal ?? 1;
 
 interface SupersedePair {
   older: string;
@@ -349,7 +356,7 @@ async function buildPlan(query: DispatchQueryExecutor, args: Args, now: Date): P
   const open = (
     await query<OpenRow>(
       `SELECT id, sender, sender_principal_id, recipient, subject_key, correlation_id, created_at,
-              substr(body, 1, 200) AS head
+              priority, substr(body, 1, 200) AS head
        FROM agent_dispatch_messages
        WHERE ${RECIPIENT_EXPRESSION} = $1 AND ${OPEN}
        ORDER BY created_at ASC, COALESCE(seq, rowid) ASC`,
@@ -373,14 +380,20 @@ async function buildPlan(query: DispatchQueryExecutor, args: Args, now: Date): P
     }
     for (const rows of groups.values()) {
       if (rows.length < 2) continue;
-      const newest = rows[rows.length - 1];
-      if (!newest) continue;
-      for (const older of rows.slice(0, -1)) {
-        const pair = { older: older.id, newer: newest.id };
-        if (newest.sender_principal_id === 'system:dispatch') k1.push(pair);
+      // Priority-safe, as at runtime: a row is folded only into the newest later row of the same
+      // or a higher priority, which itself stays open (every row after it ranks strictly lower).
+      // An older blocker followed only by normal rows stays open.
+      rows.forEach((older, index) => {
+        let newer: OpenRow | undefined;
+        for (const candidate of rows.slice(index + 1)) {
+          if (rankOf(candidate.priority) <= rankOf(older.priority)) newer = candidate;
+        }
+        if (!newer) return;
+        const pair = { older: older.id, newer: newer.id };
+        if (newer.sender_principal_id === 'system:dispatch') k1.push(pair);
         else k2.push(pair);
-        senders.add(newest.sender_principal_id ?? '');
-      }
+        senders.add(newer.sender_principal_id ?? '');
+      });
     }
   }
 

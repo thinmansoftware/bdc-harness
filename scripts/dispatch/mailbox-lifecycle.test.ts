@@ -384,6 +384,51 @@ describe('mailbox-lifecycle script', () => {
     }
   });
 
+  test('Test 4: the collapse never retires an open blocker for a newer lower-priority row', async () => {
+    const MIXED = 'gh:example/repo#9';
+    const TM = {
+      sender: 'taskmaster',
+      sender_principal_id: 'system:taskmaster',
+      subject_key: MIXED,
+    };
+    // Group A: an older blocker followed only by normal rows.
+    await insertRow({ ...TM, id: 'mp-blk', hoursOld: 30, priority: 'blocker' });
+    await insertRow({ ...TM, id: 'mp-n1', hoursOld: 20 });
+    await insertRow({ ...TM, id: 'mp-n2', hoursOld: 10 });
+    const dry = await run(['--out-dir', outDir]);
+    expect(
+      (await run(['--execute', '--confirm', tokenOf(dry.out), '--out-dir', outDir])).code
+    ).toBe(0);
+    expect([(await row('mp-blk')).status, (await row('mp-blk')).route_disposition]).toEqual([
+      'queued',
+      null,
+    ]);
+    expect(JSON.parse(String((await row('mp-n1')).result_body))).toEqual({
+      reason: 'repeat',
+      superseded_by: 'mp-n2',
+    });
+    expect((await row('mp-n2')).status).toBe('queued');
+  });
+
+  test('Test 4: a normal row between blockers folds into the newest later normal row', async () => {
+    const MIXED = 'gh:example/repo#10';
+    const TM = {
+      sender: 'taskmaster',
+      sender_principal_id: 'system:taskmaster',
+      subject_key: MIXED,
+    };
+    await insertRow({ ...TM, id: 'mq-n1', hoursOld: 30 });
+    await insertRow({ ...TM, id: 'mq-b', hoursOld: 20, priority: 'blocker' });
+    await insertRow({ ...TM, id: 'mq-n2', hoursOld: 10 });
+    const dry = await run(['--out-dir', outDir]);
+    expect(
+      (await run(['--execute', '--confirm', tokenOf(dry.out), '--out-dir', outDir])).code
+    ).toBe(0);
+    expect(JSON.parse(String((await row('mq-n1')).result_body)).superseded_by).toBe('mq-n2');
+    expect((await row('mq-b')).status).toBe('queued');
+    expect((await row('mq-n2')).status).toBe('queued');
+  });
+
   test('Test 8: worker-poll recipients are never collapsed', async () => {
     const result = await run(['--recipient', 'codex']);
     expect(result.code).toBe(0);
