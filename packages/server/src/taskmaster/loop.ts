@@ -94,6 +94,7 @@ import {
 import { pageOnce } from '../dispatch/worker-heartbeat-alarm';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
 import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
+import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -146,8 +147,8 @@ export const MAX_NO_PR_FIRES_PER_WO_PER_DAY = 2;
 
 /** Escalation reason of the one per-work-order stop message (John's answer B). */
 export const WO_NO_PR_FIRES_STOP_REASON = 'wo_no_pr_fires_stop';
-/** Cascade run statuses after which a fire can no longer open a pull request. */
-const TERMINAL_FIRE_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+/** Cascade run statuses after which a fire can no longer open a pull request (incl. escalated). */
+const TERMINAL_FIRE_RUN_STATUSES = new Set<string>(TERMINAL_WORKFLOW_STATUSES);
 
 /**
  * Per-tick cap on blocker_report sends (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01).
@@ -2273,6 +2274,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // build and is counted as a no-PR fire. A deferred row never fired.
   const todayUtc = new Date(nowMs).toISOString().slice(0, 10);
   const noPrFiresTodayByScope = new Map<string, taskmasterDb.TmJournalEntry[]>();
+  // Board desk R6: every fire row of today that the count skips is logged with its reason.
+  const skipNoPrFire = (action: taskmasterDb.TmJournalEntry, reason: string): void => {
+    log.info({ journalId: action.id, reason }, 'taskmaster.no_pr_fire_not_counted');
+  };
   for (const action of lookback) {
     if (action.action_type !== 'fire_cauldron') continue;
     if (action.outcome !== 'sent' && action.outcome !== 'failed') continue;
@@ -2289,9 +2294,13 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       project = parsed?.fireEvidence?.project;
       cascadeId = parsed?.cascadeId;
     } catch {
+      skipNoPrFire(action, 'proposal_unreadable');
       continue;
     }
-    if (typeof woId !== 'string' || !woId || typeof project !== 'string' || !project) continue;
+    if (typeof woId !== 'string' || !woId || typeof project !== 'string' || !project) {
+      skipNoPrFire(action, 'fire_identity_missing');
+      continue;
+    }
     if (typeof cascadeId === 'string' && cascadeId) {
       let run: { status: string; prOpened?: boolean } | null = null;
       try {
@@ -2299,8 +2308,20 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       } catch {
         run = null;
       }
-      if (!run || !TERMINAL_FIRE_RUN_STATUSES.has(run.status) || run.prOpened === true) continue;
+      if (!run) {
+        skipNoPrFire(action, 'cascade_evidence_unreadable');
+        continue;
+      }
+      if (run.prOpened === true) {
+        skipNoPrFire(action, 'pull_request_opened');
+        continue;
+      }
+      if (!TERMINAL_FIRE_RUN_STATUSES.has(run.status)) {
+        skipNoPrFire(action, `cascade_not_finished:${run.status}`);
+        continue;
+      }
     } else if (action.outcome !== 'failed') {
+      skipNoPrFire(action, 'sent_without_cascade');
       continue;
     }
     const scope = fireScopeKey(woId, project);

@@ -1775,6 +1775,35 @@ describe('fire_cauldron loop', () => {
     }
   });
 
+  test("John's per-work-order stop counts escalated no-PR builds as finished", async () => {
+    // Board desk R4 on PR 1626 at 9401eae7: an escalated run is terminal, and the escalation
+    // linker can relabel gate-rejected failures as escalated.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const { deps, admitted, stops } = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'cascade-escalated-1' },
+          { ref: thread.ref, cascadeId: 'cascade-escalated-2' },
+        ],
+        [thread],
+        () => ({ status: 'escalated', prOpened: false })
+      );
+      await tick(createTaskmasterState(60_000), deps);
+      expect(stops()).toHaveLength(1);
+      expect(admitted).toEqual([]);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
   test("John's per-work-order stop counts only fires whose build ended with no pull request", async () => {
     // Overseer App review of PR 1626 at 67934ae3, finding 2: a 'sent' fire row proves
     // admission, not a finished no-PR build.
