@@ -34,11 +34,10 @@ async function request(key: string, at = now): Promise<tm.AutomaticFireRequest> 
     ownerToken: `owner:${key}`,
     cascadeId: key,
     epoch: 1,
-    limit: 2,
     now: at,
   };
 }
-test('two durable slots survive restart; third automatic fire is denied', async () => {
+test('durable admissions survive restart; a third distinct automatic fire is not refused', async () => {
   for (const key of ['a', 'b']) {
     const input = await request(key);
     expect((await tm.reserveAutomaticFire(input, db)).allowed).toBe(true);
@@ -54,9 +53,18 @@ test('two durable slots survive restart; third automatic fire is denied', async 
       db
     );
   }
-  expect((await tm.reserveAutomaticFire(await request('c'), other)).allowed).toBe(false);
+  // No daily cap (WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01): a third distinct fire passes,
+  // and the two earlier admissions are still recorded after reopening the database.
+  expect((await tm.reserveAutomaticFire(await request('c'), other)).allowed).toBe(true);
+  const rows = await tm.listAutomaticFireAdmissions(other);
+  expect(
+    rows
+      .filter(row => row.state === 'admitted')
+      .map(row => row.action_key)
+      .sort()
+  ).toEqual(['a', 'b']);
 });
-test('independent connections reserve one remaining slot atomically', async () => {
+test('independent connections reserve distinct actions without competing for capacity', async () => {
   expect((await tm.reserveAutomaticFire(await request('first'), db)).allowed).toBe(true);
   const a = await request('a');
   const b = await request('b');
@@ -64,12 +72,12 @@ test('independent connections reserve one remaining slot atomically', async () =
     tm.reserveAutomaticFire(a, db),
     tm.reserveAutomaticFire(b, other),
   ]);
-  expect(results.filter(result => result.allowed)).toHaveLength(1);
+  expect(results.filter(result => result.allowed)).toHaveLength(2);
 });
-test('separate operating-system processes cannot spend the same final SQLite slot', async () => {
-  await tm.reserveAutomaticFire(await request('used'), db);
-  const a = await request('process-a');
-  const b = await request('process-b');
+test('separate operating-system processes cannot both reserve the same action', async () => {
+  // Single use across processes: the same action key, two owner tokens, one winner.
+  const a = await request('process-same');
+  const b = { ...a, ownerToken: 'owner:other-process' };
   const fixture = join(import.meta.dir, 'taskmaster-fire-cap-race.fixture.ts');
   const results = await Promise.all(
     [a, b].map(async input => {
@@ -148,18 +156,21 @@ test('admission clock is read after waiting for the database transaction lock', 
   await held;
   expect((await result).admission?.utcDay).toBe('2026-10-18');
 });
-test('unknown permission remains held on later days; only proved refusal releases', async () => {
+test('unknown permission keeps its custody on later days without blocking distinct work', async () => {
   const input = await request('unknown');
   await tm.reserveAutomaticFire(input, db);
   await tm.authorizeAutomaticFire(input, db);
   expect(
     (
       await tm.reserveAutomaticFire(
-        { ...(await request('later')), limit: 1, now: '2026-10-29T12:00:00.000Z' },
+        { ...(await request('later')), now: '2026-10-29T12:00:00.000Z' },
         other
       )
     ).allowed
-  ).toBe(false);
+  ).toBe(true);
+  expect(
+    (await tm.listAutomaticFireAdmissions(db)).find(r => r.action_key === 'unknown')?.state
+  ).toBe('unknown');
   await expect(tm.releaseAutomaticFire(input, db)).resolves.toBe(false);
   const refusal = await request('refusal');
   expect((await tm.reserveAutomaticFire(refusal, db)).allowed).toBe(true);
@@ -174,14 +185,14 @@ test('fresh pause or epoch drift refuses permission before the effect', async ()
 
 test('reconciliation settlement cannot refund committed permission', async () => {
   const input = await request('settlement-refund');
-  await tm.reserveAutomaticFire({ ...input, limit: 1 }, db);
+  await tm.reserveAutomaticFire(input, db);
   await tm.settleAutomaticFire(
     { actionKey: input.actionKey, cascadeId: input.cascadeId, state: 'released' },
     other
   );
   expect((await tm.listAutomaticFireAdmissions(db))[0]?.state).toBe('reserved');
   expect(await tm.releaseAutomaticFire({ ...input, ownerToken: 'foreign' }, other)).toBe(false);
-  await tm.authorizeAutomaticFire({ ...input, limit: 1 }, db);
+  await tm.authorizeAutomaticFire(input, db);
   const before = (await tm.listAutomaticFireAdmissions(db))[0]!;
   await tm.settleAutomaticFire(
     { actionKey: input.actionKey, cascadeId: input.cascadeId, state: 'released' },
@@ -198,15 +209,19 @@ test('reconciliation settlement cannot refund committed permission', async () =>
     other
   );
   expect((await tm.listAutomaticFireAdmissions(db))[0]).toEqual(before);
-  expect(
-    (await tm.reserveAutomaticFire({ ...(await request('not-refunded')), limit: 1 }, other)).allowed
-  ).toBe(false);
+  // Not refunded is shown by the row itself (state and admitted_at unchanged), not by a
+  // later reservation being refused: there is no capacity left to observe.
+  expect((await tm.reserveAutomaticFire(await request('not-refunded'), other)).allowed).toBe(true);
+  const after = (await tm.listAutomaticFireAdmissions(db)).find(
+    r => r.action_key === input.actionKey
+  )!;
+  expect(after).toEqual(before);
 });
 
 test.each([true, false])(
   'owned release and authorization serialize across SQLite connections: releaseFirst=%s',
   async releaseFirst => {
-    const input = { ...(await request('release-race')), limit: 1 };
+    const input = await request('release-race');
     await tm.reserveAutomaticFire(input, db);
     const release = () => tm.releaseAutomaticFire(input, other);
     const authorize = () => tm.authorizeAutomaticFire(input, db);
@@ -222,15 +237,14 @@ test.each([true, false])(
     ).rows[0]!;
     expect(row.state).toBe(released ? 'released' : 'unknown');
     expect(row.admitted_at).toBe(released ? null : now);
-    expect(
-      (await tm.reserveAutomaticFire({ ...(await request('after-race')), limit: 1 }, other)).allowed
-    ).toBe(released);
+    // A distinct action is never refused, whichever side won the race.
+    expect((await tm.reserveAutomaticFire(await request('after-race'), other)).allowed).toBe(true);
   }
 );
-test('unreconciled legacy fire journal blocks fresh budget', async () => {
+test('unreconciled legacy fire journal no longer blocks a distinct fire', async () => {
   await request('legacy');
   await db.query("UPDATE tm_journal SET outcome='sent' WHERE id='legacy'");
-  expect((await tm.reserveAutomaticFire(await request('new'), db)).allowed).toBe(false);
+  expect((await tm.reserveAutomaticFire(await request('new'), db)).allowed).toBe(true);
 });
 
 test('proven pre-effect expiration permits fresh reservation and authorization', async () => {
@@ -254,7 +268,7 @@ test.each([
   ['expired', JSON.stringify({ reason: 'other_expiration' })],
   ['sent', JSON.stringify({ reason: 'stale_epoch_before_effect' })],
   ['failed', JSON.stringify({ reason: 'stale_epoch_before_effect' })],
-])('unknown legacy history stays blocked: outcome=%s proposal=%s', async (outcome, proposal) => {
+])('unknown legacy history no longer blocks: outcome=%s proposal=%s', async (outcome, proposal) => {
   const input = await request('reserved-before-history');
   expect((await tm.reserveAutomaticFire(input, db)).allowed).toBe(true);
   for (const [key, value] of [
@@ -268,22 +282,28 @@ test.each([
       key,
     ]);
   }
-  const refused = { allowed: false, reason: 'daily_cap_legacy_history_unknown' };
-  expect(await tm.reserveAutomaticFire(await request('new-after-history'), other)).toEqual(refused);
-  expect(await tm.authorizeAutomaticFire(input, db)).toEqual(refused);
+  expect(await tm.reserveAutomaticFire(await request('new-after-history'), other)).toEqual({
+    allowed: true,
+  });
+  expect((await tm.authorizeAutomaticFire(input, db)).allowed).toBe(true);
 });
 
 test('pre-effect label cannot refund an existing committed permission', async () => {
-  const input = { ...(await request('committed')), limit: 1 };
+  const input = await request('committed');
   await tm.reserveAutomaticFire(input, db);
   await tm.authorizeAutomaticFire(input, db);
+  const before = (await tm.listAutomaticFireAdmissions(db)).find(
+    r => r.action_key === 'committed'
+  )!;
   await db.query("UPDATE tm_journal SET outcome='expired',proposal_json=$1 WHERE id=$2", [
     JSON.stringify({ reason: 'stale_epoch_before_effect' }),
     input.journalId,
   ]);
-  expect(
-    await tm.reserveAutomaticFire({ ...(await request('still-charged')), limit: 1 }, other)
-  ).toEqual({ allowed: false, reason: 'daily_cap_exhausted' });
+  // The committed permission keeps its state and admission time; it is not refunded.
+  const after = (await tm.listAutomaticFireAdmissions(db)).find(r => r.action_key === 'committed')!;
+  expect(after.state).toBe(before.state);
+  expect(after.admitted_at).toBe(before.admitted_at);
+  expect((await tm.reserveAutomaticFire(await request('still-charged'), other)).allowed).toBe(true);
 });
 
 test('proved legacy settlement preserves journal supervision and legacy attribution', async () => {
@@ -326,11 +346,10 @@ test('proved legacy settlement preserves journal supervision and legacy attribut
     ).allowed
   ).toBe(true);
 });
-test('zero or invalid limit cannot reserve; schema preserves prior journal rows', async () => {
-  const input = await request('disabled');
-  for (const limit of [0, -1, 1.5, Number.NaN]) {
-    expect((await tm.reserveAutomaticFire({ ...input, limit }, db)).allowed).toBe(false);
-  }
+test('the request carries no daily limit; reserving keeps prior journal rows', async () => {
+  const input = await request('cap-free');
+  expect('limit' in input).toBe(false);
+  expect((await tm.reserveAutomaticFire(input, db)).allowed).toBe(true);
   expect((await db.query('SELECT id FROM tm_journal')).rowCount).toBe(1);
 });
 test('additive SQLite bootstrap preserves an existing journal and installs only the cap table', async () => {
@@ -348,10 +367,7 @@ test('additive SQLite bootstrap preserves an existing journal and installs only 
 // daily limit, and earlier unknown or reserved rows, or unmatched journal history, never
 // refuse a distinct action. Pause/epoch and single use stay.
 async function capFree(key: string, at = now): Promise<tm.AutomaticFireRequest> {
-  const { limit: _ignored, ...rest } = (await request(key, at)) as tm.AutomaticFireRequest & {
-    limit?: number;
-  };
-  return rest as tm.AutomaticFireRequest;
+  return request(key, at);
 }
 test('earlier unknown, reserved and unmatched history never refuse a distinct automatic fire', async () => {
   const earlier = ['2026-10-16T09:00:00.000Z', '2026-10-17T09:00:00.000Z'];
@@ -360,6 +376,11 @@ test('earlier unknown, reserved and unmatched history never refuse a distinct au
     for (const state of ['unknown', 'unknown']) {
       n += 1;
       await db.query(
+        `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
+         VALUES ($1,$2,'fire_cauldron','{}',$1,'sent',$3)`,
+        [`old-${n}`, `test:old-${n}`, at]
+      );
+      await db.query(
         `INSERT INTO tm_fire_admissions(action_key,journal_id,source_thread_ref,owner_token,
          cascade_id,utc_day,state,reserved_at,admitted_at,updated_at)
          VALUES ($1,$1,$2,'legacy-reconciliation',$1,$3,$4,$5,$5,$5)`,
@@ -367,6 +388,11 @@ test('earlier unknown, reserved and unmatched history never refuse a distinct au
       );
     }
   }
+  await db.query(
+    `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
+     VALUES ('held','test:held','fire_cauldron','{}','held','pending',$1)`,
+    [now]
+  );
   await db.query(
     `INSERT INTO tm_fire_admissions(action_key,journal_id,source_thread_ref,owner_token,
      cascade_id,utc_day,state,reserved_at,updated_at)

@@ -31,11 +31,14 @@
  * the window and the bucket key consistent.
  */
 
-export type EscalationReason = 'unclaimed_p0' | 'unroutable_remediation';
+// wo_no_pr_fires_stop: John's per-work-order stop message (WO-HARNESS-TASKMASTER-NO-DAILY-
+// FIRE-CAP-01). Listed so its rows are never read as unclaimed_p0 by the thread-ref fallback.
+export type EscalationReason = 'unclaimed_p0' | 'unroutable_remediation' | 'wo_no_pr_fires_stop';
 
 export const ESCALATION_REASONS: readonly EscalationReason[] = [
   'unclaimed_p0',
   'unroutable_remediation',
+  'wo_no_pr_fires_stop',
 ];
 
 export const SENT_WINDOW_ENV = 'TASKMASTER_ESCALATE_P0_SENT_WINDOW_HOURS';

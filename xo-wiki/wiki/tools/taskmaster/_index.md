@@ -89,19 +89,19 @@ This preserves the existing governance-delivery behavior.
 
 ## Environment
 
-| Variable                                      | Meaning                                                                                                                                                                                                                |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TASKMASTER_INTERVAL_MS`                      | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch.                                                                                                    |
-| `TASKMASTER_GH_REPOS`                         | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                                                                                                                            |
-| `TASKMASTER_USAGE_ARTIFACT`                   | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                                                                                                                              |
-| `TASKMASTER_CLI_ANCHOR_CMD`                   | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                                                                                                                     |
-| `TASKMASTER_FIRE_VERB_ENABLED`                | Enables mechanically-qualified unclaimed-P0 Cauldron fires. Default `false`; leave off through deploy.                                                                                                                 |
-| `TASKMASTER_FIRE_MAX_PER_DAY`                 | Maximum successful automatic fires per UTC day. Default `2`.                                                                                                                                                           |
-| `TASKMASTER_ESCALATE_TO_ISSUE`                | Route `escalate_p0` for `gh:owner/repo#N` threads to a GitHub issue comment instead of the operator mailbox. Default `true`; only the literal `false` (any case) restores the pre-WO dispatch path.                    |
-| `TASKMASTER_ESCALATE_P0_SENT_WINDOW_HOURS`    | escalate_p0 dedupe window per (thread, reason), counted from the last `sent` row (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01). Integer hours 24 to 168, default `24`; anything else falls back to 24 with one warning. |
-| `TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS` | Retry backoff after a `failed` escalate_p0 delivery. Integer hours 1 to 168, default `6`.                                                                                                                              |
-| `TASKMASTER_ESCALATION_MARKER_WINDOW_HOURS`   | GitHub issue-marker cooldown of the escalate-to-issue path. Integer hours 1 to 168, default `72`.                                                                                                                      |
-| `TASKMASTER_MAX_EFFECTS_PER_TICK`             | Per-tick effect cap. Integers 1 to 10, default `10`; it can only LOWER the cap, never raise it or turn it off.                                                                                                         |
+| Variable                                      | Meaning                                                                                                                                                                                                                       |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKMASTER_INTERVAL_MS`                      | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch.                                                                                                           |
+| `TASKMASTER_GH_REPOS`                         | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                                                                                                                                   |
+| `TASKMASTER_USAGE_ARTIFACT`                   | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                                                                                                                                     |
+| `TASKMASTER_CLI_ANCHOR_CMD`                   | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                                                                                                                            |
+| `TASKMASTER_FIRE_VERB_ENABLED`                | Enables mechanically-qualified unclaimed-P0 Cauldron fires. Default `false`; leave off through deploy.                                                                                                                        |
+| `TASKMASTER_FIRE_MAX_PER_DAY`                 | Ignored: there is no daily cap on automatic fires (John, 2026-11-23; WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01). John's one per-work-order stop is the fixed `MAX_NO_PR_FIRES_PER_WO_PER_DAY = 2` in loop.ts, not a setting. |
+| `TASKMASTER_ESCALATE_TO_ISSUE`                | Route `escalate_p0` for `gh:owner/repo#N` threads to a GitHub issue comment instead of the operator mailbox. Default `true`; only the literal `false` (any case) restores the pre-WO dispatch path.                           |
+| `TASKMASTER_ESCALATE_P0_SENT_WINDOW_HOURS`    | escalate_p0 dedupe window per (thread, reason), counted from the last `sent` row (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01). Integer hours 24 to 168, default `24`; anything else falls back to 24 with one warning.        |
+| `TASKMASTER_ESCALATE_P0_FAILED_BACKOFF_HOURS` | Retry backoff after a `failed` escalate_p0 delivery. Integer hours 1 to 168, default `6`.                                                                                                                                     |
+| `TASKMASTER_ESCALATION_MARKER_WINDOW_HOURS`   | GitHub issue-marker cooldown of the escalate-to-issue path. Integer hours 1 to 168, default `72`.                                                                                                                             |
+| `TASKMASTER_MAX_EFFECTS_PER_TICK`             | Per-tick effect cap. Integers 1 to 10, default `10`; it can only LOWER the cap, never raise it or turn it off.                                                                                                                |
 
 ### Escalate a stuck P0 to its GitHub issue (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)
 
@@ -130,8 +130,7 @@ container to restore the operator-mailbox escalation path.
 ### Enable the fire verb
 
 After the updated container and migration are verified, John can set
-`TASKMASTER_FIRE_VERB_ENABLED=true` and optionally tune
-`TASKMASTER_FIRE_MAX_PER_DAY`, then force-recreate the container so its env file
+`TASKMASTER_FIRE_VERB_ENABLED=true`, then force-recreate the container so its env file
 is re-read. Observe the first fires in `tm_journal`; every `fire_cauldron` sent
 row must contain a `cascadeId`/`runId` in `proposal_json`. Set the enable flag
 back to `false` and force-recreate to stop new fire proposals. The normal

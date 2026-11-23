@@ -1,4 +1,44 @@
-# Taskmaster automatic-fire daily cap
+# Taskmaster automatic fires: no daily cap
+
+## Current policy (WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01, 2026-11-23)
+
+There is no daily cap on automatic Taskmaster fires. John ruled on 2026-11-23: "if your
+honest view is we shouldnt have it then we should not have it" (bdc-xo#6439). The old cap
+was 2 a day, and its count of unresolved "unknown" admissions held across days stalled every
+automatic fire from 2026-11-14 to 2026-11-17 (bdc-xo#4932).
+
+- `TASKMASTER_FIRE_MAX_PER_DAY` is ignored. No code reads it; leaving the line in a host env
+  file does nothing.
+- The per-tick ceiling stays: `MAX_FIRES_PER_TICK = 3`.
+- The reservation keeps its other guards: the pause and epoch check under the control-row
+  lock, single use per action key (one invocation per owned reservation), owned release of an
+  uncommitted reservation only, and settlement that never refunds a committed permission.
+- An unknown admission keeps its custody row and blocks only a replay of its own action key.
+  Its work order stays held only while its journal row is pending (unknownFireScope and
+  pendingFireScopes in loop.ts are unchanged). Earlier unknown, reserved or unmatched history
+  never refuses a distinct fire, and a failed history reconciliation no longer withholds new
+  fires.
+- A missing reservation store still refuses, under the reason `fire_store_unavailable`.
+- John's one per-work-order guard (his answer "B", PR 6440 comment 7094544309): after two
+  automatic fires of ONE work order in a UTC day that end with no pull request, Taskmaster stops
+  firing that work order for the rest of that UTC day and sends one message saying so, on its
+  escalation route to the desk (`escalate_p0` to `t3-desktop`, reason `wo_no_pr_fires_stop`,
+  once per work order per UTC day). The number is fixed: `MAX_NO_PR_FIRES_PER_WO_PER_DAY = 2`
+  in loop.ts, read from no setting; changing it is a spec change put to John first. Nothing
+  else is limited.
+
+Verification:
+
+```text
+bun test ./packages/server/src/taskmaster/daily-fire-cap.test.ts
+bun test ./packages/core/src/db/taskmaster-fire-cap.test.ts
+bun test ./packages/server/src/taskmaster/loop.test.ts
+bun test ./packages/core/src/db/taskmaster-fire-cap.postgres.test.ts   # needs PostgreSQL; CI runs it
+```
+
+## History (superseded): the daily cap as built under WO-HARNESS-TASKMASTER-DAILY-FIRE-CAP-01
+
+Everything below describes the removed daily cap and is kept as history only.
 
 Source repair for bdc-xo#2002, WO-HARNESS-TASKMASTER-DAILY-FIRE-CAP-01.
 The ordinary attended source-build scope is recorded in bdc-xo#2002 comment

@@ -12,13 +12,12 @@ import * as taskmasterDb from '@archon/core/db/taskmaster';
 import * as loop from './loop';
 import { createRecord, writeRecord } from '../../../smart-cauldron/src/recorder';
 
-test('daily cap defaults to two and invalid configuration fails closed', () => {
-  expect(loop.resolveTaskmasterFireDailyLimit(undefined)).toBe(2);
-  expect(loop.resolveTaskmasterFireDailyLimit('0')).toBe(0);
-  expect(loop.resolveTaskmasterFireDailyLimit('5')).toBe(5);
-  for (const input of ['-1', '1.5', 'NaN', '', '2oops', '9007199254740992']) {
-    expect(loop.resolveTaskmasterFireDailyLimit(input)).toBe(0);
-  }
+test('there is no daily cap: the retired setting has no reader; the per-WO stop is a fixed 2', () => {
+  // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 (John, 2026-11-23): TASKMASTER_FIRE_MAX_PER_DAY is
+  // no longer read, and John's answer B is a constant, read from no setting.
+  expect('resolveTaskmasterFireDailyLimit' in loop).toBe(false);
+  expect(loop.MAX_FIRES_PER_TICK).toBe(3);
+  expect(loop.MAX_NO_PR_FIRES_PER_WO_PER_DAY).toBe(2);
 });
 
 function fakeCascade(outDir: string): RunCascadeOptions {
@@ -351,7 +350,6 @@ test('production cascade awaits preflight then rebooks actual UTC admission day 
       ownerToken: 'test-owner',
       cascadeId: 'cap-test',
       epoch: 1,
-      limit: 2,
       now: clock,
     };
     expect((await reserveAutomaticFire(input, db)).allowed).toBe(true);
@@ -462,7 +460,6 @@ test.each([
       ownerToken: 'actual-owner',
       cascadeId: 'cap-test',
       epoch: 1,
-      limit: 1,
       now: day,
     };
     expect((await reserveAutomaticFire(input, db)).allowed).toBe(true);
@@ -576,7 +573,7 @@ test.each([
           db
         )
       ).allowed
-    ).toBe(scenario === 'matching-permission');
+    ).toBe(true); // No daily cap: a distinct action is never refused (custody checks above stay).
     expect(effects).toBe(0);
     expect(await readCascadeRecord('cap-test', directory)).toEqual(prior);
   } finally {
@@ -734,7 +731,6 @@ test.each([
           ownerToken: `real-owner:${key}`,
           cascadeId: key,
           epoch: 1,
-          limit: 2,
           now: day,
         };
         // Permission is genuine but its returned provenance was lost before recording.
@@ -779,23 +775,29 @@ test.each([
       ).rejects.toThrow('isolated-reconciliation-stop');
     };
     await reconcile(day);
+    // No daily cap: unresolved legacy history keeps its custody (asserted below) but never
+    // refuses a distinct action.
+    await db.query(
+      `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,
+      idempotency_key,outcome,created_at) VALUES ('same-day','same-day','fire_cauldron','{}','same-day','pending',$1)`,
+      [day]
+    );
     expect(
       (
         await reserveAutomaticFire(
           {
             actionKey: 'same-day',
-            journalId: 'unused',
-            sourceThreadRef: 'unused',
+            journalId: 'same-day',
+            sourceThreadRef: 'same-day',
             ownerToken: 'unused',
-            cascadeId: 'unused',
+            cascadeId: 'same-day',
             epoch: 1,
-            limit: 2,
             now: day,
           },
           db
         )
       ).allowed
-    ).toBe(false);
+    ).toBe(true);
     await db.close();
     db = new SqliteAdapter(join(directory, 'isolated.db'));
     const nextDay = '2026-10-19T12:00:00.000Z';
@@ -814,12 +816,11 @@ test.each([
           ownerToken: 'new-owner',
           cascadeId: key,
           epoch: 1,
-          limit: 2,
           now: nextDay,
         },
         db
       );
-      expect(decision.allowed).toBe(scenario.startsWith('proved') && key !== 'today-overflow');
+      expect(decision.allowed).toBe(true);
     }
     const legacy = (await taskmasterDb.listAutomaticFireAdmissions(db)).filter(row =>
       row.action_key.startsWith('legacy-')
