@@ -824,7 +824,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     if (!admission.admitted && entryOverride === 'claude') {
       throw new Error(
         `[smart-cauldron/cascade] Refused Claude entry tier "claude": ${admission.reason}. ` +
-          'The Claude seat must be measured below the entry headroom threshold.'
+          'The Claude seat is measured at or over its cutoff (the live operator cutoff, or 95).'
       );
     }
     if (!admission.admitted) {

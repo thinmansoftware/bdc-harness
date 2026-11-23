@@ -1,8 +1,10 @@
 /**
  * headroom.ts -- Pure entry-tier seat headroom decision.
  *
- * Routing only. Never holds or refuses a fire. The run-start seat gate
- * remains the only wall. No probes, credentials, or provider calls.
+ * Routing, plus the Claude tier admission (admitClaudeTier), which can refuse a
+ * Claude entry or climb when the Claude seat is measured at or over its cutoff.
+ * The run-start seat gate remains the wall for every other seat. No probes,
+ * credentials, or provider calls.
  */
 
 export type SeatId = 'claude' | 'codex' | 'cursor';
@@ -77,9 +79,9 @@ export function hasPurchasedCredits(seat: SeatId, reading: SeatReadingLike | und
  * to probe it, so Fuelglass reads it as limit_source UNKNOWN. SeatReadingLike
  * carries no note field at this layer, so the rule is simply: the cursor seat
  * with limit_source 'UNKNOWN' is unmetered headroom for entry selection.
- * Cursor only -- an UNKNOWN Claude or Codex seat stays unknown (admitClaudeTier
- * must keep refusing an unknown Claude seat). A missing cursor reading stays
- * unknown.
+ * Cursor only -- an UNKNOWN Claude or Codex seat stays unknown for entry
+ * selection (admitClaudeTier separately lets an UNKNOWN Claude seat through,
+ * WO-HARNESS-CLAUDE-LANE-REOPEN-95-01). A missing cursor reading stays unknown.
  */
 export function isUnmeteredSeat(seat: SeatId, reading: SeatReadingLike | undefined): boolean {
   return seat === 'cursor' && reading?.limit_source === 'UNKNOWN';
