@@ -231,17 +231,17 @@ describe('live ladder SOR', () => {
   });
 
   // M-20260929h: cursor and zero are live; qwen and glm stay refused. zero is
-  // first in the ladder, so it is the entry floor. claude is refused again since
-  // WO-HARNESS-REFUSE-CLAUDE-LADDER-TIER-01 (the acting XO's ruling, 2026-11-11).
-  test('cursor and zero are live, glm/qwen/claude stay refused, zero is the entry floor', () => {
+  // first in the ladder, so it is the entry floor. claude is live again
+  // (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01; John 2026-11-23: "claude lane should not be shut").
+  test('cursor, zero and claude are live, glm/qwen stay refused, zero is the entry floor', () => {
     const refused = loadRefusedTiers();
     expect(refused).not.toContain('cursor');
     expect(refused).not.toContain('zero');
     expect(refused).toContain('qwen');
     expect(refused).toContain('glm');
-    expect(refused).toContain('claude');
+    expect(refused).not.toContain('claude');
     expect(refused).not.toContain('codex');
-    expect([...refused].sort()).toEqual(['claude', 'glm', 'qwen']);
+    expect([...refused].sort()).toEqual(['glm', 'qwen']);
     const firstLive = loadLadder().find(t => !refused.includes(t.name));
     expect(firstLive?.name).toBe('zero');
   });
@@ -359,7 +359,7 @@ describe('cascade entry override and refuse', () => {
     expect(fireCalled).toBe(false);
   });
 
-  test('climb from codex skips claude; next tier is frontier', async () => {
+  test('climb from codex skips claude over the 95 cutoff; next tier is frontier', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-codex-frontier-'));
     const firedWorkflows: string[] = [];
     const thresholdEnv = 'SMART_CAULDRON_HEADROOM_THRESHOLD_PERCENT';
@@ -385,7 +385,7 @@ describe('cascade entry override and refuse', () => {
         seatUsage: async () => ({
           claude: {
             limit_source: 'measured',
-            windows: [{ name: 'seven_day', used_percent: 91 }],
+            windows: [{ name: 'seven_day', used_percent: 97 }],
           },
         }),
       };
@@ -408,11 +408,11 @@ describe('cascade entry override and refuse', () => {
       expect(record.frontierApproval?.workflowName).toBe('bdc-feature-development-fable');
       expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
       expect(loadPremiumTiers()).toContain('frontier');
-      // claude is refused outright, so its seat is never even read for admission
+      // claude is live, so its seat is read and refused at the 95 fallback cutoff
       const overThresholdLogs = log.mock.calls.filter(call =>
-        String(call[0]).includes('claude_seat_over_threshold')
+        String(call[0]).includes('claude_seat_over_threshold:97:95')
       );
-      expect(overThresholdLogs).toHaveLength(0);
+      expect(overThresholdLogs.length).toBeGreaterThan(0);
     } finally {
       log.mockRestore();
       if (previousThreshold === undefined) delete process.env[thresholdEnv];
@@ -421,7 +421,7 @@ describe('cascade entry override and refuse', () => {
     }
   });
 
-  test('a climb after a codex gate-fail stops at codex even when the claude seat reads cool (claude refused)', async () => {
+  test('a climb after a codex gate-fail lands on claude when the claude seat reads cool', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-codex-cool-claude-'));
     const firedWorkflows: string[] = [];
     const thresholdEnv = 'SMART_CAULDRON_HEADROOM_THRESHOLD_PERCENT';
@@ -444,7 +444,9 @@ describe('cascade entry override and refuse', () => {
             head_branch: 'archon/task-web-worker-1-fixture',
           },
         }),
-        // the case that let a climb land on the claude lane on 2026-11-11: the seat reads cool
+        // A climb's open-PR lookup fails closed (bdc-xo #4638); no open PR here.
+        listOpenWoPullRequests: async () => [],
+        // the seat reads cool, so the climb lands on the claude lane again
         seatUsage: async () => ({
           claude: {
             limit_source: 'measured',
@@ -466,9 +468,8 @@ describe('cascade entry override and refuse', () => {
         deps,
       });
 
-      expect(firedWorkflows).toEqual(['bdc-feature-development-codex']);
-      expect(firedWorkflows).not.toContain('bdc-feature-development');
-      expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
+      expect(firedWorkflows).toEqual(['bdc-feature-development-codex', 'bdc-feature-development']);
+      expect(record.attempts.map(a => a.tier)).toEqual(['codex', 'claude']);
       expect(record.status).toBe('pending-frontier-approval');
     } finally {
       log.mockRestore();
@@ -529,7 +530,7 @@ describe('cascade entry override and refuse', () => {
     }
   });
 
-  test('entry override claude is refused and does not fire', async () => {
+  test('entry override claude with an UNKNOWN seat is admitted, not refused', async () => {
     let fireCalled = false;
     const deps: CascadeDeps = {
       fire: async () => {
@@ -558,10 +559,9 @@ describe('cascade entry override and refuse', () => {
       thrown = err;
     }
 
-    expect(thrown).toBeInstanceOf(Error);
-    const message = thrown instanceof Error ? thrown.message : '';
-    expect(message).toContain('Refused dark/retired entry tier "claude"');
-    expect(message).toContain('refusedTiers');
+    // claude is no longer a refused tier and an UNKNOWN seat is let through
+    // (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01); the dry run plans the claude tier and fires nothing.
+    expect(thrown).toBeUndefined();
     expect(fireCalled).toBe(false);
   });
 });

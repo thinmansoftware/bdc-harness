@@ -1,8 +1,10 @@
 /**
  * headroom.ts -- Pure entry-tier seat headroom decision.
  *
- * Routing only. Never holds or refuses a fire. The run-start seat gate
- * remains the only wall. No probes, credentials, or provider calls.
+ * Routing, plus the Claude tier admission (admitClaudeTier), which can refuse a
+ * Claude entry or climb when the Claude seat is measured at or over its cutoff.
+ * The run-start seat gate remains the wall for every other seat. No probes,
+ * credentials, or provider calls.
  */
 
 export type SeatId = 'claude' | 'codex' | 'cursor';
@@ -77,9 +79,9 @@ export function hasPurchasedCredits(seat: SeatId, reading: SeatReadingLike | und
  * to probe it, so Fuelglass reads it as limit_source UNKNOWN. SeatReadingLike
  * carries no note field at this layer, so the rule is simply: the cursor seat
  * with limit_source 'UNKNOWN' is unmetered headroom for entry selection.
- * Cursor only -- an UNKNOWN Claude or Codex seat stays unknown (admitClaudeTier
- * must keep refusing an unknown Claude seat). A missing cursor reading stays
- * unknown.
+ * Cursor only -- an UNKNOWN Claude or Codex seat stays unknown for entry
+ * selection (admitClaudeTier separately lets an UNKNOWN Claude seat through,
+ * WO-HARNESS-CLAUDE-LANE-REOPEN-95-01). A missing cursor reading stays unknown.
  */
 export function isUnmeteredSeat(seat: SeatId, reading: SeatReadingLike | undefined): boolean {
   return seat === 'cursor' && reading?.limit_source === 'UNKNOWN';
@@ -118,21 +120,30 @@ export function formatRungSeatSkip(skip: RungSeatSkip): string {
   return `seat_over_cutoff:${skip.seat}:${String(skip.usedPercent)}:${String(skip.cutoffPercent)}`;
 }
 
-export type ClaudeTierAdmission =
-  | { admitted: true; reason: `claude_seat_ok:${number}:${number}` }
-  | {
-      admitted: false;
-      reason: `claude_seat_over_threshold:${number}:${number}` | 'claude_seat_unknown';
-    };
+/**
+ * Claude seat cutoff when the live operator cutoff (cutoff.percent of GET /api/fuelglass/seats)
+ * cannot be read. John 2026-11-23: "question 1 yes use 95%" (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01).
+ */
+export const CLAUDE_SEAT_CUTOFF_FALLBACK_PERCENT = 95;
 
-/** Decide whether the Claude ladder tier may use the Claude subscription seat. */
+export type ClaudeTierAdmission =
+  | {
+      admitted: true;
+      reason: `claude_seat_ok:${number}:${number}` | 'claude_seat_unknown_admitted';
+    }
+  | { admitted: false; reason: `claude_seat_over_threshold:${number}:${number}` };
+
+/**
+ * Decide whether the Claude ladder tier may use the Claude subscription seat. An UNKNOWN reading
+ * is let through (John 2026-11-23); only a measured reading at or over the cutoff refuses.
+ */
 export function admitClaudeTier(input: {
   usage: SeatUsageSnapshot | null;
   thresholdPercent: number;
 }): ClaudeTierAdmission {
   const seat = seatForTier('claude');
   const used = seat === null || input.usage === null ? null : bindingUsedPercent(input.usage[seat]);
-  if (used === null) return { admitted: false, reason: 'claude_seat_unknown' };
+  if (used === null) return { admitted: true, reason: 'claude_seat_unknown_admitted' };
   if (used >= input.thresholdPercent) {
     return {
       admitted: false,

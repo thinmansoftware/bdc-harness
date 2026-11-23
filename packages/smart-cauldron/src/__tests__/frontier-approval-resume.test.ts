@@ -10,7 +10,7 @@
  * All tests use CascadeDeps injection -- no live API calls.
  */
 
-import { describe, test, expect, afterAll } from 'bun:test';
+import { describe, test, expect, afterAll, afterEach, beforeEach } from 'bun:test';
 import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -25,6 +25,18 @@ import {
 } from '../frontier-approval.js';
 import type { CascadeRunRecord, FireResult, PollResult, GateVerdict } from '../types.js';
 import type { AcquireWoLockResult } from '../wo-lock.js';
+import { closeClaudeTier } from './claude-tier-closed.js';
+
+// claude is live again (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01); these frontier-gate tests pin it
+// closed so a codex climb reaches frontier as they intend.
+let restoreClaudeTier: (() => void) | null = null;
+beforeEach(() => {
+  restoreClaudeTier = closeClaudeTier();
+});
+afterEach(() => {
+  restoreClaudeTier?.();
+  restoreClaudeTier = null;
+});
 
 const FABLE_WORKFLOW = 'bdc-feature-development-fable';
 

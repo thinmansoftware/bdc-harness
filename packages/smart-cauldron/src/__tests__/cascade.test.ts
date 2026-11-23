@@ -13,6 +13,7 @@
 
 import { describe, test, expect, afterAll, afterEach } from 'bun:test';
 import { openClaudeTier } from './claude-tier-open.js';
+import { closeClaudeTier } from './claude-tier-closed.js';
 import { createHash, randomUUID } from 'crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -543,7 +544,8 @@ describe('bounded supervised Codex-only dispatch', () => {
           { limit_source: 'measured', windows: [{ name: 'session', used_percent: 10 }] },
           'claude',
         ],
-        [[], ['claude'], { limit_source: 'UNKNOWN', windows: [] }, 'frontier'],
+        // An UNKNOWN Claude seat is let through (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01).
+        [[], ['claude'], { limit_source: 'UNKNOWN', windows: [] }, 'claude'],
         [
           ['claude'],
           ['frontier'],
@@ -672,7 +674,8 @@ describe('bounded supervised Codex-only dispatch', () => {
           expect(record.winningTier).toBeNull();
           expect(record.providerBoundary).toMatchObject({
             reason: 'codex-only-capacity',
-            nextTier: 'frontier',
+            // claude is the live tier above codex again (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01)
+            nextTier: 'claude',
             sourceEventId: record.attempts[0]?.sourceEventId,
             sourceEventAt: record.attempts[0]?.sourceEventAt,
           });
@@ -1021,7 +1024,15 @@ describe('Test: progress-timeout respects the frontier approval gate + records a
       },
     };
 
-    const record = await runCascade(baseOpts({ deps, entryOverride: 'codex' }));
+    // claude is live again (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01); pin it closed so the climb
+    // target is frontier, as this test intends.
+    const restoreClaudeTier = closeClaudeTier();
+    let record: Awaited<ReturnType<typeof runCascade>>;
+    try {
+      record = await runCascade(baseOpts({ deps, entryOverride: 'codex' }));
+    } finally {
+      restoreClaudeTier();
+    }
 
     // No cancel-to-nowhere: the hung run was left RUNNING, not cancelled, because
     // the climb target (frontier) requires operator approval.

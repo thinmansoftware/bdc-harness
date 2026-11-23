@@ -143,24 +143,25 @@ describe('cascade headroom', () => {
         },
       });
       expect(workflows).toEqual(['bdc-feature-development']);
-      expect(record.entrySelection?.reason).toBe('claude_seat_ok:62:80');
+      expect(record.entrySelection?.reason).toBe('claude_seat_ok:62:95');
     } finally {
       await rm(outDir, { recursive: true, force: true });
     }
   });
 
-  test('explicit claude entry refuses over-threshold and unknown before recording', async () => {
+  test('explicit claude entry refuses a seat at or over the 95 cutoff before recording', async () => {
+    // WO-HARNESS-CLAUDE-LANE-REOPEN-95-01: only a measured reading at or over the cutoff refuses;
+    // an UNKNOWN seat is let through (next test).
     for (const [usage, reason] of [
       [
         {
           claude: {
             limit_source: 'measured' as const,
-            windows: [{ name: 'seven_day', used_percent: 91 }],
+            windows: [{ name: 'seven_day', used_percent: 97 }],
           },
         },
-        'claude_seat_over_threshold:91:80',
+        'claude_seat_over_threshold:97:95',
       ],
-      [{ claude: { limit_source: 'UNKNOWN' as const, windows: [] } }, 'claude_seat_unknown'],
     ] as const) {
       let fired = false;
       let recorded = false;
@@ -186,6 +187,57 @@ describe('cascade headroom', () => {
       expect(fired).toBe(false);
       expect(recorded).toBe(false);
     }
+  });
+
+  test('explicit claude entry with an UNKNOWN seat is admitted (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01 Test 2)', async () => {
+    const record = await withDefaultThreshold(async () =>
+      runCascade({
+        woId: 'WO-CLAUDE-UNKNOWN',
+        entryOverride: 'claude',
+        project: 'fixture',
+        dryRun: true,
+        token: 'test-token',
+        deps: { seatUsage: async () => ({ claude: { limit_source: 'UNKNOWN', windows: [] } }) },
+      })
+    );
+    expect(record.telemetry.entryTier).toBe('claude');
+    expect(record.entrySelection?.reason).toBe('claude_seat_unknown_admitted');
+  });
+
+  test('the Claude seat uses the live cutoff, and 95 when it is unreadable (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01 Test 4)', async () => {
+    const seat92 = {
+      claude: {
+        limit_source: 'measured' as const,
+        windows: [{ name: 'seven_day', used_percent: 92 }],
+      },
+    };
+    await withDefaultThreshold(async () => {
+      await expect(
+        runCascade({
+          woId: 'WO-CLAUDE-CUTOFF-90',
+          entryOverride: 'claude',
+          project: 'fixture',
+          dryRun: true,
+          token: 'test-token',
+          deps: { seatUsage: async () => seat92, seatCutoff: async () => 90 },
+        })
+      ).rejects.toThrow('claude_seat_over_threshold:92:90');
+      const unreadable = await runCascade({
+        woId: 'WO-CLAUDE-CUTOFF-UNREADABLE',
+        entryOverride: 'claude',
+        project: 'fixture',
+        dryRun: true,
+        token: 'test-token',
+        deps: {
+          seatUsage: async () => seat92,
+          seatCutoff: async () => {
+            throw new Error('cutoff unreadable');
+          },
+        },
+      });
+      expect(unreadable.telemetry.entryTier).toBe('claude');
+      expect(unreadable.entrySelection?.reason).toBe('claude_seat_ok:92:95');
+    });
   });
 
   test('automatic climb admits claude under threshold', async () => {
@@ -245,7 +297,7 @@ describe('cascade headroom', () => {
       );
       expect(workflows).toEqual(['bdc-feature-development-codex', 'bdc-feature-development']);
       expect(record.winningTier).toBe('claude');
-      expect(log.mock.calls.some(call => String(call[0]).includes('claude_seat_ok:41:80'))).toBe(
+      expect(log.mock.calls.some(call => String(call[0]).includes('claude_seat_ok:41:95'))).toBe(
         true
       );
     } finally {
@@ -281,7 +333,7 @@ describe('cascade headroom', () => {
         apiBaseUrl: server.url.origin,
         token: 'test-token',
       });
-      expect(measured.entrySelection?.reason).toBe('claude_seat_ok:41:80');
+      expect(measured.entrySelection?.reason).toBe('claude_seat_ok:41:95');
       status = 500;
       const unavailable = await runCascade({
         woId: 'WO-DEFAULT-SEATS-500',
