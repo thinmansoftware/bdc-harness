@@ -1495,6 +1495,80 @@ describe('fire_cauldron loop', () => {
     }
   });
 
+  test('UTC rollover does not reintroduce a budget: 3 per tick either side of 00:00Z, no daily deferral', async () => {
+    // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 Test 2.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const beforeMidnight = Date.parse('2026-08-07T23:59:30.000Z');
+      const afterMidnight = Date.parse('2026-08-08T00:00:30.000Z');
+      world.nowMs = beforeMidnight;
+      const threads = [601, 602, 603, 604, 605, 606].map(number =>
+        makeListedThread({
+          ref: `gh:thinmansoftware/bdc-harness#${number}`,
+          priority: 'P0',
+          isUnclaimed: true,
+          isUnclaimedP0: true,
+          title: `WO-HARNESS-EXAMPLE-${number} build`,
+          lastActivityAt: new Date(beforeMidnight).toISOString(),
+        })
+      );
+      const admittedAt: Array<{ woId: string; day: string }> = [];
+      const deps = makeDeps(world, {
+        listThreads: async () => threads,
+        // A work order already admitted has its build running, so it is not eligible again;
+        // that is the only gate here besides the per-tick ceiling.
+        checkFireEligibility: async title => {
+          const woId = title.split(' ')[0]!;
+          if (admittedAt.some(entry => entry.woId === woId)) return { eligible: false };
+          return {
+            eligible: true,
+            evidence: {
+              woId,
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(world.nowMs).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+              specSource: 'repo-path',
+            },
+          };
+        },
+        runCascade: (async options => {
+          admittedAt.push({
+            woId: options.woId,
+            day: new Date(world.nowMs).toISOString().slice(0, 10),
+          });
+          const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      expect(admittedAt).toHaveLength(3);
+      expect(admittedAt.every(entry => entry.day === '2026-08-07')).toBe(true);
+
+      world.nowMs = afterMidnight;
+      await tick(state, deps);
+      expect(admittedAt).toHaveLength(6);
+      expect(admittedAt.slice(3).every(entry => entry.day === '2026-08-08')).toBe(true);
+      // Six distinct work orders, none admitted twice across the rollover.
+      expect(new Set(admittedAt.map(entry => entry.woId)).size).toBe(6);
+      expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
+      const fireRows = world.journal.filter(
+        row => row.action_type === 'fire_cauldron' && row.outcome !== 'deferred'
+      );
+      expect(fireRows.filter(row => row.created_at.startsWith('2026-08-07'))).toHaveLength(3);
+      expect(fireRows.filter(row => row.created_at.startsWith('2026-08-08'))).toHaveLength(3);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
   test("John's per-work-order stop: two no-PR fires of one work order in a UTC day stop it for the day, with one message", async () => {
     // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 Test 7 (John's answer B).
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
@@ -1568,6 +1642,13 @@ describe('fire_cauldron loop', () => {
       await tick(createTaskmasterState(60_000), deps);
       expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-02']);
       expect(stops()).toHaveLength(1);
+      // Delivered on the tick the stop first trips, ahead of the ordinary unclaimed_p0 page.
+      const stopKey = `tm:wo_no_pr_fires_stop:${a.ref}:${TODAY_KEY}`;
+      expect(stops()[0]!.outcome).toBe('sent');
+      expect(stops()[0]!.idempotency_key).toBe(stopKey);
+      const stopDispatches = world.sentMessages.filter(m => m.idempotency_key === stopKey);
+      expect(stopDispatches).toHaveLength(1);
+      expect(stopDispatches[0]!.recipient).toBe('t3-desktop');
       const body = (JSON.parse(stops()[0]!.proposal_json) as { body: string }).body;
       expect(body).toContain('WO-HARNESS-EXAMPLE-01');
       expect(body).toContain('old-cascade-1');
@@ -1578,6 +1659,7 @@ describe('fire_cauldron loop', () => {
       await tick(createTaskmasterState(60_000), deps);
       expect(admitted.filter(id => id === 'WO-HARNESS-EXAMPLE-01')).toHaveLength(0);
       expect(stops()).toHaveLength(1);
+      expect(world.sentMessages.filter(m => m.idempotency_key === stopKey)).toHaveLength(1);
 
       // The next UTC day: the work order can fire again.
       world.nowMs += 24 * 60 * 60_000;

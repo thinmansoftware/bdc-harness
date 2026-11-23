@@ -141,7 +141,7 @@ export function resolveMaxEffectsPerTick(
 }
 
 function isEscalationReason(value: unknown): value is EscalationReason {
-  return value === 'unclaimed_p0' || value === 'unroutable_remediation';
+  return (ESCALATION_REASONS as readonly unknown[]).includes(value);
 }
 
 /** Reason derived from a thread ref alone; null for a heartbeat page. */
