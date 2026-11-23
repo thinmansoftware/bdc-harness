@@ -1303,7 +1303,7 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
       const artifactsDir = join(testDir, 'artifacts-idle-silent');
       const logDir = join(testDir, 'logs-idle-silent');
 
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       await executeDagWorkflow(
         mockDeps,
         platform,
@@ -1332,7 +1332,7 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
         'docs/',
         minimalConfig
       );
-      const elapsedMs = Date.now() - startedAt;
+      const elapsedMs = performance.now() - startedAt;
 
       const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
         call =>
@@ -1354,7 +1354,15 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
         events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan-review')
       ).toBe(false);
       // Idle fired at its 400ms ceiling, before the 2000ms wall.
-      expect(elapsedMs).toBeGreaterThanOrEqual(400);
+      // The silent first wait arms setTimeout for the full 400 ms ceiling.
+      // Windows CI reported 399 ms using Date.now(), while the test duration
+      // was 406 ms and the expected idle-timeout error was present. The exact
+      // cause of the discrepancy is unconfirmed. Measure with a monotonic
+      // clock and allow at most one Windows timer tick, approximately 16 ms.
+      // The 384 ms floor still rejects an early fire at 200 ms.
+      const idleCeilingMs = 400;
+      const timerTickMs = 16;
+      expect(elapsedMs).toBeGreaterThanOrEqual(idleCeilingMs - timerTickMs);
       expect(elapsedMs).toBeLessThan(2000);
     } finally {
       if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
