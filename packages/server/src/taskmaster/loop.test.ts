@@ -1775,6 +1775,54 @@ describe('fire_cauldron loop', () => {
     }
   });
 
+  test("John's per-work-order stop logs an unreadable fire row once per UTC day, not every tick", async () => {
+    // Board desk R7 on PR 1626 at 9e2e951a.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+    const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
+      streamSymbol
+    ];
+    const chunks: string[] = [];
+    const originalWrite = stream.write;
+    stream.write = (chunk: string) => {
+      chunks.push(String(chunk));
+      return true;
+    };
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const { world, deps } = noPrStopWorld(
+        [{ ref: thread.ref, cascadeId: 'cascade-unreadable' }],
+        [thread],
+        () => null
+      );
+      const logged = (): number =>
+        chunks.filter(
+          chunk =>
+            chunk.includes('taskmaster.no_pr_fire_not_counted') &&
+            chunk.includes('scoped-fire-0') &&
+            chunk.includes('cascade_evidence_unreadable')
+        ).length;
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      world.nowMs += 60_000;
+      await tick(state, deps);
+      expect(logged()).toBe(1);
+    } finally {
+      stream.write = originalWrite;
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
   test("John's per-work-order stop counts escalated no-PR builds as finished", async () => {
     // Board desk R4 on PR 1626 at 9401eae7: an escalated run is terminal, and the escalation
     // linker can relabel gate-rejected failures as escalated.

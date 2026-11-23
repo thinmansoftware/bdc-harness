@@ -193,6 +193,11 @@ export interface TaskmasterState {
   reconciled: boolean;
   /** Last tick on which a budget hold was made visible. */
   lastHoldMonitorTick: number | null;
+  /**
+   * Fire journal ids already logged at info today as not counted toward John's no-PR stop for
+   * a fail-open reason (Board desk R7). Cleared when the UTC day changes.
+   */
+  noPrSkipLogged: { day: string; ids: Set<string> };
 }
 
 export function createTaskmasterState(intervalMs: number): TaskmasterState {
@@ -202,6 +207,7 @@ export function createTaskmasterState(intervalMs: number): TaskmasterState {
     pendingConfirm: new Map(),
     reconciled: false,
     lastHoldMonitorTick: null,
+    noPrSkipLogged: { day: '', ids: new Set() },
   };
 }
 
@@ -2274,8 +2280,23 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // build and is counted as a no-PR fire. A deferred row never fired.
   const todayUtc = new Date(nowMs).toISOString().slice(0, 10);
   const noPrFiresTodayByScope = new Map<string, taskmasterDb.TmJournalEntry[]>();
-  // Board desk R6: every fire row of today that the count skips is logged with its reason.
-  const skipNoPrFire = (action: taskmasterDb.TmJournalEntry, reason: string): void => {
+  // Board desk R6 and R7: every fire row of today that the count skips is logged with its
+  // reason. A normal state (a PR opened, a build still running) is logged at debug. A fail-open
+  // reason is logged at info once per journal id per UTC day.
+  if (state.noPrSkipLogged.day !== todayUtc) {
+    state.noPrSkipLogged = { day: todayUtc, ids: new Set() };
+  }
+  const skipNoPrFire = (
+    action: taskmasterDb.TmJournalEntry,
+    reason: string,
+    failOpen: boolean
+  ): void => {
+    if (!failOpen) {
+      log.debug({ journalId: action.id, reason }, 'taskmaster.no_pr_fire_not_counted');
+      return;
+    }
+    if (state.noPrSkipLogged.ids.has(action.id)) return;
+    state.noPrSkipLogged.ids.add(action.id);
     log.info({ journalId: action.id, reason }, 'taskmaster.no_pr_fire_not_counted');
   };
   for (const action of lookback) {
@@ -2294,11 +2315,11 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       project = parsed?.fireEvidence?.project;
       cascadeId = parsed?.cascadeId;
     } catch {
-      skipNoPrFire(action, 'proposal_unreadable');
+      skipNoPrFire(action, 'proposal_unreadable', true);
       continue;
     }
     if (typeof woId !== 'string' || !woId || typeof project !== 'string' || !project) {
-      skipNoPrFire(action, 'fire_identity_missing');
+      skipNoPrFire(action, 'fire_identity_missing', true);
       continue;
     }
     if (typeof cascadeId === 'string' && cascadeId) {
@@ -2309,19 +2330,19 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         run = null;
       }
       if (!run) {
-        skipNoPrFire(action, 'cascade_evidence_unreadable');
+        skipNoPrFire(action, 'cascade_evidence_unreadable', true);
         continue;
       }
       if (run.prOpened === true) {
-        skipNoPrFire(action, 'pull_request_opened');
+        skipNoPrFire(action, 'pull_request_opened', false);
         continue;
       }
       if (!TERMINAL_FIRE_RUN_STATUSES.has(run.status)) {
-        skipNoPrFire(action, `cascade_not_finished:${run.status}`);
+        skipNoPrFire(action, `cascade_not_finished:${run.status}`, false);
         continue;
       }
     } else if (action.outcome !== 'failed') {
-      skipNoPrFire(action, 'sent_without_cascade');
+      skipNoPrFire(action, 'sent_without_cascade', true);
       continue;
     }
     const scope = fireScopeKey(woId, project);
