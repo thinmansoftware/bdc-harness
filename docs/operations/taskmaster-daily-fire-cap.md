@@ -26,6 +26,13 @@ automatic fire from 2026-11-14 to 2026-11-17 (bdc-xo#4932).
   once per work order per UTC day). The number is fixed: `MAX_NO_PR_FIRES_PER_WO_PER_DAY = 2`
   in loop.ts, read from no setting; changing it is a spec change put to John first. Nothing
   else is limited.
+  - The count is per work order (its WO id and project, from each fire's own evidence), so
+    two issue threads naming one work order share one count and one message (key
+    `tm:wo_no_pr_fires_stop:<WO id>:<project>:<UTC day>`).
+  - A fire counts only when its build is finished (cascade status completed, failed or
+    cancelled) and opened no pull request. A running build, a build that opened a PR, or a
+    build whose evidence cannot be read is not counted. A failed fire that never started a
+    build is counted.
 
 Verification:
 

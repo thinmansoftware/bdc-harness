@@ -146,6 +146,8 @@ export const MAX_NO_PR_FIRES_PER_WO_PER_DAY = 2;
 
 /** Escalation reason of the one per-work-order stop message (John's answer B). */
 export const WO_NO_PR_FIRES_STOP_REASON = 'wo_no_pr_fires_stop';
+/** Cascade run statuses after which a fire can no longer open a pull request. */
+const TERMINAL_FIRE_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
 /**
  * Per-tick cap on blocker_report sends (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01).
@@ -2263,21 +2265,50 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   // 4. Journal lookback: dedupe set + per-item 24h intervention counts.
   const lookback = await dal.getActionsSince(new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString());
-  // John's answer B: today's automatic fires per thread that ended with no pull request. A fire
-  // counts once its journal row is terminal ('sent' or 'failed'); a deferred row never fired,
-  // and a work order with an open or merged PR is no longer fire-eligible, so a fire that
-  // produced a PR never reaches this count.
+  // John's answer B: today's automatic fires per WORK ORDER (woId + project from the fire's own
+  // evidence, so two issue threads naming one work order share one count) whose build ended
+  // with no pull request. A 'sent' fire row proves admission only, so a fire with a cascade is
+  // counted only when its cascade evidence is terminal and shows no PR; running, PR-opening and
+  // unreadable cascades are not counted. A 'failed' fire row with no cascade never started a
+  // build and is counted as a no-PR fire. A deferred row never fired.
   const todayUtc = new Date(nowMs).toISOString().slice(0, 10);
-  const noPrFiresTodayByRef = new Map<string, taskmasterDb.TmJournalEntry[]>();
+  const noPrFiresTodayByScope = new Map<string, taskmasterDb.TmJournalEntry[]>();
   for (const action of lookback) {
     if (action.action_type !== 'fire_cauldron') continue;
     if (action.outcome !== 'sent' && action.outcome !== 'failed') continue;
     if (action.created_at.slice(0, 10) !== todayUtc) continue;
-    const ref = canonicalizeThreadRef(action.thread_ref);
-    const rows = noPrFiresTodayByRef.get(ref) ?? [];
+    let woId: unknown;
+    let project: unknown;
+    let cascadeId: unknown;
+    try {
+      const parsed = JSON.parse(action.proposal_json) as {
+        cascadeId?: unknown;
+        fireEvidence?: { woId?: unknown; project?: unknown };
+      } | null;
+      woId = parsed?.fireEvidence?.woId;
+      project = parsed?.fireEvidence?.project;
+      cascadeId = parsed?.cascadeId;
+    } catch {
+      continue;
+    }
+    if (typeof woId !== 'string' || !woId || typeof project !== 'string' || !project) continue;
+    if (typeof cascadeId === 'string' && cascadeId) {
+      let run: { status: string; prOpened?: boolean } | null = null;
+      try {
+        run = await getFireRunEvidence(woId, cascadeId, project);
+      } catch {
+        run = null;
+      }
+      if (!run || !TERMINAL_FIRE_RUN_STATUSES.has(run.status) || run.prOpened === true) continue;
+    } else if (action.outcome !== 'failed') {
+      continue;
+    }
+    const scope = fireScopeKey(woId, project);
+    const rows = noPrFiresTodayByScope.get(scope) ?? [];
     rows.push(action);
-    noPrFiresTodayByRef.set(ref, rows);
+    noPrFiresTodayByScope.set(scope, rows);
   }
+  const noPrStopProposedScopes = new Set<string>();
   const actionsByKey = new Map<string, taskmasterDb.TmJournalEntry>();
   const interventions24hByThread = new Map<string, number>();
   // Most recent 'sent' blocker_report per canonical ref (72h cooldown input).
@@ -2600,8 +2631,12 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         );
       }
     }
-    const noPrFiresToday = noPrFiresTodayByRef.get(canonRef) ?? [];
-    const noPrStop = fireResult.eligible && noPrFiresToday.length >= MAX_NO_PR_FIRES_PER_WO_PER_DAY;
+    const noPrScope =
+      fireResult.eligible && fireResult.evidence
+        ? fireScopeKey(fireResult.evidence.woId, fireResult.evidence.project)
+        : null;
+    const noPrFiresToday = noPrScope ? (noPrFiresTodayByScope.get(noPrScope) ?? []) : [];
+    const noPrStop = noPrScope !== null && noPrFiresToday.length >= MAX_NO_PR_FIRES_PER_WO_PER_DAY;
     const fireEligibleResolved =
       fireResult.eligible &&
       !noPrStop &&
@@ -2644,7 +2679,8 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     if (proposal) {
       proposals.push(proposal);
     }
-    if (noPrStop) {
+    if (noPrStop && noPrScope !== null && !noPrStopProposedScopes.has(noPrScope)) {
+      noPrStopProposedScopes.add(noPrScope);
       // One loud message on Taskmaster's escalation route to the desk (t3-desktop), idempotent
       // per work order per UTC day (John's answer B).
       const woId = fireResult.evidence?.woId ?? (item as ListedThread).title ?? item.ref;
@@ -2659,7 +2695,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           `its last ${noPrFiresToday.length} automatic fires today ended with no pull request (${runs}). ` +
           "John's rule (2026-11-23): two no-PR automatic fires of one work order in a UTC day stop that " +
           'work order for the day. Nothing else is limited; it can fire again tomorrow.',
-        idempotencyKey: `tm:${WO_NO_PR_FIRES_STOP_REASON}:${canonRef}:${todayUtc}`,
+        idempotencyKey: `tm:${WO_NO_PR_FIRES_STOP_REASON}:${fireResult.evidence?.woId}:${fireResult.evidence?.project}:${todayUtc}`,
         actsImmediately: true,
         reason: WO_NO_PR_FIRES_STOP_REASON,
       });

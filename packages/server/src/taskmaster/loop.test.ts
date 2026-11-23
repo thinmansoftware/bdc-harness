@@ -1597,7 +1597,7 @@ describe('fire_cauldron loop', () => {
           proposal_json: JSON.stringify({
             type: 'fire_cauldron',
             cascadeId: `old-cascade-${n}`,
-            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01', project: 'bdc-harness' },
           }),
           idempotency_key: `old-fire-${n}`,
           before_hash: null,
@@ -1643,7 +1643,7 @@ describe('fire_cauldron loop', () => {
       expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-02']);
       expect(stops()).toHaveLength(1);
       // Delivered on the tick the stop first trips, ahead of the ordinary unclaimed_p0 page.
-      const stopKey = `tm:wo_no_pr_fires_stop:${a.ref}:${TODAY_KEY}`;
+      const stopKey = `tm:wo_no_pr_fires_stop:WO-HARNESS-EXAMPLE-01:bdc-harness:${TODAY_KEY}`;
       expect(stops()[0]!.outcome).toBe('sent');
       expect(stops()[0]!.idempotency_key).toBe(stopKey);
       const stopDispatches = world.sentMessages.filter(m => m.idempotency_key === stopKey);
@@ -1665,6 +1665,151 @@ describe('fire_cauldron loop', () => {
       world.nowMs += 24 * 60 * 60_000;
       await tick(createTaskmasterState(60_000), deps);
       expect(admitted.filter(id => id === 'WO-HARNESS-EXAMPLE-01')).toHaveLength(1);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  function noPrStopWorld(
+    fires: Array<{ ref: string; cascadeId: string }>,
+    threads: ListedThread[],
+    runEvidence: (cascadeId: string) => { status: string; prOpened?: boolean } | null
+  ): {
+    world: FakeWorld;
+    deps: TaskmasterDeps;
+    admitted: string[];
+    stops: () => TmJournalEntry[];
+  } {
+    const world = makeWorld();
+    seedDigestSent(world);
+    fires.forEach((fire, n) => {
+      world.journal.push({
+        id: `scoped-fire-${n}`,
+        created_at: new Date(T0 - (n + 1) * 60_000).toISOString(),
+        thread_ref: fire.ref,
+        action_type: 'fire_cauldron',
+        proposal_json: JSON.stringify({
+          type: 'fire_cauldron',
+          cascadeId: fire.cascadeId,
+          fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01', project: 'bdc-harness' },
+        }),
+        idempotency_key: `scoped-fire-${n}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+    });
+    const admitted: string[] = [];
+    const deps = makeDeps(world, {
+      listThreads: async () => threads,
+      getFireRunEvidence: async (_woId, cascadeId) => runEvidence(cascadeId),
+      checkFireEligibility: async title => ({
+        eligible: true,
+        evidence: {
+          woId: title.split(' ')[0]!,
+          targetRepo: 'thinmansoftware/bdc-harness',
+          project: 'bdc-harness',
+          specVerifiedAt: new Date(T0).toISOString(),
+          noOpenOrMergedPr: true,
+          expectedSpec: EXPECTED_SPEC,
+        },
+      }),
+      runCascade: (async options => {
+        admitted.push(options.woId);
+        const record = {
+          cascadeId: `new-${options.woId}-${admitted.length}`,
+          status: 'running',
+        } as never;
+        options.onAdmission?.(record, true);
+        return record;
+      }) as NonNullable<TaskmasterDeps['runCascade']>,
+    });
+    const stops = (): TmJournalEntry[] =>
+      world.journal.filter(
+        row =>
+          row.action_type === 'escalate_p0' && row.proposal_json.includes('wo_no_pr_fires_stop')
+      );
+    return { world, deps, admitted, stops };
+  }
+
+  test("John's per-work-order stop counts by work order, not by issue thread: two threads naming one WO share one count and one message", async () => {
+    // Overseer App review of PR 1626 at 67934ae3, finding 1.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const first = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const second = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-xo#9504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 same work order, second issue',
+      });
+      const { world, deps, admitted, stops } = noPrStopWorld(
+        [
+          { ref: first.ref, cascadeId: 'scoped-cascade-1' },
+          { ref: second.ref, cascadeId: 'scoped-cascade-2' },
+        ],
+        [first, second],
+        () => ({ status: 'completed', prOpened: false })
+      );
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted).toEqual([]);
+      expect(stops()).toHaveLength(1);
+      const key = `tm:wo_no_pr_fires_stop:WO-HARNESS-EXAMPLE-01:bdc-harness:${TODAY_KEY}`;
+      expect(world.sentMessages.filter(m => m.idempotency_key === key)).toHaveLength(1);
+      expect(
+        world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:wo_no_pr_fires_stop:'))
+      ).toHaveLength(1);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop counts only fires whose build ended with no pull request", async () => {
+    // Overseer App review of PR 1626 at 67934ae3, finding 2: a 'sent' fire row proves
+    // admission, not a finished no-PR build.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const fires = [
+        { ref: thread.ref, cascadeId: 'cascade-running' },
+        { ref: thread.ref, cascadeId: 'cascade-pr' },
+        { ref: thread.ref, cascadeId: 'cascade-unknown' },
+      ];
+      const evidence: Record<string, { status: string; prOpened?: boolean } | null> = {
+        'cascade-running': { status: 'running', prOpened: false },
+        'cascade-pr': { status: 'completed', prOpened: true },
+        'cascade-unknown': null,
+      };
+      const notFinished = noPrStopWorld(fires, [thread], cascadeId => evidence[cascadeId] ?? null);
+      await tick(createTaskmasterState(60_000), notFinished.deps);
+      // None of the three is a finished no-PR build, so the work order is not stopped.
+      expect(notFinished.stops()).toHaveLength(0);
+
+      // Control: the same three fires, each a finished build with no PR, do stop it.
+      const finished = noPrStopWorld(fires, [thread], () => ({
+        status: 'completed',
+        prOpened: false,
+      }));
+      await tick(createTaskmasterState(60_000), finished.deps);
+      expect(finished.stops()).toHaveLength(1);
+      expect(finished.admitted).toEqual([]);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
@@ -1870,7 +2015,8 @@ describe('fire_cauldron loop', () => {
           },
         })
       );
-      expect(evidenceCalls).toBe(1);
+      // One read for John's per-work-order no-PR count (today's fire rows) and one for grading.
+      expect(evidenceCalls).toBe(2);
       expect(world.journal.find(row => row.id === testCase.id)?.grade).toBe(testCase.grade);
     }
   });
