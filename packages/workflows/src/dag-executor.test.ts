@@ -1354,19 +1354,23 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
         events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan-review')
       ).toBe(false);
       // Idle fired at its 400ms ceiling, before the 2000ms wall.
-      // Measured cause: setTimeout can complete 1 ms before an integer clock
-      // shows the full delay. withIdleTimeout arms the full ceiling; it does
-      // not fire earlier than that raw timer. Probe, bun 1.3.11 on Linux:
-      // setTimeout(400) across 37 trials, earliest performance.now() delta
-      // 399.514 (0.486 ms early); setTimeout(100) across 20 trials, Date.now()
-      // delta 99 once (1 ms early). withIdleTimeout(400) across 23 trials
-      // stayed at or above 400.076 ms. Windows CI job 135525745082 is the
-      // same 1 ms shortfall (Date.now() elapsed 399, test duration 406 ms,
-      // idle-timeout error present), not a 15.6 ms tick. Tolerance is that
-      // measured 1 ms. The 399 ms floor still rejects a fire at 200 ms.
+      // Cause: wall-clock Date.now() under-reads the armed setTimeout.
+      // withIdleTimeout waits on setTimeout(remaining). On a silent first
+      // wait, idleWaitMs is 0, so remaining is the full 400. The source
+      // does not shorten that delay. windows-latest job 135525745082
+      // reported Date.now() elapsed 399 while the bun test duration was
+      // 406, and the error text was still "exceeded idle timeout (400ms)".
+      // Date.now() is not monotonic and has 1 ms resolution. libuv can
+      // deliver that timer one Windows tick (16 ms) ahead of the reading.
+      // A Linux setTimeout sample does not establish the historical Windows
+      // shortfall, so that job is not treated as a measured 1 ms maximum.
+      // Tolerance stays one Windows timer tick, 16 ms. Floor is 384. A
+      // local performance.now() span of this case was 413.882 ms, above
+      // 384, so the source did not fire a tick early here. An early fire
+      // at 200 ms still fails this bound.
       const idleCeilingMs = 400;
-      const measuredTimerEarlyMs = 1;
-      expect(elapsedMs).toBeGreaterThanOrEqual(idleCeilingMs - measuredTimerEarlyMs);
+      const timerTickMs = 16;
+      expect(elapsedMs).toBeGreaterThanOrEqual(idleCeilingMs - timerTickMs);
       expect(elapsedMs).toBeLessThan(2000);
     } finally {
       if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
