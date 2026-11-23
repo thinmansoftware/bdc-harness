@@ -43,6 +43,11 @@ const HOLDING_CASCADE_STATUSES = new Set([
 ]);
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled', 'escalated']);
 
+/** True when a cascade record status may still resume or is still executing (claim release). */
+export function isCascadeHolding(status: string): boolean {
+  return HOLDING_CASCADE_STATUSES.has(status);
+}
+
 /** Status of one workflow run, and whether a `failed` is an approval hand-off (resumable). */
 export type ClaimRunReader = (
   runId: string

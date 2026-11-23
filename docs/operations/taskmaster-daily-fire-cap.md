@@ -29,9 +29,13 @@ automatic fire from 2026-11-14 to 2026-11-17 (bdc-xo#4932).
   - The count is per work order (its WO id and project, from each fire's own evidence), so
     two issue threads naming one work order share one count and one message (key
     `tm:wo_no_pr_fires_stop:<WO id>:<project>:<UTC day>`).
-  - A fire counts only when its build is finished (cascade status completed, failed or
-    cancelled) and opened no pull request. A running build, a build that opened a PR, or a
-    build whose evidence cannot be read is not counted. A failed fire that never started a
+  - A fire counts only when its cascade has ended by the claim-release rule
+    (`cascade/wo-claim.ts`): the cascade record, followed to the end of its resume chain, is
+    not holding (`isCascadeHolding`: running, pending-frontier-approval, frontier-approved,
+    recovery-delegated); every run in the chain is terminal (completed, failed, escalated,
+    cancelled); and no run opened a pull request. So spec-repair has ended and
+    recovery-delegated has not. A fire whose record, runs or evidence cannot be read is not
+    counted. A failed fire that never started a
     build is counted.
 
 Verification:

@@ -93,7 +93,12 @@ import {
 } from './escalation-dedupe';
 import { pageOnce } from '../dispatch/worker-heartbeat-alarm';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
-import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
+import {
+  cascadeWoClaimDeps,
+  isCascadeHolding,
+  reconcileRetainedWoClaims,
+} from '../cascade/wo-claim';
+import { getWorkflowRun } from '@archon/core/db/workflows';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import {
   createDeadmanState,
@@ -291,6 +296,8 @@ export interface TaskmasterDeps {
     | 'updateAutomaticFireExpectation'
   >;
   readFireCascade?: typeof readCascadeRecord;
+  /** Status of one workflow run for John's no-PR stop; null when the run cannot be read. */
+  readFireRunStatus?: (runId: string) => Promise<string | null>;
   /** Test seam: release retained shared WO claims whose runs are all terminal. */
   reconcileWoClaims?: () => Promise<string[]>;
   now?: () => Date;
@@ -2280,6 +2287,54 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // build and is counted as a no-PR fire. A deferred row never fired.
   const todayUtc = new Date(nowMs).toISOString().slice(0, 10);
   const noPrFiresTodayByScope = new Map<string, taskmasterDb.TmJournalEntry[]>();
+  const readFireRunStatus =
+    deps.readFireRunStatus ??
+    (async (runId: string): Promise<string | null> =>
+      (await getWorkflowRun(runId))?.status ?? null);
+  const noPrCascadeEnded = async (
+    firstCascadeId: string
+  ): Promise<true | { reason: string; failOpen: boolean }> => {
+    const runIds: string[] = [];
+    const visited = new Set<string>();
+    let cascadeId: string | null = firstCascadeId;
+    let lastStatus = '';
+    while (cascadeId !== null) {
+      if (visited.has(cascadeId) || visited.size >= 8) {
+        return { reason: 'cascade_chain_invalid', failOpen: true };
+      }
+      visited.add(cascadeId);
+      let record: Awaited<ReturnType<typeof readFire>> = null;
+      try {
+        record = await readFire(cascadeId);
+      } catch {
+        record = null;
+      }
+      if (!record) return { reason: 'cascade_record_unreadable', failOpen: true };
+      lastStatus = record.status;
+      for (const attempt of record.attempts ?? []) {
+        if (typeof attempt?.runId === 'string' && attempt.runId) runIds.push(attempt.runId);
+      }
+      const resume: unknown = record.frontierApproval?.resumeCascadeId;
+      cascadeId = typeof resume === 'string' && resume ? resume : null;
+    }
+    if (isCascadeHolding(lastStatus)) {
+      return { reason: `cascade_not_finished:${lastStatus}`, failOpen: false };
+    }
+    if (runIds.length === 0) return { reason: 'cascade_no_runs', failOpen: true };
+    for (const runId of runIds) {
+      let status: string | null = null;
+      try {
+        status = await readFireRunStatus(runId);
+      } catch {
+        status = null;
+      }
+      if (status === null) return { reason: 'run_status_unreadable', failOpen: true };
+      if (!TERMINAL_FIRE_RUN_STATUSES.has(status)) {
+        return { reason: `run_not_finished:${status}`, failOpen: false };
+      }
+    }
+    return true;
+  };
   // Board desk R6 and R7: every fire row of today that the count skips is logged with its
   // reason. A normal state (a PR opened, a build still running) is logged at debug. A fail-open
   // reason is logged at info once per journal id per UTC day.
@@ -2337,8 +2392,13 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         skipNoPrFire(action, 'pull_request_opened', false);
         continue;
       }
-      if (!TERMINAL_FIRE_RUN_STATUSES.has(run.status)) {
-        skipNoPrFire(action, `cascade_not_finished:${run.status}`, false);
+      // Board desk R8: the cascade has ended only by the claim-release definition
+      // (cascade/wo-claim.ts): the record at the end of its resume chain is not holding, and
+      // every run recorded anywhere in the chain is terminal. The rolled-up evidence status
+      // above says completed when ANY run completed, so it cannot decide this.
+      const ended = await noPrCascadeEnded(cascadeId);
+      if (ended !== true) {
+        skipNoPrFire(action, ended.reason, ended.failOpen);
         continue;
       }
     } else if (action.outcome !== 'failed') {

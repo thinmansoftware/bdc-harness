@@ -599,6 +599,7 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     ...overrides,
     fireBudget: overrides.fireBudget ?? fixtureFireBudget(world),
     readFireCascade: overrides.readFireCascade ?? (async () => null),
+    readFireRunStatus: overrides.readFireRunStatus ?? (async () => 'completed'),
     ...(overrides.runCascade
       ? {
           runCascade: (async options => {
@@ -1612,6 +1613,8 @@ describe('fire_cauldron loop', () => {
       const deps = makeDeps(world, {
         listThreads: async () => [a, b],
         getFireRunEvidence: async () => ({ status: 'completed', prOpened: false }),
+        readFireCascade: (async (cascadeId: string) =>
+          endedCascadeRecord(cascadeId)) as unknown as TaskmasterDeps['readFireCascade'],
         checkFireEligibility: async title => ({
           eligible: true,
           evidence: {
@@ -1671,10 +1674,32 @@ describe('fire_cauldron loop', () => {
     }
   });
 
+  /** A cascade record that has ended: status won, one recorded run, no resume link. */
+  function endedCascadeRecord(
+    cascadeId: string,
+    status = 'won',
+    runIds: string[] = [`run-${cascadeId}`],
+    resumeCascadeId?: string
+  ): unknown {
+    return {
+      cascadeId,
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      project: 'bdc-harness',
+      status,
+      request: { dryRun: false },
+      attempts: runIds.map(runId => ({ workflowName: 'bdc-feature-development-cursor', runId })),
+      ...(resumeCascadeId !== undefined ? { frontierApproval: { resumeCascadeId } } : {}),
+    };
+  }
+
   function noPrStopWorld(
     fires: Array<{ ref: string; cascadeId: string }>,
     threads: ListedThread[],
-    runEvidence: (cascadeId: string) => { status: string; prOpened?: boolean } | null
+    runEvidence: (cascadeId: string) => { status: string; prOpened?: boolean } | null,
+    chain: {
+      records?: Record<string, unknown>;
+      runStatus?: Record<string, string | null>;
+    } = {}
   ): {
     world: FakeWorld;
     deps: TaskmasterDeps;
@@ -1707,6 +1732,12 @@ describe('fire_cauldron loop', () => {
     const deps = makeDeps(world, {
       listThreads: async () => threads,
       getFireRunEvidence: async (_woId, cascadeId) => runEvidence(cascadeId),
+      readFireCascade: (async (cascadeId: string) =>
+        chain.records && cascadeId in chain.records
+          ? chain.records[cascadeId]
+          : endedCascadeRecord(cascadeId)) as unknown as TaskmasterDeps['readFireCascade'],
+      readFireRunStatus: async (runId: string) =>
+        chain.runStatus && runId in chain.runStatus ? chain.runStatus[runId]! : 'completed',
       checkFireEligibility: async title => ({
         eligible: true,
         evidence: {
@@ -1818,6 +1849,118 @@ describe('fire_cauldron loop', () => {
       expect(logged()).toBe(1);
     } finally {
       stream.write = originalWrite;
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop does not count a fire whose resumed cascade still has a running run", async () => {
+    // Board desk R8 (Overseer App review at a846c1ba): evidence says completed when ANY run
+    // completed; the cascade has ended only when every run in its resume chain is terminal.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const world = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'chain-a' },
+          { ref: thread.ref, cascadeId: 'chain-b' },
+        ],
+        [thread],
+        () => ({ status: 'completed', prOpened: false }),
+        {
+          records: {
+            'chain-a': endedCascadeRecord('chain-a', 'frontier-approved', ['run-a1'], 'chain-a2'),
+            'chain-a2': endedCascadeRecord('chain-a2', 'won', ['run-a2']),
+            'chain-b': endedCascadeRecord('chain-b', 'frontier-approved', ['run-b1'], 'chain-b2'),
+            'chain-b2': endedCascadeRecord('chain-b2', 'won', ['run-b2']),
+          },
+          runStatus: {
+            'run-a1': 'completed',
+            'run-a2': 'running',
+            'run-b1': 'completed',
+            'run-b2': 'running',
+          },
+        }
+      );
+      await tick(createTaskmasterState(60_000), world.deps);
+      expect(world.stops()).toHaveLength(0);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop does not count a recovery-delegated cascade", async () => {
+    // Board desk R8: recovery-delegated is in the claim-release holding set, so it has not ended.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const world = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'delegated-1' },
+          { ref: thread.ref, cascadeId: 'delegated-2' },
+        ],
+        [thread],
+        () => ({ status: 'failed', prOpened: false }),
+        {
+          records: {
+            'delegated-1': endedCascadeRecord('delegated-1', 'recovery-delegated', ['run-d1']),
+            'delegated-2': endedCascadeRecord('delegated-2', 'recovery-delegated', ['run-d2']),
+          },
+          runStatus: { 'run-d1': 'failed', 'run-d2': 'failed' },
+        }
+      );
+      await tick(createTaskmasterState(60_000), world.deps);
+      expect(world.stops()).toHaveLength(0);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop counts a spec-repair cascade whose runs are all terminal with no PR", async () => {
+    // Board desk R8: spec-repair is outside the holding set, so with every run terminal and no
+    // PR it has ended. The run-level evidence reads running so the old rolled-up check refuses it.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const world = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'repair-1' },
+          { ref: thread.ref, cascadeId: 'repair-2' },
+        ],
+        [thread],
+        () => ({ status: 'running', prOpened: false }),
+        {
+          records: {
+            'repair-1': endedCascadeRecord('repair-1', 'spec-repair', ['run-r1']),
+            'repair-2': endedCascadeRecord('repair-2', 'spec-repair', ['run-r2']),
+          },
+          runStatus: { 'run-r1': 'failed', 'run-r2': 'escalated' },
+        }
+      );
+      await tick(createTaskmasterState(60_000), world.deps);
+      expect(world.stops()).toHaveLength(1);
+      expect(world.admitted).toEqual([]);
+    } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
