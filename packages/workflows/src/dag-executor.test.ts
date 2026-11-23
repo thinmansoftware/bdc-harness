@@ -1354,15 +1354,19 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
         events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan-review')
       ).toBe(false);
       // Idle fired at its 400ms ceiling, before the 2000ms wall.
-      // The silent first wait arms setTimeout for the full 400 ms ceiling.
-      // Windows CI reported 399 ms using Date.now(), while the test duration
-      // was 406 ms and the expected idle-timeout error was present. The exact
-      // cause of the discrepancy is unconfirmed. Measure with a monotonic
-      // clock and allow at most one Windows timer tick, approximately 16 ms.
-      // The 384 ms floor still rejects an early fire at 200 ms.
+      // Measured cause: setTimeout can complete 1 ms before an integer clock
+      // shows the full delay. withIdleTimeout arms the full ceiling; it does
+      // not fire earlier than that raw timer. Probe, bun 1.3.11 on Linux:
+      // setTimeout(400) across 37 trials, earliest performance.now() delta
+      // 399.514 (0.486 ms early); setTimeout(100) across 20 trials, Date.now()
+      // delta 99 once (1 ms early). withIdleTimeout(400) across 23 trials
+      // stayed at or above 400.076 ms. Windows CI job 135525745082 is the
+      // same 1 ms shortfall (Date.now() elapsed 399, test duration 406 ms,
+      // idle-timeout error present), not a 15.6 ms tick. Tolerance is that
+      // measured 1 ms. The 399 ms floor still rejects a fire at 200 ms.
       const idleCeilingMs = 400;
-      const timerTickMs = 16;
-      expect(elapsedMs).toBeGreaterThanOrEqual(idleCeilingMs - timerTickMs);
+      const measuredTimerEarlyMs = 1;
+      expect(elapsedMs).toBeGreaterThanOrEqual(idleCeilingMs - measuredTimerEarlyMs);
       expect(elapsedMs).toBeLessThan(2000);
     } finally {
       if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
