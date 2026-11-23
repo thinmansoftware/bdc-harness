@@ -343,3 +343,71 @@ test('additive SQLite bootstrap preserves an existing journal and installs only 
   expect(columns.rows.map(row => row.name)).toContain('owner_token');
   expect(columns.rows.map(row => row.name)).toContain('run_ids_json');
 });
+
+// WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01: the cap-free contract. The request carries no
+// daily limit, and earlier unknown or reserved rows, or unmatched journal history, never
+// refuse a distinct action. Pause/epoch and single use stay.
+async function capFree(key: string, at = now): Promise<tm.AutomaticFireRequest> {
+  const { limit: _ignored, ...rest } = (await request(key, at)) as tm.AutomaticFireRequest & {
+    limit?: number;
+  };
+  return rest as tm.AutomaticFireRequest;
+}
+test('earlier unknown, reserved and unmatched history never refuse a distinct automatic fire', async () => {
+  const earlier = ['2026-10-16T09:00:00.000Z', '2026-10-17T09:00:00.000Z'];
+  let n = 0;
+  for (const at of earlier) {
+    for (const state of ['unknown', 'unknown']) {
+      n += 1;
+      await db.query(
+        `INSERT INTO tm_fire_admissions(action_key,journal_id,source_thread_ref,owner_token,
+         cascade_id,utc_day,state,reserved_at,admitted_at,updated_at)
+         VALUES ($1,$1,$2,'legacy-reconciliation',$1,$3,$4,$5,$5,$5)`,
+        [`old-${n}`, `test:old-${n}`, at.slice(0, 10), state, at]
+      );
+    }
+  }
+  await db.query(
+    `INSERT INTO tm_fire_admissions(action_key,journal_id,source_thread_ref,owner_token,
+     cascade_id,utc_day,state,reserved_at,updated_at)
+     VALUES ('held','held','test:held','owner:held','held',$1,'reserved',$2,$2)`,
+    [now.slice(0, 10), now]
+  );
+  await db.query(
+    `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
+     VALUES ('legacy-sent','test:legacy','fire_cauldron','not json','legacy-sent','sent',$1)`,
+    [now]
+  );
+  for (const key of ['x1', 'x2', 'x3']) {
+    const input = await capFree(key);
+    expect((await tm.reserveAutomaticFire(input, db)).allowed).toBe(true);
+    const decision = await tm.authorizeAutomaticFire(input, db);
+    expect(decision.allowed).toBe(true);
+    expect(decision.admission?.utcDay).toBe(now.slice(0, 10));
+  }
+  // The old rows keep their custody; they are never rewritten or deleted.
+  const rows = await tm.listAutomaticFireAdmissions(db);
+  expect(rows.filter(r => r.action_key.startsWith('old-')).every(r => r.state === 'unknown')).toBe(
+    true
+  );
+  expect(rows.find(r => r.action_key === 'held')?.state).toBe('reserved');
+});
+test('a committed unknown admission is never refunded or replayed', async () => {
+  const input = await capFree('committed');
+  expect((await tm.reserveAutomaticFire(input, db)).allowed).toBe(true);
+  expect((await tm.authorizeAutomaticFire(input, db)).allowed).toBe(true);
+  const before = (await tm.listAutomaticFireAdmissions(db)).find(
+    r => r.action_key === 'committed'
+  )!;
+  expect(before.state).toBe('unknown');
+  expect(await tm.releaseAutomaticFire(input, db)).toBe(false);
+  expect((await tm.reserveAutomaticFire(input, other)).allowed).toBe(false);
+  const after = (await tm.listAutomaticFireAdmissions(db)).find(r => r.action_key === 'committed')!;
+  expect(after.state).toBe(before.state);
+  expect(after.admitted_at).toBe(before.admitted_at);
+});
+test('pause still refuses a cap-free automatic fire', async () => {
+  const input = await capFree('paused');
+  await db.query("UPDATE tm_control SET pause_state='PAUSED' WHERE id=1");
+  expect((await tm.reserveAutomaticFire(input, db)).allowed).toBe(false);
+});

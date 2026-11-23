@@ -1353,7 +1353,7 @@ describe('fire_cauldron loop', () => {
     }
   });
 
-  test('daily cap dispatches P0 and P1 first and preserves overflow across ticks and restart', async () => {
+  test('per-tick ceiling dispatches in priority order and drains overflow on the next tick, with no daily cap', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1402,22 +1402,33 @@ describe('fire_cauldron loop', () => {
       });
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
-      expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-510', 'WO-HARNESS-EXAMPLE-511']);
-      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(3);
+      // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01: 3 per tick, in priority order.
+      expect(admitted).toEqual([
+        'WO-HARNESS-EXAMPLE-510',
+        'WO-HARNESS-EXAMPLE-511',
+        'WO-HARNESS-EXAMPLE-512',
+      ]);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(2);
 
       world.nowMs += 60_000;
       await tick(state, deps);
-      expect(admitted).toHaveLength(2);
+      // The overflow drains on the next tick; no daily budget holds it.
+      expect(admitted).toHaveLength(5);
+      expect(admitted.slice(3).sort()).toEqual([
+        'WO-HARNESS-EXAMPLE-513',
+        'WO-HARNESS-EXAMPLE-514',
+      ]);
       world.nowMs += 60_000;
       await tick(createTaskmasterState(60_000), deps);
-      expect(admitted).toHaveLength(2);
+      expect(admitted).toHaveLength(5);
+      expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
   });
 
-  test('prior same-day unresolved automatic fires close the daily faucet', async () => {
+  test('prior same-day unresolved automatic fires of other work no longer stop a new fire', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1429,16 +1440,18 @@ describe('fire_cauldron loop', () => {
         isUnclaimedP0: true,
         title: 'WO-HARNESS-EXAMPLE-01 urgent build',
       });
+      // The two earlier fires belong to a different work order. The same-work-order
+      // case is John's per-work-order stop (Test 7), not this test.
       for (const n of [1, 2]) {
         world.journal.push({
           id: `same-day-fire-${n}`,
           created_at: new Date(T0 - n * 60_000).toISOString(),
-          thread_ref: item.ref,
+          thread_ref: 'gh:thinmansoftware/bdc-harness#503',
           action_type: 'fire_cauldron',
           proposal_json: JSON.stringify({
             type: 'fire_cauldron',
             cascadeId: `old-cascade-${n}`,
-            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-00' },
           }),
           idempotency_key: `old-fire-${n}`,
           before_hash: null,
@@ -1474,8 +1487,102 @@ describe('fire_cauldron loop', () => {
           }) as NonNullable<TaskmasterDeps['runCascade']>,
         })
       );
-      expect(admissions).toBe(0);
+      expect(admissions).toBe(1);
       expect(world.journal.filter(row => row.action_type === 'fire_cauldron')).toHaveLength(3);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop: two no-PR fires of one work order in a UTC day stop it for the day, with one message", async () => {
+    // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 Test 7 (John's answer B).
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const a = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const b = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#505',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-02 urgent build',
+      });
+      for (const n of [1, 2]) {
+        world.journal.push({
+          id: `same-day-fire-${n}`,
+          created_at: new Date(T0 - n * 60_000).toISOString(),
+          thread_ref: a.ref,
+          action_type: 'fire_cauldron',
+          proposal_json: JSON.stringify({
+            type: 'fire_cauldron',
+            cascadeId: `old-cascade-${n}`,
+            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+          }),
+          idempotency_key: `old-fire-${n}`,
+          before_hash: null,
+          proof_predicate: null,
+          proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+          outcome: 'sent',
+          graded_at: null,
+          grade: null,
+        });
+      }
+      const admitted: string[] = [];
+      const deps = makeDeps(world, {
+        listThreads: async () => [a, b],
+        getFireRunEvidence: async () => ({ status: 'completed', prOpened: false }),
+        checkFireEligibility: async title => ({
+          eligible: true,
+          evidence: {
+            woId: title.split(' ')[0]!,
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(T0).toISOString(),
+            noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
+          },
+        }),
+        runCascade: (async options => {
+          admitted.push(options.woId);
+          const record = {
+            cascadeId: `new-${options.woId}-${admitted.length}`,
+            status: 'running',
+          } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const stops = (): TmJournalEntry[] =>
+        world.journal.filter(
+          row =>
+            row.action_type === 'escalate_p0' && row.proposal_json.includes('wo_no_pr_fires_stop')
+        );
+
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-02']);
+      expect(stops()).toHaveLength(1);
+      const body = (JSON.parse(stops()[0]!.proposal_json) as { body: string }).body;
+      expect(body).toContain('WO-HARNESS-EXAMPLE-01');
+      expect(body).toContain('old-cascade-1');
+      expect(body).toContain('old-cascade-2');
+
+      // Later the same day: still stopped, and no second message.
+      world.nowMs += 60 * 60_000;
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted.filter(id => id === 'WO-HARNESS-EXAMPLE-01')).toHaveLength(0);
+      expect(stops()).toHaveLength(1);
+
+      // The next UTC day: the work order can fire again.
+      world.nowMs += 24 * 60 * 60_000;
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted.filter(id => id === 'WO-HARNESS-EXAMPLE-01')).toHaveLength(1);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
@@ -2213,13 +2320,17 @@ describe('pending fire custody', () => {
   });
 
   test.each([
-    [2, 2],
-    [5, 3],
+    [undefined, 3],
+    ['0', 3],
+    ['NaN', 3],
+    ['2', 3],
+    ['5', 3],
   ])(
-    'unconfirmed admissions obey daily limit %i and per-tick ceiling (%i)',
+    'the retired daily setting (%s) has no effect; the per-tick ceiling gives %i fires',
     async (limit, expected) => {
       const previous = process.env.TASKMASTER_FIRE_MAX_PER_DAY;
-      process.env.TASKMASTER_FIRE_MAX_PER_DAY = String(limit);
+      if (limit === undefined) delete process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+      else process.env.TASKMASTER_FIRE_MAX_PER_DAY = limit;
       try {
         const world = makeWorld();
         seedDigestSent(world);
@@ -2252,6 +2363,56 @@ describe('pending fire custody', () => {
       }
     }
   );
+
+  test('a failed fire-history reconciliation no longer blocks new automatic fires', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      listThreads: async () => [
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#801',
+          priority: 'P0',
+          isUnclaimedP0: true,
+          title: 'WO-HARNESS-CUSTODY-01',
+        }),
+      ],
+      readFireCascadeEvidence: async () => {
+        throw new Error('not ready');
+      },
+    });
+    const budget = fixture.deps.fireBudget!;
+    fixture.deps.fireBudget = {
+      ...budget,
+      listAutomaticFireAdmissions: async () => {
+        throw new Error('history unavailable');
+      },
+    };
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(1);
+    expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
+  });
+
+  test('a missing reservation store still refuses, under the fire_store_unavailable reason', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      listThreads: async () => [
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#802',
+          priority: 'P0',
+          isUnclaimedP0: true,
+          title: 'WO-HARNESS-CUSTODY-02',
+        }),
+      ],
+    });
+    fixture.deps.fireBudget = undefined;
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+    const deferred = world.journal.filter(row => row.outcome === 'deferred');
+    expect(deferred.length).toBeGreaterThan(0);
+    expect(deferred.every(row => row.proposal_json.includes('fire_store_unavailable'))).toBe(true);
+    expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
+  });
 
   function seedPending(world: FakeWorld, ageDays = 8): TmJournalEntry {
     const key = 'tm:fire:old-custody';
