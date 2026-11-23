@@ -95,10 +95,11 @@ import { pageOnce } from '../dispatch/worker-heartbeat-alarm';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
 import {
   cascadeWoClaimDeps,
+  defaultRunReader,
   isCascadeHolding,
   reconcileRetainedWoClaims,
+  type ClaimRunReader,
 } from '../cascade/wo-claim';
-import { getWorkflowRun } from '@archon/core/db/workflows';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import {
   createDeadmanState,
@@ -296,8 +297,8 @@ export interface TaskmasterDeps {
     | 'updateAutomaticFireExpectation'
   >;
   readFireCascade?: typeof readCascadeRecord;
-  /** Status of one workflow run for John's no-PR stop; null when the run cannot be read. */
-  readFireRunStatus?: (runId: string) => Promise<string | null>;
+  /** One workflow run for John's no-PR stop (wo-claim's run reader); null when unreadable. */
+  readFireRun?: ClaimRunReader;
   /** Test seam: release retained shared WO claims whose runs are all terminal. */
   reconcileWoClaims?: () => Promise<string[]>;
   now?: () => Date;
@@ -2287,10 +2288,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // build and is counted as a no-PR fire. A deferred row never fired.
   const todayUtc = new Date(nowMs).toISOString().slice(0, 10);
   const noPrFiresTodayByScope = new Map<string, taskmasterDb.TmJournalEntry[]>();
-  const readFireRunStatus =
-    deps.readFireRunStatus ??
-    (async (runId: string): Promise<string | null> =>
-      (await getWorkflowRun(runId))?.status ?? null);
+  const readFireRun = deps.readFireRun ?? defaultRunReader;
   const noPrCascadeEnded = async (
     firstCascadeId: string
   ): Promise<true | { reason: string; failOpen: boolean }> => {
@@ -2299,7 +2297,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     let cascadeId: string | null = firstCascadeId;
     let lastStatus = '';
     while (cascadeId !== null) {
-      if (visited.has(cascadeId) || visited.size >= 8) {
+      if (visited.has(cascadeId)) {
         return { reason: 'cascade_chain_invalid', failOpen: true };
       }
       visited.add(cascadeId);
@@ -2322,15 +2320,18 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
     if (runIds.length === 0) return { reason: 'cascade_no_runs', failOpen: true };
     for (const runId of runIds) {
-      let status: string | null = null;
+      let run: Awaited<ReturnType<ClaimRunReader>> = null;
       try {
-        status = await readFireRunStatus(runId);
+        run = await readFireRun(runId);
       } catch {
-        status = null;
+        run = null;
       }
-      if (status === null) return { reason: 'run_status_unreadable', failOpen: true };
-      if (!TERMINAL_FIRE_RUN_STATUSES.has(status)) {
-        return { reason: `run_not_finished:${status}`, failOpen: false };
+      if (run === null) return { reason: 'run_status_unreadable', failOpen: true };
+      // Board desk R9: a failed run that is an approval hand-off can still resume (wo-claim).
+      if (run.approvalHandOff)
+        return { reason: 'run_not_finished:approval_handoff', failOpen: false };
+      if (!TERMINAL_FIRE_RUN_STATUSES.has(run.status)) {
+        return { reason: `run_not_finished:${run.status}`, failOpen: false };
       }
     }
     return true;

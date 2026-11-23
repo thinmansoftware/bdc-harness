@@ -60,7 +60,7 @@ export type ClaimRunReader = (
  * resumed after approval and then failed is terminal, not a hand-off forever.
  * Release and reconcile both use this reader.
  */
-const defaultRunReader: ClaimRunReader = async runId => {
+export const defaultRunReader: ClaimRunReader = async runId => {
   const run = await workflowsDb.getWorkflowRun(runId);
   if (!run) return null;
   if (run.status !== 'failed') return { status: run.status, approvalHandOff: false };

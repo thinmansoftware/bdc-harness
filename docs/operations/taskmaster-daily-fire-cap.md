@@ -33,7 +33,7 @@ automatic fire from 2026-11-14 to 2026-11-17 (bdc-xo#4932).
     (`cascade/wo-claim.ts`): the cascade record, followed to the end of its resume chain, is
     not holding (`isCascadeHolding`: running, pending-frontier-approval, frontier-approved,
     recovery-delegated); every run in the chain is terminal (completed, failed, escalated,
-    cancelled); and no run opened a pull request. So spec-repair has ended and
+    cancelled) and is not an approval hand-off (wo-claim's run reader); and no run opened a pull request. So spec-repair has ended and
     recovery-delegated has not. A fire whose record, runs or evidence cannot be read is not
     counted. A failed fire that never started a
     build is counted.

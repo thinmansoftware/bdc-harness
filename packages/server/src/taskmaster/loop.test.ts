@@ -599,7 +599,8 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     ...overrides,
     fireBudget: overrides.fireBudget ?? fixtureFireBudget(world),
     readFireCascade: overrides.readFireCascade ?? (async () => null),
-    readFireRunStatus: overrides.readFireRunStatus ?? (async () => 'completed'),
+    readFireRun:
+      overrides.readFireRun ?? (async () => ({ status: 'completed', approvalHandOff: false })),
     ...(overrides.runCascade
       ? {
           runCascade: (async options => {
@@ -1698,7 +1699,7 @@ describe('fire_cauldron loop', () => {
     runEvidence: (cascadeId: string) => { status: string; prOpened?: boolean } | null,
     chain: {
       records?: Record<string, unknown>;
-      runStatus?: Record<string, string | null>;
+      runStatus?: Record<string, string | { status: string; approvalHandOff: boolean } | null>;
     } = {}
   ): {
     world: FakeWorld;
@@ -1736,8 +1737,12 @@ describe('fire_cauldron loop', () => {
         chain.records && cascadeId in chain.records
           ? chain.records[cascadeId]
           : endedCascadeRecord(cascadeId)) as unknown as TaskmasterDeps['readFireCascade'],
-      readFireRunStatus: async (runId: string) =>
-        chain.runStatus && runId in chain.runStatus ? chain.runStatus[runId]! : 'completed',
+      readFireRun: async (runId: string) => {
+        const entry =
+          chain.runStatus && runId in chain.runStatus ? chain.runStatus[runId] : 'completed';
+        if (entry === null || entry === undefined) return null;
+        return typeof entry === 'string' ? { status: entry, approvalHandOff: false } : entry;
+      },
       checkFireEligibility: async title => ({
         eligible: true,
         evidence: {
@@ -1885,6 +1890,44 @@ describe('fire_cauldron loop', () => {
             'run-a2': 'running',
             'run-b1': 'completed',
             'run-b2': 'running',
+          },
+        }
+      );
+      await tick(createTaskmasterState(60_000), world.deps);
+      expect(world.stops()).toHaveLength(0);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop does not count a failed run that is an approval hand-off", async () => {
+    // Board desk R9 on PR 1626 at ea31afc2: wo-claim's run reader treats a failed run whose
+    // approvalHandOff is true as resumable, so the cascade has not ended.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const world = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'handoff-1' },
+          { ref: thread.ref, cascadeId: 'handoff-2' },
+        ],
+        [thread],
+        () => ({ status: 'failed', prOpened: false }),
+        {
+          records: {
+            'handoff-1': endedCascadeRecord('handoff-1', 'spec-repair', ['run-h1']),
+            'handoff-2': endedCascadeRecord('handoff-2', 'spec-repair', ['run-h2']),
+          },
+          runStatus: {
+            'run-h1': { status: 'failed', approvalHandOff: true },
+            'run-h2': { status: 'failed', approvalHandOff: true },
           },
         }
       );
