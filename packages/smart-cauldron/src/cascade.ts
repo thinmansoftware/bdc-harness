@@ -30,6 +30,7 @@ import { loadRuleset, pickEntryTier } from './conductor.js';
 import { resolveWoSignals } from './wo-signals.js';
 import {
   admitClaudeTier,
+  CLAUDE_SEAT_CUTOFF_FALLBACK_PERCENT,
   chooseHeadroomEntry,
   formatRungSeatSkip,
   resolveEntryThreshold,
@@ -800,6 +801,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       seatCutoffPercent = null;
     }
   }
+  // The Claude seat uses the live operator cutoff, or 95 when it cannot be read
+  // (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01); the entry threshold above stays for the other seats.
+  const claudeCutoffPercent = (): number =>
+    seatCutoffPercent ?? CLAUDE_SEAT_CUTOFF_FALLBACK_PERCENT;
   let entrySelection: EntrySelection = chooseHeadroomEntry({
     picked: entryTierName,
     tiers,
@@ -812,7 +817,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   entryTierName = entrySelection.entry;
 
   if (entryTierName === 'claude') {
-    const admission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+    const admission = admitClaudeTier({
+      usage: seatUsage,
+      thresholdPercent: claudeCutoffPercent(),
+    });
     if (!admission.admitted && entryOverride === 'claude') {
       throw new Error(
         `[smart-cauldron/cascade] Refused Claude entry tier "claude": ${admission.reason}. ` +
@@ -866,7 +874,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         continue;
       }
       if (skipped.length > 0 && tier.name === 'claude') {
-        const claudeAdmission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+        const claudeAdmission = admitClaudeTier({
+          usage: seatUsage,
+          thresholdPercent: claudeCutoffPercent(),
+        });
         if (!claudeAdmission.admitted) {
           console.log(
             `[smart-cauldron] Skipping tier "claude" during entry: ${claudeAdmission.reason}`
@@ -1162,7 +1173,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           continue;
         }
         if (candidate.name === 'claude') {
-          const admission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+          const admission = admitClaudeTier({
+            usage: seatUsage,
+            thresholdPercent: claudeCutoffPercent(),
+          });
           console.log(
             `[smart-cauldron] Claude tier decision during ${context}: ${admission.reason}`
           );

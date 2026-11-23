@@ -85,12 +85,34 @@ describe('entry headroom', () => {
         thresholdPercent: 80,
       })
     ).toEqual({ admitted: false, reason: 'claude_seat_over_threshold:80:80' });
+    // WO-HARNESS-CLAUDE-LANE-REOPEN-95-01: an UNKNOWN reading is let through.
     expect(
       admitClaudeTier({
         usage: { claude: { limit_source: 'UNKNOWN', windows: [] } },
         thresholdPercent: 80,
       })
-    ).toEqual({ admitted: false, reason: 'claude_seat_unknown' });
+    ).toEqual({ admitted: true, reason: 'claude_seat_unknown_admitted' });
+  });
+
+  test('claude-unknown-or-missing-seat-is-admitted (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01 Test 2)', () => {
+    for (const usage of [{ claude: { limit_source: 'UNKNOWN' as const, windows: [] } }, {}, null]) {
+      expect(admitClaudeTier({ usage, thresholdPercent: 95 })).toEqual({
+        admitted: true,
+        reason: 'claude_seat_unknown_admitted',
+      });
+    }
+  });
+
+  test('claude-cutoff-95-admits-below-refuses-at-or-over (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01 Test 3)', () => {
+    const at = (used: number) =>
+      admitClaudeTier({
+        usage: { claude: measured([{ name: 'seven_day', used_percent: used }]) },
+        thresholdPercent: 95,
+      });
+    expect(at(80)).toEqual({ admitted: true, reason: 'claude_seat_ok:80:95' });
+    expect(at(94)).toEqual({ admitted: true, reason: 'claude_seat_ok:94:95' });
+    expect(at(95)).toEqual({ admitted: false, reason: 'claude_seat_over_threshold:95:95' });
+    expect(at(99)).toEqual({ admitted: false, reason: 'claude_seat_over_threshold:99:95' });
   });
 
   test('over-threshold-entry-moves-up', () => {
@@ -570,9 +592,11 @@ describe('entry headroom: codex credits and unmetered cursor', () => {
     expect(asPick.changed).toBe(false);
     expect(asPick.reason).toBe('seat_unknown:claude');
 
+    // An UNKNOWN claude seat is not headroom for entry selection, but the Claude tier
+    // admission lets it through (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01).
     expect(admitClaudeTier({ usage: { claude: claudeUnknown }, thresholdPercent: 80 })).toEqual({
-      admitted: false,
-      reason: 'claude_seat_unknown',
+      admitted: true,
+      reason: 'claude_seat_unknown_admitted',
     });
 
     // An UNKNOWN codex seat is not unmetered either.

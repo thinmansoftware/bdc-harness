@@ -118,21 +118,30 @@ export function formatRungSeatSkip(skip: RungSeatSkip): string {
   return `seat_over_cutoff:${skip.seat}:${String(skip.usedPercent)}:${String(skip.cutoffPercent)}`;
 }
 
-export type ClaudeTierAdmission =
-  | { admitted: true; reason: `claude_seat_ok:${number}:${number}` }
-  | {
-      admitted: false;
-      reason: `claude_seat_over_threshold:${number}:${number}` | 'claude_seat_unknown';
-    };
+/**
+ * Claude seat cutoff when the live operator cutoff (cutoff.percent of GET /api/fuelglass/seats)
+ * cannot be read. John 2026-11-23: "question 1 yes use 95%" (WO-HARNESS-CLAUDE-LANE-REOPEN-95-01).
+ */
+export const CLAUDE_SEAT_CUTOFF_FALLBACK_PERCENT = 95;
 
-/** Decide whether the Claude ladder tier may use the Claude subscription seat. */
+export type ClaudeTierAdmission =
+  | {
+      admitted: true;
+      reason: `claude_seat_ok:${number}:${number}` | 'claude_seat_unknown_admitted';
+    }
+  | { admitted: false; reason: `claude_seat_over_threshold:${number}:${number}` };
+
+/**
+ * Decide whether the Claude ladder tier may use the Claude subscription seat. An UNKNOWN reading
+ * is let through (John 2026-11-23); only a measured reading at or over the cutoff refuses.
+ */
 export function admitClaudeTier(input: {
   usage: SeatUsageSnapshot | null;
   thresholdPercent: number;
 }): ClaudeTierAdmission {
   const seat = seatForTier('claude');
   const used = seat === null || input.usage === null ? null : bindingUsedPercent(input.usage[seat]);
-  if (used === null) return { admitted: false, reason: 'claude_seat_unknown' };
+  if (used === null) return { admitted: true, reason: 'claude_seat_unknown_admitted' };
   if (used >= input.thresholdPercent) {
     return {
       admitted: false,
