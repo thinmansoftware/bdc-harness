@@ -27,11 +27,21 @@ export interface WoClaim {
   readonly repo: string;
 }
 
-export interface FindWoClaimOptions {
+/**
+ * Extra claim signals a caller may know (WO-HARNESS-SATISFIED-GUARD-CLAIM-SIGNALS-ONLY-01).
+ * woIssueNumber: the WO's own bdc-xo issue, for signal (b). headBranches: head
+ * branches recorded for earlier runs of this WO, for signal (c).
+ */
+export interface ClaimSignals {
+  readonly woIssueNumber?: number;
+  readonly headBranches?: readonly string[];
+}
+
+export interface FindWoClaimOptions extends ClaimSignals {
   readonly woId: string;
   readonly project: string;
   /** Override gh lookup (tests). */
-  readonly lookup?: (repo: string, woId: string) => Promise<WoClaim[]>;
+  readonly lookup?: (repo: string, woId: string, signals?: ClaimSignals) => Promise<WoClaim[]>;
   readonly execFn?: typeof execFileAsync;
 }
 
@@ -118,7 +128,8 @@ interface GhPrRow {
 export async function ghPrSearchDefault(
   repo: string,
   woId: string,
-  execFn: typeof execFileAsync = execFileAsync
+  execFn: typeof execFileAsync = execFileAsync,
+  signals: ClaimSignals = {}
 ): Promise<WoClaim[]> {
   if (process.env.SMART_CAULDRON_HERMETIC === '1') {
     console.log('[smart-cauldron/already-satisfied] skipping GitHub search in hermetic mode');
@@ -155,13 +166,8 @@ export async function ghPrSearchDefault(
       const body = row.body ?? '';
       const head = row.headRefName ?? '';
       const url = row.url ?? '';
-      if (
-        !textClaimsWoId(title, woId) &&
-        !textClaimsWoId(body, woId) &&
-        !textClaimsWoId(head, woId)
-      ) {
-        continue;
-      }
+      // A title or prose mention, or a Reconcile-Skip entry, is not a claim (bdc-harness#1436).
+      if (!prClaimsWo({ headRefName: head, body }, woId, signals)) continue;
       out.push({
         number,
         state: stateRaw as WoClaimState,
@@ -207,11 +213,15 @@ async function isSpecOnlyClaim(
  */
 export async function findWoClaim(opts: FindWoClaimOptions): Promise<WoClaim | null> {
   const repo = resolveGithubRepo(opts.project);
+  const signals: ClaimSignals = {
+    woIssueNumber: opts.woIssueNumber,
+    headBranches: opts.headBranches,
+  };
   const lookup =
     opts.lookup ??
-    ((target: string, woId: string): Promise<WoClaim[]> =>
-      ghPrSearchDefault(target, woId, opts.execFn));
-  const claims = await lookup(repo, opts.woId);
+    ((target: string, woId: string, s?: ClaimSignals): Promise<WoClaim[]> =>
+      ghPrSearchDefault(target, woId, opts.execFn, s));
+  const claims = await lookup(repo, opts.woId, signals);
   const remaining: WoClaim[] = [];
   for (const claim of claims) {
     if (!(await isSpecOnlyClaim(repo, claim.number, opts.woId, opts.execFn))) remaining.push(claim);
@@ -285,6 +295,62 @@ function bodyLineClaimsWo(body: string, woId: string): boolean {
   return false;
 }
 
+/**
+ * Closing keyword, optional colon, whitespace, then the bdc-xo issue as
+ * owner/repo#N or its full URL. A bare #N names the target repo's own issue,
+ * so it never counts. The issue number is captured whole (digit boundary).
+ */
+const BDC_XO_CLOSING_RE =
+  /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+(?:thinmansoftware\/bdc-xo#|https:\/\/github\.com\/thinmansoftware\/bdc-xo\/issues\/)(\d+)(?!\d)/gi;
+
+function bodyClosesWoIssue(body: string, woIssueNumber: number | undefined): boolean {
+  if (typeof woIssueNumber !== 'number' || !Number.isInteger(woIssueNumber) || woIssueNumber < 1) {
+    return false;
+  }
+  for (const match of body.matchAll(BDC_XO_CLOSING_RE)) {
+    if (Number(match[1]) === woIssueNumber) return true;
+  }
+  return false;
+}
+
+/**
+ * The hand-build branch shape: `wo/<stem>` exactly, or `wo/<stem>-thread-...`,
+ * where <stem> is the lowercased id without its leading `wo-`
+ * (bdc-harness #1604 and #1597).
+ */
+function isHandBuildBranch(headRefName: string, woId: string): boolean {
+  const id = woId.toLowerCase();
+  const stem = id.startsWith('wo-') ? id.slice(3) : id;
+  if (!stem) return false;
+  const head = headRefName.toLowerCase();
+  const base = `wo/${stem}`;
+  return head === base || head.startsWith(`${base}-thread-`);
+}
+
+/**
+ * True when a pull request claims the WO (WO-HARNESS-SATISFIED-GUARD-CLAIM-SIGNALS-ONLY-01):
+ * (a) a manifest `WO:` line token-matching the id;
+ * (b) a closing keyword for the WO's own bdc-xo issue (only with signals.woIssueNumber);
+ * (c) the lane branch (matchesWoToken), the hand-build branch `wo/<stem>`, or a
+ *     recorded run head branch (signals.headBranches).
+ * An id in the title, in prose, on a Reconcile-Skip line, or as a longer
+ * sibling id is not a claim. A Reconcile-Skip line never cancels (a) to (c).
+ * Shared by findWoClaim and listOpenWoPullRequests so the two readers cannot drift.
+ */
+export function prClaimsWo(
+  pr: { readonly headRefName: string; readonly body: string },
+  woId: string,
+  signals: ClaimSignals = {}
+): boolean {
+  if (!woId) return false;
+  const head = pr.headRefName;
+  if (head) {
+    if (matchesWoToken(head, woId) || isHandBuildBranch(head, woId)) return true;
+    if (signals.headBranches?.includes(head)) return true;
+  }
+  return bodyLineClaimsWo(pr.body, woId) || bodyClosesWoIssue(pr.body, signals.woIssueNumber);
+}
+
 function toOpenWoPullRequest(
   row: GhOpenPullRow,
   targetRepo: string,
@@ -300,8 +366,7 @@ function toOpenWoPullRequest(
   if (typeof number !== 'number' || !Number.isInteger(number) || number < 1) return null;
   const headRefName = typeof row.head?.ref === 'string' ? row.head.ref : '';
   const body = typeof row.body === 'string' ? row.body : '';
-  const branchClaims = matchesWoToken(headRefName, woId) || headBranches.has(headRefName);
-  if (!branchClaims && !bodyLineClaimsWo(body, woId)) return null;
+  if (!prClaimsWo({ headRefName, body }, woId, { headBranches: [...headBranches] })) return null;
   if (includeDrafts && typeof row.draft !== 'boolean') {
     throw new Error(`open_pr_draft_state_unknown:#${String(number)}`);
   }

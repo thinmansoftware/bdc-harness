@@ -55,6 +55,12 @@ harness/policies/
 # stay exactly as GitHub returned them, CRLF included.
 packages/overseer/src/__tests__/fixtures/reconcile/
 
+# Real PR bodies captured verbatim with `gh pr view --json body` as
+# already-satisfied guard fixtures (WO-HARNESS-SATISFIED-GUARD-CLAIM-SIGNALS-ONLY-01,
+# bdc-harness#1436). Bytes must stay exactly as GitHub returned them.
+packages/smart-cauldron/src/__tests__/fixtures/satisfied-pr254-reconcile-skip.md
+packages/smart-cauldron/src/__tests__/fixtures/satisfied-pr77-prose-mention.md
+
 # Pinned Docker/Moby 29.3.0 default seccomp bytes (WO-HARNESS-CONTAINER-SECCOMP-USERNS-01).
 # SHA256 01536f1d1df938ae611eba20d6349e0de7a99b6ecdee1549427a0b01b8301e28. Prettier must not reflow.
 docker/seccomp-upstream-29.3.0.json
