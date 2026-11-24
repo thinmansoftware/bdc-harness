@@ -33,12 +33,17 @@ import { closeDatabase, getDatabase } from '../../packages/core/src/db/connectio
 const OPEN = `status = 'queued' AND acknowledged_at IS NULL AND addressed_at IS NULL
   AND route_disposition IS NULL`;
 
-const SELECT_SQL = `SELECT id, recipient, sender, status, completed_at, route_disposition, result_body, created_at
+// SQL only narrows the candidates; a (b) row is kept only when its body parses as JSON whose
+// TOP-LEVEL kind is exactly 'workroom_drainer_stall' (Overseer App review at d99a8e0b: a LIKE
+// pattern also matches nested kind fields, and '_' is a SQL wildcard).
+const STALL_KIND = 'workroom_drainer_stall';
+
+const SELECT_SQL = `SELECT id, recipient, sender, status, completed_at, route_disposition, result_body, created_at, body
   FROM agent_dispatch_messages
   WHERE ${OPEN}
     AND (
       (recipient = 'workroom-drainer' AND sender = 'order-events')
-      OR (recipient = 'xo' AND sender = 'dispatch' AND body LIKE '%"kind":"workroom_drainer_stall"%')
+      OR (recipient = 'xo' AND sender = 'dispatch')
     )
   ORDER BY created_at, id`;
 
@@ -65,6 +70,22 @@ export interface RetireResult {
   selected: RetireRow[];
   excluded: string[];
   changed: number;
+}
+
+/** True only when the body is JSON whose top-level kind is exactly the stall alarm's. */
+export function isStallAlarm(body: string | null): boolean {
+  if (typeof body !== 'string') return false;
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    return (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      (parsed as { kind?: unknown }).kind === STALL_KIND
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function journalKeyFor(now: Date): string {
@@ -96,7 +117,9 @@ export async function runRetireWorkroomDrainerRoute(options: {
     return { mode: 'already-done', journalKey, selected: [], excluded: [], changed: 0 };
   }
 
-  const all = (await db.query<RetireRow>(SELECT_SQL)).rows;
+  const all = (await db.query<RetireRow & { body: string | null }>(SELECT_SQL)).rows
+    .filter(row => row.recipient === 'workroom-drainer' || isStallAlarm(row.body))
+    .map(({ body: _body, ...row }) => row);
   const selected = all.filter(row => !excludeSet.has(row.id));
   const excluded = all.filter(row => excludeSet.has(row.id)).map(row => row.id);
   for (const row of selected) {

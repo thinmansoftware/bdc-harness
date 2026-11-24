@@ -82,6 +82,20 @@ beforeEach(async () => {
     recipient: 'xo',
     body: '{"kind":"duty_officer_escalation"}',
   });
+  // never touched: look-alikes of the alarm (Overseer App review at d99a8e0b): the stall kind
+  // only in a nested field, and an underscore-wildcard match of the kind text
+  await insert({
+    id: 'xo-nested',
+    sender: 'dispatch',
+    recipient: 'xo',
+    body: '{"kind":"duty_officer_escalation","detail":{"kind":"workroom_drainer_stall"}}',
+  });
+  await insert({
+    id: 'xo-wildcard',
+    sender: 'dispatch',
+    recipient: 'xo',
+    body: '{"kind":"workroomXdrainerXstall"}',
+  });
   await insert({
     id: 'copy-acked',
     sender: 'order-events',
@@ -127,6 +141,8 @@ describe('retire-workroom-drainer-route', () => {
     const untouched = {
       'xo-order': await rowOf('xo-order'),
       'xo-other': await rowOf('xo-other'),
+      'xo-nested': await rowOf('xo-nested'),
+      'xo-wildcard': await rowOf('xo-wildcard'),
       'copy-acked': await rowOf('copy-acked'),
       'copy-off-desk': await rowOf('copy-off-desk'),
     };
