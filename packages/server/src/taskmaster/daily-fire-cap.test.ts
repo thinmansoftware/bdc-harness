@@ -1118,3 +1118,134 @@ test('spec Test 2: ticks straddling 00:00Z, with permission asked after midnight
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test.each([[undefined], ['0'], ['NaN'], ['2']])(
+  'spec Test 3: unknown history preserves custody without a global stop (old setting: %s)',
+  async limit => {
+    const directory = mkdtempSync(join(tmpdir(), 'tm-cap-spec3-'));
+    const db = new SqliteAdapter(join(directory, 'budget.db'));
+    const priorEnabled = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    const priorLimit = process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    if (limit === undefined) delete process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+    else process.env.TASKMASTER_FIRE_MAX_PER_DAY = limit;
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const oldDay = '2026-08-06T12:00:00.000Z';
+      const earlierTick = '2026-08-07T11:59:00.000Z';
+      const seedJournal = (
+        key: string,
+        number: number,
+        createdAt: string,
+        outcome: 'pending' | 'sent',
+        malformed = false
+      ) => {
+        const threadRef = `gh:thinmansoftware/bdc-harness#${number}`;
+        const row: taskmasterDb.TmJournalEntry = {
+          id: key,
+          created_at: createdAt,
+          thread_ref: threadRef,
+          action_type: 'fire_cauldron',
+          proposal_json: malformed
+            ? '{'
+            : JSON.stringify({
+                type: 'fire_cauldron',
+                idempotencyKey: key,
+                cascadeId: key,
+                recipient: 'xo',
+                fireEvidence: { woId: `WO-HARNESS-CAP-${number}`, project: 'bdc-harness' },
+              }),
+          idempotency_key: key,
+          before_hash: null,
+          proof_predicate: 'actual workflow completion',
+          proof_deadline_at: new Date(world.nowMs + 86_400_000).toISOString(),
+          outcome,
+          graded_at: null,
+          grade: null,
+        };
+        world.journal.push(row);
+        return {
+          actionKey: key,
+          cascadeId: key,
+          journalId: row.id,
+          sourceThreadRef: threadRef,
+          ownerToken: `historical-owner:${key}`,
+          epoch: world.control.epoch,
+          now: createdAt,
+        };
+      };
+      // Same WO as new work, but its journal no longer holds that scope.
+      const unknown = seedJournal('old-unknown', 901, oldDay, 'sent');
+      // An unresolved pending fire still holds its own WO, even across ticks.
+      const reserved = seedJournal('old-reserved', 902, earlierTick, 'pending');
+      const legacy = seedJournal('old-legacy', 903, earlierTick, 'sent');
+      const malformed = seedJournal('old-malformed', 904, earlierTick, 'sent', true);
+
+      const { deps, invocations } = realLoopFixture(world, db, [901, 902]);
+      const budget = deps.fireBudget!;
+      expect((await budget.reserveAutomaticFire(unknown)).allowed).toBe(true);
+      expect((await budget.authorizeAutomaticFire(unknown)).allowed).toBe(true);
+      expect((await budget.reserveAutomaticFire(reserved)).allowed).toBe(true);
+      const original = await taskmasterDb.listAutomaticFireAdmissions(db);
+      expect(original.map(row => [row.action_key, row.state]).sort()).toEqual([
+        ['old-reserved', 'reserved'],
+        ['old-unknown', 'unknown'],
+      ]);
+
+      const cascadesRead: string[] = [];
+      deps.readFireCascadeEvidence = async ({ cascadeId }) => {
+        cascadesRead.push(cascadeId);
+        throw new Error('fixture: cascade evidence missing');
+      };
+      deps.checkExpectations = async () => {};
+      deps.escalationDelivery = {
+        listIssueComments: async () => [],
+        postIssueComment: async () => {},
+        posterLogin: async () => 'fixture',
+      };
+      await loop.tick(loop.createTaskmasterState(60_000), deps);
+
+      expect(invocations).toEqual([{ woId: 'WO-HARNESS-CAP-901', cascadeId: expect.any(String) }]);
+      const [fire] = invocations;
+      expect(fire!.cascadeId).not.toBe(unknown.cascadeId);
+      expect(cascadesRead).toContain(reserved.cascadeId);
+      expect(world.journal.find(row => row.id === reserved.journalId)?.outcome).toBe('pending');
+
+      const rows = await taskmasterDb.listAutomaticFireAdmissions(db);
+      for (const row of original) {
+        expect(rows.find(candidate => candidate.action_key === row.action_key)).toEqual(row);
+      }
+      expect(rows.find(row => row.action_key === legacy.actionKey)).toMatchObject({
+        state: 'unknown',
+        journal_id: legacy.journalId,
+        cascade_id: legacy.cascadeId,
+        owner_token: 'legacy-reconciliation',
+      });
+      expect(world.journal.find(row => row.id === malformed.journalId)).toMatchObject({
+        outcome: 'sent',
+        proposal_json: '{',
+      });
+      const newRows = rows.filter(row => row.cascade_id === fire!.cascadeId);
+      expect(newRows).toHaveLength(1);
+      expect(newRows[0]!.action_key).not.toBe(unknown.actionKey);
+      expect(newRows[0]!.admitted_at).not.toBeNull();
+
+      expect(
+        await budget.reserveAutomaticFire({ ...unknown, now: new Date(world.nowMs).toISOString() })
+      ).toEqual({
+        allowed: false,
+        reason: 'daily_cap_existing_action',
+      });
+      expect(await taskmasterDb.listAutomaticFireAdmissions(db)).toEqual(rows);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toEqual([]);
+    } finally {
+      if (priorEnabled === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorEnabled;
+      if (priorLimit === undefined) delete process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+      else process.env.TASKMASTER_FIRE_MAX_PER_DAY = priorLimit;
+      await db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+);
