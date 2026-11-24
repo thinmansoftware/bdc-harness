@@ -462,8 +462,16 @@ describe('claim signals only (bdc-harness#1436)', () => {
     const execFn = async (_file: string, args: readonly string[]) => {
       if (args[0] === 'pr' && args[1] === 'list') {
         prListCalls++;
+        // Honour the search the way GitHub does: `--search <term>` matches a PR's
+        // title or body, never its head branch (Overseer App review on PR 1630).
+        const term = args[args.indexOf('--search') + 1];
+        expect(term).toBe(woId);
+        const needle = (term ?? '').toLowerCase();
+        const found = rows.filter(
+          r => r.title.toLowerCase().includes(needle) || r.body.toLowerCase().includes(needle)
+        );
         return {
-          stdout: JSON.stringify(rows.map(r => ({ ...r, url: `https://example/${r.number}` }))),
+          stdout: JSON.stringify(found.map(r => ({ ...r, url: `https://example/${r.number}` }))),
           stderr: '',
         };
       }
@@ -553,7 +561,7 @@ describe('claim signals only (bdc-harness#1436)', () => {
     const row = (number: number, body: string): Row => ({
       number,
       state: 'OPEN',
-      title: 'Some change',
+      title: `Follow-up to ${id}`,
       headRefName: 'chore/unrelated',
       body,
     });
@@ -611,7 +619,7 @@ describe('claim signals only (bdc-harness#1436)', () => {
     const row = (number: number, headRefName: string): Row => ({
       number,
       state: 'OPEN',
-      title: 'Some change',
+      title: `Follow-up to ${id}`,
       headRefName,
       body: '',
     });
@@ -631,6 +639,25 @@ describe('claim signals only (bdc-harness#1436)', () => {
     expect(await claimFor(id, 'bdc-harness', [row(7, 'wo/test-branch-010')])).toBeNull();
     expect(await claimFor(id, 'bdc-harness', [row(8, 'wo/test-branch-01-02')])).toBeNull();
     expect(await claimFor(id, 'bdc-harness', [row(9, 'chore/anything')])).toBeNull();
+  });
+
+  test('known search limit: a PR whose id is in neither title nor body is never seen', async () => {
+    // The gh search matches title and body only, and the spec leaves the query
+    // unchanged (Scope OUT). A lane-branch-only PR is therefore not returned, so
+    // the guard proceeds. This pins today's behavior; widening the fetch is a
+    // separate work order (Overseer App review on PR 1630, bdc-xo#6506).
+    const id = 'WO-TEST-SEARCH-01';
+    expect(
+      await claimFor(id, 'bdc-harness', [
+        {
+          number: 1,
+          state: 'OPEN',
+          title: 'BDC feature Work Order implementation',
+          headRefName: 'feat/wo-test-search-01-thread-abc',
+          body: 'No id here.',
+        },
+      ])
+    ).toBeNull();
   });
 
   test('Test 7: prClaimsWo, findWoClaim and listOpenWoPullRequests agree', async () => {
@@ -654,7 +681,13 @@ describe('claim signals only (bdc-harness#1436)', () => {
       const viaClassifier = prClaimsWo(c, id, {});
       const viaFind =
         (await claimFor(id, 'bdc-harness', [
-          { number, state: 'OPEN', title: 'Some change', headRefName: c.headRefName, body: c.body },
+          {
+            number,
+            state: 'OPEN',
+            title: `Follow-up to ${id}`,
+            headRefName: c.headRefName,
+            body: c.body,
+          },
         ])) === number;
       const open = await listOpenWoPullRequests({
         woId: id,
