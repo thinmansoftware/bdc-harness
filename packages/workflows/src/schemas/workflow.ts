@@ -22,6 +22,16 @@ export const webSearchModeSchema = z.enum(['disabled', 'cached', 'live']);
 
 export type WebSearchMode = z.infer<typeof webSearchModeSchema>;
 
+/** Workflow-level `unattended_questions` key. Only value: `report`. */
+export const unattendedQuestionsModeSchema = z.enum(['report']);
+
+export type UnattendedQuestionsMode = z.infer<typeof unattendedQuestionsModeSchema>;
+
+/** Workflow-level `idle_handoff` key. Only value: `overseer`. */
+export const idleHandoffModeSchema = z.enum(['overseer']);
+
+export type IdleHandoffMode = z.infer<typeof idleHandoffModeSchema>;
+
 // ---------------------------------------------------------------------------
 // Workflow-level worktree policy
 // ---------------------------------------------------------------------------
@@ -106,6 +116,25 @@ export const workflowBaseSchema = z.object({
    * Anchor: 2026-05-16 cross-repo incident (26 files pushed to wrong remote).
    */
   target_repo: z.string().optional(),
+  /**
+   * WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 (Correction F, engine). Opt-in.
+   * `report`: a NON-interactive loop node that escalates (ESCALATION_REQUIRED=true,
+   * or a prior escalation binding) or terminal-blocks still writes its escalation
+   * packet as before, ALSO writes the question to `$ARTIFACTS_DIR/questions/<node id>.md`,
+   * and completes with output exactly `UNATTENDED_QUESTION=true` instead of node_failed.
+   * Omitted: unchanged behavior. A lane detects it with
+   * `when: "$<node id>.output == 'UNATTENDED_QUESTION=true'"`.
+   */
+  unattended_questions: unattendedQuestionsModeSchema.optional(),
+  /**
+   * WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 (idle timeout and a hung step). Opt-in.
+   * `overseer`: when an AI step's or loop step's idle timer fires, the engine records
+   * the workflow event `idle_handoff_overseer` (step id, idle ms, last output), writes
+   * no node_failed for the timeout, and completes the step with output exactly
+   * `IDLE_HANDOFF=true`. It re-runs nothing. Omitted: unchanged behavior. A lane
+   * detects it with `when: "$<node id>.output == 'IDLE_HANDOFF=true'"`.
+   */
+  idle_handoff: idleHandoffModeSchema.optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;

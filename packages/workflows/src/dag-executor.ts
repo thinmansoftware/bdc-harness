@@ -469,6 +469,116 @@ async function writePlanReviewEscalationPacket(
   return packetPath;
 }
 
+// ---------------------------------------------------------------------------
+// WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 (bdc-xo#6687): two opt-in engine keys.
+//
+// unattended_questions: report -- a non-interactive loop node that escalates or
+//   terminal-blocks completes with output exactly UNATTENDED_QUESTION_OUTPUT and
+//   its question in $ARTIFACTS_DIR/questions/<node id>.md. A lane detects it with:
+//     when: "$<node id>.output == 'UNATTENDED_QUESTION=true'"
+//   (and the opposite branch with `!=`).
+//
+// idle_handoff: overseer -- an AI step or loop step whose idle timer fires records
+//   the workflow event `idle_handoff_overseer` and completes with output exactly
+//   IDLE_HANDOFF_OUTPUT. No node_failed is written for the timeout. A lane detects it with:
+//     when: "$<node id>.output == 'IDLE_HANDOFF=true'"
+//   For "any step of the run ended idle", OR the atoms:
+//     when: "$a.output == 'IDLE_HANDOFF=true' || $b.output == 'IDLE_HANDOFF=true'"
+//
+// The output is the whole string (not a line inside a longer text) because the
+// `when:` evaluator compares the full output with `==`; the details live in the
+// event data and the questions file. Neither key adds a limit, timer or retry.
+// ---------------------------------------------------------------------------
+export const UNATTENDED_QUESTION_OUTPUT = 'UNATTENDED_QUESTION=true';
+export const IDLE_HANDOFF_OUTPUT = 'IDLE_HANDOFF=true';
+const IDLE_HANDOFF_LAST_OUTPUT_LINES = 200;
+
+function lastLines(text: string, count: number): string {
+  const lines = text.split('\n');
+  return lines.length <= count ? text : lines.slice(-count).join('\n');
+}
+
+async function writeUnattendedQuestionFile(
+  artifactsDir: string,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  details: {
+    iteration: number;
+    source: string;
+    question: string;
+    reason: string;
+    rawOutput: string;
+  }
+): Promise<string> {
+  const dir = join(artifactsDir, 'questions');
+  const path = join(dir, `${sanitizeArtifactKey(nodeId)}.md`);
+  const body = [
+    `# Unattended question from ${nodeId}`,
+    '',
+    `- run: ${workflowRun.id}`,
+    `- workflow: ${workflowRun.workflow_name}`,
+    `- node: ${nodeId}`,
+    `- iteration: ${String(details.iteration)}`,
+    `- source: ${details.source}`,
+    '',
+    '## Question',
+    '',
+    details.question,
+    '',
+    '## Reason',
+    '',
+    details.reason,
+    '',
+    '## Node output',
+    '',
+    '```',
+    details.rawOutput,
+    '```',
+    '',
+  ].join('\n');
+  await mkdir(dir, { recursive: true });
+  await writeFile(path, body, 'utf8');
+  return path;
+}
+
+async function recordIdleHandoffEvent(
+  deps: WorkflowDeps,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  details: {
+    kind: 'step' | 'loop';
+    idleMs: number;
+    lastOutput: string;
+    iteration?: number;
+    reason?: string;
+  }
+): Promise<void> {
+  getLog().warn(
+    { nodeId, workflowRunId: workflowRun.id, idleMs: details.idleMs, kind: details.kind },
+    'dag.idle_handoff_overseer'
+  );
+  await deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'idle_handoff_overseer',
+      step_name: nodeId,
+      data: {
+        step_id: nodeId,
+        step_kind: details.kind,
+        idle_ms: details.idleMs,
+        last_output: lastLines(details.lastOutput, IDLE_HANDOFF_LAST_OUTPUT_LINES),
+        ...(details.iteration !== undefined ? { iteration: details.iteration } : {}),
+        ...(details.reason !== undefined ? { reason: details.reason } : {}),
+      },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, eventType: 'idle_handoff_overseer' },
+        'workflow_event_persist_failed'
+      );
+    });
+}
+
 function hasUnapprovedFailedPlanReviewAncestor(
   node: DagNode,
   allNodes: readonly DagNode[],
@@ -572,6 +682,10 @@ interface WorkflowLevelOptions {
   // failover_provider/failover_model. Control-plane only -- never sent to the SDK.
   failoverProvider?: string;
   failoverModel?: string;
+  // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: opt-in engine keys, control-plane only.
+  // See UNATTENDED_QUESTION_OUTPUT and IDLE_HANDOFF_OUTPUT below.
+  unattendedQuestions?: 'report';
+  idleHandoff?: 'overseer';
 }
 
 /**
@@ -2161,6 +2275,9 @@ export type DagBindingWorkflow = {
   // (snake_case YAML field names on WorkflowDefinition).
   failover_provider?: string;
   failover_model?: string;
+  // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: opt-in workflow-root engine keys.
+  unattended_questions?: 'report';
+  idle_handoff?: 'overseer';
 } & WorkflowLevelOptions;
 
 interface DagNodeBindingInput {
@@ -2434,6 +2551,9 @@ function dagWorkflowLevelOptions(workflow: DagBindingWorkflow): WorkflowLevelOpt
     // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-level failover defaults.
     failoverProvider: workflow.failover_provider,
     failoverModel: workflow.failover_model,
+    // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: opt-in, absent means today's behavior.
+    ...(workflow.unattended_questions === 'report' ? { unattendedQuestions: 'report' } : {}),
+    ...(workflow.idle_handoff === 'overseer' ? { idleHandoff: 'overseer' } : {}),
   };
 }
 
@@ -3668,6 +3788,70 @@ async function executeNodeInternal(
       }
       const silenceReason: 'provider_never_started' | 'provider_silent' =
         nodeChunksSeen === 0 ? 'provider_never_started' : 'provider_silent';
+      // idle_handoff: overseer -- record the hand-off and complete the step in the
+      // IDLE_HANDOFF_OUTPUT state instead of writing node_failed for the timeout.
+      if (workflowLevelOptions.idleHandoff === 'overseer') {
+        await recordIdleHandoffEvent(deps, workflowRun, node.id, {
+          kind: 'step',
+          idleMs: effectiveIdleTimeout,
+          lastOutput: nodeOutputText,
+          reason: silenceReason,
+        });
+        const idleDuration = Date.now() - nodeStartTime;
+        await logNodeComplete(logDir, workflowRun.id, node.id, node.command ?? '<inline>', {
+          durationMs: idleDuration,
+          tokens: nodeTokens,
+        });
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'node_completed',
+            step_name: node.id,
+            data: {
+              duration_ms: idleDuration,
+              node_output: IDLE_HANDOFF_OUTPUT,
+              idle_handoff: true,
+              idle_timeout_ms: effectiveIdleTimeout,
+              reason: silenceReason,
+              ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
+              ...(nodeTokens ? { tokens: nodeTokens } : {}),
+              ...(declaredModelId !== undefined ? { declared_model_id: declaredModelId } : {}),
+              ...(nodeOptions?.model !== undefined
+                ? { requested_model_id: nodeOptions.model }
+                : {}),
+              ...(nodeServedModelId !== undefined ? { served_model_id: nodeServedModelId } : {}),
+              entry_rung: deriveEntryRung(provider, nodeOptions?.model),
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'node_completed' },
+              'workflow_event_persist_failed'
+            );
+          });
+        emitter.emit({
+          type: 'node_completed',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          nodeName: node.command ?? node.id,
+          duration: idleDuration,
+          ...(nodeCostUsd !== undefined ? { costUsd: nodeCostUsd } : {}),
+        });
+        await safeSendMessage(
+          platform,
+          conversationId,
+          `Node '${node.id}' went idle for ${String(effectiveIdleTimeout)}ms; handed to the Overseer (idle_handoff: overseer).`,
+          nodeContext
+        );
+        lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
+        lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
+        return {
+          state: 'completed',
+          output: IDLE_HANDOFF_OUTPUT,
+          costUsd: nodeCostUsd,
+          ...(nodeTokens ? { tokens: nodeTokens } : {}),
+        };
+      }
       const progressError = `Node '${node.id}' ${silenceReason}: no provider output for ${String(effectiveIdleTimeout)}ms`;
       await safeSendMessage(
         platform,
@@ -5073,6 +5257,153 @@ async function executeLoopNode(
   // next iteration cannot "un-detect" a signal the agent already emitted.
   let stickySignalDetected = false;
 
+  // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: opt-in end states (see
+  // UNATTENDED_QUESTION_OUTPUT / IDLE_HANDOFF_OUTPUT). Both write node_completed so
+  // resume treats the node as done and `when:` reads the exact output string.
+  const loopNodeStartedAt = Date.now();
+  const unattendedQuestionsReport =
+    workflowLevelOptions?.unattendedQuestions === 'report' && loop.interactive !== true;
+
+  const persistLoopNodeCompletedAs = async (
+    output: string,
+    extra: Record<string, unknown>
+  ): Promise<void> => {
+    await deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'node_completed',
+        step_name: node.id,
+        data: {
+          duration_ms: Date.now() - loopNodeStartedAt,
+          node_output: output,
+          ...extra,
+          ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
+          ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+          entry_rung: deriveEntryRung(workflowProvider, workflowModel),
+          ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+          ...(workflowModel !== undefined ? { declared_model_id: workflowModel } : {}),
+          ...(resolvedOptions.model !== undefined
+            ? { requested_model_id: resolvedOptions.model }
+            : {}),
+          ...(loopServedModelId !== undefined ? { served_model_id: loopServedModelId } : {}),
+        },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, eventType: 'node_completed' },
+          'workflow_event_persist_failed'
+        );
+      });
+    getWorkflowEventEmitter().emit({
+      type: 'node_completed',
+      runId: workflowRun.id,
+      nodeId: node.id,
+      nodeName: node.id,
+      duration: Date.now() - loopNodeStartedAt,
+      ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
+    });
+  };
+
+  // Returns undefined when the question file could not be written: the caller then
+  // takes today's failing path, so a question is never lost silently.
+  const completeWithUnattendedQuestion = async (
+    iteration: number,
+    source: string,
+    question: string,
+    reason: string,
+    rawOutput: string,
+    reasonData: Record<string, unknown>
+  ): Promise<NodeExecutionResult | undefined> => {
+    const questionsPath = await writeUnattendedQuestionFile(artifactsDir, workflowRun, node.id, {
+      iteration,
+      source,
+      question,
+      reason,
+      rawOutput,
+    }).catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, nodeId: node.id, iteration },
+        'loop_node.unattended_question_write_failed'
+      );
+      return undefined;
+    });
+    if (!questionsPath) return undefined;
+
+    getLog().warn(
+      { nodeId: node.id, workflowRunId: workflowRun.id, iteration, source, questionsPath },
+      'loop_node.unattended_question_reported'
+    );
+    await deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'workflow_artifact',
+        step_name: node.id,
+        data: {
+          artifact_type: 'file_created',
+          path: questionsPath,
+          nodeId: node.id,
+          reason: 'unattended_question',
+        },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, eventType: 'workflow_artifact' },
+          'workflow_event_persist_failed'
+        );
+      });
+    await persistLoopNodeCompletedAs(UNATTENDED_QUESTION_OUTPUT, {
+      unattended_question: true,
+      questions_path: questionsPath,
+      question_source: source,
+      iteration,
+      ...reasonData,
+    });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `Loop node '${node.id}' reported an unattended question at iteration ${String(iteration)}: ${question}`,
+      msgContext
+    );
+    return {
+      state: 'completed',
+      output: UNATTENDED_QUESTION_OUTPUT,
+      sessionId: currentSessionId,
+      costUsd: loopTotalCostUsd,
+      ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+    };
+  };
+
+  const completeWithIdleHandoff = async (
+    iteration: number,
+    idleMs: number,
+    lastOutput: string
+  ): Promise<NodeExecutionResult> => {
+    await recordIdleHandoffEvent(deps, workflowRun, node.id, {
+      kind: 'loop',
+      iteration,
+      idleMs,
+      lastOutput,
+    });
+    await persistLoopNodeCompletedAs(IDLE_HANDOFF_OUTPUT, {
+      idle_handoff: true,
+      idle_timeout_ms: idleMs,
+      iteration,
+    });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `Loop '${node.id}' iteration ${String(iteration)} went idle for ${String(idleMs)}ms; handed to the Overseer (idle_handoff: overseer)`,
+      msgContext
+    );
+    return {
+      state: 'completed',
+      output: IDLE_HANDOFF_OUTPUT,
+      sessionId: currentSessionId,
+      costUsd: loopTotalCostUsd,
+      ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+    };
+  };
+
   // Within-run escalation binding (WO-HARNESS-REPAIR-NODE-ESCALATION-OVERRIDE-01 /
   // bdc-xo#1460). Once this loop (or a prior attempt in the same run) recorded
   // ESCALATION_REQUIRED, later iterations must not re-invoke the provider and
@@ -5159,6 +5490,25 @@ async function executeLoopNode(
             'workflow_event_persist_failed'
           );
         });
+    }
+
+    // unattended_questions: report -- the packet above is written as today; the
+    // question is also reported and the node completes instead of failing.
+    if (unattendedQuestionsReport) {
+      const reported = await completeWithUnattendedQuestion(
+        iteration,
+        source,
+        decisionText,
+        reason,
+        rawOutput || lastIterationOutput,
+        {
+          escalation_reason: reason,
+          escalation_source: source,
+          escalation_binding: source === 'prior_artifact' || source === 'post_completion_guard',
+          ...(packetPath ? { escalation_packet: packetPath } : {}),
+        }
+      );
+      if (reported) return reported;
     }
 
     await deps.store
@@ -5800,6 +6150,15 @@ async function executeLoopNode(
         });
         iterationAttemptCompleted = true;
       }
+      // idle_handoff: overseer -- no node_failed for the timeout; the step ends in
+      // the IDLE_HANDOFF_OUTPUT state for the lane's Overseer look. Re-runs nothing.
+      if (workflowLevelOptions?.idleHandoff === 'overseer') {
+        return await completeWithIdleHandoff(
+          i,
+          effectiveIdleTimeout,
+          fullOutput || lastIterationOutput
+        );
+      }
       const idleError = `Loop '${node.id}' iteration ${String(i)} exceeded idle timeout (${String(effectiveIdleTimeout)}ms)`;
       await safeSendMessage(platform, conversationId, idleError, msgContext);
       await persistLoopNodeFailed(idleError);
@@ -6046,6 +6405,47 @@ async function executeLoopNode(
         return undefined;
       });
 
+      const persistBlockedPreserveArtifact = async (): Promise<void> => {
+        if (!preserveDir) return;
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'workflow_artifact',
+            step_name: node.id,
+            data: {
+              artifact_type: 'file_created',
+              path: preserveDir,
+              nodeId: node.id,
+              reason: 'terminal_blocked_work_preserve',
+              blocked_reason: blockedSignal.reason,
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'workflow_artifact' },
+              'workflow_event_persist_failed'
+            );
+          });
+      };
+
+      // unattended_questions: report -- work is preserved as today; the blocker is
+      // reported as a question and the node completes instead of failing.
+      if (unattendedQuestionsReport) {
+        await persistBlockedPreserveArtifact();
+        const reported = await completeWithUnattendedQuestion(
+          i,
+          'terminal_blocked',
+          blockedSignal.reason,
+          blockedSignal.reason,
+          lastIterationOutput,
+          {
+            blocked_reason: blockedSignal.reason,
+            ...(preserveDir ? { preserved_work_dir: preserveDir } : {}),
+          }
+        );
+        if (reported) return reported;
+      }
+
       await deps.store
         .createWorkflowEvent({
           workflow_run_id: workflowRun.id,
@@ -6074,26 +6474,10 @@ async function executeLoopNode(
           );
         });
 
-      if (preserveDir) {
-        await deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'workflow_artifact',
-            step_name: node.id,
-            data: {
-              artifact_type: 'file_created',
-              path: preserveDir,
-              nodeId: node.id,
-              reason: 'terminal_blocked_work_preserve',
-              blocked_reason: blockedSignal.reason,
-            },
-          })
-          .catch((err: Error) => {
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, eventType: 'workflow_artifact' },
-              'workflow_event_persist_failed'
-            );
-          });
+      // In report mode this already ran above (the question path fell back here
+      // only because the question file could not be written).
+      if (!unattendedQuestionsReport) {
+        await persistBlockedPreserveArtifact();
       }
 
       await safeSendMessage(platform, conversationId, errorMsg, msgContext);

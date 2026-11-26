@@ -82,6 +82,10 @@ export const WORKFLOW_EVENT_TYPES = [
   // WO-HARNESS-RUN-LEASE-LOST-SAYS-SO-01: written when the executor stops a run because its lease was lost;
   // data carries where, reason, last_renewed_at, expires_at, detected_at and gap_seconds.
   'run_lease_lost',
+  // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: written instead of node_failed when a step's
+  // idle timer fires in a workflow with `idle_handoff: overseer`; data carries step_id,
+  // step_kind, idle_ms and last_output (last 200 lines).
+  'idle_handoff_overseer',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
