@@ -68,6 +68,7 @@ const IMPLEMENT_GATE = "$implement-block-gate.output.terminal == 'no'";
 const REBUILT_LANE = 'bdc-feature-development.yaml';
 const NOT_RETURNED = "$assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'";
 const REBUILT_GUARDED_WHEN: Record<string, string> = {
+  'repair-round-1': `$classify-diff-review.output.verdict == 'needs_revision' && ${GUARDED_WHEN['checkpoint-push']} && ${NOT_RETURNED}`,
   implement: `${GUARDED_WHEN.implement} && $lane-scope-check.output == 'LANE_SCOPE=ok' && $plan-review.output != 'UNATTENDED_QUESTION=true'`,
   'commit-and-push': `$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && ${NOT_RETURNED} && $block-reclassify.output.status != 'ALREADY_SATISFIED'`,
 };
@@ -321,11 +322,14 @@ function assertGuarded(
   allow: boolean
 ): void {
   const outputs = runningAtoms(gate);
-  for (const [id, guardedWhen] of Object.entries(GUARDED_WHEN)) {
+  const rebuilt = file === REBUILT_LANE;
+  const guards = rebuilt
+    ? Object.entries(GUARDED_WHEN).filter(([id]) => id !== 'diff-repair' && id !== 'opus-repair')
+    : Object.entries(GUARDED_WHEN);
+  if (rebuilt) guards.push(['repair-round-1', REBUILT_GUARDED_WHEN['repair-round-1']]);
+  for (const [id, guardedWhen] of guards) {
     const node = nodeOf(nodes, id, file);
-    // The nodes that repair, push, commit or open a PR also carry the implement-block gate on every
-    // OR clause (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01).
-    const rebuilt = file === REBUILT_LANE;
+    // The rebuilt lane excludes returned work orders. Legacy lanes keep the implement-block gate.
     const gateClause = rebuilt ? NOT_RETURNED : IMPLEMENT_GATE;
     const expectedWhen =
       rebuilt && REBUILT_GUARDED_WHEN[id] !== undefined
@@ -337,10 +341,11 @@ function assertGuarded(
               .join(' || ')
           : guardedWhen;
     expect(node.when, `${file} ${id}`).toBe(expectedWhen);
-    expect(node.depends_on ?? [], `${file} ${id}`).toContain('repair-gate');
-    expect((node.depends_on ?? [])[(node.depends_on ?? []).length - 1], `${file} ${id}`).toBe(
-      'repair-gate'
-    );
+    if (id === 'repair-round-1') {
+      expect(node.depends_on, file).toEqual(['classify-diff-review']);
+    } else {
+      expect(node.depends_on?.at(-1), `${file} ${id}`).toBe('repair-gate');
+    }
     const evaluated = evaluateCondition(node.when ?? '', outputs);
     expect(evaluated.parsed, `${file} ${id}`).toBe(true);
     expect(evaluated.result, `${file} ${id}`).toBe(allow);

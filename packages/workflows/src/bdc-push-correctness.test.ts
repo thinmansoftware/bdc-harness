@@ -888,12 +888,24 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
       const yaml = readFileSync(lane, 'utf8').replace(/\r\n/g, '\n');
       expect(yaml).toContain('  - id: resolve-review-base\n');
       expect(yaml).toContain('depends_on: [war-council-validator, resolve-review-base]');
-      // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane has no implement-block-gate.
-      expect(yaml).toContain(
-        lane.endsWith('bdc-feature-development.yaml')
-          ? 'depends_on: [diff-review, classify-diff-review, resolve-review-base, assert-implement-produced-work, repair-gate]'
-          : 'depends_on: [diff-review, classify-diff-review, resolve-review-base, implement-block-gate, repair-gate]'
-      );
+      if (basename(lane) === 'bdc-feature-development.yaml') {
+        const { workflow, error } = parseWorkflow(yaml, basename(lane));
+        if (!workflow) throw new Error(error?.error ?? 'Unable to load the default lane');
+        const node = (id: string) => workflow.nodes.find(candidate => candidate.id === id);
+        expect(node('diff-review')?.depends_on).toContain('capture-diff');
+        expect(node('classify-diff-review')?.depends_on).toContain('diff-review');
+        expect(node('repair-round-1')?.depends_on).toContain('classify-diff-review');
+        expect(node('repair-round-1')?.when).toContain(
+          "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
+        );
+        expect(node('repair-round-1')?.when).toContain(
+          "$assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'"
+        );
+      } else {
+        expect(yaml).toContain(
+          'depends_on: [diff-review, classify-diff-review, resolve-review-base, implement-block-gate, repair-gate]'
+        );
+      }
       expect(yaml).toContain('depends_on: [checkpoint-diff-repair, resolve-review-base]');
       expect(yaml).not.toContain('BASE_REF="origin/${BASE_BRANCH:-main}"');
       expect(yaml).toContain('base_branch_override');
