@@ -464,7 +464,8 @@ manifest_consistency_guard_block() {
   awk '
     index($0, "if [ \"$STATUS\" = \"PROCEED\" ] && [ -n \"$PR_URL\" ]; then") { capture=1 }
     capture { sub(/^      /, ""); print }
-    capture && /printf '\''OK\\n'\''/ { exit }
+    capture && /printf '\''OK\\n'\''/ { okseen=1; next }
+    okseen { exit }
   ' "$CANONICAL_WORKFLOW"
 }
 
@@ -484,6 +485,10 @@ manifest_consistency_check() (
     { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
   }
   PRS_LINE=$(extract "PRs")
+  # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: in the rebuilt lane a contradiction is a recorded
+  # finding (lane_finding), not a failed run; the node prints FINDING lines instead of OK.
+  MCC_FOUND=0
+  lane_finding() { MCC_FOUND=1; printf 'FINDING=%s\n' "$1"; }
 
   eval "$MANIFEST_CONSISTENCY_GUARD"
 )
@@ -491,11 +496,11 @@ manifest_consistency_check() (
 PR_URL_FIXTURE="https://github.com/thinmansoftware/bdc-harness/pull/405"
 MF_FALSE_NEGATIVE=$'WO: WO-X\nPRs: N/A (no commit was made; HEAD still equals RUN_START_SHA a00f47d; no PR opened)\nVALIDATION: FAIL'
 set +e
-GUARD_FALSE_STDERR=$(manifest_consistency_check "PROCEED" "$PR_URL_FIXTURE" "$MF_FALSE_NEGATIVE" 2>&1 >/dev/null)
+GUARD_FALSE_STDERR=$(manifest_consistency_check "PROCEED" "$PR_URL_FIXTURE" "$MF_FALSE_NEGATIVE" 2>&1)
 GUARD_FALSE_EXIT=$?
 set -e
-assert_eq "guard rejects PROCEED + PR URL contradicted by N/A PRs line" "1" "$GUARD_FALSE_EXIT"
-assert_contains "guard error names SELF_CONSISTENCY_ERROR" "SELF_CONSISTENCY_ERROR" "$GUARD_FALSE_STDERR"
+assert_eq "guard records PROCEED + PR URL contradicted by N/A PRs line as a finding (exit 0)" "0" "$GUARD_FALSE_EXIT"
+assert_contains "guard finding names SELF_CONSISTENCY_ERROR" "FINDING=SELF_CONSISTENCY_ERROR" "$GUARD_FALSE_STDERR"
 assert_contains "guard error includes real PR URL" "$PR_URL_FIXTURE" "$GUARD_FALSE_STDERR"
 
 MF_HONEST_PROCEED=$'WO: WO-X\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/405\nVALIDATION: PASS'

@@ -137,6 +137,17 @@ for LANEFILE in "$DEFAULTS"/bdc-feature-development*.yaml; do
   L="$(basename "$LANEFILE" .yaml | sed 's/^bdc-feature-development//; s/^-//')"
   [ -n "$L" ] || L=base
   echo "---- lane: $L"
+  if [ "$L" = base ]; then
+    # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 removed implement-block-gate and blocked-terminal-gate
+    # from bdc-feature-development.yaml: a declared BLOCKED with code is salvaged, published and held;
+    # with no code it returns to its author (june-shape-lane.sh, lane-implement-block-stop.test.ts).
+    if grep -q 'implement-block-gate\|blocked-terminal-gate' "$LANEFILE"; then
+      bad "T- base: implement-block-gate / blocked-terminal-gate must be gone from the rebuilt lane" ""
+    else
+      ok "T- base: implement-block-gate and blocked-terminal-gate are gone from the rebuilt lane"
+    fi
+    continue
+  fi
   if grep -q '^  - id: blocked-issue' "$LANEFILE"; then HAS_BI=1; else HAS_BI=0; fi
   : > "$WORK/empty.subs"
   node_script "$LANEFILE" implement-block-gate "$WORK/empty.subs" > "$WORK/gate.sh"

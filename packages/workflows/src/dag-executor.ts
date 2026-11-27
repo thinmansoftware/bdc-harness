@@ -4331,6 +4331,32 @@ async function persistBashRunEvents(
       const value: unknown = JSON.parse(line.slice('BDC_RUN_EVENT '.length));
       if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
       const data = value as Record<string, unknown>;
+      // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 (Correction F, lane): a run whose question went
+      // back to the work order's author records run_outcome=returned_to_author. Allowlisted
+      // shape only: the outcome value, an optional positive issue number, the run id.
+      if (data.event_type === 'run_outcome') {
+        const { outcome, issue, run_id: runIdField } = data;
+        if (outcome !== 'returned_to_author') continue;
+        if (
+          issue !== undefined &&
+          (typeof issue !== 'number' || !Number.isSafeInteger(issue) || issue <= 0)
+        )
+          continue;
+        if (typeof runIdField !== 'string' || runIdField.length === 0 || runIdField.length > 256)
+          continue;
+        await deps.store.createWorkflowEvent({
+          workflow_run_id: runId,
+          event_type: 'run_outcome',
+          step_name: nodeId,
+          data: {
+            event_type: 'run_outcome',
+            outcome,
+            run_id: runIdField,
+            ...(issue !== undefined ? { issue } : {}),
+          },
+        });
+        continue;
+      }
       if (data.event_type !== 'duplicate_pr_suppressed') continue;
       const {
         existing_pr: existingPr,

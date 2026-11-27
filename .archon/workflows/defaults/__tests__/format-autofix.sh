@@ -51,7 +51,9 @@ mkdir -p "$NODE_SHIM"
 ln -sf "$(command -v bun)" "$NODE_SHIM/node"
 export PATH="$NODE_SHIM:$PATH"
 
-REFERENCE="$DEFAULTS/bdc-feature-development.yaml"
+# The rebuilt bdc-feature-development.yaml (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01) records a missing
+# scope list as a FINDING instead of failing, so it is excluded from this parity; codex is the reference.
+REFERENCE="$DEFAULTS/bdc-feature-development-codex.yaml"
 SCRIPT="$TMP/format-autofix.sh"
 extract_node_script "$REFERENCE" format-autofix > "$SCRIPT"
 if [ ! -s "$SCRIPT" ]; then
@@ -63,6 +65,7 @@ fi
 mapfile -t LANES < <(find "$DEFAULTS" -maxdepth 1 -name 'bdc-feature-development*.yaml' -printf '%f\n' | sort)
 PARITY_FAILURES=""
 for lane in "${LANES[@]}"; do
+  [ "$lane" = bdc-feature-development.yaml ] && continue
   candidate="$TMP/${lane}.sh"
   extract_node_script "$DEFAULTS/$lane" format-autofix > "$candidate"
   cmp -s "$SCRIPT" "$candidate" || PARITY_FAILURES+="$lane "

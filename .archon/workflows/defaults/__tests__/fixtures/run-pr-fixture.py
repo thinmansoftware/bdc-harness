@@ -140,7 +140,9 @@ def fixture(t):
         (bindir / tool).chmod(0o755)
     state = t / 'state.json'
     shell_path = str(Path(BASH).parent) + os.pathsep if os.name == 'nt' else ''
-    env = dict(os.environ, PATH=str(bindir) + os.pathsep + shell_path + os.environ['PATH'], ARTIFACTS_DIR=str(artifacts), ARCHON_NODE_OUT=str(out), WORKFLOW_ID='fixture-run', WO_ID=WO, USER_MESSAGE=WO, RECORDED_BASE_BRANCH='dev', BASE_BRANCH='dev', PR_FIXTURE_STATE=str(state), CAULDRON_INTERACTIVE='false', TMPDIR=str(t), TEMP=str(t), TMP=str(t))
+    # The rebuilt lane (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01) checks every final base against
+    # the production-base list, so the guard script must resolve on every path.
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + shell_path + os.environ['PATH'], ARTIFACTS_DIR=str(artifacts), ARCHON_NODE_OUT=str(out), WORKFLOW_ID='fixture-run', WO_ID=WO, USER_MESSAGE=WO, RECORDED_BASE_BRANCH='dev', BASE_BRANCH='dev', PR_FIXTURE_STATE=str(state), CAULDRON_INTERACTIVE='false', TMPDIR=str(t), TEMP=str(t), TMP=str(t), BDC_PROD_BASE_GUARD_SCRIPT=(ROOT / 'scripts/lane/prod-base-guard.sh').as_posix())
     for key in ('GH_TOKEN', 'GITHUB_TOKEN'):
         env.pop(key, None)
     for key in list(env):
@@ -199,22 +201,32 @@ def run_adopt():
                 print('PASS: '+case+' refuses without any PR creation or modification',flush=True)
                 continue
             if case == 'wrong-base-after-create':
+                # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 (Correction E amendment 1c): one create
+                # attempt per node run, no in-run retry. The failed run leaves the unrelated
+                # wrong-base PR untouched; a replay of the node creates the run's own PR.
                 state.write_text(json.dumps({'prs': []}))
                 env['PR_FIXTURE_WRONG_BASE_AFTER_CREATE']='1'
+                drive(t,wt,env,'open-pr-if-needed',expected=1)
+                data=json.loads(state.read_text())
+                assert len(data['prs'])==1 and data['prs'][0]['baseRefName']=='main'
+                assert int(Path(str(state)+'.attempts').read_text())==1
                 drive(t,wt,env,'open-pr-if-needed')
                 data=json.loads(state.read_text())
                 assert len(data['prs'])==2 and [p['baseRefName'] for p in data['prs']]==['main','dev']
                 assert data['prs'][0]['body']=='unrelated base body' and data['prs'][0]['comments']==[]
                 assert int(Path(str(state)+'.attempts').read_text())==2
                 assert json.loads((artifacts/'run-pr.json').read_text())['number']==data['prs'][1]['number']
-                print('PASS: wrong-base-after-create is never adopted or retargeted; own PR created',flush=True)
+                print('PASS: wrong-base-after-create is never adopted or retargeted; own PR created on replay, no in-run retry',flush=True)
                 continue
             if case in ['transient-retry', 'created-nonzero', 'replay-after-failure']:
                 env['PR_FIXTURE_TRANSIENT_FAILURES'] = '3' if case == 'replay-after-failure' else ('2' if case == 'transient-retry' else '0')
                 if case == 'created-nonzero': env['PR_FIXTURE_CREATED_NONZERO'] = '1'
-                if case == 'replay-after-failure':
-                    drive(t, wt, env, 'open-pr-if-needed', expected=1)
-                    assert int(Path(str(state)+'.attempts').read_text()) == 3
+                if case in ['transient-retry', 'replay-after-failure']:
+                    # No in-run retry (Correction E amendment 1c): each node run makes one attempt.
+                    for failed in range(1, int(env['PR_FIXTURE_TRANSIENT_FAILURES']) + 1):
+                        drive(t, wt, env, 'open-pr-if-needed', expected=1)
+                        assert int(Path(str(state)+'.attempts').read_text()) == failed
+                        assert json.loads(state.read_text())['prs'] == []
                     env['PR_FIXTURE_TRANSIENT_FAILURES'] = '0'
                 drive(t, wt, env, 'open-pr-if-needed')
                 assert len(json.loads(state.read_text())['prs']) == 1
@@ -262,80 +274,9 @@ def run_adopt():
             print('PASS: adoption ' + case + ' and replay', flush=True)
 
 
-def run_fallback():
-    for case in ['recorded', 'discovered', 'merged', 'none']:
-        if os.environ.get('PR_FIXTURE_CASE') and os.environ['PR_FIXTURE_CASE'] != case:
-            continue
-        existing = case != 'none'
-        with tempfile.TemporaryDirectory(prefix='.fallback-fixture-', dir=ROOT) as tmp:
-            t = Path(tmp)
-            wt, bare, artifacts, state, env, branch, unique, ancestor, head, base = fixture(t)
-            # Salvage obtains the repo from origin; keep Git local with an insteadOf mapping.
-            cmd(['git', 'config', 'url.' + bare.as_posix() + '.insteadOf', 'https://github.com/fixture/repo.git'], wt)
-            cmd(['git', 'remote', 'set-url', 'origin', 'https://github.com/fixture/repo.git'], wt)
-            pr = primary(branch, ancestor)
-            if case == 'merged': pr['state'] = 'MERGED'
-            state.write_text(json.dumps({'prs': [pr] if existing else []}))
-            if case in ['recorded', 'merged']:
-                (artifacts / 'run-pr.json').write_text(json.dumps(dict(number=7, url=pr['url'], head_branch=branch, base='dev', wo_id=WO, run_id='fixture-run', repo=REPO)))
-            before = cmd(['git', 'rev-parse', 'refs/heads/' + branch], bare).stdout
-            (wt / 'file').write_text('salvage bytes\n')
-            output = drive(t, wt, env, 'noninteractive-salvage')
-            data = json.loads(state.read_text())
-            assert len(data['prs']) == 1, data
-            assert cmd(['git', 'rev-parse', 'refs/heads/' + branch], bare).stdout == before
-            assert cmd(['git', 'rev-parse', 'refs/heads/' + branch], wt).stdout.strip() == head
-            salvage = cmd(['git', 'for-each-ref', '--format=%(refname:short)', 'refs/heads/salvage/'], bare).stdout.strip()
-            assert salvage.startswith('salvage/opus-repair-'), salvage
-            assert cmd(['git', 'show', 'refs/heads/' + salvage + ':file'], bare).stdout == 'salvage bytes\n'
-            if existing:
-                assert data['prs'][0]['body'] == pr['body']
-                assert len(data['prs'][0]['comments']) == 1
-                assert salvage in data['prs'][0]['comments'][0]['body']
-                events = [json.loads(line[len('BDC_RUN_EVENT '):]) for line in output.splitlines() if line.startswith('BDC_RUN_EVENT ')]
-                assert len(events) == 1, output
-                assert events[0]['event_type'] == 'duplicate_pr_suppressed'
-                assert events[0]['existing_pr'] == 7 and events[0]['kind'] == 'fallback' and events[0]['salvage_branch'] == salvage
-            else:
-                assert data['prs'][0]['title'].startswith('FALLBACK:')
-                assert 'BDC_RUN_EVENT ' not in output
-                assert json.loads((artifacts / 'run-pr.json').read_text())['number'] == data['prs'][0]['number']
-            assert not (artifacts / 'run-pr.lock').exists()
-            drive(t, wt, env, 'noninteractive-salvage')
-            assert len(json.loads(state.read_text())['prs'][0]['comments']) == (1 if existing else 0)
-            print('PASS: fallback ' + case + ' ' + ('suppressed with branch/body unchanged, comment and event' if existing else 'opens and records one PR'), flush=True)
-
-
-def run_local_preservation():
-    for case in ['missing-context', 'github-unreachable', 'recorded-ownership-refused']:
-        if os.environ.get('PR_FIXTURE_CASE') and os.environ['PR_FIXTURE_CASE'] != case:
-            continue
-        with tempfile.TemporaryDirectory(prefix='.local-salvage-', dir=ROOT) as tmp:
-            t = Path(tmp)
-            wt, bare, artifacts, state, env, branch, unique, ancestor, head, base = fixture(t)
-            state.write_text(json.dumps({'prs': []}))
-            if case == 'missing-context':
-                for key in ['ARTIFACTS_DIR', 'WORKFLOW_ID', 'RECORDED_BASE_BRANCH', 'ACTING_LOGIN']:
-                    env.pop(key, None)
-            else:
-                cmd(['git', 'config', 'url.' + bare.as_posix() + '.insteadOf', 'https://github.com/fixture/repo.git'], wt)
-                cmd(['git', 'remote', 'set-url', 'origin', 'https://github.com/fixture/repo.git'], wt)
-                if case == 'github-unreachable': env['PR_FIXTURE_GH_FAIL'] = '1'
-                else:
-                    pr = primary(branch, ancestor); pr['author'] = {'login': 'unrelated'}
-                    state.write_text(json.dumps({'prs': [pr]}))
-                    (artifacts / 'run-pr.json').write_text(json.dumps(dict(number=7, url=pr['url'], head_branch=branch, base='dev', wo_id=WO, run_id='fixture-run', repo=REPO)))
-            (wt / 'file').write_text('preserve even offline\n')
-            output = drive(t, wt, env, 'noninteractive-salvage', expected=1 if case == 'recorded-ownership-refused' else 0)
-            assert 'SALVAGE=preserved_uncommitted:1' in output, output
-            if case != 'recorded-ownership-refused': assert 'SALVAGE=preserved_local_only reason=' in output, output
-            assert cmd(['git', 'log', '-1', '--format=%s'], wt).stdout.strip() == 'salvage(uncommitted): 1 files'
-            assert cmd(['git', 'show', 'HEAD:file'], wt).stdout == 'preserve even offline\n'
-            assert cmd(['git', 'branch', '--show-current'], wt).stdout.startswith('salvage/')
-            assert cmd(['git', 'rev-parse', 'refs/heads/' + branch], wt).stdout.strip() == head
-            assert not (artifacts / 'run-pr.lock').exists()
-            assert not Path(str(state)+'.attempts').exists()
-            print('PASS: local preservation '+case+' keeps salvage commit and expected exit', flush=True)
+# WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: noninteractive-salvage commits only (no push, no PR,
+# no run PR lock), so its fallback-PR, local-preservation and lock-contention cases were
+# removed with that behavior; june-shape-fixture.py salvage covers the rebuilt node.
 
 
 def wait_for(path, process):
@@ -346,69 +287,6 @@ def wait_for(path, process):
             raise AssertionError('fixture process exited before gate: ' + stdout + stderr)
         assert time.monotonic() < deadline, 'fixture did not reach gate'
         time.sleep(0.05)
-
-
-def run_concurrent():
-    # A process gate makes contention deterministic; both orders use the real nodes.
-    for winner in ['primary', 'salvage']:
-        if os.environ.get('PR_FIXTURE_CASE') and os.environ['PR_FIXTURE_CASE'] != winner:
-            continue
-        with tempfile.TemporaryDirectory(prefix='.concurrent-pr-', dir=ROOT) as tmp:
-            t = Path(tmp)
-            wt, bare, artifacts, state, env, branch, unique, ancestor, head, base = fixture(t)
-            cmd(['git', 'config', 'url.' + bare.as_posix() + '.insteadOf', 'https://github.com/fixture/repo.git'], wt)
-            cmd(['git', 'remote', 'set-url', 'origin', 'https://github.com/fixture/repo.git'], wt)
-            (wt / 'file').write_text('salvage bytes\n')
-            state.write_text(json.dumps({'prs': []}))
-            gate = t / 'create-release'
-            waiting = t / 'contender-waiting'
-            first_env = dict(env, PR_FIXTURE_CREATE_GATE=str(gate))
-            names = ['open-pr-if-needed', 'noninteractive-salvage'] if winner == 'primary' else ['noninteractive-salvage', 'open-pr-if-needed']
-            scripts = []
-            for name in names:
-                text = node(name)
-                if name == names[1]:
-                    # Observe the real wait branch, rather than inferring lock
-                    # contention from an arbitrary delay or process liveness.
-                    marker = 'echo "run_pr_guard_waiting: another node holds the run PR lock" >&2'
-                    assert marker in text
-                    text = text.replace(marker, marker + '\n          touch "$PR_FIXTURE_WAITING"')
-                path = t / (name + '.sh'); write_lf(path, text); scripts.append(path)
-            processes = []
-            try:
-                first = subprocess.Popen([BASH, str(scripts[0])], cwd=wt, env=first_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                processes.append(first)
-                wait_for(gate.with_suffix('.entered'), first)
-                # When salvage wins it has already changed HEAD. Publish its new HEAD to
-                # the run's unique branch as commit-and-push would, to satisfy the primary
-                # node's independent origin precondition before it reaches the lock.
-                if winner == 'salvage': cmd(['git', 'push', '-q', 'origin', 'HEAD:' + unique], wt)
-                second = subprocess.Popen([BASH, str(scripts[1])], cwd=wt, env=dict(env, PR_FIXTURE_WAITING=str(waiting)), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                processes.append(second)
-                wait_for(waiting, second)
-                gate.touch()
-                first_out, first_err = first.communicate(timeout=45)
-                second_out, second_err = second.communicate(timeout=45)
-                assert first.returncode == second.returncode == 0, first_out + first_err + second_out + second_err
-                data = json.loads(state.read_text())
-                assert len(data['prs']) == 1, data
-                assert int(Path(str(state)+'.attempts').read_text()) == 1
-                if winner == 'primary':
-                    assert 'BDC_RUN_EVENT ' in second_out and 'duplicate_pr_suppressed' in second_out
-                    assert len(data['prs'][0]['comments']) == 1
-                    assert data['prs'][0]['headRefName'] == unique
-                    assert cmd(['git', 'rev-parse', 'refs/heads/' + unique], bare).stdout.strip() == head
-                else:
-                    assert data['prs'][0]['headRefName'].startswith('salvage/')
-                    assert 'PR_URL=' + data['prs'][0]['url'] in second_out
-                assert not (artifacts / 'run-pr.lock').exists()
-                print('PASS: concurrent '+winner+' wins; both nodes exit 0 and exactly one PR exists', flush=True)
-            finally:
-                gate.touch()
-                for process in processes:
-                    if process.poll() is None:
-                        process.terminate()
-                    process.communicate(timeout=45)
 
 
 def run_stale_lock():
@@ -452,19 +330,12 @@ while [ ! -f "$HOLDER_RELEASE" ]; do sleep 0.1; done
             assert holder.poll() is None and lock.exists()
             assert not Path(str(state)+'.attempts').exists()
             print('PASS: old live-holder lock is retained and contender reports bounded timeout', flush=True)
-            (wt / 'file').write_text('preserved despite lock timeout\n')
-            write_lf(script, node('noninteractive-salvage').replace('RPR_LOCK_TIMEOUT=180', 'RPR_LOCK_TIMEOUT=2'))
-            result=cmd([BASH, str(script)], wt, env, check=False)
-            assert result.returncode == 0, result.stdout+result.stderr
-            assert 'SALVAGE=preserved_uncommitted:1' in result.stdout
-            assert 'SALVAGE=preserved_local_only reason=github_or_lock_unavailable' in result.stdout
-            assert cmd(['git', 'show', 'HEAD:file'], wt).stdout == 'preserved despite lock timeout\n'
-            assert holder.poll() is None and lock.exists()
-            print('PASS: salvage lock timeout preserves local commit and exits zero', flush=True)
+            # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: noninteractive-salvage no longer takes the
+            # run PR lock (it commits only); its lock-timeout case is gone with its PR path.
         finally:
             release.touch()
             holder.communicate(timeout=15)
 
 
 if __name__ == '__main__':
-    {'adopt': run_adopt, 'fallback': run_fallback, 'concurrent': run_concurrent, 'stale': run_stale_lock, 'local': run_local_preservation}[sys.argv[1]]()
+    {'adopt': run_adopt, 'stale': run_stale_lock}[sys.argv[1]]()

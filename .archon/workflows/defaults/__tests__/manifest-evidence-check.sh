@@ -102,6 +102,13 @@ SME_CALL="$(extract_call "$CANONICAL_YAML" sme_process)"
 MEC_CALL="$(extract_call "$CANONICAL_YAML" mec_check)"
 for lane in $LANES; do
   assert_eq "sme call parity $lane" "$SME_CALL" "$(extract_call "$DEFAULTS/$lane" sme_process)"
+  if [ "$lane" = "bdc-feature-development.yaml" ]; then
+    # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane captures mec_check's refusal as a
+    # recorded finding (MEC_OUT=$(...) || MEC_RC=$?); the mec core itself stays identical above.
+    assert_contains "mec call captured in $lane" 'MEC_OUT=$(printf' "$(tr -d '\r' < "$DEFAULTS/$lane" | grep -F '| mec_check "$STATUS"')"
+    assert_contains "mec refusal recorded as a finding in $lane" '|| MEC_RC=$?' "$(tr -d '\r' < "$DEFAULTS/$lane" | grep -F 'MEC_ERR")')"
+    continue
+  fi
   assert_eq "mec call parity $lane" "$MEC_CALL" "$(extract_call "$DEFAULTS/$lane" mec_check)"
 done
 
@@ -257,5 +264,18 @@ assert_eq "blocked numeric evidence exits 1" "1" "$RC"
 assert_contains "blocked has named prefix" "TESTS_BLOCKED: missing_tool:pytest" "$OUT"
 OUT="$(printf 'Tests: one: 1/1 (bash a.sh) | two: 2/2 (bash b.sh)\nGrep assertions: N/A\n' | mec_check PROCEED MIXED passed 0 not_required 0 2>&1)"
 assert_eq "stage PASS is accepted" "OK" "$OUT"
+
+echo
+# Test 9 (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01): in the rebuilt bdc-feature-development.yaml
+# the evidence and consistency checks no longer fail the run. The real node bash runs through
+# june-shape-fixture.py: HARNESS_REFUSED and a missing manifest path each exit 0 with a
+# FINDING, patch-pr-body writes both under "Findings (not lane-verified)", and
+# hold-if-findings holds the PR. The mec core itself is unchanged (parity above).
+echo "--- Test 9: evidence and consistency findings do not end the run (rebuilt lane) ---"
+T9_OUT="$(python3 "$HERE/fixtures/june-shape-fixture.py" evidence 2>&1)"
+printf '%s\n' "$T9_OUT" | grep -E '^(PASS|FAIL): '
+PASS=$((PASS + $(printf '%s\n' "$T9_OUT" | grep -c '^PASS: ' || true)))
+FAIL=$((FAIL + $(printf '%s\n' "$T9_OUT" | grep -c '^FAIL: ' || true)))
+assert_eq "Test 9 scenario ran its four checks" "4" "$(printf '%s\n' "$T9_OUT" | grep -cE '^(PASS|FAIL): T9 ' || true)"
 echo "manifest-evidence-check.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

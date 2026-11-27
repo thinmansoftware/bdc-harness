@@ -86,6 +86,10 @@ export const WORKFLOW_EVENT_TYPES = [
   // idle timer fires in a workflow with `idle_handoff: overseer`; data carries step_id,
   // step_kind, idle_ms and last_output (last 200 lines).
   'idle_handoff_overseer',
+  // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 (Correction F, lane): written from a lane's bash
+  // event protocol when an unattended question with no code goes back to the work order's
+  // author; data carries outcome='returned_to_author', run_id and the issue number.
+  'run_outcome',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

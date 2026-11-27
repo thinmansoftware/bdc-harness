@@ -888,8 +888,11 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
       const yaml = readFileSync(lane, 'utf8').replace(/\r\n/g, '\n');
       expect(yaml).toContain('  - id: resolve-review-base\n');
       expect(yaml).toContain('depends_on: [war-council-validator, resolve-review-base]');
+      // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane has no implement-block-gate.
       expect(yaml).toContain(
-        'depends_on: [diff-review, classify-diff-review, resolve-review-base, implement-block-gate, repair-gate]'
+        lane.endsWith('bdc-feature-development.yaml')
+          ? 'depends_on: [diff-review, classify-diff-review, resolve-review-base, assert-implement-produced-work, repair-gate]'
+          : 'depends_on: [diff-review, classify-diff-review, resolve-review-base, implement-block-gate, repair-gate]'
       );
       expect(yaml).toContain('depends_on: [checkpoint-diff-repair, resolve-review-base]');
       expect(yaml).not.toContain('BASE_REF="origin/${BASE_BRANCH:-main}"');
@@ -1409,7 +1412,12 @@ describe('Spec-authorized repair onto wo and Cauldron task branches', () => {
       expect(yaml, label).toContain('CHECKOUT_OUTPUT=$checkout-repair-target.output');
       const repairAssign = block.indexOf('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
       const ordinaryAssign = block.indexOf(ORDINARY_BRANCH_PATTERN);
-      const threadAssign = block.indexOf('UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"');
+      // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane's new run branch ends -run-<12 hex>.
+      const threadAssign = block.indexOf(
+        label === 'bdc-feature-development.yaml'
+          ? 'UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}-run-${RUN_MARKER:-}"'
+          : 'UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"'
+      );
       expect(repairAssign, label).toBeGreaterThanOrEqual(0);
       expect(ordinaryAssign, label).toBeGreaterThan(repairAssign);
       expect(threadAssign, label).toBeGreaterThan(ordinaryAssign);

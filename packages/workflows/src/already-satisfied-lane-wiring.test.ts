@@ -125,8 +125,12 @@ describe('already-satisfied lane wiring', () => {
       expect(node('plan-review')?.trigger_rule).toBe('all_done');
       // Repair runs also require an open repair-gate. The gate clause is
       // ANDed so a missing gate output fails closed (WO-HARNESS-REPAIR-RUN-GUARDS-01).
+      // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane also requires lane-scope-check and
+      // skips implement after an unattended plan-review question.
       expect(node('implement')?.when).toBe(
-        "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+        file === 'bdc-feature-development.yaml'
+          ? "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $lane-scope-check.output == 'LANE_SCOPE=ok' && $plan-review.output != 'UNATTENDED_QUESTION=true'"
+          : "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
       );
       expect(node('implement')?.trigger_rule).toBe('all_done');
 

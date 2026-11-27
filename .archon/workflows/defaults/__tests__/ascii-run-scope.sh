@@ -6,8 +6,10 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 AUTOFIX="$ROOT/harness/scripts/ascii-autofix.py"
 PYTHON_BIN=$(command -v python3 || command -v python || true)
+# bdc-feature-development.yaml is excluded (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01): there a dirty
+# capture or a missing/invalid run scope is a recorded FINDING that holds the PR, not a failed run
+# (exit-table FINDING rows); june-shape-lane.sh Test 8 pins its exits.
 LANES=(
-  bdc-feature-development.yaml
   bdc-feature-development-codex.yaml
   bdc-feature-development-codex-only.yaml
   bdc-feature-development-zero.yaml

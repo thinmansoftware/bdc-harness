@@ -141,8 +141,14 @@ describe('#841 wiring: resolve-review-base reads the authority file', () => {
     it(`${file}: authority file read, no read-spec substitution or heredoc`, () => {
       const bash = nodeBash(file, 'resolve-review-base') ?? '';
       expect(bash).toContain('RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"');
-      expect(bash).toContain('SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")');
-      expect(bash).toContain('scope_authority_missing');
+      if (file === 'bdc-feature-development.yaml') {
+        // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: authority is checked at the start and before the
+        // push, so the rebuilt lane's resolve-review-base only reads the file (exit-table GONE row).
+        expect(bash).toContain('SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC" 2>/dev/null || true)');
+      } else {
+        expect(bash).toContain('SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")');
+        expect(bash).toContain('scope_authority_missing');
+      }
       expect(bash).not.toContain('SPEC_TEXT=$read-spec.output');
       expect(bash).not.toContain("<<'");
     });

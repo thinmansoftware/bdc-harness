@@ -114,8 +114,14 @@ describe('blocked-terminal-gate', () => {
   });
 
   test('Test 3: every lane that defines block-reclassify carries the same gate after every terminal node', () => {
-    const files = laneFiles();
-    expect(files.length).toBeGreaterThanOrEqual(13);
+    // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 removed this gate from the rebuilt
+    // bdc-feature-development.yaml (a blocked run with code is pushed and held, not failed);
+    // the other 12 lanes keep it unchanged.
+    const files = laneFiles().filter(name => name !== 'bdc-feature-development.yaml');
+    expect(files.length).toBeGreaterThanOrEqual(12);
+    expect(readFileSync(join(defaultsDir, 'bdc-feature-development.yaml'), 'utf8')).not.toContain(
+      GATE_ID
+    );
     const cores = new Set<string>();
     for (const file of files) {
       const workflow = loadLane(file);
