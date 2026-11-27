@@ -364,10 +364,19 @@ describe('shipped lane reviewer failover declarations', () => {
       if (!parsed.workflow) throw new Error(`${file} failed to load: ${parsed.error?.error}`);
       const exceptions = REVIEWER_FAILOVER_EXCEPTIONS[file] ?? {};
       const strict = parsed.workflow.nodes.filter(node => node.provider === 'codex-native-strict');
+      const repairReviews =
+        file === 'bdc-feature-development.yaml'
+          ? [
+              'review-round-1',
+              'review-round-2',
+              'review-round-3',
+              'review-round-4',
+              'review-round-5',
+            ]
+          : ['diff-review-final', 'opus-rereview'];
       expect(strict.map(node => node.id)).toEqual([
         'diff-review',
-        'diff-review-final',
-        'opus-rereview',
+        ...repairReviews,
         'apply-diff-review-final',
       ]);
       for (const node of strict) {
