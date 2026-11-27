@@ -164,7 +164,15 @@ describe('repair-target lane wiring', () => {
         'DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"'
       );
       expect(commitBash, file).toContain('DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")');
-      expect(commitBash, file).toContain('if [ ! -s "$DECIDE_OUT_FILE" ]; then');
+      if (file === 'bdc-feature-development.yaml') {
+        // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 exit table (W:5693/5829 DERIVE): a missing push
+        // target is an in-node default; commit-and-push derives the branch and continues.
+        expect(commitBash, file).toContain('if [ -s "$DECIDE_OUT_FILE" ]; then');
+        expect(commitBash, file).toContain('handed over no push target');
+        expect(commitBash, file).toContain('deriving the branch in-node');
+      } else {
+        expect(commitBash, file).toContain('if [ ! -s "$DECIDE_OUT_FILE" ]; then');
+      }
       expect(commitBash, file).toContain('PLAN_REVIEW_OUT_FILE="$ARCHON_NODE_OUT/plan-review.out"');
       expect(commitBash, file).toContain('PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")');
       expect(commitBash, file).toContain('if [ ! -s "$PLAN_REVIEW_OUT_FILE" ]; then');

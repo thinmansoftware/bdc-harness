@@ -28,6 +28,9 @@ def cmd(args, cwd, env=None, check=True):
     return subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, check=check)
 
 
+PREFLIGHT = {'out': ''}
+
+
 def node(name):
     lines = YAML.read_text().splitlines()
     start = lines.index('  - id: ' + name)
@@ -43,6 +46,7 @@ def node(name):
         'evidence-repair-final': '{"state":"not_applicable"}',
     }.items():
         text = text.replace('$' + ref + '.output', shlex.quote(value))
+    text = text.replace('$preflight-github-auth.output', shlex.quote(PREFLIGHT['out']))
     for ref, value in {
         'block-reclassify': '{"status":"BLOCKED"}',
         'plan-review': '=== APPROVED_PLAN_BEGIN ===\nCommit message: fixture\n=== APPROVED_PLAN_END ===',
@@ -162,7 +166,7 @@ def fixture(t):
     assert Path(cmd(['git', 'remote', 'get-url', '--push', 'origin'], wt).stdout.strip()).resolve() == bare.resolve()
     # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the lane publishes (the adopt push included) only
     # through the pubg core that its first node, preflight-github-auth, defines and saves.
-    drive(t, wt, env, 'preflight-github-auth')
+    PREFLIGHT['out'] = drive(t, wt, env, 'preflight-github-auth').rstrip('\n')
     return wt, bare, artifacts, state, env, branch, unique, ancestor, head, base
 
 

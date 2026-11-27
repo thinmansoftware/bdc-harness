@@ -159,6 +159,7 @@ structural() {
   local pre core_free pushes
   pre=$(node_block preflight-github-auth)
   assert_eq "the pubg core lives in preflight-github-auth (the run's first node)" "1" "$(count_in '# ---- BEGIN pubg core' "$pre")"
+  assert_eq "preflight-github-auth records the sha256 of the saved core in its output" "1" "$(count_in 'echo "PUBG_CORE_SHA256=$(sha256sum < "$ARTIFACTS_DIR/evidence/pubg.core.sh" | cut -c1-64)"' "$pre")"
   assert_eq "preflight-github-auth saves the core for the publishing nodes" "1" "$(count_in 'declare -f pubg_record pubg_preserve pubg_refuse pubg_have pubg_push > "$ARTIFACTS_DIR/evidence/pubg.core.sh"' "$pre")"
   core_free=$(tr -d '\r' < "$W" | awk '/# ---- BEGIN pubg core/ { c = 1 } !c { print } /# ---- END pubg core ----/ { c = 0 }')
   pushes=$(printf '%s\n' "$core_free" | grep -v '^[[:space:]]*#' | grep -F 'git push' | grep -vF 'echo "ERROR: git push failed after 3 attempts' || true)
@@ -167,7 +168,9 @@ structural() {
   local id blk
   for id in checkout-repair-target checkpoint-push commit-and-push open-pr-if-needed; do
     blk=$(node_block "$id")
-    assert_eq "$id sources the saved pubg core" "1" "$(count_in '. "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"' "$blk")"
+    assert_eq "$id loads the saved pubg core only after its sha256 check" "1" "$(count_in 'pf=$preflight-github-auth.output' "$blk")"
+    assert_eq "$id never sources the saved pubg core file directly" "0" "$(printf '%s\n' "$blk" | grep -cE '^[[:space:]]*(\.|source) .*pubg\.core' || true)"
+    assert_eq "$id sources exactly the verified copy" "1" "$(count_in '. "$copy"' "$blk")"
     if [ "$(count_in 'pubg_push ' "$blk")" -ge 1 ]; then ok "$id publishes through pubg_push"; else bad "$id publishes through pubg_push"; fi
   done
   blk=$(node_block checkout-repair-target)
@@ -181,6 +184,17 @@ structural() {
   assert_eq "open-pr adopt push goes through pubg_push with the lease" "1" "$(count_in 'pubg_push "$(git rev-parse HEAD)" "$RPR_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"' "$blk")"
   assert_eq "no slice-2 placeholder is left" "0" "$(count_w 'TODO-SLICE2')"
   assert_eq "no pushed_sha fallback is left" "0" "$(count_w 'pushed_sha')"
+
+  echo "--- Scan settings are never taken from the run (Test 13 a-d) ---"
+  local pcore
+  pcore=$(printf '%s\n' "$pre" | awk '/# ---- BEGIN pubg core/ { c = 1 } c { print } /# ---- END pubg core ----/ { c = 0 }')
+  assert_eq "gitleaks runs with GITLEAKS_CONFIG and GITLEAKS_CONFIG_TOML unset" "1" "$(count_in 'env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML GIT_DIR="$gitdir"' "$pcore")"
+  assert_eq "gitleaks always ignores gitleaks:allow markers" "1" "$(count_in '--ignore-gitleaks-allow' "$pcore")"
+  assert_eq "gitleaks gets an explicit --config" "1" "$(count_in '--config "$gld/config.toml"' "$pcore")"
+  assert_eq "gitleaks gets an explicit --gitleaks-ignore-path" "1" "$(count_in '--gitleaks-ignore-path "$gld/ignore"' "$pcore")"
+  assert_eq "the config comes from the base tip B" "1" "$(count_in 'git show "${b}:.gitleaks.toml"' "$pcore")"
+  assert_eq "the ignore list comes from the base tip B" "1" "$(count_in 'git show "${b}:.gitleaksignore"' "$pcore")"
+  assert_eq "gitleaks never scans from the worktree (an empty source dir)" "0" "$(count_in 'git rev-parse --show-toplevel' "$pcore")"
 
   echo "--- Test 14: the implement prompt has no push; the gap is recorded ---"
   local impl_blk
@@ -241,7 +255,7 @@ structural() {
 
 fixture() {
   local scenario out rc
-  for scenario in blocked hold-failures prod-guard markers repair scope returned pubg-core publication refused-edit rule-1b unpublished; do
+  for scenario in blocked hold-failures prod-guard markers repair scope returned pubg-core scan-config tamper publication refused-edit rule-1b unpublished; do
     echo "--- fixture scenario: $scenario ---"
     out=$(python3 "$FIXTURE" "$scenario" 2>&1); rc=$?
     printf '%s\n' "$out" | grep -E '^(PASS|FAIL): '

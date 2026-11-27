@@ -60,6 +60,17 @@ const GUARDED_WHEN: Record<string, string> = {
 };
 
 const IMPLEMENT_GATE = "$implement-block-gate.output.terminal == 'no'";
+
+// WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 changed these guards in bdc-feature-development.yaml only:
+// implement-block-gate is removed (its clause becomes "not returned to author"), implement also
+// waits for lane-scope-check and skips a plan-review question (Correction F), and commit-and-push
+// runs for BLOCKED as well as PROCEED (exit-table HOLD) once per run that has code.
+const REBUILT_LANE = 'bdc-feature-development.yaml';
+const NOT_RETURNED = "$assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'";
+const REBUILT_GUARDED_WHEN: Record<string, string> = {
+  implement: `${GUARDED_WHEN.implement} && $lane-scope-check.output == 'LANE_SCOPE=ok' && $plan-review.output != 'UNATTENDED_QUESTION=true'`,
+  'commit-and-push': `$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && ${NOT_RETURNED} && $block-reclassify.output.status != 'ALREADY_SATISFIED'`,
+};
 const IMPLEMENT_GATED = new Set([
   'diff-repair',
   'checkpoint-diff-repair',
@@ -296,6 +307,8 @@ function runningAtoms(gate: string | undefined): Map<string, NodeOutput> {
     // A normal run: the implement step did not declare BLOCKED (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-
     // AND-IMPLEMENT-BLOCK-STOP-01), so the gate does not change what repair-gate decides.
     'implement-block-gate': '{"terminal":"no"}',
+    // The rebuilt lane's scope check passed (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01).
+    'lane-scope-check': 'LANE_SCOPE=ok',
   };
   if (gate !== undefined) entries['repair-gate'] = gate;
   return outputMap(entries);
@@ -312,12 +325,17 @@ function assertGuarded(
     const node = nodeOf(nodes, id, file);
     // The nodes that repair, push, commit or open a PR also carry the implement-block gate on every
     // OR clause (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01).
-    const expectedWhen = IMPLEMENT_GATED.has(id)
-      ? guardedWhen
-          .split(' || ')
-          .map(clause => `${clause} && ${IMPLEMENT_GATE}`)
-          .join(' || ')
-      : guardedWhen;
+    const rebuilt = file === REBUILT_LANE;
+    const gateClause = rebuilt ? NOT_RETURNED : IMPLEMENT_GATE;
+    const expectedWhen =
+      rebuilt && REBUILT_GUARDED_WHEN[id] !== undefined
+        ? REBUILT_GUARDED_WHEN[id]
+        : IMPLEMENT_GATED.has(id)
+          ? guardedWhen
+              .split(' || ')
+              .map(clause => `${clause} && ${gateClause}`)
+              .join(' || ')
+          : guardedWhen;
     expect(node.when, `${file} ${id}`).toBe(expectedWhen);
     expect(node.depends_on ?? [], `${file} ${id}`).toContain('repair-gate');
     expect((node.depends_on ?? [])[(node.depends_on ?? []).length - 1], `${file} ${id}`).toBe(

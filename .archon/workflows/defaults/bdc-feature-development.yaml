@@ -111,6 +111,7 @@ nodes:
       }
       pubg_push() {
         local lease="${3:-}" base="${BASE_BRANCH:-}" remote="" t="" b="" def="" range="" label="" rep="" rc=0 out="" findings=""
+        local gld="" gitdir=""
         PUBG_DEST="${2:-}"
         PUBG_SHA=$(git rev-parse --verify -q "${1:-}^{commit}" 2>/dev/null) || PUBG_SHA="${1:-}"
         PUBG_URL=$(git remote get-url origin 2>/dev/null) || PUBG_URL=""
@@ -144,8 +145,26 @@ nodes:
         if [ "$range" != "none" ]; then
           # 3. Scan.
           command -v gitleaks >/dev/null 2>&1 || { pubg_refuse "scanner_missing: gitleaks is not on PATH"; return 1; }
-          rep=$(mktemp "${TMPDIR:-/tmp}/pubg-report.XXXXXX") || { pubg_refuse "scan_error: no report file"; return 1; }
-          gitleaks git --redact --no-banner --report-format json --report-path "$rep" --log-opts "--diff-merges=separate ${range}" "$(git rev-parse --show-toplevel)" >/dev/null 2>&1 || rc=$?
+          # Settings the run controls cannot weaken the scan: the config and the ignore list come
+          # from the base tip B (else gitleaks' defaults and an empty list), gitleaks:allow
+          # markers are ignored, GITLEAKS_CONFIG* is unset, and gitleaks runs on GIT_DIR from an
+          # empty directory, so no .gitleaks.toml or .gitleaksignore of the worktree is read.
+          gld=$(mktemp -d "${TMPDIR:-/tmp}/pubg-scan.XXXXXX") && mkdir "$gld/src" \
+            && gitdir=$(git rev-parse --absolute-git-dir) || { pubg_refuse "scan_error: no scan directory"; return 1; }
+          rep="$gld/report.json"
+          if [ -n "$b" ] && pubg_have "$b" "$base" && git cat-file -e "${b}:.gitleaks.toml" 2>/dev/null; then
+            git show "${b}:.gitleaks.toml" > "$gld/config.toml" || { rm -rf "$gld"; pubg_refuse "scan_error: base scan config unreadable"; return 1; }
+          else
+            printf '[extend]\nuseDefault = true\n' > "$gld/config.toml"
+          fi
+          if [ -n "$b" ] && git cat-file -e "${b}:.gitleaksignore" 2>/dev/null; then
+            git show "${b}:.gitleaksignore" > "$gld/ignore" || { rm -rf "$gld"; pubg_refuse "scan_error: base ignore list unreadable"; return 1; }
+          else
+            : > "$gld/ignore"
+          fi
+          ( cd "$gld/src" && env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML GIT_DIR="$gitdir" \
+            gitleaks git --redact --no-banner --config "$gld/config.toml" --gitleaks-ignore-path "$gld/ignore" --ignore-gitleaks-allow \
+            --report-format json --report-path "$rep" --log-opts "--diff-merges=separate ${range}" "$gld/src" ) >/dev/null 2>&1 || rc=$?
           if [ "$rc" -ne 0 ]; then
             findings=$(python3 -c 'import json, sys
       try:
@@ -153,11 +172,11 @@ nodes:
       except Exception:
           items = []
       print("; ".join("file=%s rule=%s commit=%s" % (i.get("File", "?"), i.get("RuleID", "?"), str(i.get("Commit", ""))[:12]) for i in items if isinstance(i, dict)))' "$rep" 2>/dev/null) || findings=""
-            rm -f "$rep"
+            rm -rf "$gld"
             if [ -n "$findings" ]; then pubg_refuse "secret_found: ${findings} (scan of the ${label})"; return 1; fi
             pubg_refuse "scan_error: gitleaks exited ${rc} on the ${label} range"; return 1
           fi
-          rm -f "$rep"
+          rm -rf "$gld"
           pubg_record "pubg_scanned: ${label} (${range}) clean"
           # 4. Push.
           if [ -n "$lease" ]; then
@@ -188,6 +207,8 @@ nodes:
       # commit-and-push, open-pr-if-needed); each sources this file before its first push.
       mkdir -p "$ARTIFACTS_DIR/evidence"
       declare -f pubg_record pubg_preserve pubg_refuse pubg_have pubg_push > "$ARTIFACTS_DIR/evidence/pubg.core.sh"
+      # The engine keeps this output; publishing steps compare the saved file against it.
+      echo "PUBG_CORE_SHA256=$(sha256sum < "$ARTIFACTS_DIR/evidence/pubg.core.sh" | cut -c1-64)"
 
   - id: read-spec
     persona: xo
@@ -913,12 +934,25 @@ nodes:
         fi
       }
       # ---- END rtw core ----
-      # The guarded publisher (pubg core): defined once in preflight-github-auth and saved there.
-      if [ -s "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh" ]; then
-        . "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
-      else
-        pubg_push() { echo "pubg_refused: the publication core was not saved by preflight-github-auth; nothing was pushed and the unpublished work was NOT preserved" >&2; return 1; }
-      fi
+      # The guarded publisher (pubg core) is defined once, in preflight-github-auth, which saves it
+      # and records its sha256 in its engine-held node output. The first pubg_push call loads a
+      # private copy of the saved core only when its sha256 equals that value; a missing value, a
+      # missing file or a mismatch refuses publication (nothing is written, no retry).
+      pubg_push() {
+        local pf want have copy file="${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+        pf=$preflight-github-auth.output
+        want=$(printf '%s\n' "$pf" | sed -n 's/^PUBG_CORE_SHA256=\([0-9a-f]\{64\}\)$/\1/p' | tail -n 1)
+        copy=$(mktemp "${TMPDIR:-/tmp}/pubg-core.XXXXXX") || copy=""
+        if [ -n "$copy" ] && cp "$file" "$copy" 2>/dev/null; then have=$(sha256sum < "$copy" | cut -c1-64); else have=""; fi
+        if [ -z "$want" ] || [ "$have" != "$want" ]; then
+          [ -z "$copy" ] || rm -f "$copy"
+          echo "pubg_refused: publication core unverified (expected sha256 ${want:-missing}, saved core ${have:-missing}); nothing was pushed and the unpublished work was NOT preserved" >&2
+          return 1
+        fi
+        . "$copy"
+        rm -f "$copy"
+        pubg_push "$@"
+      }
       rtw_checkout_repair_branch "$SPEC_REPAIR_BRANCH"
       git fetch origin "+refs/heads/${SPEC_REPAIR_BRANCH}:refs/remotes/origin/${SPEC_REPAIR_BRANCH}"
       git branch --set-upstream-to="origin/${SPEC_REPAIR_BRANCH}" "${SPEC_REPAIR_BRANCH}"
@@ -1457,7 +1491,7 @@ nodes:
   - id: implement
     idle_timeout: 600000
     persona: major-build
-    depends_on: [prep-dependencies, repair-gate, lane-scope-check]
+    depends_on: [prep-dependencies, lane-scope-check, repair-gate]
     trigger_rule: all_done
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $lane-scope-check.output == 'LANE_SCOPE=ok' && $plan-review.output != 'UNATTENDED_QUESTION=true'"
     agent: major-build
@@ -1677,12 +1711,25 @@ nodes:
       Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>" \
         2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
 
-      # The guarded publisher (pubg core): defined once in preflight-github-auth and saved there.
-      if [ -s "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh" ]; then
-        . "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
-      else
-        pubg_push() { echo "pubg_refused: the publication core was not saved by preflight-github-auth; nothing was pushed and the unpublished work was NOT preserved" >&2; return 1; }
-      fi
+      # The guarded publisher (pubg core) is defined once, in preflight-github-auth, which saves it
+      # and records its sha256 in its engine-held node output. The first pubg_push call loads a
+      # private copy of the saved core only when its sha256 equals that value; a missing value, a
+      # missing file or a mismatch refuses publication (nothing is written, no retry).
+      pubg_push() {
+        local pf want have copy file="${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+        pf=$preflight-github-auth.output
+        want=$(printf '%s\n' "$pf" | sed -n 's/^PUBG_CORE_SHA256=\([0-9a-f]\{64\}\)$/\1/p' | tail -n 1)
+        copy=$(mktemp "${TMPDIR:-/tmp}/pubg-core.XXXXXX") || copy=""
+        if [ -n "$copy" ] && cp "$file" "$copy" 2>/dev/null; then have=$(sha256sum < "$copy" | cut -c1-64); else have=""; fi
+        if [ -z "$want" ] || [ "$have" != "$want" ]; then
+          [ -z "$copy" ] || rm -f "$copy"
+          echo "pubg_refused: publication core unverified (expected sha256 ${want:-missing}, saved core ${have:-missing}); nothing was pushed and the unpublished work was NOT preserved" >&2
+          return 1
+        fi
+        . "$copy"
+        rm -f "$copy"
+        pubg_push "$@"
+      }
       PUBG_RC=0
       pubg_push "$(git rev-parse HEAD)" "$WIP_BRANCH" || PUBG_RC=$?
       if [ "$PUBG_RC" -eq 0 ]; then
@@ -6121,12 +6168,25 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
       # so the local archon/thread-<hash> branch lands on a unique remote name
       # (UNIQUE_BRANCH) and does not collide with other parallel runs.
-      # The guarded publisher (pubg core): defined once in preflight-github-auth and saved there.
-      if [ -s "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh" ]; then
-        . "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
-      else
-        pubg_push() { echo "pubg_refused: the publication core was not saved by preflight-github-auth; nothing was pushed and the unpublished work was NOT preserved" >&2; return 1; }
-      fi
+      # The guarded publisher (pubg core) is defined once, in preflight-github-auth, which saves it
+      # and records its sha256 in its engine-held node output. The first pubg_push call loads a
+      # private copy of the saved core only when its sha256 equals that value; a missing value, a
+      # missing file or a mismatch refuses publication (nothing is written, no retry).
+      pubg_push() {
+        local pf want have copy file="${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+        pf=$preflight-github-auth.output
+        want=$(printf '%s\n' "$pf" | sed -n 's/^PUBG_CORE_SHA256=\([0-9a-f]\{64\}\)$/\1/p' | tail -n 1)
+        copy=$(mktemp "${TMPDIR:-/tmp}/pubg-core.XXXXXX") || copy=""
+        if [ -n "$copy" ] && cp "$file" "$copy" 2>/dev/null; then have=$(sha256sum < "$copy" | cut -c1-64); else have=""; fi
+        if [ -z "$want" ] || [ "$have" != "$want" ]; then
+          [ -z "$copy" ] || rm -f "$copy"
+          echo "pubg_refused: publication core unverified (expected sha256 ${want:-missing}, saved core ${have:-missing}); nothing was pushed and the unpublished work was NOT preserved" >&2
+          return 1
+        fi
+        . "$copy"
+        rm -f "$copy"
+        pubg_push "$@"
+      }
       PUSH_OK=false
       for attempt in 1 2 3; do
         PUBG_RC=0
@@ -6224,12 +6284,25 @@ nodes:
       # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
       # then re-push and re-verify before failing the PR-open precondition.
       LOCAL_HEAD="$(git rev-parse HEAD)"
-      # The guarded publisher (pubg core): defined once in preflight-github-auth and saved there.
-      if [ -s "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh" ]; then
-        . "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
-      else
-        pubg_push() { echo "pubg_refused: the publication core was not saved by preflight-github-auth; nothing was pushed and the unpublished work was NOT preserved" >&2; return 1; }
-      fi
+      # The guarded publisher (pubg core) is defined once, in preflight-github-auth, which saves it
+      # and records its sha256 in its engine-held node output. The first pubg_push call loads a
+      # private copy of the saved core only when its sha256 equals that value; a missing value, a
+      # missing file or a mismatch refuses publication (nothing is written, no retry).
+      pubg_push() {
+        local pf want have copy file="${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+        pf=$preflight-github-auth.output
+        want=$(printf '%s\n' "$pf" | sed -n 's/^PUBG_CORE_SHA256=\([0-9a-f]\{64\}\)$/\1/p' | tail -n 1)
+        copy=$(mktemp "${TMPDIR:-/tmp}/pubg-core.XXXXXX") || copy=""
+        if [ -n "$copy" ] && cp "$file" "$copy" 2>/dev/null; then have=$(sha256sum < "$copy" | cut -c1-64); else have=""; fi
+        if [ -z "$want" ] || [ "$have" != "$want" ]; then
+          [ -z "$copy" ] || rm -f "$copy"
+          echo "pubg_refused: publication core unverified (expected sha256 ${want:-missing}, saved core ${have:-missing}); nothing was pushed and the unpublished work was NOT preserved" >&2
+          return 1
+        fi
+        . "$copy"
+        rm -f "$copy"
+        pubg_push "$@"
+      }
 
       wait_match() {
         local attempt remote

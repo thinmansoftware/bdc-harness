@@ -575,7 +575,10 @@ def scenario_returned(tmp):
 # ---------------------------------------------------------------------------------------------
 
 PROCEED = '{"status":"PROCEED"}'
-VARIANTS = ['clean', 'secret', 'tracking', 'absent', 'shape', 'lease', 'merge']
+VARIANTS = ['clean', 'secret', 'tracking', 'absent', 'shape', 'lease', 'merge',
+            'run-toml', 'run-ignore', 'run-allow', 'base-toml']
+# A gitleaks config that would excuse the planted secret (path allowlist on cfg.txt).
+ALLOW_TOML = '[extend]\nuseDefault = true\n\n[allowlist]\npaths = [\'\'\'(^|/)cfg\\.txt$\'\'\']\n'
 WORKER = 'archon/task-web-worker-1790865294847-n1qba8'
 
 
@@ -593,6 +596,22 @@ def variant_commits(f, v, cwd=None, tracking=()):
             f.git(['update-ref', 'refs/remotes/origin/' + ref, c1])
     elif v == 'merge':
         f.merge_secret(cwd)
+    elif v == 'run-toml':
+        # (a) the run itself adds a .gitleaks.toml allowlist that would excuse the secret
+        f.commit_file('.gitleaks.toml', ALLOW_TOML, 'scan config', cwd)
+        f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+    elif v == 'run-ignore':
+        # (b) the run adds a .gitleaksignore entry (commit and global fingerprints) for it
+        c1 = f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+        f.commit_file('.gitleaksignore', '%s:cfg.txt:aws-access-token:1\ncfg.txt:aws-access-token:1\n' % c1, 'ignore list', cwd)
+    elif v == 'run-allow':
+        # (c) an inline gitleaks:allow marker on the added secret line
+        f.commit_file('cfg.txt', SECRET.rstrip('\n') + ' # gitleaks:allow\n', 'add config', cwd)
+    elif v == 'base-toml':
+        # (d) the BASE branch's own .gitleaks.toml allowlist is honored
+        f.commit_file('.gitleaks.toml', ALLOW_TOML, 'base scan config')
+        f.git(['push', '-q', 'origin', 'HEAD:refs/heads/dev'])
+        f.commit_file('cfg.txt', SECRET, 'add config', cwd)
     else:
         f.commit_file('feature.txt', 'feature\n', 'feature', cwd)
     if v == 'absent':
@@ -713,7 +732,7 @@ PUB_PATHS = [
 def scenario_publication(tf):
     """Test 13 (and Test 4 on commit-and-push): every publication path x every variant."""
     for label, driver, has_lease in PUB_PATHS:
-        for v in VARIANTS:
+        for v in [x for x in os.environ.get('JSF_VARIANTS', '').split(',') if x] or VARIANTS:
             if v == 'lease' and not has_lease:
                 continue  # this path never carries a lease (no lease argument reaches pubg_push)
             with tf() as tmp:
@@ -724,13 +743,13 @@ def scenario_publication(tf):
                 text = out + err + f.record()
                 tag = 'T13 %s [%s]' % (label, v)
                 check(tag + ': synthetic key text never printed', KEY not in text, text[-600:])
-                if v == 'clean':
+                if v in ('clean', 'base-toml'):
                     check(tag + ': clean range pushes (exit 0)', rc == 0 and ok(), text[-1500:])
                     check(tag + ': published head recorded', (f.art / 'evidence' / 'published.head').exists() and 'pubg_published:' in f.record(), f.record())
                     continue
                 check(tag + ': step exits nonzero', rc != 0, text[-1500:])
                 check(tag + ': nothing reaches the remote', f.remote_refs() == before, f.remote_refs() + '\n--\n' + before)
-                if v in ('secret', 'tracking', 'merge'):
+                if v in ('secret', 'tracking', 'merge', 'run-toml', 'run-ignore', 'run-allow'):
                     check(tag + ': refused as secret_found naming file and rule', 'secret_found:' in text and 'file=cfg.txt' in text and 'rule=aws-access-token' in text, text[-1500:])
                 if v == 'absent':
                     check(tag + ': missing scanner refuses', 'scanner_missing' in text, text[-1500:])
@@ -785,6 +804,82 @@ def scenario_pubg_core(tf):
         f.commit_file('a.txt', 'a\n', 'orphan a')
         rc, out, err = f.run('core-full-clean', text=core_script('pubg_push HEAD feat/orphan-thread-y'))
         check('pubg: a clean unrelated history is scanned in full, then pushed', rc == 0 and 'scanned=full history' in err and f.remote_tip('feat/orphan-thread-y') == f.git(['rev-parse', 'HEAD']), err)
+
+
+PERMISSIVE = "[extend]\nuseDefault = true\n\n[allowlist]\npaths = ['''cfg\\.txt''']\n"
+
+
+def naive_scan(f, name, extra=None):
+    """Control: the scan as an unguarded caller runs it (worktree as source, no flags). Exit 0
+    means the planted weakening WOULD excuse the synthetic key there."""
+    return f.run(name, extra, text='gitleaks git --no-banner --redact --log-opts "%s..HEAD" . >/dev/null 2>&1\n' % f.base_sha)[0]
+
+
+def scenario_scan_config(tf):
+    """Test 13 (scan config): config the run controls never weakens pubg_push's scan; the base
+    branch's own .gitleaks.toml is honored."""
+    for v in ['toml', 'ignore', 'allow', 'env']:
+        with tf() as tmp:
+            f = Fixture(tmp)
+            extra = {}
+            if v == 'toml':
+                f.commit_file('cfg.txt', SECRET, 'add config')
+                f.commit_file('.gitleaks.toml', PERMISSIVE, 'allowlist cfg.txt')
+            elif v == 'ignore':
+                sha = f.commit_file('cfg.txt', SECRET, 'add config')
+                f.commit_file('.gitleaksignore', '%s:cfg.txt:aws-access-token:1\n' % sha, 'ignore the finding')
+            elif v == 'allow':
+                f.commit_file('cfg.txt', SECRET.rstrip('\n') + '  # gitleaks:allow\n', 'add config')
+            else:
+                f.commit_file('cfg.txt', SECRET, 'add config')
+                write_lf(f.t / 'permissive.toml', PERMISSIVE)
+                extra = {'GITLEAKS_CONFIG': (f.t / 'permissive.toml').as_posix(), 'GITLEAKS_CONFIG_TOML': PERMISSIVE}
+            tag = 'T13 scan config (%s)' % {'toml': 'a: run adds .gitleaks.toml', 'ignore': 'b: run adds .gitleaksignore',
+                                             'allow': 'c: gitleaks:allow on the added line', 'env': 'GITLEAKS_CONFIG env'}[v]
+            check(tag + ': control -- the weakening excuses the key in an unguarded scan', naive_scan(f, 'naive-' + v, extra) == 0)
+            before = f.remote_refs()
+            rc, out, err = f.run('scan-' + v, extra, text=core_script('pubg_push HEAD feat/scan-%s-thread-x' % v))
+            text = out + err + f.record()
+            check(tag + ': still refused as secret_found naming file and rule', rc == 1 and 'secret_found:' in text and 'file=cfg.txt' in text and 'rule=aws-access-token' in text, text[-1500:])
+            check(tag + ': nothing reaches the remote', f.remote_refs() == before)
+            check(tag + ': key text never printed', KEY not in text)
+    with tf() as tmp:
+        f = Fixture(tmp)
+        f.commit_file('.gitleaks.toml', PERMISSIVE, 'base: allowlist cfg.txt')
+        f.git(['push', '-q', 'origin', 'HEAD:refs/heads/dev'])
+        f.commit_file('cfg.txt', SECRET, 'add config')
+        rc, out, err = f.run('scan-base', text=core_script('pubg_push HEAD feat/scan-base-thread-x'))
+        text = out + err + f.record()
+        check('T13 scan config (d: the base branch .gitleaks.toml allowlist is honored): pushed', rc == 0 and f.remote_tip('feat/scan-base-thread-x') == f.git(['rev-parse', 'HEAD']) and 'pubg_published:' in text, text[-1500:])
+        check('T13 scan config (d): key text never printed', KEY not in text)
+
+
+def scenario_tamper(tf):
+    """The saved core is tamper-evident: a publishing step loads it only when its sha256 equals the
+    value preflight-github-auth recorded in its engine-held output."""
+    for case in ['tampered', 'missing-file', 'missing-hash', 'intact']:
+        with tf() as tmp:
+            f = Fixture(tmp)
+            f.commit_change()
+            f.set_out('block-reclassify', PROCEED)
+            core = f.art / 'evidence' / 'pubg.core.sh'
+            if case == 'tampered':
+                # An edit after preflight: a pubg_push that skips the scan.
+                with open(core, 'a', newline='\n') as fh:
+                    fh.write('pubg_push() { git push -q "$(git remote get-url origin)" "${1}:refs/heads/${2}"; echo pushed-unscanned; }\n')
+            elif case == 'missing-file':
+                core.unlink()
+            elif case == 'missing-hash':
+                f.set_out('preflight-github-auth', 'preflight-github-auth PASS')
+            before = f.remote_refs()
+            rc, out, err = f.run('commit-and-push')
+            tag = 'core tamper check (%s)' % case
+            if case == 'intact':
+                check(tag + ': the verified core publishes', rc == 0 and f.remote_tip(UNIQUE) == f.git(['rev-parse', 'HEAD']), out + err)
+                continue
+            check(tag + ': commit-and-push refuses publication (nonzero)', rc != 0 and 'publication core unverified' in err, out + err)
+            check(tag + ': the remote is unchanged', f.remote_refs() == before)
+            check(tag + ': the tampered function never ran', 'pushed-unscanned' not in out + err)
 
 
 def rmtree_force(path):
@@ -920,6 +1015,8 @@ def main():
         'returned': lambda: once(tf, scenario_returned),
         'publication': lambda: scenario_publication(tf),
         'pubg-core': lambda: scenario_pubg_core(tf),
+        'scan-config': lambda: scenario_scan_config(tf),
+        'tamper': lambda: scenario_tamper(tf),
         'refused-edit': lambda: scenario_refused_edit(tf),
         'rule-1b': lambda: scenario_rule_1b(tf),
         'unpublished': lambda: scenario_unpublished(tf),
