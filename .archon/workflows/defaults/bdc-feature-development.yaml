@@ -110,6 +110,34 @@ nodes:
         git update-ref -d refs/pubg/bound >/dev/null 2>&1 || true
         git cat-file -e "${1}^{commit}" 2>/dev/null
       }
+      # Existing PR hold read-back, bdc-xo#6687 comment 7212155712.
+      pubg_pr_state() {
+        gh pr view "$2" --repo "$1" --json state,headRefName,headRefOid,isDraft,labels 2>/dev/null
+      }
+      pubg_pr_head_matches() {
+        jq -e --arg head "$2" --arg branch "$PUBG_DEST" '(.state == "OPEN") and (.headRefName == $branch) and (.headRefOid == $head) and ((.isDraft | type) == "boolean") and ((.labels | type) == "array")' <<< "$1" >/dev/null
+      }
+      pubg_pr_held() {
+        if [ "$2" = draft ]; then
+          jq -e '.isDraft == true' <<< "$1" >/dev/null
+        else
+          jq -e 'any(.labels[]; .name == "run:blocked")' <<< "$1" >/dev/null
+        fi
+      }
+      pubg_pr_verify_hold() {
+        local repo="$1" number="$2" head="$3" kind="$4" state="$5"
+        pubg_pr_head_matches "$state" "$head" || return 1
+        if pubg_pr_held "$state" "$kind"; then return 0; fi
+        if [ "$kind" = draft ]; then
+          local draft_action=(pr ready --undo)
+          gh "${draft_action[@]}" "$number" --repo "$repo" >/dev/null 2>&1 || return 1
+        else
+          gh pr edit "$number" --repo "$repo" --add-label run:blocked >/dev/null 2>&1 || return 1
+        fi
+        state=$(pubg_pr_state "$repo" "$number") &&
+          pubg_pr_head_matches "$state" "$head" &&
+          pubg_pr_held "$state" "$kind"
+      }
       pubg_push() {
         local lease="${3:-}" base="${BASE_BRANCH:-}" remote="" t="" b="" def="" range="" label="" rep="" rc=0 out="" findings=""
         local gld="" gitdir=""
@@ -132,28 +160,6 @@ nodes:
         if [ -n "$base" ] && [ "$PUBG_DEST" = "$base" ]; then pubg_refuse "bad_ref: '${PUBG_DEST}' is the run's base branch"; return 1; fi
         if [ -n "$lease" ] && [ "$t" != "$lease" ]; then
           pubg_refuse "lease_mismatch: repair_target_lease_rejected (remote tip ${t:-absent}, lease ${lease})"; return 1
-        fi
-        # Before changing an existing PR branch, confirm every matching open PR is
-        # still draft or already carries the lane hold. Read the repo from the frozen
-        # authority spec so a suggestion from a model cannot redirect the check.
-        if [ "${PUBG_VERIFY_PR_HOLD:-0}" = 1 ] && [ -n "$t" ] && [ "$t" != "$PUBG_SHA" ]; then
-          local pr_repo pr_states
-          pr_repo=$(python3 - "${ARTIFACTS_DIR:?}/authority/work-order.md" <<'PY'
-      import re, sys
-      with open(sys.argv[1], encoding="utf-8") as spec:
-          for line in spec:
-              match = re.match(r"^\s*(?:target_repo:|\*\*Target [Rr]epo:\*\*|Target repo:)\s*`?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)`?\s*$", line)
-              if match:
-                  print(match.group(1))
-                  break
-      PY
-          ) || pr_repo=""
-          if [ -z "$pr_repo" ] ||
-             ! pr_states=$(gh pr list --repo "$pr_repo" --head "$PUBG_DEST" --state open --json isDraft,labels 2>/dev/null) ||
-             ! jq -e 'type == "array" and all(.[]; .isDraft == true or any(.labels[]?; .name == "run:blocked"))' <<< "$pr_states" >/dev/null 2>&1; then
-            pubg_refuse "unprotected_ready_pr: destination must be draft or already held before its head changes"
-            return 1
-          fi
         fi
         if [ -n "$t" ] && [ "$t" = "$PUBG_SHA" ]; then
           range="none"
@@ -201,6 +207,46 @@ nodes:
           fi
           rm -rf "$gld"
           pubg_record "pubg_scanned: ${label} (${range}) clean"
+          # Read existing PR state immediately before the push. Known repair and
+          # adoption targets are verified by number even if discovery omits them.
+          local pr_repo="" pr_numbers="" pr_number pr_kind pr_state
+          local -a pr_holds=()
+          if [ "${PUBG_VERIFY_PR_HOLD:-0}" = 1 ] && [ -n "$t" ]; then
+          pr_repo=$(python3 - "${ARTIFACTS_DIR:?}/authority/work-order.md" <<'PY'
+      import re, sys
+      with open(sys.argv[1], encoding="utf-8") as spec:
+          for line in spec:
+              match = re.match(r"^\s*(?:target_repo:|\*\*Target [Rr]epo:\*\*|Target repo:)\s*`?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)`?\s*$", line)
+              if match:
+                  print(match.group(1))
+                  break
+      PY
+          ) || pr_repo=""
+            if [ -z "$pr_repo" ] ||
+               ! pr_numbers=$(gh pr list --repo "$pr_repo" --head "$PUBG_DEST" --state open --json number 2>/dev/null | jq -r 'if type == "array" then .[].number else error("expected PR list") end'); then
+              pubg_refuse "unprotected_ready_pr: destination PR visibility could not be verified"
+              return 1
+            fi
+            if [ -n "${PUBG_PR_NUMBER:-}" ] && ! grep -qxF "$PUBG_PR_NUMBER" <<< "$pr_numbers"; then
+              pr_numbers+=$'\n'"$PUBG_PR_NUMBER"
+            fi
+            while IFS= read -r pr_number; do
+              [ -n "$pr_number" ] || continue
+              if ! [[ "$pr_number" =~ ^[1-9][0-9]*$ ]] ||
+                 ! pr_state=$(pubg_pr_state "$pr_repo" "$pr_number") ||
+                 ! pubg_pr_head_matches "$pr_state" "$t"; then
+                pubg_refuse "unprotected_ready_pr: exact PR state could not be verified before push"
+                return 1
+              fi
+              pr_kind=label
+              if jq -e '.isDraft == true' <<< "$pr_state" >/dev/null; then pr_kind=draft; fi
+              if ! pubg_pr_verify_hold "$pr_repo" "$pr_number" "$t" "$pr_kind" "$pr_state"; then
+                pubg_refuse "unprotected_ready_pr: required hold could not be verified before push"
+                return 1
+              fi
+              pr_holds+=("$pr_number:$pr_kind")
+            done <<< "$pr_numbers"
+          fi
           # 4. Push.
           if [ -n "$lease" ]; then
             out=$(git push --force-with-lease="refs/heads/${PUBG_DEST}:${lease}" "$PUBG_URL" "${PUBG_SHA}:refs/heads/${PUBG_DEST}" 2>&1) || rc=$?
@@ -215,6 +261,16 @@ nodes:
             pubg_record "pubg_push_failed: dest=${PUBG_DEST} sha=${PUBG_SHA} (git push exited ${rc}; not a refusal)"
             return 2
           fi
+          local hold
+          for hold in "${pr_holds[@]}"; do
+            pr_number="${hold%%:*}"
+            pr_kind="${hold#*:}"
+            if ! pr_state=$(pubg_pr_state "$pr_repo" "$pr_number") ||
+               ! pubg_pr_verify_hold "$pr_repo" "$pr_number" "$PUBG_SHA" "$pr_kind" "$pr_state"; then
+              pubg_record "publication_hold_failed: PR #${pr_number} head=${PUBG_SHA}; exact head and hold could not be verified after push"
+              rc=3
+            fi
+          done
           git update-ref "refs/remotes/origin/${PUBG_DEST}" "$PUBG_SHA" >/dev/null 2>&1 || true
         fi
         if mkdir -p "${ARTIFACTS_DIR:-/nonexistent}/evidence" 2>/dev/null \
@@ -223,13 +279,13 @@ nodes:
         else
           pubg_record "pubg_published: dest=${PUBG_DEST} sha=${PUBG_SHA}; WARNING the published head could not be recorded, so hold-if-findings will keep the PR a draft"
         fi
-        return 0
+        return "$rc"
       }
       # ---- END pubg core ----
       # Save the core for the nodes that publish (checkout-repair-target, checkpoint-push,
       # commit-and-push, open-pr-if-needed); each sources this file before its first push.
       mkdir -p "$ARTIFACTS_DIR/evidence"
-      declare -f pubg_record pubg_preserve pubg_refuse pubg_have pubg_push > "$ARTIFACTS_DIR/evidence/pubg.core.sh"
+      declare -f pubg_record pubg_preserve pubg_refuse pubg_have pubg_pr_state pubg_pr_head_matches pubg_pr_held pubg_pr_verify_hold pubg_push > "$ARTIFACTS_DIR/evidence/pubg.core.sh"
       # The engine keeps this output; publishing steps compare the saved file against it.
       echo "PUBG_CORE_SHA256=$(sha256sum < "$ARTIFACTS_DIR/evidence/pubg.core.sh" | cut -c1-64)"
 
@@ -6048,6 +6104,7 @@ nodes:
         fi
         REPAIR_TARGET_LEASE_SHA="${CHECKOUT_LEASE_SHA:-$REPAIR_TARGET_LIVE_OID}"
         echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
+        echo "REPAIR_TARGET_PR=${REPAIR_TARGET_PR}"
         if ! git merge-base --is-ancestor "$REPAIR_TARGET_LEASE_SHA" HEAD; then
           echo "repair_target_base_not_incorporated"
           echo "ERROR: repair_target_base_not_incorporated: HEAD does not contain repair-target lease ${REPAIR_TARGET_LEASE_SHA}" >&2
@@ -6198,14 +6255,18 @@ nodes:
       PUSH_OK=false
       for attempt in 1 2 3; do
         PUBG_RC=0
-        PUBG_VERIFY_PR_HOLD=1 pubg_push "$(git rev-parse HEAD)" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
+        PUBG_VERIFY_PR_HOLD=1 PUBG_PR_NUMBER="${REPAIR_TARGET_PR:-}" pubg_push "$(git rev-parse HEAD)" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
         if [ "$PUBG_RC" -eq 0 ]; then
           PUSH_OK=true
           break
         fi
         if [ "$PUBG_RC" -ne 2 ]; then
-          echo "publication_refused"
-          echo "ERROR: publication_refused: the guarded publisher refused HEAD -> ${UNIQUE_BRANCH}${REPAIR_TARGET_LEASE_SHA:+ (lease ${REPAIR_TARGET_LEASE_SHA})}; nothing was pushed" >&2
+          if [ "$PUBG_RC" -eq 3 ]; then
+            echo "ERROR: publication_hold_failed: the head was pushed, but the required PR hold could not be verified" >&2
+          else
+            echo "publication_refused"
+            echo "ERROR: publication_refused: the guarded publisher refused HEAD -> ${UNIQUE_BRANCH}${REPAIR_TARGET_LEASE_SHA:+ (lease ${REPAIR_TARGET_LEASE_SHA})}; nothing was pushed" >&2
+          fi
           exit 1
         fi
         echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
@@ -6289,6 +6350,7 @@ nodes:
         exit 1
       fi
       REPAIR_TARGET_LEASE_SHA=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
+      RECOVERY_PR_NUMBER=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_PR=//p' | tail -n 1)
       # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
       # then re-push and re-verify before failing the PR-open precondition.
       LOCAL_HEAD="$(git rev-parse HEAD)"
@@ -6331,14 +6393,18 @@ nodes:
         PUSH_OK=false
         for attempt in 1 2 3; do
           PUBG_RC=0
-          PUBG_VERIFY_PR_HOLD=1 pubg_push "$LOCAL_HEAD" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
+          PUBG_VERIFY_PR_HOLD=1 PUBG_PR_NUMBER="$RECOVERY_PR_NUMBER" pubg_push "$LOCAL_HEAD" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
           if [ "$PUBG_RC" -eq 0 ]; then
             PUSH_OK=true
             break
           fi
           if [ "$PUBG_RC" -ne 2 ]; then
-            echo "publication_refused"
-            echo "ERROR: publication_refused: the guarded publisher refused the re-push of ${LOCAL_HEAD} -> ${UNIQUE_BRANCH}${REPAIR_TARGET_LEASE_SHA:+ (lease ${REPAIR_TARGET_LEASE_SHA})}; nothing was pushed" >&2
+            if [ "$PUBG_RC" -eq 3 ]; then
+              echo "ERROR: publication_hold_failed: the head was pushed, but the required PR hold could not be verified" >&2
+            else
+              echo "publication_refused"
+              echo "ERROR: publication_refused: the guarded publisher refused the re-push of ${LOCAL_HEAD} -> ${UNIQUE_BRANCH}${REPAIR_TARGET_LEASE_SHA:+ (lease ${REPAIR_TARGET_LEASE_SHA})}; nothing was pushed" >&2
+            fi
             exit 1
           fi
           echo "WARN: re-push attempt ${attempt} failed; retrying..." >&2
@@ -6696,8 +6762,8 @@ nodes:
         # Only ordinary fast-forward pushes to a verified run-owned branch, through the
         # guarded publisher (with the exact repair lease on repair-in-place).
         if [ "$RPR_STATE" = "OPEN" ]; then
-          if ! PUBG_VERIFY_PR_HOLD=1 pubg_push "$(git rev-parse HEAD)" "$RPR_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"; then
-            echo "ERROR: publication_refused: the guarded publisher refused the adopt push to ${RPR_BRANCH}; nothing was pushed" >&2
+          if ! PUBG_VERIFY_PR_HOLD=1 PUBG_PR_NUMBER="$RPR_NUMBER" pubg_push "$(git rev-parse HEAD)" "$RPR_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"; then
+            echo "ERROR: publication_refused: the guarded publisher could not complete the adopt push and hold verification for ${RPR_BRANCH}" >&2
             exit 1
           fi
         fi
@@ -8152,7 +8218,7 @@ nodes:
             HIF_BRANCH="${HIF_ADOPTED:-$HIF_BRANCH}"
           fi
           [ -z "$HIF_LEASE" ] || HIF_LEASE="$HIF_PREVIOUS"
-          PUBG_VERIFY_PR_HOLD=1 pubg_push "$HIF_LOCAL" "$HIF_BRANCH" "$HIF_LEASE" || hif_fail "Overseer publication refused"
+          PUBG_VERIFY_PR_HOLD=1 PUBG_PR_NUMBER="${HIF_URL##*/}" pubg_push "$HIF_LOCAL" "$HIF_BRANCH" "$HIF_LEASE" || hif_fail "Overseer publication refused"
           HIF_CHANGE=true
           HIF_BANNER='Changed by the in-run Overseer after publication -- not reviewed in-run'
         fi

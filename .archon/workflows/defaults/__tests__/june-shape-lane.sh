@@ -163,7 +163,7 @@ structural() {
   pre=$(node_block preflight-github-auth)
   assert_eq "the pubg core lives in preflight-github-auth (the run's first node)" "1" "$(count_in '# ---- BEGIN pubg core' "$pre")"
   assert_eq "preflight-github-auth records the sha256 of the saved core in its output" "1" "$(count_in 'echo "PUBG_CORE_SHA256=$(sha256sum < "$ARTIFACTS_DIR/evidence/pubg.core.sh" | cut -c1-64)"' "$pre")"
-  assert_eq "preflight-github-auth saves the core for the publishing nodes" "1" "$(count_in 'declare -f pubg_record pubg_preserve pubg_refuse pubg_have pubg_push > "$ARTIFACTS_DIR/evidence/pubg.core.sh"' "$pre")"
+  assert_eq "preflight-github-auth saves the core for the publishing nodes" "1" "$(count_in 'declare -f pubg_record pubg_preserve pubg_refuse pubg_have pubg_pr_state pubg_pr_head_matches pubg_pr_held pubg_pr_verify_hold pubg_push > "$ARTIFACTS_DIR/evidence/pubg.core.sh"' "$pre")"
   core_free=$(tr -d '\r' < "$W" | awk '/# ---- BEGIN pubg core/ { c = 1 } !c { print } /# ---- END pubg core ----/ { c = 0 }')
   pushes=$(printf '%s\n' "$core_free" | grep -v '^[[:space:]]*#' | grep -F 'git push' | grep -vF 'echo "ERROR: git push failed after 3 attempts' || true)
   assert_eq "outside the pubg core, the only git push is the preflight dry run" 'if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then' "$(printf '%s\n' "$pushes" | sed 's/^[[:space:]]*//')"
@@ -258,7 +258,7 @@ structural() {
 
 fixture() {
   local scenario out rc
-  for scenario in blocked hold-failures prod-guard markers repair scope returned wall-salvage empty-build round-limit closed-list overseer-repairs idle-published adopted-idle unheld-adoption unreadable-finding idle-spec idle-environment idle-provider pubg-core scan-config tamper publication refused-edit rule-1b unpublished; do
+  for scenario in blocked hold-failures prod-guard markers repair scope returned wall-salvage empty-build round-limit closed-list overseer-repairs idle-published adopted-idle unheld-adoption raced-hold raced-hold-failed unreadable-finding idle-spec idle-environment idle-provider pubg-core scan-config tamper publication refused-edit rule-1b unpublished; do
     echo "--- fixture scenario: $scenario ---"
     out=$(python3 "$FIXTURE" "$scenario" 2>&1); rc=$?
     printf '%s\n' "$out" | grep -E '^(PASS|FAIL): '

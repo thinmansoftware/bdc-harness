@@ -100,6 +100,10 @@ elif a[:2] == ['pr', 'list']:
     print(json.dumps([show(v, opt('--json')) for v in items]))
 elif a[:2] == ['pr', 'view']:
     v = live(find(a[2]))
+    if os.environ.get('JSF_RACE_HEAD') == v['headRefOid'] and not d.get('race_applied'):
+        v['labels'] = [label for label in v['labels'] if label != 'run:blocked']
+        d['race_applied'] = True
+        save()
     emit(show(v, opt('--json')) if '--jq' not in a or 'isCrossRepository' not in opt('--jq') else v)
 elif a[:2] == ['pr', 'create']:
     n = 100 + len(d['prs']); branch = opt('--head')
@@ -123,7 +127,7 @@ elif a[:2] == ['pr', 'edit']:
     save()
 elif a[:2] == ['pr', 'ready']:
     if os.environ.get('JSF_READY_FAIL'): raise SystemExit('fixture: ready failed')
-    find(a[2])['isDraft'] = False; save()
+    find(a[3] if '--undo' in a else a[2])['isDraft'] = '--undo' in a; save()
 elif a[:2] == ['pr', 'comment']:
     find(a[2])['comments'].append(Path(opt('--body-file')).read_text()); save()
 elif a[:2] == ['label', 'create']: pass
@@ -1146,8 +1150,28 @@ def scenario_unheld_adoption(tmp):
     state['prs'][0]['isDraft'] = False
     f.state.write_text(json.dumps(state))
     f.commit_change('unpublished change\n', 'fix: candidate')
-    rc, out, err = f.run('commit-and-push')
+    rc, out, err = f.run('commit-and-push', {'JSF_LABEL_FAIL': '1'})
     check('ready unheld PR refuses a new head before publication', rc != 0 and f.remote_tip(UNIQUE) == before and 'unprotected_ready_pr' in out + err, out + err)
+
+
+def scenario_raced_hold(tmp, reapply_fails):
+    """Read/push/read race disposition, bdc-xo#6687 comment 7212155712."""
+    f = Fixture(tmp)
+    publish_through_open_pr(f)
+    state = json.loads(f.state.read_text())
+    state['prs'][0]['isDraft'] = False
+    state['prs'][0]['labels'] = ['run:blocked']
+    f.state.write_text(json.dumps(state))
+    f.commit_change('raced candidate\n', 'fix: candidate')
+    head = f.git(['rev-parse', 'HEAD'])
+    extra = {'JSF_RACE_HEAD': head}
+    if reapply_fails:
+        extra['JSF_LABEL_FAIL'] = '1'
+    rc, out, err = f.run('commit-and-push', extra)
+    pr = f.prs()[0]
+    edits = [call for call in f.gh_calls() if call[:2] == ['pr', 'edit'] and '--add-label' in call]
+    check('raced removal gets exactly one re-application after push', len(edits) == 1 and f.remote_tip(UNIQUE) == head, out + err)
+    check('post-push hold verification returns the expected status', (rc != 0 and 'publication_hold_failed' in err and 'run:blocked' not in pr['labels']) if reapply_fails else (rc == 0 and 'run:blocked' in pr['labels']), out + err)
 
 
 def scenario_adopted_idle(tmp):
@@ -1226,6 +1250,8 @@ def main():
         'idle-published': lambda: once(tf, scenario_idle_published),
         'adopted-idle': lambda: once(tf, scenario_adopted_idle),
         'unheld-adoption': lambda: once(tf, scenario_unheld_adoption),
+        'raced-hold': lambda: once(tf, lambda tmp: scenario_raced_hold(tmp, False)),
+        'raced-hold-failed': lambda: once(tf, lambda tmp: scenario_raced_hold(tmp, True)),
         'unreadable-finding': lambda: once(tf, scenario_unreadable_finding),
         'overseer-repairs': lambda: scenario_overseer_repairs(tf),
         'publication': lambda: scenario_publication(tf),
