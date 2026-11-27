@@ -153,8 +153,11 @@ describe('repair-target lane wiring', () => {
       const yaml = readLane(file);
       const nodes = nodesOf(file);
 
-      // 1a: exactly two node-out reads of decide-push-target.out and no old decide heredoc.
-      expect(yaml.split('ARCHON_NODE_OUT/decide-push-target.out').length - 1, file).toBe(2);
+      // 1a: two handoff sites. The rebuilt lane also checks file existence before opening the PR.
+      const expectedReferences = file === 'bdc-feature-development.yaml' ? 3 : 2;
+      expect(yaml.split('ARCHON_NODE_OUT/decide-push-target.out').length - 1, file).toBe(
+        expectedReferences
+      );
       expect(yaml, file).not.toContain('BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET');
 
       // 1a: commit-and-push reads both node-output files with explicit non-empty fail-closed checks.
