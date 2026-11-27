@@ -31,8 +31,8 @@ BANNER = 'RUN BLOCKED -- not lane-verified'
 RESULTS = {'pass': 0, 'fail': 0}
 # A synthetic AWS-style access key id that matches gitleaks' default aws-access-token rule. Test
 # data only, never a real credential; built from two parts so this file itself does not match.
-KEY = 'AKIA' + 'Z7Q3XW2RB4NPLM5K'
-SECRET = 'aws_access_key_id = ' + KEY + '\n'
+SYNTHETIC_MATCH_TEXT = 'AKIA' + 'Z7Q3XW2RB4NPLM5K'
+SYNTHETIC_SCAN_SAMPLE = 'aws_access_key_id = ' + SYNTHETIC_MATCH_TEXT + '\n'
 UNIQUE = 'feat/wo-fix-01-thread-%s-run-%s' % (THREAD, RUN_ID[:12])
 
 
@@ -287,7 +287,7 @@ class Fixture:
         self.git(['switch', '-q', cur], cwd)
         self.commit_file('main.txt', 'main\n', 'main', cwd)
         self.git(['merge', '-q', '--no-ff', '--no-commit', side], cwd)
-        write_lf(cwd / 'cfg.txt', SECRET)
+        write_lf(cwd / 'cfg.txt', SYNTHETIC_SCAN_SAMPLE)
         self.git(['add', 'cfg.txt'], cwd)
         self.git(['commit', '-qm', 'merge side'], cwd)
         return self.git(['rev-parse', 'HEAD'], cwd)
@@ -598,11 +598,11 @@ def variant_commits(f, v, cwd=None, tracking=()):
     """Apply one variant's commits in cwd (default the run worktree); returns extra env."""
     env = {}
     if v == 'secret':
-        f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+        f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config', cwd)
     elif v == 'tracking':
         # C1 carries the secret; C2 removes it. Only local remote-tracking refs claim C1 is on the
         # remote; a bound taken from them would scan C2 alone and pass.
-        c1 = f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+        c1 = f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config', cwd)
         f.commit_file('cfg.txt', 'clean = 1\n', 'clean config', cwd)
         for ref in tracking:
             f.git(['update-ref', 'refs/remotes/origin/' + ref, c1])
@@ -611,19 +611,19 @@ def variant_commits(f, v, cwd=None, tracking=()):
     elif v == 'run-toml':
         # (a) the run itself adds a .gitleaks.toml allowlist that would excuse the secret
         f.commit_file('.gitleaks.toml', ALLOW_TOML, 'scan config', cwd)
-        f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+        f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config', cwd)
     elif v == 'run-ignore':
         # (b) the run adds a .gitleaksignore entry (commit and global fingerprints) for it
-        c1 = f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+        c1 = f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config', cwd)
         f.commit_file('.gitleaksignore', '%s:cfg.txt:aws-access-token:1\ncfg.txt:aws-access-token:1\n' % c1, 'ignore list', cwd)
     elif v == 'run-allow':
         # (c) an inline gitleaks:allow marker on the added secret line
-        f.commit_file('cfg.txt', SECRET.rstrip('\n') + ' # gitleaks:allow\n', 'add config', cwd)
+        f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE.rstrip('\n') + ' # gitleaks:allow\n', 'add config', cwd)
     elif v == 'base-toml':
         # (d) the BASE branch's own .gitleaks.toml allowlist is honored
         f.commit_file('.gitleaks.toml', ALLOW_TOML, 'base scan config')
         f.git(['push', '-q', 'origin', 'HEAD:refs/heads/dev'])
-        f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+        f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config', cwd)
     else:
         f.commit_file('feature.txt', 'feature\n', 'feature', cwd)
     if v == 'absent':
@@ -754,7 +754,7 @@ def scenario_publication(tf):
                 rc, out, err = run()
                 text = out + err + f.record()
                 tag = 'T13 %s [%s]' % (label, v)
-                check(tag + ': synthetic key text never printed', KEY not in text, text[-600:])
+                check(tag + ': synthetic key text never printed', SYNTHETIC_MATCH_TEXT not in text, text[-600:])
                 if v in ('clean', 'base-toml'):
                     check(tag + ': clean range pushes (exit 0)', rc == 0 and ok(), text[-1500:])
                     check(tag + ': published head recorded', (f.art / 'evidence' / 'published.head').exists() and 'pubg_published:' in f.record(), f.record())
@@ -803,13 +803,13 @@ def scenario_pubg_core(tf):
         # An unrelated history: no remote tip is an ancestor, so the whole history is scanned. The
         # secret sits in the orphan root, two commits below the pushed SHA.
         f.git(['switch', '-q', '--orphan', 'orphan'])
-        f.commit_file('cfg.txt', SECRET, 'orphan root with config')
+        f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'orphan root with config')
         f.commit_file('cfg.txt', 'clean = 1\n', 'clean config')
         f.commit_file('other.txt', 'x\n', 'other')
         before = f.remote_refs()
         rc, out, err = f.run('core-full', text=core_script('pubg_push HEAD feat/orphan-thread-x'))
         check('pubg: no provable bound scans the full history and refuses the old secret', rc == 1 and 'secret_found' in err and 'full history' in err and f.remote_refs() == before, err)
-        check('pubg: key text never printed (full history)', KEY not in out + err + f.record())
+        check('pubg: key text never printed (full history)', SYNTHETIC_MATCH_TEXT not in out + err + f.record())
     with tf() as tmp:
         f = Fixture(tmp)
         f.git(['switch', '-q', '--orphan', 'orphan'])
@@ -835,15 +835,15 @@ def scenario_scan_config(tf):
             f = Fixture(tmp)
             extra = {}
             if v == 'toml':
-                f.commit_file('cfg.txt', SECRET, 'add config')
+                f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config')
                 f.commit_file('.gitleaks.toml', PERMISSIVE, 'allowlist cfg.txt')
             elif v == 'ignore':
-                sha = f.commit_file('cfg.txt', SECRET, 'add config')
+                sha = f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config')
                 f.commit_file('.gitleaksignore', '%s:cfg.txt:aws-access-token:1\n' % sha, 'ignore the finding')
             elif v == 'allow':
-                f.commit_file('cfg.txt', SECRET.rstrip('\n') + '  # gitleaks:allow\n', 'add config')
+                f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE.rstrip('\n') + '  # gitleaks:allow\n', 'add config')
             else:
-                f.commit_file('cfg.txt', SECRET, 'add config')
+                f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config')
                 write_lf(f.t / 'permissive.toml', PERMISSIVE)
                 extra = {'GITLEAKS_CONFIG': (f.t / 'permissive.toml').as_posix(), 'GITLEAKS_CONFIG_TOML': PERMISSIVE}
             tag = 'T13 scan config (%s)' % {'toml': 'a: run adds .gitleaks.toml', 'ignore': 'b: run adds .gitleaksignore',
@@ -854,16 +854,16 @@ def scenario_scan_config(tf):
             text = out + err + f.record()
             check(tag + ': still refused as secret_found naming file and rule', rc == 1 and 'secret_found:' in text and 'file=cfg.txt' in text and 'rule=aws-access-token' in text, text[-1500:])
             check(tag + ': nothing reaches the remote', f.remote_refs() == before)
-            check(tag + ': key text never printed', KEY not in text)
+            check(tag + ': key text never printed', SYNTHETIC_MATCH_TEXT not in text)
     with tf() as tmp:
         f = Fixture(tmp)
         f.commit_file('.gitleaks.toml', PERMISSIVE, 'base: allowlist cfg.txt')
         f.git(['push', '-q', 'origin', 'HEAD:refs/heads/dev'])
-        f.commit_file('cfg.txt', SECRET, 'add config')
+        f.commit_file('cfg.txt', SYNTHETIC_SCAN_SAMPLE, 'add config')
         rc, out, err = f.run('scan-base', text=core_script('pubg_push HEAD feat/scan-base-thread-x'))
         text = out + err + f.record()
         check('T13 scan config (d: the base branch .gitleaks.toml allowlist is honored): pushed', rc == 0 and f.remote_tip('feat/scan-base-thread-x') == f.git(['rev-parse', 'HEAD']) and 'pubg_published:' in text, text[-1500:])
-        check('T13 scan config (d): key text never printed', KEY not in text)
+        check('T13 scan config (d): key text never printed', SYNTHETIC_MATCH_TEXT not in text)
 
 
 def scenario_tamper(tf):
@@ -924,7 +924,7 @@ def scenario_refused_edit(tf):
             if variant == 'lease':
                 write_lf(f.wt / 'file', 'edited by the in-run Overseer\n')
             else:
-                write_lf(f.wt / 'cfg.txt', SECRET)
+                write_lf(f.wt / 'cfg.txt', SYNTHETIC_SCAN_SAMPLE)
             f.git(['add', '-A'])
             f.git(['commit', '-qm', 'fix: in-run Overseer edit\n\nCauldron-Role: overseer-repair'])
             edit = f.git(['rev-parse', 'HEAD'])
@@ -943,7 +943,7 @@ def scenario_refused_edit(tf):
             tag = 'T20(%s)' % variant
             check(tag + ' the push of the edit is refused (nonzero)', rc != 0, text[-1500:])
             check(tag + ' the fake remote holds no commit of the edit', not f.remote_has(edit) and f.remote_tip(UNIQUE) == published)
-            check(tag + ' key text never printed', KEY not in text)
+            check(tag + ' key text never printed', SYNTHETIC_MATCH_TEXT not in text)
             calls = f.gh_calls()
             pr = f.prs()[0]
             check(tag + ' hold-if-findings fails the run', rc != 0 and 'Overseer publication refused' in err, out + err)
