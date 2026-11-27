@@ -22,6 +22,7 @@ model: claude-sonnet-5-5
 # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 (Correction F): an unattended loop question is
 # recorded (questions/<node>.md, output UNATTENDED_QUESTION=true), never a failed node.
 unattended_questions: report
+idle_handoff: overseer
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -213,6 +214,7 @@ nodes:
   - id: read-spec
     persona: xo
     depends_on: [preflight-github-auth]
+    abort_run_on_failure: true
     bash: |
       set -euo pipefail
       AUTHORITY_DIR="$ARTIFACTS_DIR/authority"
@@ -226,6 +228,20 @@ nodes:
       EXPECTED_HASH=$(jq -er '.specHash' "$AUTHORITY_MANIFEST")
       ACTUAL_HASH="sha256:$(sha256sum "$AUTHORITY_SPEC" | awk '{print $1}')"
       [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ] || { echo "authority_conflict: work-order.md hash mismatch" >&2; exit 1; }
+      SPEC_BLOB=$(git hash-object "$AUTHORITY_SPEC")
+      printf '%s\n' "$SPEC_BLOB" > "$ARTIFACTS_DIR/spec-blob.txt"
+      SPEC_ISSUE=$(printf '%s\n' "${USER_MESSAGE:-}" | sed -n 's/.*issue=\([0-9][0-9]*\).*/\1/p' | head -1)
+      if [ -z "$SPEC_ISSUE" ]; then
+        SPEC_ISSUE=$(gh issue list --repo thinmansoftware/bdc-xo --search "${WO_ID} in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+      fi
+      if [ -n "$SPEC_ISSUE" ]; then
+        ISSUE_STATE=$(gh issue view "$SPEC_ISSUE" --repo thinmansoftware/bdc-xo --json labels,comments 2>/dev/null || true)
+        RETURN_BLOB=$(printf '%s\n' "$ISSUE_STATE" | jq -r 'select(any(.labels[]?; .name == "spec:rewrite-required")) | [.comments[]?.body | split("\n")[] | select(startswith("Spec-Returned-At-Blob: ")) | ltrimstr("Spec-Returned-At-Blob: ")] | last // empty')
+        if [ "$SPEC_BLOB" = "$RETURN_BLOB" ]; then
+          echo 'spec_unchanged_since_returned' >&2
+          exit 1
+        fi
+      fi
       RUN_START_SHA=$(git rev-parse --verify 'HEAD^{commit}') || { echo "scope_authority_missing: HEAD" >&2; exit 1; }
       printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt"
       printf 'WO_ID=%s\nSPEC_PATH=%s\nSPEC_REVISION=%s\nSPEC_HASH=%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$SPEC_REVISION" "$EXPECTED_HASH" "$RUN_START_SHA"
@@ -974,6 +990,7 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
+    idle_timeout: 600000
     persona: war-council-architect
     agent: war-council-architect
     depends_on: [checkout-repair-target]
@@ -1095,6 +1112,7 @@ nodes:
       exit 0
 
   - id: plan
+    idle_timeout: 600000
     persona: war-council-architect
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -1668,6 +1686,12 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
+      FAILED_NODES=$_run.output.failed_nodes
+      case ",$FAILED_NODES," in
+        *,implement,*)
+          echo 'Checkpoint skipped after failed implement; noninteractive-salvage owns the dirty worktree.'
+          exit 0 ;;
+      esac
       # FINDING (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 exit table): record and continue.
       lane_finding() {
         mkdir -p "$ARTIFACTS_DIR/findings" 2>/dev/null && printf 'FINDING=%s\n' "$1" >> "$ARTIFACTS_DIR/findings/checkpoint-push.txt" || true
@@ -1845,6 +1869,10 @@ nodes:
       done
       if ls "${ARTIFACTS_DIR:-/nonexistent}"/blocked-preserve/implement-iter-*/blocked-reason.txt >/dev/null 2>&1; then
         ATR_QUESTION=true
+      fi
+      if [ "$HAS_WORK" != "true" ] && grep -qx 'IDLE_HANDOFF=true' "${ARCHON_NODE_OUT:-/nonexistent}"/*.out 2>/dev/null; then
+        echo 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'
+        exit 0
       fi
       if [ "$HAS_WORK" != "true" ] && [ "$ATR_QUESTION" = "true" ] && [ "${CAULDRON_INTERACTIVE:-}" != "true" ]; then
         echo "assert-implement-produced-work: question or BLOCKED refusal with no code -- returned to the work order's author (CHANGED=$CHANGED AHEAD=$AHEAD)" >&2
@@ -3771,6 +3799,7 @@ nodes:
       print(json.dumps(dict(status=status,repairable="true" if status=="failed" and not reason else "false",reason=reason),separators=(",",":")))'
 
   - id: test-repair
+    idle_timeout: 600000
     depends_on: [classify-test-result, assert-implement-produced-work]
     when: "$classify-test-result.output.repairable == 'true' && $assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'"
     task_class: medium_work
@@ -4442,6 +4471,7 @@ nodes:
       exit 0
 
   - id: war-council-validator
+    idle_timeout: 600000
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -4590,6 +4620,7 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
+    idle_timeout: 600000
     provider: codex-native-strict
     # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
     model: gpt-6.1-sol
@@ -4653,120 +4684,143 @@ nodes:
       [ -z "$verdict" ] && verdict=needs_revision
       printf '{"verdict":"%s"}\n' "$verdict"
 
-  - id: diff-repair
-    persona: major-build
+  - id: repair-round-1
     agent: major-build
-    depends_on: [diff-review, classify-diff-review, resolve-review-base, assert-implement-produced-work, repair-gate]
-    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-diff-review.output.verdict == 'needs_revision' && $assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'"
+    depends_on: [classify-diff-review]
+    when: "$classify-diff-review.output.verdict == 'needs_revision' && $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'"
+    idle_timeout: 600000
     task_class: medium_work
-    idle_timeout: 570000
-    wall_timeout_ms: 1230000
-    loop:
-      fresh_context: true
-      # NF3 + schema fix: the loader REQUIRES loop.until (schemas/loop.ts:11,
-      # z.string().min(1)) -- omitting it makes the DAG invalid and the loader
-      # SILENTLY DROPS the whole workflow (anchor: 2026-05-30 the entire lane went
-      # unregistered). Completion is `sentinel OR until_bash`. To keep until_bash the
-      # SOLE real authority (so a premature text sentinel can't short-circuit the
-      # flag+debug gate), `until:` is set to a sentinel the agent is instructed to
-      # NEVER emit. Thus only until_bash (done.flag exists AND no debug prints in the
-      # feature diff) can complete the loop.
-      until: __NEVER_EMIT_USE_UNTIL_BASH__
-      max_iterations: 20
-      until_bash: |
-        set -uo pipefail
-        # MECHANICAL invariants ONLY. This does NOT prove Codex is satisfied --
-        # diff-review-final (a real re-review) does that. Complete when the repair node
-        # signalled done AND the feature diff has no obvious mechanical defects.
-        DONE="$ARTIFACTS_DIR/diff-repair-done.flag"
-        [ -f "$DONE" ] || { echo "repair not signalled done"; exit 1; }
-        # F4: implement already committed, so `git diff --cached` is empty. Check the
-        # real feature diff: merge-base..HEAD (committed) PLUS HEAD..worktree (unstaged).
-        # NF2: empty-tree fallback (not HEAD) so a single-commit/no-base repo still
-        # produces a non-empty committed diff to scan for debug prints.
-        REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
-        $resolve-review-base.output
-        RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
-        )
-        REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
-        [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
-        BASE_REF="origin/$REVIEW_BASE"
-        EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
-        MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
-        [ -n "$MB" ] || MB="$EMPTY_TREE"
-        DEBUG_RE='console\.log\(|debugger;|binding\.pry|import pdb'
-        if { git diff --unified=0 "$MB"..HEAD 2>/dev/null; git diff --unified=0 HEAD 2>/dev/null; } \
-             | grep -E '^\+' | grep -Eq "$DEBUG_RE"; then
-          echo "debug statement present in feature diff"; exit 1
-        fi
-        exit 0
-      prompt: |
-        You are major-build. The Codex diff reviewer raised findings on your diff.
-        Fix every fixable finding in place. You are the BUILDER; Codex does not edit.
+    prompt: |
+      Repair the findings from $classify-diff-review.output on the current run branch.
+      Work order: $read-spec.output
+      Commit the repair on the run branch.
+      Record why the change was needed in the commit body.
+      Do not publish from this step. Leave the committed head for independent review.
 
-        ## Codex review verdict (read directly -- prompt substitution, not shell)
-        $diff-review.output
+  - id: review-round-1
+    provider: codex-native-strict
+    # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
+    model: gpt-6.1-sol
+    # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
+    # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
+    # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
+    # HONORS-FIRED-LANE-TIER-01: lets the seat gate proceed when Codex is over cutoff.
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
+    agent: codex-adversarial-reviewer
+    depends_on: [repair-round-1]
+    when: "$classify-diff-review.output.verdict == 'needs_revision' && $repair-round-1.output != 'IDLE_HANDOFF=true' && $repair-round-1.output != 'CLOSED_LIST=production settings' && $repair-round-1.output != 'CLOSED_LIST=secrets' && $repair-round-1.output != 'CLOSED_LIST=another product contract'"
+    idle_timeout: 600000
+    task_class: medium_work
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [verdict, findings]
+      properties:
+        verdict:
+          type: string
+          enum: [approve, needs_revision]
+        findings:
+          type: array
+          items:
+            type: string
+    prompt: |
+      Independently inspect the current committed head against $read-spec.output.
+      Review the full diff from the run base, with special attention to the prior findings.
+      Do not edit any files. Approve only if the committed head resolves the findings.
 
-        ## Prior repair iteration (if any)
-        $LOOP_PREV_OUTPUT
+  - id: repair-round-2
+    agent: major-build
+    depends_on: [review-round-1]
+    when: "$review-round-1.output.verdict == 'needs_revision'"
+    idle_timeout: 600000
+    task_class: medium_work
+    prompt: |
+      Repair the findings from $review-round-1.output on the current run branch.
+      Work order: $read-spec.output
+      Commit the repair on the run branch.
+      Record why the change was needed in the commit body.
+      Do not publish from this step. Leave the committed head for independent review.
 
-        ## What to do
-        - If DIFF_REVIEW=satisfied with no findings: make no changes; just signal done.
-        - Otherwise: resolve each FINDINGS line. Add the missing test, fix the contract
-          drift, close the unsafe path. Modify only in-scope files. Do not reformat
-          unrelated code. Do not deploy.
+  - id: review-round-2
+    provider: codex-native-strict
+    # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
+    model: gpt-6.1-sol
+    # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
+    # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
+    # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
+    # HONORS-FIRED-LANE-TIER-01: lets the seat gate proceed when Codex is over cutoff.
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
+    agent: codex-adversarial-reviewer
+    depends_on: [repair-round-2]
+    when: "$review-round-1.output.verdict == 'needs_revision' && $repair-round-2.output != 'IDLE_HANDOFF=true' && $repair-round-2.output != 'CLOSED_LIST=production settings' && $repair-round-2.output != 'CLOSED_LIST=secrets' && $repair-round-2.output != 'CLOSED_LIST=another product contract'"
+    idle_timeout: 600000
+    task_class: medium_work
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [verdict, findings]
+      properties:
+        verdict:
+          type: string
+          enum: [approve, needs_revision]
+        findings:
+          type: array
+          items:
+            type: string
+    prompt: |
+      Independently inspect the current committed head against $read-spec.output.
+      Review the full diff from the run base, with special attention to the prior findings.
+      Do not edit any files. Approve only if the committed head resolves the findings.
 
-        ## NEVER FABRICATE A DIFF (Fix C, 2026-05-30 -- anchor run 04daeafc)
-        If the captured diff is empty / header-only because the WO appears already
-        implemented on origin/main or in other commits, you MUST NOT regenerate or
-        reconstruct $ARTIFACTS_DIR/diff.patch (or diff-final.patch) from those
-        already-merged commits, from origin/main, or from any other branch/worktree.
-        The diff artifact must reflect ONLY real, uncommitted-or-this-worktree changes.
-        Manufacturing a reviewable artifact from already-merged work is fraud -- it tricks
-        the final reviewer into certifying changes this run did not make.
-        If the diff is genuinely empty because there is nothing to repair (the WO is
-        already satisfied or implement produced no changes), do NOT write the done.flag
-        and do NOT fabricate -- instead write the escalation block (below) with
-        ESCALATION_REASON=already-implemented-no-diff and STOP. diff-review-final will
-        see the empty diff and the run will pause for correction (not silently pass).
-        Anchor: run 04daeafc's diff-repair tried to "regenerate diff.patch with the actual
-        implementation content from those commits" -- exactly the fraud this rule forbids.
+  - id: repair-round-3
+    agent: major-build
+    depends_on: [review-round-2]
+    when: "$review-round-2.output.verdict == 'needs_revision'"
+    idle_timeout: 600000
+    task_class: medium_work
+    prompt: |
+      Repair the findings from $review-round-2.output on the current run branch.
+      Work order: $read-spec.output
+      Commit the repair on the run branch.
+      Record why the change was needed in the commit body.
+      Do not publish from this step. Leave the committed head for independent review.
 
-        ## Escalation (ONLY these -- else fix and let the loop continue)
-        A stop condition whose spec line ends `-- recorded by XO`, `-- recorded by the
-        operator`, or `(operator-recorded)` is outside the builder's gate and is NOT
-        human-only-authority escalation grounds. Do not escalate on an unmet marked
-        stop. Render it in the completion manifest as `OPERATOR-RECORDED (pending)`
-        (not FAIL or N/A), then proceed to the normal done-flag signal.
-        Write the escalation block to $ARTIFACTS_DIR/diff-repair-escalation.txt and STOP if:
-        - a finding requires a new side-effect class / scope the lane was not granted
-        - a finding requires human-only authority (deploy, prod write, customer comms,
-          irreversible/destructive op) where safe behavior is not already encoded
-        - the spec is ambiguous about the correct fix
-        - the same finding survived a prior repair attempt and you cannot resolve it
-        Escalation block (exact keys):
-          ESCALATION_REQUIRED=true
-          ESCALATION_REASON=<new-side-effect-class|human-only-authority|ambiguous-spec|loop-exhausted|already-implemented-no-diff>
-          WO_ID=<id>
-          NODE=diff-repair
-          ATTEMPTS=<n>/3
-          WHAT_FAILED=<one paragraph>
-          WHAT_WAS_TRIED=<3-6 bullets>
-          LAST_REVIEW_FINDINGS=<exact Codex findings>
-          SINGLE_DECISION_NEEDED=<one sentence John can answer>
-          SAFE_STATE=<work is local in the worktree; nothing committed or pushed yet>
-
-        ## Signal done (the FLAG is the only gate -- there is NO completion token)
-        The loop completes ONLY via until_bash, which checks that the done.flag exists
-        AND the feature diff has no debug prints. There is NO text sentinel that finishes
-        this loop (loop.until is set to a token you must NEVER emit) -- do not try to
-        emit one. When you have addressed every fixable finding (or there were none) AND
-        introduced no debug prints:
-          - Write an empty file at $ARTIFACTS_DIR/diff-repair-done.flag   (the ONLY signal)
-        If you escalated or could not resolve a finding, do NOT write the flag: the loop
-        will exhaust max_iterations and fail closed, and diff-review-final adjudicates the
-        unresolved state. The flag means "repair pass complete", not "semantically
-        certified" -- diff-review-final re-checks semantics next.
+  - id: review-round-3
+    provider: codex-native-strict
+    # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
+    model: gpt-6.1-sol
+    # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
+    # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
+    # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
+    # HONORS-FIRED-LANE-TIER-01: lets the seat gate proceed when Codex is over cutoff.
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
+    agent: codex-adversarial-reviewer
+    depends_on: [repair-round-3]
+    when: "$review-round-2.output.verdict == 'needs_revision' && $repair-round-3.output != 'IDLE_HANDOFF=true' && $repair-round-3.output != 'CLOSED_LIST=production settings' && $repair-round-3.output != 'CLOSED_LIST=secrets' && $repair-round-3.output != 'CLOSED_LIST=another product contract'"
+    idle_timeout: 600000
+    task_class: medium_work
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [verdict, findings]
+      properties:
+        verdict:
+          type: string
+          enum: [approve, needs_revision]
+        findings:
+          type: array
+          items:
+            type: string
+    prompt: |
+      Independently inspect the current committed head against $read-spec.output.
+      Review the full diff from the run base, with special attention to the prior findings.
+      Do not edit any files. Approve only if the committed head resolves the findings.
 
   # checkpoint-diff-repair: commit any diff-repair fix to HEAD before capture-diff-final
   # snapshots the review diff, so diff-review-final judges the repaired code, not a stale
@@ -4778,11 +4832,21 @@ nodes:
   # judged the stale committed HEAD at 11 locations, block-classify->BLOCKED, and the fix
   # was lost. WO-HARNESS-DIFF-REPAIR-COMMITS-BEFORE-FINAL-REVIEW-01.
   - id: checkpoint-diff-repair
-    depends_on: [diff-repair, assert-implement-produced-work, repair-gate]
+    depends_on: [review-round-3, assert-implement-produced-work, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'"
     trigger_rule: all_done
     bash: |
       set -uo pipefail
+      FAILED_NODES=$_run.output.failed_nodes
+      case ",$FAILED_NODES," in
+        *,implement,*)
+          echo 'Checkpoint skipped after failed implement; noninteractive-salvage owns the dirty worktree.'
+          exit 0 ;;
+      esac
+      ROUND3="${ARCHON_NODE_OUT:-/nonexistent}/review-round-3.out"
+      if [ "$(jq -r '.verdict // empty' "$ROUND3" 2>/dev/null || true)" = needs_revision ]; then
+        jq -c --arg head "$(git rev-parse HEAD)" '{event_type:"repair_handoff_overseer",round:3,head_sha:$head,findings:.findings}' "$ROUND3" | sed 's/^/BDC_RUN_EVENT /'
+      fi
       if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
         echo "CHECKPOINT_DIFF_REPAIR=noop"
         exit 0
@@ -4859,7 +4923,22 @@ nodes:
       echo "DIFF_FINAL_ARTIFACT=$OUT"
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
-  - id: diff-review-final
+  - id: overseer-repair-round-4
+    agent: overseer-in-run
+    depends_on: [checkpoint-diff-repair]
+    when: "$review-round-3.output.verdict == 'needs_revision'"
+    idle_timeout: 600000
+    task_class: medium_work
+    prompt: |
+      Repair the findings from $review-round-3.output on the current run branch.
+      Work order: $read-spec.output
+      If a closed-list item is required, make no protected change and emit exactly
+      CLOSED_LIST=production settings, CLOSED_LIST=secrets, or CLOSED_LIST=another product contract
+      as appropriate. Otherwise commit with trailer Cauldron-Role: overseer-repair.
+      Record why the change was needed in the commit body.
+      Do not publish from this step. Leave the committed head for independent review.
+
+  - id: review-round-4
     provider: codex-native-strict
     # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
     model: gpt-6.1-sol
@@ -4871,72 +4950,87 @@ nodes:
     failover_model: moonshotai/kimi-k3.1-pro
     failover_agent: opr-adversarial-reviewer
     agent: codex-adversarial-reviewer
-    depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
-    trigger_rule: all_done
+    depends_on: [overseer-repair-round-4]
+    when: "$review-round-3.output.verdict == 'needs_revision' && $overseer-repair-round-4.output != 'IDLE_HANDOFF=true' && $overseer-repair-round-4.output != 'CLOSED_LIST=production settings' && $overseer-repair-round-4.output != 'CLOSED_LIST=secrets' && $overseer-repair-round-4.output != 'CLOSED_LIST=another product contract'"
+    idle_timeout: 600000
+    task_class: medium_work
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [verdict, findings]
+      properties:
+        verdict:
+          type: string
+          enum: [approve, needs_revision]
+        findings:
+          type: array
+          items:
+            type: string
+    prompt: |
+      Independently inspect the current committed head against $read-spec.output.
+      Review the full diff from the run base, with special attention to the prior findings.
+      Do not edit any files. Approve only if the committed head resolves the findings.
+
+  - id: overseer-repair-round-5
+    agent: overseer-in-run
+    depends_on: [review-round-4]
+    when: "$review-round-4.output.verdict == 'needs_revision' && $overseer-repair-round-4.output != 'CLOSED_LIST=production settings' && $overseer-repair-round-4.output != 'CLOSED_LIST=secrets' && $overseer-repair-round-4.output != 'CLOSED_LIST=another product contract'"
+    idle_timeout: 600000
     task_class: medium_work
     prompt: |
-      You are the Codex adversarial reviewer doing the FINAL re-review after repair.
-      Read-only. This node decides whether any semantic finding remains before commit --
-      the mechanical repair gate did NOT prove your earlier objections were fixed.
+      Repair the findings from $review-round-4.output on the current run branch.
+      Work order: $read-spec.output
+      If a closed-list item is required, make no protected change and emit exactly
+      CLOSED_LIST=production settings, CLOSED_LIST=secrets, or CLOSED_LIST=another product contract
+      as appropriate. Otherwise commit with trailer Cauldron-Role: overseer-repair.
+      Record why the change was needed in the commit body.
+      Do not publish from this step. Leave the committed head for independent review.
 
-      ## Inputs
-      Spec: $read-spec.output
-      Plan review terminal outcome: $plan-review.output
-      If this output does not contain PLAN_REVIEW_APPROVED, fail closed with
-      DIFF_REVIEW_FINAL=needs_revision. Do not certify a diff after rejected or
-      escalated plan-review output.
-      Your original findings: $diff-review.output
-      Classifier verdict: $classify-diff-review.output
-      Repair pass output: $diff-repair.output
-      Refreshed diff provenance: $capture-diff-final.output
-      (Read the repaired diff at DIFF_FINAL_ARTIFACT = $ARTIFACTS_DIR/diff-final.patch.
-      You have no Bash tool -- do not run git; read that file.)
+  - id: review-round-5
+    provider: codex-native-strict
+    # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
+    model: gpt-6.1-sol
+    # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
+    # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
+    # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
+    # HONORS-FIRED-LANE-TIER-01: lets the seat gate proceed when Codex is over cutoff.
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
+    agent: codex-adversarial-reviewer
+    depends_on: [overseer-repair-round-5]
+    when: "$review-round-4.output.verdict == 'needs_revision' && $overseer-repair-round-5.output != 'IDLE_HANDOFF=true' && $overseer-repair-round-5.output != 'CLOSED_LIST=production settings' && $overseer-repair-round-5.output != 'CLOSED_LIST=secrets' && $overseer-repair-round-5.output != 'CLOSED_LIST=another product contract'"
+    idle_timeout: 600000
+    task_class: medium_work
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [verdict, findings]
+      properties:
+        verdict:
+          type: string
+          enum: [approve, needs_revision]
+        findings:
+          type: array
+          items:
+            type: string
+    prompt: |
+      Independently inspect the current committed head against $read-spec.output.
+      Review the full diff from the run base, with special attention to the prior findings.
+      Do not edit any files. Approve only if the committed head resolves the findings.
 
-      ## Branch on the repair outcome FIRST (check the SATISFIED FAST PATH before anything else)
-      - SATISFIED FAST PATH: if your original review verdict was DIFF_REVIEW=satisfied
-        (Classifier verdict above is {"verdict":"satisfied"}), then diff-repair was
-        correctly SKIPPED by its `when:` guard because there were no findings to fix.
-        An empty $diff-repair.output and a missing done.flag are EXPECTED on this path,
-        NOT a failure. Re-inspect the captured diff once more to confirm no new unsafe
-        behavior was introduced between the original review and now (e.g., scope creep,
-        unrelated edits). If the diff is still clean, emit DIFF_REVIEW_FINAL=satisfied
-        with UNRESOLVED: (none). Do NOT treat the skipped repair as failed repair.
-      - If the original verdict was needs_revision AND diff-repair FAILED or exhausted
-        iterations (its output is empty, shows ESCALATION_REQUIRED=true, or the done.flag
-        was never written): do NOT certify. Emit DIFF_REVIEW_FINAL=needs_revision,
-        summarize the unresolved repair state in UNRESOLVED, and carry through any
-        escalation reason. Never PASS on failed repair.
-      - Otherwise (original verdict was needs_revision AND diff-repair signalled done):
-        re-inspect the repaired diff. For EACH finding you raised originally, verify it
-        is actually resolved in the current tree -- not merely claimed resolved.
-
-      ## Output (STDOUT only)
-        DIFF_REVIEW_FINAL=<satisfied|needs_revision>
-        UNRESOLVED:
-        - <file:line> <finding still open>   (repeat; or "(none)")
-        SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
-      DIFF_REVIEW_FINAL=satisfied ONLY if every original finding is genuinely resolved and
-      no new unsafe behavior was introduced by the repair.
-
-  # ===== Fix D (2026-05-30): pause-not-fail + Opus-tier on a blocked irreversible gate =====
-  # Replaces commit-and-push's old `exit 1` dead-end. A blocked run must NOT terminate as
-  # "failed"; it goes: classify -> Opus auto-repair (one pass) -> re-classify -> PAUSE
-  # (resumable approval) -> human corrects+resumes OR rejects. A clean run PROCEEDs with no
-  # human gate. An already-satisfied no-op resolves as success. (doctrine: fail-closed-must-
-  # pause-not-fail + self-repair-review-loops autonomy ladder.)
-  #
   # block-classify: emit ONE JSON line so downstream `when:` can read $block-classify.output.status
   # (condition-evaluator parses $node.output.field as JSON). status one of:
   #   PROCEED           -- diff-review-final=satisfied AND real build -> commit/PR
   #   ALREADY_SATISFIED -- no work needed, worktree clean, legitimately done -> success no-op
   #   BLOCKED           -- false-completion OR diff-review-final=needs_revision -> repair/pause
   - id: block-classify
-    depends_on: [diff-review-final, assert-implement-produced-work]
+    depends_on: [diff-review, assert-implement-produced-work]
     trigger_rule: all_done
     bash: |
       set -uo pipefail
       DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003'
-      $diff-review-final.output
+      $diff-review.output
       BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003
       )
       BUILD=$assert-implement-produced-work.output
@@ -4960,9 +5054,9 @@ nodes:
       # Anchor-free parse: diff-review-final is Codex prose; sentinel appears inline,
       # not at column 0. Take LAST occurrence so the final verdict always wins.
       final_verdict=$(printf '%s\n' "$DIFF_FINAL" \
-        | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | grep -oE 'DIFF_REVIEW=(satisfied|needs_revision)' \
         | tail -n 1)
-      if [ "$final_verdict" = "DIFF_REVIEW_FINAL=satisfied" ]; then final_ok=true; fi
+      if [ "$final_verdict" = "DIFF_REVIEW=satisfied" ]; then final_ok=true; fi
       outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
 
       # Codex FINDING_2: PROCEED requires BOTH a real build AND a satisfied final review.
@@ -4990,134 +5084,8 @@ nodes:
         printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}"
       fi
 
-  # opus-repair: one harder AUTONOMOUS fix pass by the Opus overseer when BLOCKED, BEFORE
-  # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
-  # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
-  - id: opus-repair
-    agent: overseer-opus
-    effort: xhigh
-    context: fresh
-    depends_on: [block-classify, assert-implement-produced-work, repair-gate]
-    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-classify.output.status == 'BLOCKED' && $assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'"
-    prompt: |
-      The bdc-feature-development run is BLOCKED before the irreversible commit. Before a
-      human is paused, you get ONE autonomous repair pass. Diagnose and, if you can,
-      resolve it so the build can proceed safely.
-
-      ## Why blocked
-      block-classify: $block-classify.output
-      diff-review-final: $diff-review-final.output
-      assert-implement-produced-work: $assert-implement-produced-work.output
-      Original Codex findings: $diff-review.output
-
-      ## Your job
-      - If the block is FALSE_COMPLETE (implement claimed done but produced no real changes
-        in THIS worktree): determine whether the WO genuinely needs work here. If it does and
-        you can make the in-scope changes, make them in the assigned worktree (you have the
-        tools). If the WO is genuinely already implemented in this worktree, say so.
-      - If the block is diff-review-final=needs_revision: make the specific fix the final
-        reviewer named, in scope, in this worktree.
-      - Judge ONLY against this worktree (no origin/main, no sibling worktrees). NEVER
-        fabricate a diff from already-merged commits.
-
-      ## Output (last lines)
-      - If you resolved it (real in-scope changes now exist in this worktree):
-          OPUS_REPAIR=fixed
-      - If it is genuinely already-satisfied (no work needed in this worktree):
-          OPUS_REPAIR=already-satisfied
-      - If you could NOT resolve it and a human must decide:
-          OPUS_REPAIR=needs-human
-          REASON=<one sentence>
-
-  # classify-opus-repair: bash classifier -- converts the plain-text OPUS_REPAIR=fixed
-  # sentinel to {"fixed":"true|false"} so opus-rereview can gate on
-  # $classify-opus-repair.output.fixed == 'true'. Mirrors classify-apply-review idiom.
-  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01)
-  - id: classify-opus-repair
-    depends_on: [opus-repair]
-    trigger_rule: all_done
-    bash: |
-      set -uo pipefail
-      OPUS=$(cat <<'BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_006'
-      $opus-repair.output
-      BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_006
-      )
-      if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed'; then
-        printf '{"fixed":"true"}\n'
-      else
-        printf '{"fixed":"false"}\n'
-      fi
-
-  # opus-rereview: autonomous Codex adversarial re-review of the opus-repair diff.
-  # Only runs when classify-opus-repair reports fixed=true. Mirrors apply-diff-review-final.
-  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01) -- this is the AUTONOMOUS rung of the
-  # autonomy ladder: a passing re-review here lets block-reclassify emit PROCEED so the
-  # repaired build can land as a normal feature-branch PR instead of dead-ending at a
-  # terminal-BLOCKED on a non-interactive run.
-  - id: opus-rereview
-    provider: codex-native-strict
-    # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
-    model: gpt-6.1-sol
-    # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
-    # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
-    # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
-    # HONORS-FIRED-LANE-TIER-01: lets the seat gate proceed when Codex is over cutoff.
-    failover_provider: openrouter
-    failover_model: moonshotai/kimi-k3.1-pro
-    failover_agent: opr-adversarial-reviewer
-    agent: codex-adversarial-reviewer
-    depends_on: [classify-opus-repair]
-    trigger_rule: all_done
-    when: "$classify-opus-repair.output.fixed == 'true'"
-    prompt: |
-      opus-repair just made autonomous in-scope changes to resolve a BLOCKED build. Re-review
-      ONLY the current worktree diff (the post-repair state). Read-only. Judge ONLY this worktree
-      (no origin/main, no sibling worktrees; never fabricate a diff from already-merged commits).
-      Confirm the build now satisfies the WO and introduces no regression or unsafe behavior.
-
-      ## What opus-repair reported
-      $opus-repair.output
-
-      ## Original block reason
-      $block-classify.output
-      $diff-review-final.output
-
-      ## Output (STDOUT only, last lines)
-        OPUS_REREVIEW=<satisfied|needs_revision>
-        UNRESOLVED:
-        - <finding still open>   (or "(none)")
-
-  # classify-opus-rereview: grep the OPUS_REREVIEW sentinel out of opus-rereview's
-  # multi-line Codex prose and emit ONE JSON line so block-reclassify can read
-  # $classify-opus-rereview.output.verdict. Mirrors classify-apply-review exactly.
-  # Fail CLOSED: missing/unparseable sentinel -> needs_revision, never satisfied.
-  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01)
-  - id: classify-opus-rereview
-    depends_on: [opus-rereview]
-    trigger_rule: all_done
-    bash: |
-      set -uo pipefail
-      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007'
-      $opus-rereview.output
-      BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007
-      )
-      verdict=$(printf '%s\n' "$REVIEW" \
-        | grep -oE 'OPUS_REREVIEW=(satisfied|needs_revision)' \
-        | tail -n 1 \
-        | sed 's/OPUS_REREVIEW=//')
-      if [ -z "$verdict" ]; then
-        verdict=needs_revision
-      fi
-      printf '{"verdict":"%s"}\n' "$verdict"
-
-  # block-reclassify: after the Opus pass + autonomous re-review (or skip if it wasn't
-  # BLOCKED), re-emit the JSON status. trigger_rule all_done so it runs whether or not
-  # opus-repair / opus-rereview ran. WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01 added
-  # classify-opus-rereview to depends_on and replaced the prior dead-end terminal with a
-  # verdict-gated split: satisfied -> PROCEED (opus-repaired-and-rereviewed-satisfied),
-  # needs_revision -> BLOCKED (opus-made-changes-rereview-failed).
   - id: block-reclassify
-    depends_on: [block-classify, opus-repair, classify-opus-rereview]
+    depends_on: [capture-diff-final, block-classify, review-round-1, review-round-2, review-round-3, review-round-4, review-round-5, overseer-repair-round-4, overseer-repair-round-5]
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -5125,18 +5093,36 @@ nodes:
       $block-classify.output
       BDC_FEATURE_DEV_PRIOR_BLOCK_CLASSIFY_20260719_008
       )
-      OPUS=$(cat <<'BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_009'
-      $opus-repair.output
-      BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_009
-      )
-      REREVIEW=$(cat <<'BDC_FEATURE_DEV_REREVIEW_CLASSIFY_OPUS_REREVIEW_20260719_010'
-      $classify-opus-rereview.output
-      BDC_FEATURE_DEV_REREVIEW_CLASSIFY_OPUS_REREVIEW_20260719_010
-      )
+      out="${ARCHON_NODE_OUT:-/nonexistent}"
+      verdict=""
+      last_round=0
+      closed_item=""
+      for round in 1 2 3 4 5; do
+        if [ "$round" -ge 4 ]; then
+          result=$(cat "$out/overseer-repair-round-$round.out" 2>/dev/null || true)
+          case "$result" in
+            'CLOSED_LIST=production settings'|'CLOSED_LIST=secrets'|'CLOSED_LIST=another product contract')
+              closed_item="${result#CLOSED_LIST=}"
+              break ;;
+          esac
+        fi
+        [ -s "$out/review-round-$round.out" ] || break
+        last_round="$round"
+        verdict=$(jq -r '.verdict // empty' "$out/review-round-$round.out" 2>/dev/null || true)
+        [ "$verdict" = needs_revision ] || break
+      done
+      if [ -n "$closed_item" ]; then
+        mkdir -p "$ARTIFACTS_DIR/findings"
+        printf 'Closed-list change needed (%s) -- the work order goes back to its owner\n' "$closed_item" > "$ARTIFACTS_DIR/repair-return.txt"
+      elif [ "$last_round" = 5 ] && [ "$verdict" != approve ]; then
+        mkdir -p "$ARTIFACTS_DIR/findings"
+        printf '%s\n' 'Repair limit (5) reached -- the work order goes back to its owner' > "$ARTIFACTS_DIR/repair-return.txt"
+        jq -r '.findings[]' "$out/review-round-5.out" >> "$ARTIFACTS_DIR/repair-return.txt" 2>/dev/null || true
+      fi
       prior_status=$(printf '%s\n' "$PRIOR" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
 
       # If it wasn't blocked, keep the prior status unchanged.
-      if [ "$prior_status" != "BLOCKED" ]; then
+      if [ "$prior_status" != "BLOCKED" ] && [ "$last_round" = 0 ] && [ -z "$closed_item" ]; then
         printf '{"status":"%s"}\n' "${prior_status:-BLOCKED}"
         exit 0
       fi
@@ -5176,20 +5162,12 @@ nodes:
       validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
       AHEAD=$AHEAD_RAW
 
-      if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed' && { [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; }; then
-        # Opus made real changes. The autonomous re-review verdict decides the path:
-        # satisfied -> PROCEED (normal commit/PR); anything else -> BLOCKED (salvage
-        # net + human gate own it). Fail CLOSED: missing/unparseable verdict -> BLOCKED.
-        rereview_verdict=$(printf '%s\n' "$REREVIEW" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
-        if [ "$rereview_verdict" = "satisfied" ]; then
-          printf '{"status":"PROCEED","note":"opus-repaired-and-rereviewed-satisfied"}\n'
-        else
-          printf '{"status":"BLOCKED","note":"opus-made-changes-rereview-failed"}\n'
-        fi
-      elif printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=already-satisfied'; then
-        printf '{"status":"ALREADY_SATISFIED","note":"opus-confirmed-already-satisfied"}\n'
+      if [ -s "$ARTIFACTS_DIR/repair-return.txt" ]; then
+        printf '{"status":"BLOCKED","note":"repair-return-required","return_required":true}\n'
+      elif [ "$verdict" = approve ] && { [ "$CHANGED" -gt 0 ] || [ "$AHEAD" -gt 0 ]; }; then
+        printf '{"status":"PROCEED","note":"repair-round-approved"}\n'
       else
-        printf '{"status":"BLOCKED","note":"opus-could-not-resolve"}\n'
+        printf '{"status":"BLOCKED","note":"repair-round-not-approved"}\n'
       fi
 
   # noninteractive-salvage (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01, desk point 3): salvage is
@@ -5221,6 +5199,8 @@ nodes:
       STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
       NOT_CLEAN=""
       not_clean() { NOT_CLEAN="${NOT_CLEAN:+${NOT_CLEAN}; }$1"; }
+      FAILED_NODES=$_run.output.failed_nodes
+      case ",$FAILED_NODES," in *,implement,*) not_clean "implement_failed" ;; esac
       [ "$STATUS" = "PROCEED" ] || not_clean "review_status=${STATUS:-none}"
       IMPL_OUT_FILE="${ARCHON_NODE_OUT:-/nonexistent}/implement.out"
       if [ ! -s "$IMPL_OUT_FILE" ]; then
@@ -5306,6 +5286,7 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
+    idle_timeout: 600000
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -5314,7 +5295,7 @@ nodes:
     persona: xo
     depends_on: [block-reclassify]
     trigger_rule: all_done
-    when: "$assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'"
+    when: "$assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR' && $block-reclassify.output.return_required != 'true'"
     task_class: clerical
     prompt: |
       Build the human-facing findings ledger for the approval gate. Read every review output
@@ -5328,14 +5309,19 @@ nodes:
       diff-review verdict + findings:
       $diff-review.output
 
-      diff-review-final verdict + UNRESOLVED list:
-      $diff-review-final.output
+      Repair round verdicts and findings:
+      $review-round-1.output
+      $review-round-2.output
+      $review-round-3.output
+      $review-round-4.output
+      $review-round-5.output
 
-      block-classify / block-reclassify status:
+      Block reclassification:
       $block-reclassify.output
 
-      opus-repair result (REASON= names any fix the self-repair tier deferred):
-      $opus-repair.output
+      Overseer repair reports:
+      $overseer-repair-round-4.output
+      $overseer-repair-round-5.output
 
       ## Output: STRICT JSON only. No prose. No code fences.
       {
@@ -5343,7 +5329,7 @@ nodes:
         "findings": [
           {
             "id": "<stable-kebab-id, e.g. locg-migration>",
-            "source": "plan-review | diff-review | diff-review-final | opus-repair",
+            "source": "plan-review | diff-review | review-round-N | overseer-repair-round-N",
             "severity": "LOW | MEDIUM | HIGH",
             "title": "<one line>",
             "resolution": "FIXED-BY-LOOP | UNRESOLVED",
@@ -5402,6 +5388,7 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
+    idle_timeout: 600000
     agent: overseer-opus
     effort: xhigh
     context: fresh
@@ -5437,6 +5424,7 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
+    idle_timeout: 600000
     provider: codex-native-strict
     model: gpt-5.6-terra
     # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
@@ -5462,7 +5450,7 @@ nodes:
       $findings-consolidate.output
 
       ## Output (STDOUT only)
-        APPLY_DIFF_REVIEW_FINAL=<satisfied|needs_revision>
+        APPLY_DIFF_REVIEW=<satisfied|needs_revision>
         UNRESOLVED:
         - <finding still open>   (or "(none)")
 
@@ -5483,15 +5471,16 @@ nodes:
       BDC_FEATURE_DEV_REVIEW_APPLY_DIFF_REVIEW_FINAL_20260719_012
       )
       verdict=$(printf '%s\n' "$REVIEW" \
-        | grep -oE 'APPLY_DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | grep -oE 'APPLY_DIFF_REVIEW=(satisfied|needs_revision)' \
         | tail -n 1 \
-        | sed 's/APPLY_DIFF_REVIEW_FINAL=//')
+        | sed 's/APPLY_DIFF_REVIEW=//')
       if [ -z "$verdict" ]; then
         verdict=needs_revision
       fi
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: decide-push-target
+    idle_timeout: 600000
     persona: major-build
     depends_on: [pause-gate, classify-apply-review, assert-implement-produced-work]
     trigger_rule: all_done
@@ -5642,7 +5631,7 @@ nodes:
     # noninteractive-salvage (trigger_rule all_done), for PROCEED and for BLOCKED alike: a
     # review that said BLOCKED or not authorized is pushed and then held (HOLD), never a
     # failed run. It skips only a run returned to its author (no code) and ALREADY_SATISFIED.
-    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview, noninteractive-salvage, repair-gate]
+    depends_on: [decide-push-target, classify-apply-review, block-reclassify, noninteractive-salvage, repair-gate]
     trigger_rule: all_done
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR' && $block-reclassify.output.status != 'ALREADY_SATISFIED'"
     load_bearing: true
@@ -5686,7 +5675,7 @@ nodes:
         lane_finding "approved_plan_fence_missing: plan-review output has no APPROVED_PLAN fence"
       fi
       DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_015'
-      $diff-review-final.output
+      $diff-review.output
       BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_015
       )
       RECLASS=$(cat <<'BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_016'
@@ -5701,11 +5690,7 @@ nodes:
       $classify-apply-review.output
       BDC_FEATURE_DEV_APPLY_REVIEW_CLASSIFY_APPLY_REVIEW_20260719_018
       )
-      OPUS_REREVIEW_CLASS=$(cat <<'BDC_FEATURE_DEV_OPUS_REREVIEW_CLASS_CLASSIFY_OPUS_REREVIEW_20260719_019'
-      $classify-opus-rereview.output
-      BDC_FEATURE_DEV_OPUS_REREVIEW_CLASS_CLASSIFY_OPUS_REREVIEW_20260719_019
-      )
-      echo "$DECIDE_OUTPUT"
+
       # The out-of-scope rule runs before implement, in lane-scope-check (General 2).
       # Irreversible-action gate (Fix D, 2026-05-30): the BLOCK/PAUSE decision now lives
       # upstream in block-classify -> opus-repair -> block-reclassify -> pause-gate. This
@@ -5731,12 +5716,11 @@ nodes:
       # is not used. Authorize commit here by reading the opus rereview verdict directly --
       # mirrors the approve-with-fix bridge above. Fail CLOSED: missing/unparseable verdict
       # never grants authorization.
-      OPUS_REREVIEW_VERDICT=$(printf '%s\n' "$OPUS_REREVIEW_CLASS" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
-      OPUS_REREVIEW_OK=false
-      if [ "$OPUS_REREVIEW_VERDICT" = "satisfied" ] && [ "$RECLASS_NOTE" = "opus-repaired-and-rereviewed-satisfied" ]; then
-        OPUS_REREVIEW_OK=true
+      ROUND_REVIEW_OK=false
+      if [ "$RECLASS_NOTE" = "repair-round-approved" ]; then
+        ROUND_REVIEW_OK=true
       fi
-      if [ "$RECLASS_STATUS" != "PROCEED" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$OPUS_REREVIEW_OK" != "true" ]; then
+      if [ "$RECLASS_STATUS" != "PROCEED" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$ROUND_REVIEW_OK" != "true" ]; then
         echo "HOLD: commit-and-push reached with status='$RECLASS_STATUS' and no satisfied approve-with-fix or opus-rereview authorization: pushing, then holding the PR." >&2
         lane_finding "hold: review status ${RECLASS_STATUS:-none}${RECLASS_NOTE:+ (${RECLASS_NOTE})}; not authorized by a satisfied re-review -- pushed and held"
       fi
@@ -5746,9 +5730,9 @@ nodes:
       # of block-classify). Fail-closed: anything other than an explicit satisfied leaves the
       # gate refusing unless one of the two downstream bridges is true.
       final_verdict_cap=$(printf '%s\n' "$DIFF_FINAL" \
-        | { grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' || true; } \
+        | { grep -oE 'DIFF_REVIEW=(satisfied|needs_revision)' || true; } \
         | tail -n 1)
-      if [ "$final_verdict_cap" != "DIFF_REVIEW_FINAL=satisfied" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$OPUS_REREVIEW_OK" != "true" ]; then
+      if [ "$final_verdict_cap" != "DIFF_REVIEW=satisfied" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$ROUND_REVIEW_OK" != "true" ]; then
         echo "HOLD: neither diff-review-final, a satisfied approve-with-fix re-review, nor a satisfied opus autonomous re-review authorizes this commit: pushing, then holding the PR." >&2
         lane_finding "hold: final review not satisfied (${final_verdict_cap:-no verdict}) -- pushed and held"
       fi
@@ -6093,9 +6077,14 @@ nodes:
           # 2d5f6ac0 on origin/archon/thread-9772643d but UNIQUE_BRANCH was
           # archon/thread-9772643d-thread-9772643d).
           LOCAL_HEAD=$(git rev-parse HEAD)
+          RUN_START_SHA=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || true)
           RECOVERED=$(git ls-remote origin 2>/dev/null \
             | awk -v sha="$LOCAL_HEAD" '$1 == sha {sub(/^refs\/heads\//, "", $2); print $2}' \
             | head -1)
+          if [ "$LOCAL_HEAD" = "$RUN_START_SHA" ] || [ -z "$RECOVERED" ]; then
+            echo 'No changed files and no verified commits after run start -- implement loop did not produce work' >&2
+            exit 1
+          fi
           if [ -n "$RECOVERED" ]; then
             echo "Recovered push target from remote: $RECOVERED"
             # DEFECT FIX 2026-07-27 (anchor: bdc-crm PR #4, run f8ef4b92).
@@ -6110,9 +6099,6 @@ nodes:
             else
               echo "WARN: recovered remote ref '${RECOVERED}' is malformed -- refusing to adopt it; keeping ${UNIQUE_BRANCH}" >&2
             fi
-          else
-            echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
-            exit 1
           fi
         else
           echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
@@ -6791,7 +6777,7 @@ nodes:
       $diff-review.output
 
       Diff review (Codex, final after repair):
-      $diff-review-final.output
+      $diff-review.output
 
       ## Required Manifest Fields -- v2 labels (validator-compatible)
       Emit these labels verbatim at the top of the manifest (one per line):
@@ -6813,7 +6799,7 @@ nodes:
       ## In-run review evidence (record as evidence, NOT vibes -- doctrine
       self-repair-review-loops)
       - plan-review verdict (PLAN_REVIEW_PASS + RISK)
-      - diff-review-final verdict (DIFF_REVIEW_FINAL)
+      - Independent repair-round verdicts, when any repair ran
       - diff-review provider used (codex cross-model, OR claude-fallback with
         CROSS_MODEL_REVIEW=false disclosed)
       If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
@@ -6827,6 +6813,35 @@ nodes:
   # flips VALIDATION: PASS to FAIL when a declared stop condition did not hold, and
   # records a "Stop conditions:" audit line. Short ALREADY_SATISFIED / BLOCKED
   # manifests (no Tests: line) pass through untouched.
+  - id: overseer-idle-look
+    agent: overseer-in-run
+    idle_timeout: 600000
+    task_class: medium_work
+    depends_on: [build-manifest, patch-pr-body]
+    trigger_rule: all_done
+    when: "$check-already-satisfied.output == 'IDLE_HANDOFF=true' || $plan.output == 'IDLE_HANDOFF=true' || $implement.output == 'IDLE_HANDOFF=true' || $test-repair.output == 'IDLE_HANDOFF=true' || $war-council-validator.output == 'IDLE_HANDOFF=true' || $diff-review.output == 'IDLE_HANDOFF=true' || $findings-consolidate.output == 'IDLE_HANDOFF=true' || $apply-suggested-fix.output == 'IDLE_HANDOFF=true' || $apply-diff-review-final.output == 'IDLE_HANDOFF=true' || $decide-push-target.output == 'IDLE_HANDOFF=true' || $plan-review.output == 'IDLE_HANDOFF=true' || $repair-round-1.output == 'IDLE_HANDOFF=true' || $review-round-1.output == 'IDLE_HANDOFF=true' || $repair-round-2.output == 'IDLE_HANDOFF=true' || $review-round-2.output == 'IDLE_HANDOFF=true' || $repair-round-3.output == 'IDLE_HANDOFF=true' || $review-round-3.output == 'IDLE_HANDOFF=true' || $overseer-repair-round-4.output == 'IDLE_HANDOFF=true' || $review-round-4.output == 'IDLE_HANDOFF=true' || $overseer-repair-round-5.output == 'IDLE_HANDOFF=true' || $review-round-5.output == 'IDLE_HANDOFF=true'"
+    output_format:
+      type: object
+      additionalProperties: false
+      required: [class, evidence]
+      properties:
+        class:
+          type: string
+          enum: [spec, environment, provider, fixed]
+        evidence:
+          type: string
+    prompt: |
+      Read the interrupted step and its last output from $ARTIFACTS_DIR/idle-handoffs/*.json.
+      Diagnose the idle hand-off from that evidence and the run's node outputs.
+      Do not restart any step. If no run PR exists and no code was produced,
+      diagnose only. Return JSON with class (spec, environment, or provider)
+      and evidence explaining the cause and what must change before the next fire.
+      If a run PR exists and you cannot fix the issue, return JSON with class
+      (spec, environment, or provider) and evidence explaining what is missing.
+      Otherwise make only the needed fix and commit it on the run branch
+      with trailer Cauldron-Role: overseer-repair. Return class fixed and explain the fix.
+      Do not publish yourself.
+
   - id: stamp-manifest-evidence
     persona: major-build
     load_bearing: true
@@ -7755,7 +7770,7 @@ nodes:
       echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
 
   - id: blocked-issue
-    depends_on: [block-reclassify]
+    depends_on: [block-reclassify, overseer-idle-look]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -7777,6 +7792,46 @@ nodes:
       bi_outcome_event() {
         BI_ISSUE="${1:-}" BI_RUN="$BI_RUN_ID" python3 -c 'import json,os; d=dict(event_type="run_outcome", outcome="returned_to_author", run_id=os.environ["BI_RUN"]); i=os.environ["BI_ISSUE"]; d.update(issue=int(i)) if i.isdigit() else None; print("BDC_RUN_EVENT " + json.dumps(d))'
       }
+
+      BI_IDLE=$(cat "${ARCHON_NODE_OUT:-/nonexistent}/overseer-idle-look.out" 2>/dev/null || true)
+      BI_CLASS=$(printf '%s' "$BI_IDLE" | jq -r '.class // empty' 2>/dev/null || true)
+      case "$BI_CLASS" in spec|environment|provider) ;; *) BI_CLASS="" ;; esac
+      BI_EVIDENCE=$(printf '%s' "$BI_IDLE" | jq -r '.evidence // empty' 2>/dev/null || true)
+      if [ "$BI_RETURNED" = true ] && [ -z "$BI_CLASS$BI_EVIDENCE" ] && grep -qx 'IDLE_HANDOFF=true' "${ARCHON_NODE_OUT:-/nonexistent}"/*.out 2>/dev/null; then
+        BI_CLASS=provider
+        BI_EVIDENCE='The provider did not produce an Overseer diagnosis after the idle hand-off. Restore a responding provider before re-firing.'
+      fi
+      if [ -s "$ARTIFACTS_DIR/repair-return.txt" ] || [ -n "$BI_CLASS" ]; then
+        ISSUE_REPO="thinmansoftware/bdc-xo"
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | sed -n 's/.*issue=\([0-9][0-9]*\).*/\1/p' | head -1)
+        if [ -z "$ISSUE_NUM" ]; then
+          BI_WO=$(sed -n 's/^WO_ID=//p' "${ARCHON_NODE_OUT:-/nonexistent}/read-spec.out" | head -1)
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "${BI_WO} in:title" --json number --jq '.[0].number // empty')
+        fi
+        BI_BODY=$(mktemp)
+        BI_REWRITE=false
+        if [ -s "$ARTIFACTS_DIR/repair-return.txt" ]; then
+          cat "$ARTIFACTS_DIR/repair-return.txt" > "$BI_BODY"
+          BI_REWRITE=true
+        else
+          if [ "$BI_RETURNED" = true ]; then
+            BI_HEADING='Idle before any code -- diagnosis by the in-run Overseer'
+          else
+            BI_HEADING='Idle hand-off -- diagnosis by the in-run Overseer'
+          fi
+          printf '%s\n\nClass: %s\n\n' "$BI_HEADING" "$BI_CLASS" > "$BI_BODY"
+          printf '%s\n' "$BI_EVIDENCE" >> "$BI_BODY"
+          if [ "$BI_CLASS" = spec ] || [ "$BI_RETURNED" != true ]; then BI_REWRITE=true; fi
+        fi
+        if [ "$BI_REWRITE" = true ]; then
+          printf '\nSpec-Returned-At-Blob: %s\n' "$(cat "$ARTIFACTS_DIR/spec-blob.txt")" >> "$BI_BODY"
+          gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label spec:rewrite-required
+        fi
+        gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$BI_BODY"
+        rm -f "$BI_BODY"
+        bi_outcome_event "$ISSUE_NUM"
+        exit 0
+      fi
 
       RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
       $block-reclassify.output
@@ -8016,7 +8071,7 @@ nodes:
   # It depends (all_done) on every sink node of the DAG, so every node has settled when
   # $_run.output.failed_nodes is substituted (rule 1b: any failed node holds the PR).
   - id: hold-if-findings
-    depends_on: [patch-pr-body, review-issue, blocked-issue, record-wo-completion-candidate, repair-gate-fail, manifest-evidence-check, manifest-consistency-check, open-pr-if-needed, commit-and-push, noninteractive-salvage, block-reclassify, checkpoint-diff-repair, tests-blocked-report, capture-run-scope, checkpoint-push, derive-run-source-scope, ascii-autofix, ascii-gate, format-autofix]
+    depends_on: [overseer-idle-look, patch-pr-body, review-issue, blocked-issue, record-wo-completion-candidate, repair-gate-fail, manifest-evidence-check, manifest-consistency-check, open-pr-if-needed, commit-and-push, noninteractive-salvage, block-reclassify, checkpoint-diff-repair, tests-blocked-report, capture-run-scope, checkpoint-push, derive-run-source-scope, ascii-autofix, ascii-gate, format-autofix]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -8043,6 +8098,43 @@ nodes:
         echo "hold-if-findings: no PR opened or adopted by this run -- nothing to hold."
         exit 0
       fi
+      HIF_CHANGE=""
+      HIF_RETURN="$ARTIFACTS_DIR/repair-return.txt"
+      if [ -s "$HIF_RETURN" ]; then
+        HIF_BANNER=$(head -n 1 "$HIF_RETURN")
+      fi
+      hif_published_head() { head -n 1 "$ARTIFACTS_DIR/evidence/published.head" 2>/dev/null | tr -d '[:space:]'; }
+      if grep -qx 'IDLE_HANDOFF=true' "$HIF_OUT"/*.out 2>/dev/null; then
+        HIF_LOCAL=$(git rev-parse HEAD) || hif_fail "local head unavailable"
+        HIF_PREVIOUS=$(hif_published_head)
+        [ -n "$HIF_PREVIOUS" ] || hif_fail "published head unavailable"
+        if [ "$HIF_LOCAL" != "$HIF_PREVIOUS" ]; then
+          HIF_BRANCH=$(sed -n 's/^unique_branch=//p' "$HIF_OUT/commit-and-push.out" | head -n 1)
+          HIF_LEASE=$(sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' "$HIF_OUT/commit-and-push.out" | tail -n 1)
+          pubg_push() {
+            local pf want have copy file="${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+            pf=$preflight-github-auth.output
+            want=$(printf '%s\n' "$pf" | sed -n 's/^PUBG_CORE_SHA256=\([0-9a-f]\{64\}\)$/\1/p' | tail -n 1)
+            copy=$(mktemp "${TMPDIR:-/tmp}/pubg-core.XXXXXX") || return 1
+            if cp "$file" "$copy" 2>/dev/null; then have=$(sha256sum < "$copy" | cut -c1-64); else have=""; fi
+            if [ -z "$want" ] || [ "$have" != "$want" ]; then
+              rm -f "$copy"
+              return 1
+            fi
+            . "$copy"
+            rm -f "$copy"
+            pubg_push "$@"
+          }
+          if [ -s "$ARTIFACTS_DIR/run-pr.json" ]; then
+            HIF_ADOPTED=$(jq -r '.branch // empty' "$ARTIFACTS_DIR/run-pr.json")
+            HIF_BRANCH="${HIF_ADOPTED:-$HIF_BRANCH}"
+          fi
+          [ -z "$HIF_LEASE" ] || HIF_LEASE="$HIF_PREVIOUS"
+          pubg_push "$HIF_LOCAL" "$HIF_BRANCH" "$HIF_LEASE" || hif_fail "Overseer publication refused"
+          HIF_CHANGE=true
+          HIF_BANNER='Changed by the in-run Overseer after publication -- not reviewed in-run'
+        fi
+      fi
       if [ -z "$HIF_REPO" ]; then
         HIF_REPO=$(printf '%s\n' "$HIF_URL" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p' | head -n 1)
       fi
@@ -8050,6 +8142,8 @@ nodes:
       # -- Is this a clean PROCEED (1b)? Every other outcome is held.
       HIF_REASONS=""
       hif_hold() { HIF_REASONS="${HIF_REASONS:+${HIF_REASONS}; }$1"; }
+      [ -z "$HIF_CHANGE" ] || hif_hold "Overseer changed the published head"
+      [ ! -s "$HIF_RETURN" ] || hif_hold "work order returned to its owner"
       HIF_STATUS=$(sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' "$HIF_OUT/block-reclassify.out" 2>/dev/null | head -n 1)
       [ "$HIF_STATUS" = "PROCEED" ] || hif_hold "review status ${HIF_STATUS:-unreadable}"
       if [ -d "$ARTIFACTS_DIR/findings" ] && [ ! -r "$ARTIFACTS_DIR/findings" ]; then
@@ -8079,7 +8173,7 @@ nodes:
       # -- The head this run last published: every successful pubg_push records it. The PR head
       #    must equal it, and the worktree must hold no unpublished commit and no uncommitted
       #    change; otherwise the run fails and the PR stays a draft (1c).
-      HIF_HEAD=$(head -n 1 "$ARTIFACTS_DIR/evidence/published.head" 2>/dev/null | tr -d '[:space:]')
+      HIF_HEAD=$(hif_published_head)
       printf '%s\n' "$HIF_HEAD" | grep -Eq '^[0-9a-f]{40}$' || hif_fail "published head SHA unknown; the PR stays a draft"
       HIF_LOCAL=$(git rev-parse HEAD 2>/dev/null || true)
       [ "$HIF_LOCAL" = "$HIF_HEAD" ] || hif_fail "worktree HEAD ${HIF_LOCAL:-unknown} is not the published head ${HIF_HEAD} (an unpublished commit); the PR stays a draft"
@@ -8089,11 +8183,14 @@ nodes:
       # -- Write every hold (labels by a separate edit; banner and markers in the body).
       HIF_BODY_NOW=$(gh pr view "$HIF_URL" --repo "$HIF_REPO" --json body --jq '.body') || hif_fail "PR body unreadable; the PR stays a draft"
       HIF_BODY_FILE=$(mktemp "${ARTIFACTS_DIR:?}/hold-body.XXXXXX")
-      HIF_BODY_NOW="$HIF_BODY_NOW" HIF_RUN="$HIF_RUN_ID" HIF_BANNER="$HIF_BANNER" HIF_HOLD="$HIF_HOLD" python3 - "$HIF_BODY_FILE" <<'PY' || hif_fail "body could not be composed; the PR stays a draft"
+      HIF_OVERSEER=$(git log --format='%H %s%n%b' --grep='Cauldron-Role: overseer-repair' "$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || git rev-parse HEAD)..HEAD")
+      HIF_OVERSEER="$HIF_OVERSEER" HIF_BODY_NOW="$HIF_BODY_NOW" HIF_RUN="$HIF_RUN_ID" HIF_BANNER="$HIF_BANNER" HIF_HOLD="$HIF_HOLD" python3 - "$HIF_BODY_FILE" <<'PY' || hif_fail "body could not be composed; the PR stays a draft"
       import os, sys
       e = os.environ
       lines = e["HIF_BODY_NOW"].replace("\r\n", "\n").split("\n")
       rest = [l for l in lines if not l.startswith("Cauldron-Run: ") and not l.startswith("Cauldron-Lane: ") and l != e["HIF_BANNER"]]
+      if e["HIF_OVERSEER"]:
+          rest += ["", "## Changes made by the Overseer", "", e["HIF_OVERSEER"]]
       while rest and not rest[0].strip():
           rest.pop(0)
       head = ["Cauldron-Run: " + e["HIF_RUN"], "Cauldron-Lane: bdc-feature-development", ""]

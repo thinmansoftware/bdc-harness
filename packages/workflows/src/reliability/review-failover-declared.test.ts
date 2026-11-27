@@ -23,6 +23,7 @@ import {
   DEFAULT_CLAUDE_FAILOVER_MODEL,
   isReviewNode,
   REVIEW_NODE_IDS,
+  REPAIR_REVIEW_NODE_IDS,
   selectSeatNodeFailover,
 } from './seat-node-failover';
 
@@ -33,6 +34,7 @@ const CODE_REVIEW_IDS = [
   'diff-review-final',
   'opus-rereview',
   'apply-diff-review-final',
+  ...REPAIR_REVIEW_NODE_IDS,
 ];
 
 interface Lane {
@@ -76,7 +78,14 @@ describe('D0: shipped lane review nodes declare a non-Claude failover', () => {
     expect(lanes).toHaveLength(13);
     let checked = 0;
     for (const { file, workflow } of lanes) {
-      for (const id of REVIEW_NODE_IDS) {
+      const reviewIds =
+        file === 'bdc-feature-development.yaml'
+          ? [
+              ...REVIEW_NODE_IDS.filter(id => id !== 'diff-review-final' && id !== 'opus-rereview'),
+              ...REPAIR_REVIEW_NODE_IDS,
+            ]
+          : REVIEW_NODE_IDS;
+      for (const id of reviewIds) {
         const node = workflow.nodes.find(entry => entry.id === id);
         expect({ file, id, found: node !== undefined }).toEqual({ file, id, found: true });
         if (!node) continue;
@@ -136,13 +145,13 @@ describe('D0: shipped lane review nodes declare a non-Claude failover', () => {
       }
     }
     console.log(`review nodes checked: ${String(checked)} across ${String(lanes.length)} lanes`);
-    expect(checked).toBe(91);
+    expect(checked).toBe(94);
   });
 
   test('review_node_never_selects_claude_even_with_only_claude_headroom', () => {
     let checked = 0;
     for (const { workflow } of loadLanes()) {
-      for (const id of REVIEW_NODE_IDS) {
+      for (const id of [...REVIEW_NODE_IDS, ...REPAIR_REVIEW_NODE_IDS]) {
         const node = workflow.nodes.find(entry => entry.id === id);
         if (!node) continue;
         const provider = effectiveProvider(node, workflow);

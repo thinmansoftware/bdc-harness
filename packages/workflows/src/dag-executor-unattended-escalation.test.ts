@@ -18,18 +18,33 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import * as git from '@archon/git';
-import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
+import {
+  clearRegistry,
+  getAgentProvider,
+  getProviderCapabilities,
+  registerBuiltinProviders,
+  registerProvider,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
+registerProvider({
+  id: 'openrouter',
+  displayName: 'OpenRouter fixture',
+  factory: () => getAgentProvider('codex'),
+  capabilities: getProviderCapabilities('codex'),
+  builtIn: false,
+});
 import { executeDagWorkflow, substituteNodeOutputRefs } from './dag-executor';
 import type { NodeOutput } from './schemas/workflow-run';
+import { isEvidenceNode } from './schemas';
 import { parseWorkflow } from './loader';
+import { evaluateCondition } from './condition-evaluator';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowRun } from './schemas';
 
 type Ev = { event_type: string; step_name?: string; data?: Record<string, unknown> };
-type Chunk = { type: string; content?: string; sessionId?: string };
+type Chunk = { type: string; content?: string; sessionId?: string; structuredOutput?: unknown };
 
 const config: WorkflowConfig = {
   assistant: 'claude',
@@ -71,12 +86,14 @@ describe('dag-executor unattended questions and idle hand-off', () => {
   let dir: string;
   let exec: ReturnType<typeof spyOn>;
   let ranBash: string[];
-  let script: () => AsyncGenerator<Chunk>;
+  let script: (prompt: string) => AsyncGenerator<Chunk>;
+  let bashOutput: (path: string) => string;
   let sendCalls: number;
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'unattended-esc-'));
     ranBash = [];
+    bashOutput = () => 'ran';
     sendCalls = 0;
     script = async function* () {
       yield { type: 'assistant', content: 'COMPLETE' };
@@ -86,8 +103,9 @@ describe('dag-executor unattended questions and idle hand-off', () => {
       async (command: string, args?: readonly string[]) => {
         if (command === 'bash') {
           // The script file is node-<id>-<runId>.sh; ran() below matches on it.
-          ranBash.push(String(args?.[0] ?? '').replace(/\\/g, '/'));
-          return { stdout: 'ran', stderr: '' };
+          const file = String(args?.[0] ?? '').replace(/\\/g, '/');
+          ranBash.push(file);
+          return { stdout: bashOutput(file), stderr: '' };
         }
         // git and anything else: no repo here, behave like an empty success.
         return { stdout: '', stderr: '' };
@@ -132,9 +150,9 @@ describe('dag-executor unattended questions and idle hand-off', () => {
     const deps: WorkflowDeps = {
       store,
       getAgentProvider: (() => ({
-        sendQuery: () => {
+        sendQuery: (prompt: string) => {
           sendCalls += 1;
-          return script();
+          return script(prompt);
         },
         getType: () => 'claude',
         getCapabilities: claudeCaps,
@@ -197,6 +215,257 @@ describe('dag-executor unattended questions and idle hand-off', () => {
       return false;
     }
   }
+
+  test('T16: the real round chain runs five independent reviews and records one hand-off', async () => {
+    const file = join(
+      import.meta.dir,
+      '../../../.archon/workflows/defaults/bdc-feature-development.yaml'
+    );
+    const result = parseWorkflow(await readFile(file, 'utf8'), file);
+    expect(result.error).toBeNull();
+    const ids = new Set([
+      'diff-review',
+      'classify-diff-review',
+      'assert-implement-produced-work',
+      'repair-gate',
+      'checkpoint-diff-repair',
+      ...Array.from({ length: 5 }, (_, index) => 'review-round-' + (index + 1)),
+      'repair-round-1',
+      'repair-round-2',
+      'repair-round-3',
+      'overseer-repair-round-4',
+      'overseer-repair-round-5',
+    ]);
+    const nodes = (result.workflow?.nodes ?? [])
+      .filter(node => ids.has(node.id))
+      .map(node => ({ ...node, depends_on: node.depends_on?.filter(id => ids.has(id)) }));
+    const verdict = { verdict: 'needs_revision', findings: ['Fixture finding'] };
+    const head = 'a'.repeat(40);
+    bashOutput = file => {
+      if (file.includes('/node-classify-diff-review-')) return JSON.stringify(verdict);
+      if (file.includes('/node-repair-gate-')) return '{"REPAIR_GATE_ALLOW":"yes"}';
+      if (file.includes('/node-checkpoint-diff-repair-')) {
+        return (
+          'BDC_RUN_EVENT ' +
+          JSON.stringify({
+            event_type: 'repair_handoff_overseer',
+            round: 3,
+            head_sha: head,
+            findings: verdict.findings,
+          })
+        );
+      }
+      return 'BUILD_OUTCOME=REAL_BUILD';
+    };
+    script = async function* (prompt) {
+      if (prompt.includes('You are the Codex adversarial diff reviewer')) {
+        yield { type: 'assistant', content: 'DIFF_REVIEW=needs_revision' };
+      } else if (prompt.includes('Independently inspect the current committed head')) {
+        yield { type: 'assistant', content: JSON.stringify(verdict) };
+      } else {
+        yield { type: 'assistant', content: 'Committed fixture repair' };
+      }
+      yield { type: 'result', sessionId: 'fixture' };
+    };
+    const { events, failRun } = await run({ name: 'repair-round-fixture', nodes }, 'fixture-t16');
+    expect(failRun).toBe(0);
+    const reviewEvents = events.filter(
+      event => event.event_type === 'node_completed' && /^review-round-/.test(event.step_name ?? '')
+    );
+    expect(reviewEvents.map(event => event.step_name)).toEqual(
+      Array.from({ length: 5 }, (_, index) => 'review-round-' + (index + 1))
+    );
+    const handoff = events.filter(event => event.event_type === 'repair_handoff_overseer');
+    expect(handoff).toHaveLength(1);
+    expect(handoff[0]?.data).toMatchObject({
+      round: 3,
+      head_sha: head,
+      findings: verdict.findings,
+    });
+    const opening = of(events, 'node_completed', 'diff-review');
+    expect(opening).toHaveLength(1);
+    expect(events.indexOf(opening[0]!)).toBeLessThan(events.indexOf(reviewEvents[0]!));
+    expect(events.indexOf(handoff[0]!)).toBeGreaterThan(events.indexOf(reviewEvents[2]!));
+    expect(events.indexOf(handoff[0]!)).toBeLessThan(events.indexOf(reviewEvents[3]!));
+  });
+
+  for (const scenario of ['wall-salvage', 'clean', 'question', 'empty'] as const) {
+    test('T15: loaded lane publication order for ' + scenario, async () => {
+      const file = join(
+        import.meta.dir,
+        '../../../.archon/workflows/defaults/bdc-feature-development.yaml'
+      );
+      const result = parseWorkflow(await readFile(file, 'utf8'), file);
+      expect(result.error).toBeNull();
+      const keep = new Set([
+        'plan-review',
+        'repair-gate',
+        'implement',
+        'checkpoint-push',
+        'assert-implement-produced-work',
+        'block-reclassify',
+        'noninteractive-salvage',
+        'commit-and-push',
+        'open-pr-if-needed',
+        'blocked-issue',
+        'hold-if-findings',
+      ]);
+      const nodes = (result.workflow?.nodes ?? [])
+        .filter(node => keep.has(node.id))
+        .map(node => {
+          const depends_on = node.depends_on?.filter(dep => keep.has(dep)) ?? [];
+          if (node.id === 'plan-review') return { id: node.id, bash: 'echo plan', depends_on };
+          if (node.id === 'implement')
+            return {
+              ...node,
+              depends_on,
+              when: "$plan-review.output != 'UNATTENDED_QUESTION=true'",
+              trigger_rule: 'all_done',
+              wall_timeout_ms: 250,
+              idle_timeout: 350,
+              loop: { prompt: 'Implement fixture', until: 'COMPLETE', max_iterations: 1 },
+            };
+          if (node.id === 'block-reclassify') depends_on.push('assert-implement-produced-work');
+          return { ...node, depends_on };
+        });
+      const stage = (file: string, id: string) => file.includes('/node-' + id + '-');
+      const publications: string[] = [];
+      const committed: string[] = [];
+      bashOutput = file => {
+        if (stage(file, 'plan-review'))
+          return scenario === 'question' ? 'UNATTENDED_QUESTION=true' : 'APPROVED';
+        if (stage(file, 'repair-gate')) return '{"REPAIR_GATE_ALLOW":"yes"}';
+        if (stage(file, 'assert-implement-produced-work'))
+          return scenario === 'question'
+            ? 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'
+            : scenario === 'empty'
+              ? 'BUILD_OUTCOME=FALSE_COMPLETE'
+              : 'BUILD_OUTCOME=REAL_BUILD';
+        if (stage(file, 'block-reclassify'))
+          return scenario === 'clean' ? '{"status":"PROCEED"}' : '{"status":"BLOCKED"}';
+        if (stage(file, 'noninteractive-salvage') && scenario === 'wall-salvage')
+          committed.push('salvage');
+        if (stage(file, 'commit-and-push')) {
+          if (scenario === 'empty') throw new Error('nothing produced');
+          publications.push('push');
+        }
+        if (stage(file, 'open-pr-if-needed')) publications.push('open');
+        if (stage(file, 'hold-if-findings') && publications.includes('open')) {
+          if (scenario === 'wall-salvage') publications.push('hold');
+          publications.push('ready');
+        }
+        return 'fixture';
+      };
+      script = async function* () {
+        if (scenario === 'wall-salvage') {
+          yield { type: 'assistant', content: 'Started work before wall timeout' };
+          await HANG();
+        }
+        yield { type: 'assistant', content: 'COMPLETE' };
+        yield { type: 'result', sessionId: 'fixture' };
+      };
+      const { events } = await run(
+        { name: 'publication-order-fixture', nodes },
+        'fixture-t15-' + scenario
+      );
+      if (scenario === 'wall-salvage') {
+        expect(of(events, 'node_failed', 'implement')).toHaveLength(1);
+        expect(committed).toEqual(['salvage']);
+        expect(publications).toEqual(['push', 'open', 'hold', 'ready']);
+        const position = (id: string) => ranBash.findIndex(file => stage(file, id));
+        expect(position('noninteractive-salvage')).toBeLessThan(position('commit-and-push'));
+      } else if (scenario === 'clean') {
+        expect(committed).toEqual([]);
+        expect(publications).toEqual(['push', 'open', 'ready']);
+      } else if (scenario === 'question') {
+        expect(of(events, 'node_started', 'implement')).toHaveLength(0);
+        expect(ran('blocked-issue')).toBe(true);
+        expect(publications).toEqual([]);
+      } else {
+        expect(of(events, 'node_failed', 'commit-and-push')).toHaveLength(1);
+        expect(publications).toEqual([]);
+      }
+    });
+  }
+
+  // Test 20 trigger disposition: bdc-xo#6687 comment 7211389114.
+  test('T20: test repair idles after checkpoint publication and the look follows the draft', async () => {
+    const file = join(
+      import.meta.dir,
+      '../../../.archon/workflows/defaults/bdc-feature-development.yaml'
+    );
+    const result = parseWorkflow(await readFile(file, 'utf8'), file);
+    expect(result.error).toBeNull();
+    const keep = new Set([
+      'repair-gate',
+      'checkpoint-push',
+      'assert-implement-produced-work',
+      'classify-test-result',
+      'test-repair',
+      'run-stop-tests-final',
+      'commit-and-push',
+      'open-pr-if-needed',
+      'build-manifest',
+      'overseer-idle-look',
+      'hold-if-findings',
+    ]);
+    const dependencies = (id: string, existing: readonly string[] = []): string[] => {
+      const filtered = existing.filter(dep => keep.has(dep));
+      if (id === 'classify-test-result') return [...filtered, 'assert-implement-produced-work'];
+      if (id === 'commit-and-push') return [...filtered, 'run-stop-tests-final'];
+      return filtered;
+    };
+    const nodes = (result.workflow?.nodes ?? [])
+      .filter(node => keep.has(node.id))
+      .map(node => {
+        const depends_on = dependencies(node.id, node.depends_on);
+        if (node.id === 'repair-gate') return { id: node.id, depends_on, bash: 'echo gate' };
+        if (node.id === 'build-manifest')
+          return { id: node.id, depends_on, bash: 'echo mechanical evidence' };
+        return { ...node, depends_on, ...(node.id === 'test-repair' ? { idle_timeout: 200 } : {}) };
+      });
+    bashOutput = file => {
+      if (file.includes('/node-repair-gate-')) return '{"REPAIR_GATE_ALLOW":"yes"}';
+      if (file.includes('/node-classify-test-result-')) return '{"repairable":"true"}';
+      return 'fixture';
+    };
+    script = async function* (prompt) {
+      if (prompt.includes('Repair the real test failure')) {
+        yield { type: 'assistant', content: 'Fix started before provider stopped.' };
+        await HANG();
+      }
+      yield {
+        type: 'assistant',
+        content: '{"class":"fixed","evidence":"Committed fixture repair"}',
+      };
+      yield { type: 'result', sessionId: 'fixture' };
+    };
+    const { events, artifactsDir } = await run(
+      { name: 'idle-republication-fixture', idle_handoff: 'overseer', nodes },
+      'fixture-t20'
+    );
+    const handoffs = of(events, 'idle_handoff_overseer', 'test-repair');
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0]?.data?.last_output).toContain('Fix started');
+    expect(of(events, 'node_failed', 'test-repair')).toHaveLength(0);
+    const proof = JSON.parse(
+      await readFile(join(artifactsDir, 'idle-handoffs/test-repair.json'), 'utf8')
+    );
+    expect(proof.last_output).toContain('Fix started');
+    const completed = (id: string) => of(events, 'node_completed', id);
+    for (const id of [
+      'checkpoint-push',
+      'open-pr-if-needed',
+      'overseer-idle-look',
+      'hold-if-findings',
+    ]) {
+      expect(completed(id)).toHaveLength(1);
+    }
+    const position = (id: string) => events.indexOf(completed(id)[0]!);
+    expect(position('checkpoint-push')).toBeLessThan(events.indexOf(handoffs[0]!));
+    expect(position('open-pr-if-needed')).toBeLessThan(position('overseer-idle-look'));
+    expect(position('overseer-idle-look')).toBeLessThan(position('hold-if-findings'));
+  });
 
   // -------------------------------------------------------------------------
   // Test 5: unattended_questions: report
@@ -585,6 +854,56 @@ describe('dag-executor unattended questions and idle hand-off', () => {
     expect(of(events, 'node_completed', 'implement')).toHaveLength(0);
     expect(ran('overseer-idle-look')).toBe(false);
   });
+});
+
+test('round five is gated on an independent revision verdict and no protected prerequisite', async () => {
+  const file = join(
+    import.meta.dir,
+    '../../../.archon/workflows/defaults/bdc-feature-development.yaml'
+  );
+  const result = parseWorkflow(await readFile(file, 'utf8'), file);
+  expect(result.error).toBeNull();
+  const nodes = result.workflow?.nodes ?? [];
+  const roundFive = nodes.find(node => node.id === 'overseer-repair-round-5');
+  expect(roundFive?.when).toBeDefined();
+  const evaluate = (repair: string, review: string): boolean =>
+    evaluateCondition(
+      roundFive!.when!,
+      new Map([
+        ['overseer-repair-round-4', { state: 'completed', output: repair }],
+        ['review-round-4', { state: 'completed', output: review }],
+      ]) as Map<string, NodeOutput>
+    ).result;
+  const revision = '{"verdict":"needs_revision","findings":["Required fix"]}';
+  expect(evaluate('CLOSED_LIST=production settings', revision)).toBe(false);
+  expect(evaluate('CLOSED_LIST=secrets', revision)).toBe(false);
+  expect(evaluate('CLOSED_LIST=another product contract', revision)).toBe(false);
+  expect(evaluate('Committed a fix.', revision)).toBe(true);
+  expect(evaluate('Committed a fix.', 'invalid JSON')).toBe(false);
+  expect(evaluate('Committed a fix.', '{"verdict":"approve","findings":[]}')).toBe(false);
+});
+
+test('rebuilt lane schedules the idle look after manifest and before issue return and ready', async () => {
+  const filename = join(
+    import.meta.dir,
+    '../../../.archon/workflows/defaults/bdc-feature-development.yaml'
+  );
+  const result = parseWorkflow(await readFile(filename, 'utf8'), filename);
+  expect(result.error).toBeNull();
+  const nodes = result.workflow?.nodes ?? [];
+  expect(nodes).toHaveLength(67);
+  const node = (id: string) => nodes.find(candidate => candidate.id === id);
+  const look = node('overseer-idle-look');
+  expect(look?.depends_on).toContain('build-manifest');
+  expect(look?.trigger_rule).toBe('all_done');
+  expect(look?.when).toContain("$implement.output == 'IDLE_HANDOFF=true'");
+  expect(look?.when).toContain("$test-repair.output == 'IDLE_HANDOFF=true'");
+  expect(look?.when).not.toContain('$build-manifest.output');
+  const manifest = node('build-manifest');
+  expect(manifest && isEvidenceNode(manifest)).toBe(true);
+  expect(manifest?.idle_timeout).toBeUndefined();
+  expect(node('blocked-issue')?.depends_on).toContain('overseer-idle-look');
+  expect(node('hold-if-findings')?.depends_on).toContain('blocked-issue');
 });
 
 describe('loader: the two opt-in keys', () => {

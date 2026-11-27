@@ -129,7 +129,15 @@ elif a[:2] == ['pr', 'comment']:
 elif a[:2] == ['label', 'create']: pass
 elif a[:2] == ['issue', 'comment']:
     d.setdefault('issue_comments', []).append({'issue': a[2], 'body': Path(opt('--body-file')).read_text()}); save()
-elif a[:2] == ['issue', 'edit']: pass
+elif a[:2] == ['issue', 'edit']:
+    if '--add-label' in a:
+        label = opt('--add-label')
+        if label not in d.setdefault('issue_labels', []):
+            d['issue_labels'].append(label)
+        save()
+elif a[:2] == ['issue', 'view']:
+    print(json.dumps({'labels': [{'name': name} for name in d.get('issue_labels', [])],
+                      'comments': d.get('issue_comments', [])}))
 elif a[:2] == ['issue', 'list']: print('42')
 else: raise SystemExit('unexpected gh call: ' + str(a))
 '''
@@ -364,7 +372,7 @@ def scenario_hold_failures(tmp_factory):
         f = Fixture(tmp)
         f.commit_change()
         f.set_out('block-reclassify', '{"status":"PROCEED"}')
-        f.outputs['diff-review-final'] = 'DIFF_REVIEW_FINAL=satisfied'
+        f.set_out('diff-review', 'DIFF_REVIEW=satisfied')
         rcs = publish_chain(f, 'c', skip_hold=True)
         (f.art / 'findings').mkdir(exist_ok=True)
         write_lf(f.art / 'findings' / 'manifest-evidence-check.txt', 'FINDING=HARNESS_REFUSED: fixture late evidence finding\n')
@@ -529,7 +537,7 @@ def scenario_evidence(tmp):
     f = Fixture(tmp)
     f.commit_change()
     f.set_out('block-reclassify', '{"status":"PROCEED"}')
-    f.outputs['diff-review-final'] = 'DIFF_REVIEW_FINAL=satisfied'
+    f.set_out('diff-review', 'DIFF_REVIEW=satisfied')
     for name in ['noninteractive-salvage', 'commit-and-push', 'open-pr-if-needed']:
         f.run(name)
     f.set_out('run-stop-tests-final', 'TESTS_CLASS=CODE\nTESTS_STATUS=passed\nTESTS_EXIT=0')
@@ -893,7 +901,7 @@ def rmtree_force(path):
 def publish_through_open_pr(f):
     f.commit_change()
     f.set_out('block-reclassify', PROCEED)
-    f.outputs['diff-review-final'] = 'DIFF_REVIEW_FINAL=satisfied'
+    f.set_out('diff-review', 'DIFF_REVIEW=satisfied')
     for name in ['noninteractive-salvage', 'commit-and-push', 'open-pr-if-needed']:
         rc, out, err = f.run(name)
         if rc != 0:
@@ -919,17 +927,22 @@ def scenario_refused_edit(tf):
             authored = cmd(['git', 'diff', '--binary', edit + '^', edit], f.wt).stdout
             if variant == 'no-mount':
                 shutil.rmtree(f.host)
-            lease = ' ' + 'f' * 40 if variant == 'lease' else ''
-            rc, out, err = f.run('look-push', text=core_script('pubg_push "$(git rev-parse HEAD)" %s%s' % (UNIQUE, lease)))
+            f.set_out('test-repair', 'IDLE_HANDOFF=true')
+            if variant == 'lease':
+                # Emulate a repair lease whose recorded publication is stale while the
+                # fixture remote and PR still show the last actual published head.
+                write_lf(f.art / 'evidence' / 'published.head', 'f' * 40 + '\n')
+                output = f.outputs.get('commit-and-push', '')
+                f.set_out('commit-and-push', output + '\nREPAIR_TARGET_LEASE_SHA=' + 'f' * 40)
+            rc, out, err = f.run('hold-if-findings')
             text = out + err + f.record()
             tag = 'T20(%s)' % variant
             check(tag + ' the push of the edit is refused (nonzero)', rc != 0, text[-1500:])
             check(tag + ' the fake remote holds no commit of the edit', not f.remote_has(edit) and f.remote_tip(UNIQUE) == published)
             check(tag + ' key text never printed', KEY not in text)
-            rc, out, err = f.run('hold-if-findings')
             calls = f.gh_calls()
             pr = f.prs()[0]
-            check(tag + ' hold-if-findings fails the run', rc != 0 and 'not the published head' in err, out + err)
+            check(tag + ' hold-if-findings fails the run', rc != 0 and 'Overseer publication refused' in err, out + err)
             check(tag + ' gh pr ready never called', not any(c[:2] == ['pr', 'ready'] for c in calls))
             check(tag + ' the PR stays a draft at its last published head', pr['isDraft'] is True and pr['headRefOid'] == published and pr['number'] == pr_before['number'] and len(f.prs()) == 1)
             bundle = f.host / RUN_ID / ('unpublished-%s.bundle' % edit[:12])
@@ -1000,6 +1013,154 @@ def once(tf, fn):
         fn(tmp)
 
 
+def set_spec_authority(f, spec):
+    import hashlib
+    data = spec.encode('ascii')
+    (f.art / 'authority' / 'work-order.md').write_bytes(data)
+    write_lf(f.art / 'authority' / 'run-authority.json', json.dumps({
+        'woId': WO,
+        'specSource': 'docs/work-orders/' + WO + '.md',
+        'specRevision': f.base_sha,
+        'specHash': 'sha256:' + hashlib.sha256(data).hexdigest(),
+    }))
+
+
+def scenario_wall_salvage(tmp):
+    """Test 15(a): failed implement leaves dirty work for the single salvage commit."""
+    f = Fixture(tmp)
+    f.failed_nodes = 'implement'
+    f.set_out('block-reclassify', PROCEED)
+    write_lf(f.wt / 'interrupted.txt', 'unfinished work\n')
+    for node in ('checkpoint-push', 'checkpoint-diff-repair'):
+        rc, out, err = f.run(node)
+        check('T15(a) ' + node + ' leaves code for salvage', rc == 0 and f.git(['rev-parse', 'HEAD']) == f.base_sha and 'noninteractive-salvage owns' in out, out + err)
+    publish_chain(f, 'wall-salvage')
+    prs = f.prs()
+    check('T15(a) one held PR contains salvage', len(prs) == 1 and 'run:blocked' in prs[0]['labels'] and not prs[0]['isDraft'])
+    check('T15(a) salvage commit contains the interrupted work', 'Cauldron-Role: salvage' in f.git(['log', '-1', '--format=%B']) and 'interrupted.txt' in f.git(['ls-tree', '--name-only', 'HEAD']))
+
+
+def scenario_empty_build(tmp):
+    """Test 15(d): an ordinary empty build cannot publish the base commit."""
+    f = Fixture(tmp)
+    f.set_out('assert-implement-produced-work', 'BUILD_OUTCOME=FALSE_COMPLETE')
+    f.set_out('block-reclassify', '{"status":"BLOCKED","note":"empty build"}')
+    before = f.remote_refs()
+    rc, out, err = f.run('commit-and-push')
+    check('T15(d) ordinary empty build fails before push', rc != 0 and 'did not produce work' in err and f.remote_refs() == before and not f.prs(), out + err)
+
+
+def scenario_round_limit(tmp):
+    """Test 17: round five returns the exact authority blob and rejects only that blob."""
+    f = Fixture(tmp)
+    set_spec_authority(f, SPEC)
+    rc, out, err = f.run('read-spec')
+    check('T17 the authority blob is recorded', rc == 0 and (f.art / 'spec-blob.txt').is_file(), out + err)
+    f.commit_change()
+    for round_number in range(1, 6):
+        role = '\n\nCauldron-Role: overseer-repair' if round_number >= 4 else ''
+        f.commit_file('repair-%d.txt' % round_number, 'candidate\n', 'repair round %d' % round_number + role)
+        f.set_out('review-round-%d' % round_number, '{"verdict":"needs_revision","findings":["Still missing"]}')
+    rc, out, err = f.run('block-reclassify')
+    check('T17 round five records a return', rc == 0 and (f.art / 'repair-return.txt').is_file(), err)
+    f.set_out('block-reclassify', out)
+    rc, out, err = f.run('blocked-issue')
+    state = json.loads(f.state.read_text())
+    check('T17 issue receives the blob and open findings', rc == 0 and 'Still missing' in state['issue_comments'][0]['body'] and 'Spec-Returned-At-Blob:' in state['issue_comments'][0]['body'], err)
+    check('T17 the issue receives the rewrite label', 'spec:rewrite-required' in state.get('issue_labels', []))
+    publish_chain(f, 'round-limit')
+    prs = f.prs()
+    check('T16 one held PR contains both Overseer commits', len(prs) == 1 and not prs[0]['isDraft'] and 'run:blocked' in prs[0]['labels'] and 'Repair limit (5) reached -- the work order goes back to its owner' in prs[0]['body'])
+    check('T16 the published head contains both trailers', f.remote_tip(UNIQUE) == f.git(['rev-parse', 'HEAD']) and f.git(['log', '-2', '--format=%B']).count('Cauldron-Role: overseer-repair') == 2)
+    rc, out, err = f.run('read-spec')
+    check('T17 unchanged spec is refused', rc != 0 and 'spec_unchanged_since_returned' in err, out + err)
+    set_spec_authority(f, SPEC + '\nClarified missing detail.\n')
+    rc, out, err = f.run('read-spec')
+    check('T17 changed spec is accepted', rc == 0, err)
+
+
+def scenario_closed_list(tmp):
+    """Test 19(c), immediate return at discovery per bdc-xo#6687 comment 7211068548."""
+    f = Fixture(tmp)
+    f.commit_change()
+    for round_number in range(1, 4):
+        f.set_out('review-round-%d' % round_number, '{"verdict":"needs_revision","findings":["Fix required"]}')
+    f.set_out('overseer-repair-round-4', 'CLOSED_LIST=production settings')
+    write_lf(f.art / 'spec-blob.txt', '1' * 40 + '\n')
+    rc, out, err = f.run('block-reclassify')
+    check('T19(c) round 4 returns with a blocked review', rc == 0 and json.loads(out)['status'] == 'BLOCKED', err)
+    f.set_out('block-reclassify', out)
+    rc, out, err = f.run('blocked-issue')
+    body = json.loads(f.state.read_text()).get('issue_comments', [{}])[0].get('body', '')
+    check('T19(c) issue names the item and spec blob', rc == 0 and 'Closed-list change needed (production settings)' in body and 'Spec-Returned-At-Blob:' in body, err)
+    check('T19(c) issue receives rewrite label', any('spec:rewrite-required' in call for call in f.gh_calls()))
+    check('T19(c) round 5 has no output', not (f.out / 'overseer-repair-round-5.out').exists())
+
+
+def scenario_overseer_repairs(tmp_factory):
+    """Test 19(a,b): approved Overseer commits publish via the one guarded PR path."""
+    for path in ('file', 'prerequisite.txt'):
+        with tmp_factory() as tmp:
+            f = Fixture(tmp)
+            f.commit_change()
+            f.commit_file(path, 'necessary Overseer fix\n', 'fix: fulfill the prerequisite\n\nCauldron-Role: overseer-repair')
+            for round_number in range(1, 4):
+                f.set_out('review-round-%d' % round_number, '{"verdict":"needs_revision","findings":["Required fix"]}')
+            f.set_out('review-round-4', '{"verdict":"approve","findings":[]}')
+            rc, out, err = f.run('block-reclassify')
+            check('T19 ' + path + ': independent approval permits proceeding', rc == 0 and json.loads(out)['status'] == 'PROCEED', out + err)
+            f.set_out('block-reclassify', out)
+            publish_chain(f, 'overseer-' + path)
+            prs = f.prs()
+            check('T19 ' + path + ': same guarded route publishes one ready PR', len(prs) == 1 and not prs[0]['isDraft'] and f.remote_tip(UNIQUE) == f.git(['rev-parse', 'HEAD']))
+            check('T19 ' + path + ': records the Overseer change without returning the spec', len(prs) == 1 and 'Changes made by the Overseer' in prs[0]['body'] and not (f.art / 'repair-return.txt').exists())
+
+
+def scenario_idle_published(tmp):
+    """Test 20, bdc-xo#6687 comment 7211389114: republish after test-repair goes idle."""
+    f = Fixture(tmp)
+    checkpoint, checkpoint_reached_remote = p_checkpoint(f, 'clean')
+    rc, out, err = checkpoint()
+    check('T20 checkpoint commits code before the first guarded push', rc == 0 and checkpoint_reached_remote(), out + err)
+    f.set_out('test-repair', 'IDLE_HANDOFF=true')
+    publish_through_open_pr(f)
+    original_pr = f.prs()[0]
+    f.commit_change('idle repair\n', 'fix: idle repair\n\nCauldron-Role: overseer-repair')
+    head = f.git(['rev-parse', 'HEAD'])
+    f.set_out('overseer-idle-look', 'Committed a necessary fix.')
+    rc, out, err = f.run('hold-if-findings')
+    prs = f.prs()
+    check('T20 the guarded publisher advances the same PR', rc == 0 and len(prs) == 1 and prs[0]['number'] == original_pr['number'] and f.remote_tip(UNIQUE) == head, out + err)
+    check('T20 evidence equals the updated head', (f.art / 'evidence' / 'published.head').read_text().strip() == head)
+    pr = prs[0]
+    check('T20 the PR is held with the idle change banner', 'run:blocked' in pr['labels'] and 'Changed by the in-run Overseer after publication -- not reviewed in-run' in pr['body'])
+    check('T20 the PR is ready and lists the Overseer change', not pr['isDraft'] and 'Changes made by the Overseer' in pr['body'])
+
+
+def scenario_idle_no_code(tmp, cause):
+    """No-code idle disposition, bdc-xo#6687 comment 7211103883."""
+    f = Fixture(tmp)
+    f.set_out('implement', 'IDLE_HANDOFF=true')
+    f.set_out('overseer-idle-look', json.dumps({
+        'class': cause, 'evidence': 'Fixture diagnosis and next-fire prerequisite.',
+    }))
+    set_spec_authority(f, SPEC)
+    rc, out, err = f.run('read-spec')
+    check(cause + ': authority recorded', rc == 0, err)
+    rc, out, err = f.run('assert-implement-produced-work')
+    check(cause + ': no code takes the return path', rc == 0 and out == 'BUILD_OUTCOME=RETURNED_TO_AUTHOR', err)
+    f.set_out('assert-implement-produced-work', out)
+    rc, out, err = f.run('blocked-issue')
+    comments = json.loads(f.state.read_text()).get('issue_comments', [])
+    body = comments[0]['body'] if len(comments) == 1 else ''
+    check(cause + ': one diagnosis', rc == 0 and body.startswith('Idle before any code -- diagnosis by the in-run Overseer') and ('Class: ' + cause) in body, err)
+    check(cause + ': rewrite only for a spec diagnosis', ('Spec-Returned-At-Blob:' in body) == (cause == 'spec'))
+    check(cause + ': returned event', 'returned_to_author' in out, err)
+    check(cause + ': no PR', not f.prs())
+    rc, out, err = f.run('read-spec')
+    check(cause + ': unchanged re-fire allowed only for environment or provider', (rc != 0 and 'spec_unchanged_since_returned' in err) if cause == 'spec' else rc == 0, out + err)
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else 'all'
     tf = TmpFactory()
@@ -1013,6 +1174,12 @@ def main():
         'salvage': lambda: scenario_salvage(tf),
         'evidence': lambda: once(tf, scenario_evidence),
         'returned': lambda: once(tf, scenario_returned),
+        'closed-list': lambda: once(tf, scenario_closed_list),
+        'round-limit': lambda: once(tf, scenario_round_limit),
+        'empty-build': lambda: once(tf, scenario_empty_build),
+        'wall-salvage': lambda: once(tf, scenario_wall_salvage),
+        'idle-published': lambda: once(tf, scenario_idle_published),
+        'overseer-repairs': lambda: scenario_overseer_repairs(tf),
         'publication': lambda: scenario_publication(tf),
         'pubg-core': lambda: scenario_pubg_core(tf),
         'scan-config': lambda: scenario_scan_config(tf),
@@ -1021,6 +1188,8 @@ def main():
         'rule-1b': lambda: scenario_rule_1b(tf),
         'unpublished': lambda: scenario_unpublished(tf),
     }
+    for cause in ('spec', 'environment', 'provider'):
+        table['idle-' + cause] = lambda cause=cause: once(tf, lambda tmp: scenario_idle_no_code(tmp, cause))
     names = list(table) if which == 'all' else [which]
     for name in names:
         try:

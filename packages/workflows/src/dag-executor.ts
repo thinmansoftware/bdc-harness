@@ -64,8 +64,10 @@ import type {
   EffortLevel,
   ThinkingConfig,
   SandboxSettings,
+  UnattendedQuestionsMode,
 } from './schemas';
 import { deriveNodeExecutionRequirements } from './schemas/dag-node';
+import type { IdleHandoffMode } from './schemas/workflow';
 import {
   isBashNode,
   isLoopNode,
@@ -545,6 +547,7 @@ async function recordIdleHandoffEvent(
   deps: WorkflowDeps,
   workflowRun: WorkflowRun,
   nodeId: string,
+  artifactsDir: string | undefined,
   details: {
     kind: 'step' | 'loop';
     idleMs: number;
@@ -557,19 +560,33 @@ async function recordIdleHandoffEvent(
     { nodeId, workflowRunId: workflowRun.id, idleMs: details.idleMs, kind: details.kind },
     'dag.idle_handoff_overseer'
   );
+  const evidence = {
+    step_id: nodeId,
+    step_kind: details.kind,
+    idle_ms: details.idleMs,
+    last_output: lastLines(details.lastOutput, IDLE_HANDOFF_LAST_OUTPUT_LINES),
+    ...(details.iteration !== undefined ? { iteration: details.iteration } : {}),
+    ...(details.reason !== undefined ? { reason: details.reason } : {}),
+  };
+  if (artifactsDir) {
+    const dir = join(artifactsDir, 'idle-handoffs');
+    try {
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        join(dir, encodeURIComponent(nodeId) + '.json'),
+        JSON.stringify(evidence),
+        'utf8'
+      );
+    } catch (err) {
+      getLog().warn({ err, nodeId }, 'idle_handoff_artifact_write_failed');
+    }
+  }
   await deps.store
     .createWorkflowEvent({
       workflow_run_id: workflowRun.id,
       event_type: 'idle_handoff_overseer',
       step_name: nodeId,
-      data: {
-        step_id: nodeId,
-        step_kind: details.kind,
-        idle_ms: details.idleMs,
-        last_output: lastLines(details.lastOutput, IDLE_HANDOFF_LAST_OUTPUT_LINES),
-        ...(details.iteration !== undefined ? { iteration: details.iteration } : {}),
-        ...(details.reason !== undefined ? { reason: details.reason } : {}),
-      },
+      data: evidence,
     })
     .catch((err: Error) => {
       getLog().error(
@@ -684,8 +701,8 @@ interface WorkflowLevelOptions {
   failoverModel?: string;
   // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: opt-in engine keys, control-plane only.
   // See UNATTENDED_QUESTION_OUTPUT and IDLE_HANDOFF_OUTPUT below.
-  unattendedQuestions?: 'report';
-  idleHandoff?: 'overseer';
+  unattendedQuestions?: UnattendedQuestionsMode;
+  idleHandoff?: IdleHandoffMode;
 }
 
 /**
@@ -3804,7 +3821,7 @@ async function executeNodeInternal(
       // idle_handoff: overseer -- record the hand-off and complete the step in the
       // IDLE_HANDOFF_OUTPUT state instead of writing node_failed for the timeout.
       if (workflowLevelOptions.idleHandoff === 'overseer') {
-        await recordIdleHandoffEvent(deps, workflowRun, node.id, {
+        await recordIdleHandoffEvent(deps, workflowRun, node.id, artifactsDir, {
           kind: 'step',
           idleMs: effectiveIdleTimeout,
           lastOutput: nodeOutputText,
@@ -4339,7 +4356,7 @@ async function persistBashRunEvents(
   output: string
 ): Promise<void> {
   for (const line of output.split(/\r?\n/)) {
-    if (!line.startsWith('BDC_RUN_EVENT ') || Buffer.byteLength(line, 'utf8') > 4096) continue;
+    if (!line.startsWith('BDC_RUN_EVENT ')) continue;
     try {
       const value: unknown = JSON.parse(line.slice('BDC_RUN_EVENT '.length));
       if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
@@ -4347,7 +4364,27 @@ async function persistBashRunEvents(
       // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 (Correction F, lane): a run whose question went
       // back to the work order's author records run_outcome=returned_to_author. Allowlisted
       // shape only: the outcome value, an optional positive issue number, the run id.
+      if (data.event_type === 'repair_handoff_overseer') {
+        const { round, head_sha: headSha, findings } = data;
+        if (
+          nodeId !== 'checkpoint-diff-repair' ||
+          round !== 3 ||
+          typeof headSha !== 'string' ||
+          !/^[0-9a-f]{40}$/.test(headSha) ||
+          !Array.isArray(findings) ||
+          !findings.every(finding => typeof finding === 'string')
+        )
+          continue;
+        await deps.store.createWorkflowEvent({
+          workflow_run_id: runId,
+          event_type: 'repair_handoff_overseer',
+          step_name: nodeId,
+          data: { round, head_sha: headSha, findings },
+        });
+        continue;
+      }
       if (data.event_type === 'run_outcome') {
+        if (Buffer.byteLength(line, 'utf8') > 4096) continue;
         const { outcome, issue, run_id: runIdField } = data;
         if (outcome !== 'returned_to_author') continue;
         if (
@@ -4370,7 +4407,8 @@ async function persistBashRunEvents(
         });
         continue;
       }
-      if (data.event_type !== 'duplicate_pr_suppressed') continue;
+      if (data.event_type !== 'duplicate_pr_suppressed' || Buffer.byteLength(line, 'utf8') > 4096)
+        continue;
       const {
         existing_pr: existingPr,
         existing_pr_url: existingPrUrl,
@@ -5417,7 +5455,7 @@ async function executeLoopNode(
     idleMs: number,
     lastOutput: string
   ): Promise<NodeExecutionResult> => {
-    await recordIdleHandoffEvent(deps, workflowRun, node.id, {
+    await recordIdleHandoffEvent(deps, workflowRun, node.id, artifactsDir, {
       kind: 'loop',
       iteration,
       idleMs,

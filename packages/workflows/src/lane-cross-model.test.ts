@@ -14,6 +14,7 @@
  * real regressions -- they read the same files the executor loads.
  */
 
+import { REPAIR_REVIEW_NODE_IDS } from './reliability/seat-node-failover';
 import { describe, it, expect } from 'bun:test';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
@@ -28,10 +29,20 @@ const REVIEW_NODE_IDS = new Set([
   'diff-review-final',
   'opus-rereview',
   'apply-diff-review-final',
+  ...REPAIR_REVIEW_NODE_IDS,
 ]);
 
 // Builder node IDs (the implement + repair trio)
-const BUILD_NODE_IDS = new Set(['implement', 'diff-repair', 'opus-repair']);
+const BUILD_NODE_IDS = new Set([
+  'implement',
+  'diff-repair',
+  'opus-repair',
+  'repair-round-1',
+  'repair-round-2',
+  'repair-round-3',
+  'overseer-repair-round-4',
+  'overseer-repair-round-5',
+]);
 
 interface NodeDef {
   id: string;

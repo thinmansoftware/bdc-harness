@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { REPAIR_REVIEW_NODE_IDS } from './reliability/seat-node-failover';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -39,7 +40,10 @@ const FOUR_SEATS = [
 const TERRA_LANES: ReadonlyArray<{ file: string; seats: readonly string[] }> = [
   { file: 'bdc-feature-development-codex.yaml', seats: SEVEN_SEATS },
   { file: 'bdc-feature-development-codex-only.yaml', seats: SEVEN_SEATS },
-  { file: 'bdc-feature-development.yaml', seats: FOUR_SEATS },
+  {
+    file: 'bdc-feature-development.yaml',
+    seats: ['diff-review', ...REPAIR_REVIEW_NODE_IDS, 'apply-diff-review-final'],
+  },
   { file: 'bdc-feature-development-fable.yaml', seats: FOUR_SEATS },
 ];
 
@@ -177,7 +181,8 @@ describe('strict seat model pins', () => {
         const expectedTerra =
           file === 'bdc-feature-development-codex.yaml' ? 'gpt-6.1-terra' : 'gpt-5.6-terra';
         expect(binding.model, `${file}:${id}:model`).toBe(
-          REVIEWER_SOL_SEATS.has(id) && REVIEWER_SOL_LANES.includes(file)
+          (REVIEWER_SOL_SEATS.has(id) || REPAIR_REVIEW_NODE_IDS.includes(id)) &&
+            REVIEWER_SOL_LANES.includes(file)
             ? 'gpt-6.1-sol'
             : expectedTerra
         );
@@ -188,7 +193,11 @@ describe('strict seat model pins', () => {
   test('reviewer_seats_resolve_gpt_61_sol_on_non_sol_builder_lanes_and_terra_on_sol_builder_lanes', async () => {
     for (const file of REVIEWER_SOL_LANES) {
       const workflow = loadWorkflow(readFileSync(join(defaultsDir, file), 'utf8'), file);
-      for (const id of REVIEWER_SOL_SEATS) {
+      const ids =
+        file === 'bdc-feature-development.yaml'
+          ? ['diff-review', ...REPAIR_REVIEW_NODE_IDS]
+          : REVIEWER_SOL_SEATS;
+      for (const id of ids) {
         const node = workflow.nodes.find(candidate => candidate.id === id);
         expect(node, `${file}:${id}`).toBeDefined();
         const binding = await resolveStrictBinding(workflow, node!);

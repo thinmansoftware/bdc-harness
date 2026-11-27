@@ -77,15 +77,18 @@ structural() {
   else
     bad "exit lines of W differ from the fixture" "$(diff <(printf '%s\n' "$expected") <(printf '%s\n' "$regen") | head -20 | tr '\n' ' ')"
   fi
-  # TODO-SLICE3: diff-repair is replaced by the written-out repair rounds; then every row is HARD.
   local nonhard
-  nonhard=$(tr -d '\r' < "$TSV" | grep -v '^#' | awk -F'\t' '$3 != "HARD" && !($1 == "diff-repair" && $3 == "PENDING-SLICE3")' | head -5)
-  assert_eq "every fixture row is HARD (diff-repair pending slice 3)" "" "$nonhard"
+  nonhard=$(tr -d '\r' < "$TSV" | grep -v '^#' | awk -F'\t' '$3 != "HARD"' | head -5)
+  assert_eq "every fixture row is HARD" "" "$nonhard"
   local blank_tag
   blank_tag=$(tr -d '\r' < "$TSV" | grep -v '^#' | awk -F'\t' 'NF != 3 || $2 == ""' | head -3)
   assert_eq "every fixture row has a step, a reason tag and a fate" "" "$blank_tag"
 
   echo "--- Test 8: removed and added steps ---"
+  assert_eq "lane has 67 steps (bdc-xo#6687 comment 7211048145)" "67" "$(grep -c '^  - id: ' "$W")"
+  for round in 1 2 3 4 5; do
+    assert_eq "round $round has an independent reviewer" "1" "$(count_in 'agent: codex-adversarial-reviewer' "$(node_block "review-round-$round")")"
+  done
   local id
   for id in evidence-repair-start evidence-repair-final evidence-repair-verify implement-block-gate blocked-terminal-gate; do
     assert_eq "step $id is gone (no id line, no reference)" "0" "$(count_w "$id")"
@@ -255,7 +258,7 @@ structural() {
 
 fixture() {
   local scenario out rc
-  for scenario in blocked hold-failures prod-guard markers repair scope returned pubg-core scan-config tamper publication refused-edit rule-1b unpublished; do
+  for scenario in blocked hold-failures prod-guard markers repair scope returned wall-salvage empty-build round-limit closed-list overseer-repairs idle-published idle-spec idle-environment idle-provider pubg-core scan-config tamper publication refused-edit rule-1b unpublished; do
     echo "--- fixture scenario: $scenario ---"
     out=$(python3 "$FIXTURE" "$scenario" 2>&1); rc=$?
     printf '%s\n' "$out" | grep -E '^(PASS|FAIL): '
