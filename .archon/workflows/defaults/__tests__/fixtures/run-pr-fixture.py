@@ -72,6 +72,12 @@ elif a[:2]==['pr','list']:
     print(json.dumps(items))
 elif a[:2]==['pr','view']:
     item=next(v for v in d['prs'] if str(v['number'])==a[2] or v['url']==a[2])
+    if 'isDraft' in opt('--json').split(','):
+        # Exact publication checks observe the real fixture ref on either side of the push.
+        item = dict(item)
+        item['headRefOid'] = subprocess.check_output(
+            ['git', 'ls-remote', 'origin', 'refs/heads/'+item['headRefName']], text=True
+        ).split()[0]
     print(json.dumps(item))
 elif a[:2]==['pr','create']:
     attempts=Path(str(p)+'.attempts')
@@ -92,9 +98,9 @@ elif a[:2]==['pr','create']:
         print('a pull request already exists for this head/base',file=sys.stderr); raise SystemExit(1)
     sha=subprocess.check_output(['git','ls-remote','origin','refs/heads/'+branch],text=True).split()[0]
     if os.environ.get('PR_FIXTURE_WRONG_BASE_AFTER_CREATE') and count==1:
-        d['prs'].append(dict(number=7,url='https://github.com/fixture/repo/pull/7',headRefName=branch,headRefOid=sha,baseRefName='main',author={'login':'builder'},title='other base',body='unrelated base body',comments=[],state='OPEN'))
+        d['prs'].append(dict(number=7,url='https://github.com/fixture/repo/pull/7',headRefName=branch,headRefOid=sha,baseRefName='main',author={'login':'builder'},title='other base',body='unrelated base body',comments=[],state='OPEN',isDraft='--draft' in a,labels=[]))
         save(); raise SystemExit(1)
-    d['prs'].append(dict(number=n,url='https://github.com/fixture/repo/pull/'+str(n),headRefName=branch,headRefOid=sha,baseRefName=opt('--base'),author={'login':'builder'},title=opt('--title'),body=Path(opt('--body-file')).read_text() if '--body-file' in a else opt('--body'),comments=[],state='OPEN'))
+    d['prs'].append(dict(number=n,url='https://github.com/fixture/repo/pull/'+str(n),headRefName=branch,headRefOid=sha,baseRefName=opt('--base'),author={'login':'builder'},title=opt('--title'),body=Path(opt('--body-file')).read_text() if '--body-file' in a else opt('--body'),comments=[],state='OPEN',isDraft='--draft' in a,labels=[]))
     save(); print(d['prs'][-1]['url'])
     if os.environ.get('PR_FIXTURE_HIDE_CREATED'): raise SystemExit(1)
     if os.environ.get('PR_FIXTURE_CREATED_NONZERO'): raise SystemExit(1)
@@ -130,6 +136,8 @@ def fixture(t):
     unique = 'feat/wo-env-fixture-thread-unique'
     cmd(['git', 'push', '-q', 'origin', 'HEAD:' + unique], wt)
     artifacts = t / 'artifacts'; artifacts.mkdir()
+    authority = artifacts / 'authority'; authority.mkdir()
+    write_lf(authority / 'work-order.md', 'target_repo: ' + REPO + '\n')
     out = artifacts / 'node-out'; out.mkdir()
     write_lf(out / 'read-spec.out', 'WO_ID=' + WO + '\n')
     write_lf(out / 'checkout-repair-target.out', 'REPAIR_TARGET=none\n')
@@ -142,6 +150,23 @@ def fixture(t):
     for tool in ('ssh', 'curl'):
         write_lf(bindir / tool, '#!/usr/bin/env bash\nexit 97\n')
         (bindir / tool).chmod(0o755)
+    # These ownership cases use clean commits and test publication ordering. The
+    # June-shape scanner suite separately exercises the real gitleaks executable.
+    scanner = bindir / 'gitleaks'
+    write_lf(scanner, """#!/usr/bin/env bash
+set -eu
+[[ "${1:-}" == git && "${2:-}" == --redact && -n "${GIT_DIR:-}" ]]
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --log-opts ]; then
+    [[ "${2:-}" == '--diff-merges=separate '* ]]
+    printf '%s\n' scan >> "${PR_FIXTURE_STATE}.scans"
+    exit 0
+  fi
+  shift
+done
+exit 1
+""")
+    scanner.chmod(0o755)
     state = t / 'state.json'
     shell_path = str(Path(BASH).parent) + os.pathsep if os.name == 'nt' else ''
     # The rebuilt lane (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01) checks every final base against
@@ -160,7 +185,7 @@ def fixture(t):
         env['PR_FIXTURE_BIN'] = str(bindir)
     config = t / 'gh-empty'; config.mkdir()
     env['GH_CONFIG_DIR'] = str(config)
-    for tool in ('gh', 'ssh', 'curl'):
+    for tool in ('gh', 'ssh', 'curl', 'gitleaks'):
         probe = cmd([BASH, '-c', 'export PATH="$PR_FIXTURE_BIN:$PATH"; hash -r; actual=$(command -v ' + tool + ') || exit 98; if command -v cygpath >/dev/null; then cygpath -m "$actual"; else printf "%s\\n" "$actual"; fi'], wt, env)
         assert Path(probe.stdout.strip()).resolve() == (bindir / tool).resolve(), 'Unshimmed fixture tool: ' + tool
     assert Path(cmd(['git', 'remote', 'get-url', '--push', 'origin'], wt).stdout.strip()).resolve() == bare.resolve()
@@ -171,7 +196,7 @@ def fixture(t):
 
 
 def primary(branch, sha, **updates):
-    return dict(number=7, url='https://github.com/fixture/repo/pull/7', headRefName=branch, headRefOid=sha, baseRefName='dev', author={'login': 'builder'}, title=WO, body='original verified body', comments=[], state='OPEN', **updates)
+    return dict(number=7, url='https://github.com/fixture/repo/pull/7', headRefName=branch, headRefOid=sha, baseRefName='dev', author={'login': 'builder'}, title=WO, body='original verified body', comments=[], state='OPEN', isDraft=True, labels=[], **updates)
 
 
 def drive(t, wt, env, name, expected=0):
@@ -263,6 +288,8 @@ def run_adopt():
                 assert 'PR_URL=' + pr['url'] in output, output
                 assert cmd(['git', 'rev-parse', 'refs/heads/' + pr['headRefName']], bare).stdout.strip() == head
                 assert json.loads((artifacts / 'run-pr.json').read_text())['number'] == 7
+                if case == 'own-ancestor':
+                    assert Path(str(state) + '.scans').read_text().splitlines() == ['scan']
             else:
                 assert len(data['prs']) == 2, data
                 assert data['prs'][0] == pr, data
