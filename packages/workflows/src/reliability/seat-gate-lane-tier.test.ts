@@ -1,3 +1,4 @@
+import { REPAIR_REVIEW_NODE_IDS } from './seat-node-failover';
 /**
  * WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01: the run-start seat gate
  * evaluates the lane's OWN seat; a seat bound only by reviewer nodes refuses
@@ -366,13 +367,7 @@ describe('shipped lane reviewer failover declarations', () => {
       const strict = parsed.workflow.nodes.filter(node => node.provider === 'codex-native-strict');
       const repairReviews =
         file === 'bdc-feature-development.yaml'
-          ? [
-              'review-round-1',
-              'review-round-2',
-              'review-round-3',
-              'review-round-4',
-              'review-round-5',
-            ]
+          ? REPAIR_REVIEW_NODE_IDS
           : ['diff-review-final', 'opus-rereview'];
       expect(strict.map(node => node.id)).toEqual([
         'diff-review',

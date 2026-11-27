@@ -1,3 +1,4 @@
+import { REPAIR_REVIEW_NODE_IDS } from './reliability/seat-node-failover';
 /**
  * node-failover.test.ts -- WO-HARNESS-NODE-PROVIDER-FAILOVER-01
  *
@@ -673,8 +674,6 @@ describe('review failover dispatch resolves the failover model, not the persona 
     'plan-review',
     'war-council-validator',
     'diff-review',
-    'diff-review-final',
-    'opus-rereview',
     'findings-consolidate',
     'apply-diff-review-final',
   ];
@@ -795,7 +794,11 @@ describe('review failover dispatch resolves the failover model, not the persona 
     const rows: string[] = [];
     const bad: string[] = [];
     for (const lane of lanes) {
-      for (const id of REVIEW_IDS) {
+      const repairReviewIds =
+        lane === 'bdc-feature-development.yaml'
+          ? REPAIR_REVIEW_NODE_IDS
+          : ['diff-review-final', 'opus-rereview'];
+      for (const id of [...REVIEW_IDS, ...repairReviewIds]) {
         const result = await dispatchUnderFailover(loadLaneNode(lane, id));
         const target = result.declaredProvider ?? '(none)';
         const sent = result.models[target];
@@ -813,7 +816,7 @@ describe('review failover dispatch resolves the failover model, not the persona 
       `failover dispatch sweep: ${String(rows.length)} review nodes, ${String(bad.length)} bad`
     );
     for (const row of bad) console.log(`  BAD ${row}`);
-    expect(rows).toHaveLength(91);
+    expect(rows).toHaveLength(94);
     expect(bad).toEqual([]);
   });
 });
