@@ -1184,6 +1184,7 @@ def scenario_adopted_idle(tmp):
     f.git(['push', '-q', 'origin', 'HEAD:refs/heads/' + branch])
     state = json.loads(f.state.read_text())
     state['prs'][0]['headRefName'] = branch
+    state['prs'][0]['hidden'] = True  # Branch discovery omits it, exact PR view does not.
     f.state.write_text(json.dumps(state))
     write_lf(f.art / 'run-pr.json', json.dumps({
         'number': pr['number'], 'url': pr['url'], 'head_branch': branch, 'repo': 'fixture/repo',

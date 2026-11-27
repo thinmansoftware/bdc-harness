@@ -211,7 +211,7 @@ nodes:
           # adoption targets are verified by number even if discovery omits them.
           local pr_repo="" pr_numbers="" pr_number pr_kind pr_state
           local -a pr_holds=()
-          if [ "${PUBG_VERIFY_PR_HOLD:-0}" = 1 ] && [ -n "$t" ]; then
+          if [ "${PUBG_VERIFY_PR_HOLD:-0}" = 1 ] && { [ -n "$t" ] || [ -n "${PUBG_PR_NUMBER:-}" ]; }; then
           pr_repo=$(python3 - "${ARTIFACTS_DIR:?}/authority/work-order.md" <<'PY'
       import re, sys
       with open(sys.argv[1], encoding="utf-8") as spec:
