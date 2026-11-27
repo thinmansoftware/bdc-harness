@@ -1,9 +1,23 @@
 import { describe, expect, test } from 'bun:test';
 import { checksVerdict, decideBlocker, reviewVerdict } from '../decide-card';
 import fixture from './fixtures/base.json';
+import {
+  REQUIRED_CHECK_NAME,
+  reportedChecksForHead,
+  requiredCheckCases,
+} from '../../../overseer/src/__tests__/fixtures/required-check-decisions';
 
 const pr = { ...fixture };
 describe('merge guard parity and blocker decisions', () => {
+  test.each(requiredCheckCases)('Rule 4 Grimoire parity: $name', checkCase => {
+    const verdict = checksVerdict(reportedChecksForHead(checkCase), [], [REQUIRED_CHECK_NAME]);
+    const expected = { pass: 'merge_ready', fail: 'checks_red', pending: 'checks_pending' };
+    expect(
+      decideBlocker({ pr, reviewVerdict: 'OK', checksVerdict: verdict, woId: null, runs: [] })
+        .blocker_class
+    ).toBe(expected[checkCase.outcome]);
+  });
+
   test('1 changes requested on exact head', () => {
     const verdict = reviewVerdict(
       [
@@ -44,7 +58,8 @@ describe('merge guard parity and blocker decisions', () => {
     expect(
       checksVerdict(
         [{ name: 'test (ubuntu-latest)', status: 'completed', conclusion: 'failure' }],
-        []
+        [],
+        ['test (ubuntu-latest)']
       )
     ).toBe('checks not green: test (ubuntu-latest)=failure'));
   test('6 production base needs motion', () =>

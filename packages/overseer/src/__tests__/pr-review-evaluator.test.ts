@@ -8,6 +8,11 @@ import {
 } from '../reviewer-broker-client.ts';
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
+  REQUIRED_CHECK_NAME,
+  reportedChecksForHead,
+  requiredCheckCases,
+} from './fixtures/required-check-decisions';
+import {
   createRealFetchExactHeadPullRequestEvidence,
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
@@ -73,6 +78,26 @@ function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
     ...overrides,
   };
 }
+
+test.each(requiredCheckCases)('Rule 4 review evaluator parity: $name', async checkCase => {
+  const result = await evaluatePullRequest(
+    input,
+    deps({
+      fetchEvidence: async () => ({
+        diff: '+ safe implementation',
+        checks: reportedChecksForHead(checkCase),
+        requiredContexts: [REQUIRED_CHECK_NAME],
+      }),
+    })
+  );
+  const expected = { pass: 'APPROVE', fail: 'REQUEST_CHANGES', pending: 'CHECKS_PENDING' };
+  expect(result.verdict).toBe(expected[checkCase.outcome]);
+  if (checkCase.outcome === 'pass') {
+    expect(result.findings).toEqual([
+      expect.objectContaining({ scope: 'checks/optional preview', severity: 'note' }),
+    ]);
+  }
+});
 
 describe('#6357 -- composed prompt byte cap', () => {
   const cap = 1_048_576;

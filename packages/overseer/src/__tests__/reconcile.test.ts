@@ -1,7 +1,13 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   RECONCILE_SUPERSEDE_ACTION,
+  closeSupersededPullRequest,
+  proveSupersession,
   runReconcileOnce,
+  type OctokitLike,
   type ReconcileActionRecord,
   type ReconcileDeps,
   type ReconcileMergedPullRequest,
@@ -282,6 +288,8 @@ function keeperOpenPr(
     number,
     body: woLine,
     headRefName,
+    headSha: 'a'.repeat(40),
+    labels: [],
     isDraft: false,
     headRepository: { owner: 'thinmansoftware', repo: 'bdc-harness' },
     createdAt,
@@ -323,8 +331,15 @@ function supersedeDeps(
     listCalls.count += 1;
     return opens;
   };
+  deps.listPullRequestFiles = async () => ['src/index.ts'];
+  deps.proveSupersession = async (_merged, candidate) => ({
+    headSha: candidate.headSha!,
+    baseSha: 'b'.repeat(40),
+    baseRef: 'dev',
+  });
   deps.closePullRequest = async closeInput => {
     pullCloses.push({ number: closeInput.number, comment: closeInput.comment });
+    return true;
   };
   deps.hasSupersedeBeenRecorded = async ({ prRef, woId }) =>
     deps.actions.some(
@@ -542,5 +557,224 @@ describe('reconcile supersede', () => {
 
     expect(deps.pullCloses.map(close => close.number)).toEqual([4422]);
     expect(deps.pullCloses[0]?.comment.includes('Superseded by #4425')).toBe(true);
+  });
+});
+
+describe('bdc-xo#6714: supersession requires the exact deliverable in the landed tree', () => {
+  let cwd: string;
+  let base: string;
+  let head: string;
+  let squash: string;
+  let ancestryOnly: string;
+  let dropped: string;
+
+  function git(...args: string[]): string {
+    const result = Bun.spawnSync(
+      ['git', '-c', 'core.hooksPath=hooks-disabled', '-c', 'core.autocrlf=false', ...args],
+      { cwd }
+    );
+    if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+    return result.stdout.toString();
+  }
+
+  function write(path: string, value: string): void {
+    writeFileSync(join(cwd, path), value);
+  }
+
+  beforeAll(() => {
+    cwd = mkdtempSync(join(tmpdir(), 'reconcile-supersession-'));
+    git('init');
+    git('config', 'user.name', 'Reconcile Fixture');
+    git('config', 'user.email', 'reconcile@example.invalid');
+    git('config', 'commit.gpgsign', 'false');
+    write('feature.ts', 'before\n');
+    write('old.txt', 'rename me\n');
+    write('remove.txt', 'remove me\n');
+    git('add', '.');
+    git('commit', '-m', 'base');
+    base = git('rev-parse', 'HEAD').trim();
+
+    write('feature.ts', 'after\n');
+    git('mv', 'old.txt', 'new.txt');
+    git('rm', 'remove.txt');
+    git('add', '.');
+    git('commit', '-m', 'candidate implementation');
+    head = git('rev-parse', 'HEAD').trim();
+
+    git('checkout', '--detach', base);
+    git('cherry-pick', '--no-commit', head);
+    write('extra.txt', 'independent landed change\n');
+    git('add', '.');
+    git('commit', '-m', 'squash candidate with an extra change');
+    squash = git('rev-parse', 'HEAD').trim();
+
+    git('checkout', '--detach', base);
+    git('merge', '--no-ff', '-s', 'ours', head, '-m', 'record ancestry only');
+    ancestryOnly = git('rev-parse', 'HEAD').trim();
+
+    git('checkout', '--detach', base);
+    git('merge', '--no-ff', '--no-commit', '-s', 'ours', head);
+    write('extra.txt', 'different change that does not carry the candidate\n');
+    git('add', '.');
+    git('commit', '-m', 'merge with candidate changes dropped');
+    dropped = git('rev-parse', 'HEAD').trim();
+  });
+
+  afterAll(() => {
+    if (cwd) rmSync(cwd, { recursive: true, force: true });
+  });
+
+  function changedFiles(range: string) {
+    return git('diff', '--name-status', '-M', range)
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => {
+        const [code, path, renamedTo] = line.split('\t');
+        if (code.startsWith('R')) {
+          return { filename: renamedTo, status: 'renamed', previous_filename: path };
+        }
+        const status = code === 'D' ? 'removed' : code === 'A' ? 'added' : 'modified';
+        return { filename: path, status };
+      });
+  }
+
+  async function reconcile(
+    landed: string,
+    options: {
+      listingHeld?: boolean;
+      lateHold?: boolean;
+      movedHead?: boolean;
+      unknownLabels?: boolean;
+      truncated?: boolean;
+      incompleteFiles?: boolean;
+      mergedFiles?: string[];
+      explicitLink?: boolean;
+    } = {}
+  ) {
+    const candidate = {
+      ...keeperOpenPr(
+        1259,
+        `WO: ${KEEPER_WO}\n${options.explicitLink ? 'Superseded by #1263' : ''}`,
+        'fix/candidate'
+      ),
+      headSha: head,
+      labels: options.listingHeld ? ['Merge-Hold'] : [],
+    };
+    const deps = supersedeDeps({
+      pr: mergedPr({ number: 1263, body: `WO: ${KEEPER_WO}`, mergeCommitSha: landed }),
+      opens: [candidate],
+    });
+    deps.listPullRequestFiles = async () =>
+      options.mergedFiles ?? changedFiles(`${base}..${landed}`).map(file => file.filename);
+    const close = mock(async () => undefined);
+    const comment = mock(async () => undefined);
+    const candidateFiles = changedFiles(`${base}...${head}`);
+    let reads = 0;
+    const pullsGet = mock(async () => {
+      reads++;
+      const labels = options.unknownLabels
+        ? undefined
+        : reads > 1 && options.lateHold
+          ? [{ name: 'merge-hold' }]
+          : [];
+      return {
+        data: {
+          html_url: 'https://github.com/thinmansoftware/bdc-harness/pull/1259',
+          state: 'open' as const,
+          draft: false,
+          head: { sha: reads > 1 && options.movedHead ? dropped : head },
+          base: { ref: 'dev', sha: base },
+          labels,
+          changed_files: candidateFiles.length,
+        },
+      };
+    });
+    const octokit: OctokitLike = {
+      search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+      pulls: { listFiles: async () => ({ data: [] }), get: pullsGet },
+      git: {
+        getCommit: async ({ commit_sha }) => {
+          const sha = String(commit_sha);
+          const [tree, ...parents] = git('show', '-s', '--format=%T %P', sha).trim().split(' ');
+          return { data: { sha, tree: { sha: tree }, parents: parents.map(sha => ({ sha })) } };
+        },
+        getTree: async ({ tree_sha }) => {
+          const sha = String(tree_sha);
+          const tree = git('ls-tree', '-r', '-z', sha)
+            .split('\0')
+            .filter(Boolean)
+            .map(entry => {
+              const [object, path] = entry.split('\t');
+              const [mode, type, sha] = object.split(' ');
+              return { path, mode, type, sha };
+            });
+          return { data: { sha, truncated: options.truncated ?? false, tree } };
+        },
+      },
+      repos: {
+        compareCommitsWithBasehead: async ({ basehead }) => {
+          const files = changedFiles(String(basehead));
+          return { data: { files: options.incompleteFiles ? files.slice(1) : files } };
+        },
+      },
+      issues: { update: close, createComment: comment, addLabels: async () => undefined },
+    };
+    deps.proveSupersession = (pr, sibling) => proveSupersession(octokit, pr, sibling);
+    deps.closePullRequest = request => closeSupersededPullRequest(octokit, request, deps.log!);
+    await runReconcileOnce({ deps });
+    return {
+      close,
+      comment,
+      pullsGet,
+      actions: deps.actions.filter(action => action.action === RECONCILE_SUPERSEDE_ACTION),
+    };
+  }
+
+  function expectOpen(result: Awaited<ReturnType<typeof reconcile>>): void {
+    expect(result.close).not.toHaveBeenCalled();
+    expect(result.comment).not.toHaveBeenCalled();
+    expect(result.actions).toEqual([]);
+  }
+
+  test('held candidate remains open even with an explicit link and full content inclusion', async () => {
+    const result = await reconcile(squash, { listingHeld: true, explicitLink: true });
+    expectOpen(result);
+    expect(result.pullsGet).not.toHaveBeenCalled();
+  });
+
+  test('a merged PR with zero changed paths cannot close a code PR', async () => {
+    expectOpen(await reconcile(ancestryOnly, { explicitLink: true }));
+  });
+
+  test('an unchanged landed tree cannot close a PR even if GitHub lists changed paths', async () => {
+    expect(git('merge-base', ancestryOnly, head).trim()).toBe(head);
+    expectOpen(await reconcile(ancestryOnly, { mergedFiles: ['feature.ts'] }));
+  });
+
+  test('ancestry plus a changed landed tree is insufficient when the deliverable was dropped', async () => {
+    expect(git('merge-base', dropped, head).trim()).toBe(head);
+    expectOpen(await reconcile(dropped));
+  });
+
+  test('incomplete tree or file evidence fails closed', async () => {
+    expectOpen(await reconcile(squash, { truncated: true }));
+    expectOpen(await reconcile(squash, { incompleteFiles: true }));
+    expectOpen(await reconcile(squash, { unknownLabels: true }));
+  });
+
+  test('head drift or a newly applied hold immediately before close fails closed', async () => {
+    expectOpen(await reconcile(squash, { movedHead: true }));
+    expectOpen(await reconcile(squash, { lateHold: true }));
+  });
+
+  test('squashed inclusion of changes, deletion, and rename closes once and records the action', async () => {
+    expect(git('merge-base', squash, head).trim()).toBe(base);
+    const result = await reconcile(squash);
+    expect(result.close).toHaveBeenCalledTimes(1);
+    expect(result.comment).toHaveBeenCalledTimes(1);
+    expect(result.actions).toEqual([
+      expect.objectContaining({ prRef: 'thinmansoftware/bdc-harness#1259', result: '#1263' }),
+    ]);
   });
 });

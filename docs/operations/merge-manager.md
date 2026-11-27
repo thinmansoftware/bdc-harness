@@ -20,6 +20,12 @@ A missing spec (HTTP 404) is not a hold. Any other spec-read failure, including 
 
 A pull request label named exactly `merge-hold` (case-sensitive) holds any pull request, including ones that are not tied to a work order. The bridge records `merge_hold_label` and does not read a spec. Removing the label lets the next tick merge through the existing guards.
 
+## Worktree provenance holds
+
+The run-linked manager compares the tip of the engine-recorded worktree with the GitHub PR head before it judges the merge. A reaped or unreadable worktree produces `provenance_worktree_unavailable` even when the exact-head review and required checks are green. A different worktree tip produces `provenance_head_sha_mismatch`. GitHub review and check evidence identifies the PR commit. Worktree provenance supplies the separate link between that commit and the run.
+
+For an unavailable worktree, check whether the run's original worktree or a trusted snapshot of it can be recovered, and verify its tip against the current GitHub head. For a mismatch, investigate the recorded run, PR and both SHAs first. A push or rebase requires fresh review and required checks at the new head as well as independently verified run provenance. A durable recovery would record the run ID, repository and full published SHA from engine-controlled evidence before worktree cleanup, then require an exact GitHub head match. Reconstructing a worktree from the PR branch or treating a run-backed PR as run-less would discard the run-to-commit proof.
+
 ## Originating run evidence hold
 
 Both merge paths use the same exported evidence gate in `merge-manager.ts`: the run-linked manager checks the provenance-bound `WatchedRunRecord.runId` before judging, and the verdict-driven bridge checks its resolved originating run immediately before the merge API call. A `node_failed` event for `manifest-evidence-check`, or a failed run whose failure names that node, holds with `originating_run_failed_evidence_gate`. A missing events reader or failed event lookup holds with `originating_run_unreadable`. The manager runtime resolves the run row before reading its events; the bridge retains the row from `store.getRunById(verdict.run_id)`. Both readers use `listRunEventsForOverseer`; the bridge wires it in `service.ts`. **Order of the bridge pass and at most one approval (bdc-xo#5358).** In `mergeClaimedVerdict` the evidence holds (run-less trace and run-bound check) now run BEFORE the merge slot is reserved and BEFORE any approval is posted. A held verdict therefore takes no slot and posts no approval on any pass; it only re-reads the run's events and, once per head SHA, posts the hold comment. Before this, every pass of a held verdict reserved a slot, posted a fresh empty APPROVED review and then found the hold (27 approvals in 15 minutes on one held PR, about 105 review calls an hour). The bridge also posts at most one approval per exact head SHA per ten minutes per GitHub client (an in-process memo): a pass that stops before the merge (a review still in flight, changes requested, a merge failure) does not post another. A new head is a new approval. The one review a held pull request keeps is the Overseer model review itself.
@@ -129,7 +135,10 @@ A squash merge lands the head the Overseer approved. If the PR branch still exis
 | `thinmansoftware/lspro-react` | `main` | no | skip |
 | `thinmansoftware/shopops-storefront` | `staging` | yes | skip |
 | `thinmansoftware/shopops-storefront` | `master` | no | skip |
+| `thinmansoftware/receiving-shipping-desk` | `staging` | yes | merge |
 | `thinmansoftware/comicstoreos-provisioner` | `main` | yes | skip |
+
+The policy makes desk staging eligible. PR-first discovery selects repositories through `OVERSEER_MERGE_DISCOVERY_REPOS`.
 
 `release/lspro`, `release/ce`, `main` and `master` are production lanes and are never unattended candidates: `release/*` has no entry at all.
 

@@ -1,11 +1,5 @@
 import type { BlockedPrCard, CauldronRun, RawReview, SourceStatus } from './card-types';
-import {
-  checksVerdict,
-  decideBlocker,
-  OVERSEER_BOT,
-  reviewVerdict,
-  withRequiredContexts,
-} from './decide-card';
+import { checksVerdict, decideBlocker, OVERSEER_BOT, reviewVerdict } from './decide-card';
 import { readGitHub, type GitHubSnapshot } from './sources/github';
 import { readEventStore, readTaskmaster } from './sources/event-store';
 
@@ -65,10 +59,7 @@ export async function buildBlockedPrCard(ref: string, deps: CardDeps = {}): Prom
     (deps.taskmaster ?? readTaskmaster)({ owner: owner, repo: repo, number }),
   ]);
   const rv = reviewVerdict(github.reviews, github.pr.head_sha);
-  const cv = withRequiredContexts(
-    checksVerdict(github.checkRuns, github.statuses),
-    github.requiredMissing ?? []
-  );
+  const cv = checksVerdict(github.checkRuns, github.statuses, github.requiredContexts);
   const latest = latestOverseer(github.reviews);
   const latestByUser = new Map<string, RawReview>();
   github.reviews
