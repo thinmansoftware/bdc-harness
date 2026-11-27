@@ -6314,9 +6314,8 @@ nodes:
       }
       RPR_ORIGINAL_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
-      DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"
-      if [ -s "$DECIDE_OUT_FILE" ]; then
-        DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")
+      if [ -s "$ARCHON_NODE_OUT/decide-push-target.out" ]; then
+        DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
       else
         # commit-and-push supplies the recovered branch via unique_branch.
         # Recover repository identity from the frozen authority and use the recorded base.
