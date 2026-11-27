@@ -2230,6 +2230,19 @@ export function substituteNodeOutputRefs(
     const wrap = (val: string): string =>
       escapedForBash && !swallowQuotes ? `${leadingQuote}${val}${trailingQuote}` : val;
 
+    // Reserved token $_run.output.failed_nodes (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01,
+    // Correction E amendment rule 1b, bdc-xo#6451 comment 7191042669): the ids of the
+    // nodes recorded failed so far in this run, sorted and comma-separated, or '' when
+    // none. A step that must judge "no node of the run failed" reads it. Step ids that
+    // start with "_" are not used by any workflow, so the name cannot collide.
+    if (nodeId === '_run' && field === 'failed_nodes') {
+      const failed = [...nodeOutputs.entries()]
+        .filter(([, out]) => out.state === 'failed')
+        .map(([id]) => id)
+        .sort()
+        .join(',');
+      return escapedForBash ? wrap(shellQuote(failed)) : failed;
+    }
     const nodeOutput = nodeOutputs.get(nodeId);
     if (!nodeOutput) {
       getLog().warn({ nodeId, match }, 'dag_node_output_ref_unknown_node');

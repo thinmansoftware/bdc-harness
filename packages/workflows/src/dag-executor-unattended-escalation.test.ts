@@ -21,7 +21,8 @@ import * as git from '@archon/git';
 import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
-import { executeDagWorkflow } from './dag-executor';
+import { executeDagWorkflow, substituteNodeOutputRefs } from './dag-executor';
+import type { NodeOutput } from './schemas/workflow-run';
 import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
@@ -622,5 +623,37 @@ describe('loader: the two opt-in keys', () => {
     const b = parseWorkflow(yaml('idle_handoff: retry'), 'keys.yaml');
     expect(b.workflow).toBeNull();
     expect(b.error?.error).toContain('idle_handoff');
+  });
+});
+
+// Rule 1b of the Correction E amendment (General, bdc-xo#6451 comment 7191042669):
+// hold-if-findings readies a PR without run:blocked only when no node of the run
+// recorded failed. The reserved token $_run.output.failed_nodes lists them.
+describe('reserved token $_run.output.failed_nodes', () => {
+  const outputs = (states: Record<string, NodeOutput['state']>): Map<string, NodeOutput> =>
+    new Map(Object.entries(states).map(([id, state]) => [id, { state, output: '' } as NodeOutput]));
+
+  test('lists failed node ids, sorted, comma-separated, in bash mode', () => {
+    const m = outputs({
+      implement: 'failed',
+      'run-stop-greps': 'completed',
+      'diff-review': 'failed',
+      x: 'skipped',
+    });
+    expect(substituteNodeOutputRefs('F=$_run.output.failed_nodes', m, true)).toBe(
+      "F='diff-review,implement'"
+    );
+  });
+
+  test('is empty when no node failed', () => {
+    const m = outputs({ implement: 'completed', x: 'skipped' });
+    expect(substituteNodeOutputRefs('F=$_run.output.failed_nodes', m, true)).toBe("F=''");
+    expect(substituteNodeOutputRefs('[$_run.output.failed_nodes]', m, false)).toBe('[]');
+  });
+
+  test('leaves ordinary node references unchanged', () => {
+    const m = outputs({ implement: 'failed' });
+    m.set('plan', { state: 'completed', output: 'ok' } as NodeOutput);
+    expect(substituteNodeOutputRefs('$plan.output', m, false)).toBe('ok');
   });
 });
