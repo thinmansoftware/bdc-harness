@@ -516,8 +516,6 @@ def scenario_salvage(tmp_factory):
             check('T11(%s) salvage makes no gh call (no PR create)' % variant, calls_after_salvage == [], str(calls_after_salvage))
             msg = f.git(['log', '-1', '--format=%B'])
             check('T11(%s) salvage commits on the run branch with the trailer' % variant, 'Cauldron-Role: salvage' in msg and f.git(['branch', '--show-current']) == 'archon/thread-' + THREAD, msg)
-            if variant == 'b':
-                f.set_out('decide-push-target', 'repo: fixture/repo\npr_required: true\nstaging_gate_required: false')
             runs = 0
             for name in ['commit-and-push', 'open-pr-if-needed', 'patch-pr-body', 'hold-if-findings']:
                 rc, out, err = f.run(name)

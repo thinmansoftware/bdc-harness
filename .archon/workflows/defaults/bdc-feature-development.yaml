@@ -6314,7 +6314,16 @@ nodes:
       }
       RPR_ORIGINAL_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
-      DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
+      DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"
+      if [ -s "$DECIDE_OUT_FILE" ]; then
+        DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")
+      else
+        # commit-and-push supplies the recovered branch via unique_branch.
+        # Recover repository identity from the frozen authority and use the recorded base.
+        RECOVERED_REPO=$(sed -nE 's~^[[:space:]]*(target_repo:|\*\*Target [Rr]epo:\*\*|Target repo:)[[:space:]]*`?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)`?[[:space:]]*$~\2~p' "$ARTIFACTS_DIR/authority/work-order.md" | head -n 1)
+        DECIDE_OUTPUT=$(printf 'pr_required: true\nrepo: %s\n' "$RECOVERED_REPO")
+        lane_finding "push_target_recovered: using the published branch and frozen repository authority"
+      fi
       # Extract ONLY the approved-plan block for the PR title/body (F8 fix) -- keep
       # reviewer critique out of the customer-visible PR. FAIL CLOSED if the fence is
       # absent (NF1): never put raw critique-bearing output in the PR body.
