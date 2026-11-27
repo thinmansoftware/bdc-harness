@@ -160,6 +160,9 @@ def fixture(t):
         probe = cmd([BASH, '-c', 'export PATH="$PR_FIXTURE_BIN:$PATH"; hash -r; actual=$(command -v ' + tool + ') || exit 98; if command -v cygpath >/dev/null; then cygpath -m "$actual"; else printf "%s\\n" "$actual"; fi'], wt, env)
         assert Path(probe.stdout.strip()).resolve() == (bindir / tool).resolve(), 'Unshimmed fixture tool: ' + tool
     assert Path(cmd(['git', 'remote', 'get-url', '--push', 'origin'], wt).stdout.strip()).resolve() == bare.resolve()
+    # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the lane publishes (the adopt push included) only
+    # through the pubg core that its first node, preflight-github-auth, defines and saves.
+    drive(t, wt, env, 'preflight-github-auth')
     return wt, bare, artifacts, state, env, branch, unique, ancestor, head, base
 
 

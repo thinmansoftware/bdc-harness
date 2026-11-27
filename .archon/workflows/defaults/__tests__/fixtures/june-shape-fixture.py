@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,11 @@ RUN_ID = '0123456789abcdef0123456789abcdef'
 THREAD = 'abcd1234'
 BANNER = 'RUN BLOCKED -- not lane-verified'
 RESULTS = {'pass': 0, 'fail': 0}
+# A synthetic AWS-style access key id that matches gitleaks' default aws-access-token rule. Test
+# data only, never a real credential; built from two parts so this file itself does not match.
+KEY = 'AKIA' + 'Z7Q3XW2RB4NPLM5K'
+SECRET = 'aws_access_key_id = ' + KEY + '\n'
+UNIQUE = 'feat/wo-fix-01-thread-%s-run-%s' % (THREAD, RUN_ID[:12])
 
 
 def check(label, cond, detail=''):
@@ -165,6 +171,12 @@ class Fixture:
         write_lf(t / 'gh.py', STUB)
         for tool in ('ssh', 'curl'):
             write_lf(bindir / tool, '#!/usr/bin/env bash\nexit 97\n')
+        # Fake clock for the origin-visibility waits: with JSF_FAST_SLEEP set, sleep returns at once.
+        write_lf(bindir / 'sleep', '#!/usr/bin/env bash\n[ -n "${JSF_FAST_SLEEP:-}" ] && exit 0\nexec /usr/bin/sleep "$@"\n')
+        # The private host mount /host-artifacts (the docker-compose bind mount), mapped into the run.
+        self.host = t / 'host-artifacts'
+        self.host.mkdir()
+        self.failed_nodes = ''
         for f in bindir.iterdir():
             f.chmod(0o755)
         self.state = t / 'state.json'
@@ -196,6 +208,10 @@ class Fixture:
         self.set_out('assert-implement-produced-work', 'BUILD_OUTCOME=REAL_BUILD')
         self.set_out('lane-scope-check', 'LANE_SCOPE=ok')
         self.set_out('stamp-manifest-pr', 'WO: %s\nBuilder: Major Build\nTests: 1/1 (fixture)\nPRs: pending\nVALIDATION: PASS' % WO)
+        # The run's first node defines the guarded publisher (pubg core) and saves it.
+        rc, out, err = self.run('preflight-github-auth')
+        if rc != 0 or not (self.art / 'evidence' / 'pubg.core.sh').is_file():
+            raise RuntimeError('preflight-github-auth did not save the pubg core: ' + out + err)
 
     def git(self, args, cwd=None):
         return cmd(['git'] + args, cwd or self.wt).stdout.strip()
@@ -211,7 +227,11 @@ class Fixture:
             f.unlink()
 
     def script(self, name):
-        text = node_text(name)
+        return self.substitute(node_text(name))
+
+    def substitute(self, text):
+        text = text.replace('/host-artifacts', self.host.as_posix())
+        text = text.replace('$_run.output.failed_nodes', shlex.quote(self.failed_nodes))
         for var, value in [('WORKFLOW_ID', RUN_ID), ('USER_MESSAGE', self.env['USER_MESSAGE']),
                            ('ARTIFACTS_DIR', self.art.as_posix()), ('BASE_BRANCH', self.env['BASE_BRANCH'])]:
             text = re.sub(r'\$' + var + r'(?![A-Za-z0-9_])', lambda m, v=value: v, text)
@@ -219,9 +239,9 @@ class Fixture:
                       lambda m: shlex.quote(self.outputs.get(m.group(1), '')), text)
         return text
 
-    def run(self, name, extra=None):
+    def run(self, name, extra=None, text=None):
         path = self.t / (name + '.sh')
-        write_lf(path, self.script(name))
+        write_lf(path, self.script(name) if text is None else self.substitute(text))
         res = cmd([BASH, str(path)], self.wt, dict(self.env, **(extra or {})), check_rc=False)
         out = res.stdout[:-1] if res.stdout.endswith('\n') else res.stdout
         if res.returncode == 0:
@@ -237,6 +257,46 @@ class Fixture:
     def commit_change(self, text='implemented\n', msg='impl'):
         write_lf(self.wt / 'file', text)
         self.git(['commit', '-qam', msg])
+
+    def commit_file(self, name, text, msg, cwd=None):
+        cwd = Path(cwd or self.wt)
+        write_lf(cwd / name, text)
+        self.git(['add', name], cwd)
+        self.git(['commit', '-qm', msg], cwd)
+        return self.git(['rev-parse', 'HEAD'], cwd)
+
+    def merge_secret(self, cwd=None):
+        """A merge whose RESULT adds the secret; neither parent has it."""
+        cwd = Path(cwd or self.wt)
+        cur = self.git(['branch', '--show-current'], cwd)
+        side = 'side-' + cur.replace('/', '-')
+        self.git(['switch', '-q', '-c', side], cwd)
+        self.commit_file('side.txt', 'side\n', 'side', cwd)
+        self.git(['switch', '-q', cur], cwd)
+        self.commit_file('main.txt', 'main\n', 'main', cwd)
+        self.git(['merge', '-q', '--no-ff', '--no-commit', side], cwd)
+        write_lf(cwd / 'cfg.txt', SECRET)
+        self.git(['add', 'cfg.txt'], cwd)
+        self.git(['commit', '-qm', 'merge side'], cwd)
+        return self.git(['rev-parse', 'HEAD'], cwd)
+
+    def path_without_gitleaks(self):
+        probe = ('p="$PATH"; n=0; while d=$(PATH="$p" command -v gitleaks 2>/dev/null) && [ -n "$d" ] && [ "$n" -lt 50 ]; do '
+                 'n=$((n + 1)); p=$(printf "%s" "$p" | tr ":" "\\n" | grep -vxF "${d%/*}" | paste -sd: -); done; printf "%s" "$p"')
+        return cmd([BASH, '-c', probe], self.wt, self.env).stdout
+
+    def remote_refs(self):
+        return cmd(['git', 'for-each-ref', '--format=%(refname) %(objectname)'], self.bare).stdout
+
+    def remote_tip(self, branch):
+        return cmd(['git', 'rev-parse', '--verify', '-q', 'refs/heads/' + branch], self.bare, check_rc=False).stdout.strip()
+
+    def remote_has(self, sha):
+        return cmd(['git', 'cat-file', '-e', sha + '^{commit}'], self.bare, check_rc=False).returncode == 0
+
+    def record(self):
+        f = self.art / 'evidence' / 'pubg-record.txt'
+        return f.read_text() if f.exists() else ''
 
 
 def mutating(call):
@@ -510,6 +570,331 @@ def scenario_returned(tmp):
     check('F no push and no PR', not f.prs() and cmd(['git', 'for-each-ref', 'refs/heads/'], f.bare).stdout.count('\n') == 1)
 
 
+# ---------------------------------------------------------------------------------------------
+# Slice 2: the guarded publication core (pubg_push), Tests 4, 13, 20 and rule 1b.
+# ---------------------------------------------------------------------------------------------
+
+PROCEED = '{"status":"PROCEED"}'
+VARIANTS = ['clean', 'secret', 'tracking', 'absent', 'shape', 'lease', 'merge']
+WORKER = 'archon/task-web-worker-1790865294847-n1qba8'
+
+
+def variant_commits(f, v, cwd=None, tracking=()):
+    """Apply one variant's commits in cwd (default the run worktree); returns extra env."""
+    env = {}
+    if v == 'secret':
+        f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+    elif v == 'tracking':
+        # C1 carries the secret; C2 removes it. Only local remote-tracking refs claim C1 is on the
+        # remote; a bound taken from them would scan C2 alone and pass.
+        c1 = f.commit_file('cfg.txt', SECRET, 'add config', cwd)
+        f.commit_file('cfg.txt', 'clean = 1\n', 'clean config', cwd)
+        for ref in tracking:
+            f.git(['update-ref', 'refs/remotes/origin/' + ref, c1])
+    elif v == 'merge':
+        f.merge_secret(cwd)
+    else:
+        f.commit_file('feature.txt', 'feature\n', 'feature', cwd)
+    if v == 'absent':
+        env['PATH'] = f.path_without_gitleaks()
+    return env
+
+
+def p_checkpoint(f, v):
+    env = variant_commits(f, v, tracking=('dev',))
+    write_lf(f.wt / 'dirty.txt', 'checkpoint me\n')
+    if v == 'shape':
+        env['WO_ID'] = 'WO..BAD'
+
+    def ok():
+        heads = [l.split() for l in f.remote_refs().splitlines() if ' ' in l]
+        return any(r.startswith('refs/heads/wip/' + WO + '-') and s == f.git(['rev-parse', 'HEAD']) for r, s in heads)
+    return (lambda: f.run('checkpoint-push', env)), ok
+
+
+def p_backup(f, v):
+    holder = f.t / 'holder'
+    f.git(['worktree', 'add', '-q', '-b', 'feat/x', str(holder)])
+    env = variant_commits(f, v, cwd=holder, tracking=('feat/x', 'dev'))
+    write_lf(holder / 'dirty.txt', 'holder work\n')
+    text = node_text('checkout-repair-target')
+    core = text[text.index('# ---- BEGIN rtw core'):text.index('# ---- END rtw core ----')]
+    after = text[text.index('# ---- END rtw core ----'):text.index('rtw_checkout_repair_branch "$SPEC_REPAIR_BRANCH"')]
+    branch = 'a..b' if v == 'shape' else 'feat/x'
+    script = ('set -euo pipefail\n' + core + after + 'holder=%s\nbranch=%s\nbest_id=deadbeefcafe\nrtw_backup_dirty_holder\n'
+              % (shlex.quote(holder.as_posix()), shlex.quote(branch)))
+
+    def ok():
+        heads = [l.split() for l in f.remote_refs().splitlines() if ' ' in l]
+        hit = [s for r, s in heads if r.startswith('refs/heads/backup/feat/x-dirty-')]
+        return len(hit) == 1 and 'dirty.txt' in cmd(['git', 'ls-tree', '--name-only', hit[0]], f.bare).stdout.split()
+    return (lambda: f.run('rtw-backup', env, text=script)), ok
+
+
+def p_cap_plain(f, v):
+    env = variant_commits(f, v, tracking=(UNIQUE, 'dev'))
+    f.set_out('block-reclassify', PROCEED)
+    if v == 'shape':
+        f.set_out('decide-push-target', DECIDE.replace('feature-branch:feat/wo-fix-01', 'feature-branch:main'))
+    return (lambda: f.run('commit-and-push', env)), (lambda: f.remote_tip(UNIQUE) == f.git(['rev-parse', 'HEAD']))
+
+
+def setup_repair(f, branch='feat/x-thread-ab'):
+    f.git(['push', '-q', 'origin', 'HEAD:refs/heads/' + branch])
+    lease = f.git(['rev-parse', 'HEAD'])
+    write_lf(f.art / 'authority' / 'work-order.md', SPEC + 'Repair target: PR #12 (branch %s)\n' % branch)
+    f.state.write_text(json.dumps({'prs': [dict(number=12, url='https://github.com/fixture/repo/pull/12', headRefName=branch, headRefOid=lease, baseRefName='dev', author={'login': 'builder'}, title='held', state='OPEN', body='Cauldron-Run: older\nheld body', labels=['run:blocked'], comments=[], isDraft=False)]}))
+    f.set_out('checkout-repair-target', 'REPAIR_TARGET=#12\nREPAIR_TARGET_BRANCH=%s\nREPAIR_TARGET_LEASE_SHA=%s' % (branch, lease))
+    f.set_out('decide-push-target', DECIDE.replace('feat/wo-fix-01', branch) + '\nrepair_target_pr: #12\nrepair_target_branch: %s\nrepair_target_authorized_by_spec: #12' % branch)
+    f.set_out('plan-review', PLAN.replace('- file\n', '- file\nrepair_target_authorized_by_spec: #12\n'))
+    return lease
+
+
+def p_cap_lease(f, v):
+    branch = 'feat/x-thread-ab'
+    lease = setup_repair(f, branch)
+    env = variant_commits(f, v, tracking=(branch, 'dev'))
+    if v == 'lease':
+        moved = f.git(['commit-tree', lease + '^{tree}', '-p', lease, '-m', 'moved by someone else'])
+        f.git(['push', '-q', '-f', 'origin', moved + ':refs/heads/' + branch])
+    if v == 'shape':
+        f.set_out('checkout-repair-target', 'REPAIR_TARGET=#12\nREPAIR_TARGET_BRANCH=main\nREPAIR_TARGET_LEASE_SHA=%s' % lease)
+        f.set_out('decide-push-target', DECIDE.replace('feat/wo-fix-01', 'main') + '\nrepair_target_pr: #12\nrepair_target_branch: main\nrepair_target_authorized_by_spec: #12')
+    f.set_out('block-reclassify', PROCEED)
+    return (lambda: f.run('commit-and-push', env)), (lambda: f.remote_tip(branch) == f.git(['rev-parse', 'HEAD']))
+
+
+def p_opr_recovery(f, v):
+    env = variant_commits(f, v, tracking=(UNIQUE, 'dev'))
+    out = 'unique_branch=%s' % ('main' if v == 'shape' else UNIQUE)
+    if v == 'lease':
+        f.git(['push', '-q', 'origin', f.base_sha + ':refs/heads/' + UNIQUE])
+        out += '\nREPAIR_TARGET_LEASE_SHA=' + 'f' * 40
+    f.set_out('commit-and-push', out)
+    f.set_out('block-reclassify', PROCEED)
+    env['JSF_FAST_SLEEP'] = '1'
+
+    def ok():
+        return f.remote_tip(UNIQUE) == f.git(['rev-parse', 'HEAD']) and sum(1 for c in f.gh_calls() if c[:2] == ['pr', 'create']) == 1
+    return (lambda: f.run('open-pr-if-needed', env)), ok
+
+
+def p_opr_adopt(f, v):
+    target = 'main' if v == 'shape' else WORKER
+    if v != 'shape':
+        f.git(['switch', '-q', '-c', WORKER])
+    f.git(['push', '-q', 'origin', 'HEAD:refs/heads/' + target])
+    f.state.write_text(json.dumps({'prs': [dict(number=7, url='https://github.com/fixture/repo/pull/7', headRefName=target, headRefOid=f.base_sha, baseRefName='dev', author={'login': 'builder'}, title=WO, state='OPEN', body='Cauldron-Run: ' + RUN_ID + '\nbody', labels=[], comments=[], isDraft=True)]}))
+    env = variant_commits(f, v, tracking=(target, 'dev'))
+    unique = 'main' if v == 'shape' else UNIQUE
+    f.git(['push', '-q', '-f', 'origin', 'HEAD:refs/heads/' + unique])  # what commit-and-push already published
+    out = 'unique_branch=' + unique
+    if v == 'lease':
+        out += '\nREPAIR_TARGET_LEASE_SHA=' + 'f' * 40
+    f.set_out('commit-and-push', out)
+    f.set_out('block-reclassify', PROCEED)
+    env['JSF_FAST_SLEEP'] = '1'
+
+    def ok():
+        return f.remote_tip(WORKER) == f.git(['rev-parse', 'HEAD']) and not any(c[:2] == ['pr', 'create'] for c in f.gh_calls())
+    return (lambda: f.run('open-pr-if-needed', env)), ok
+
+
+PUB_PATHS = [
+    ('checkpoint-push wip/', p_checkpoint, False),
+    ('checkout-repair-target backup/', p_backup, False),
+    ('commit-and-push plain', p_cap_plain, False),
+    ('commit-and-push lease', p_cap_lease, True),
+    ('open-pr recovery re-push', p_opr_recovery, True),
+    ('open-pr adopt push', p_opr_adopt, True),
+]
+
+
+def scenario_publication(tf):
+    """Test 13 (and Test 4 on commit-and-push): every publication path x every variant."""
+    for label, driver, has_lease in PUB_PATHS:
+        for v in VARIANTS:
+            if v == 'lease' and not has_lease:
+                continue  # this path never carries a lease (no lease argument reaches pubg_push)
+            with tf() as tmp:
+                f = Fixture(tmp)
+                run, ok = driver(f, v)
+                before = f.remote_refs()
+                rc, out, err = run()
+                text = out + err + f.record()
+                tag = 'T13 %s [%s]' % (label, v)
+                check(tag + ': synthetic key text never printed', KEY not in text, text[-600:])
+                if v == 'clean':
+                    check(tag + ': clean range pushes (exit 0)', rc == 0 and ok(), text[-1500:])
+                    check(tag + ': published head recorded', (f.art / 'evidence' / 'published.head').exists() and 'pubg_published:' in f.record(), f.record())
+                    continue
+                check(tag + ': step exits nonzero', rc != 0, text[-1500:])
+                check(tag + ': nothing reaches the remote', f.remote_refs() == before, f.remote_refs() + '\n--\n' + before)
+                if v in ('secret', 'tracking', 'merge'):
+                    check(tag + ': refused as secret_found naming file and rule', 'secret_found:' in text and 'file=cfg.txt' in text and 'rule=aws-access-token' in text, text[-1500:])
+                if v == 'absent':
+                    check(tag + ': missing scanner refuses', 'scanner_missing' in text, text[-1500:])
+                if v == 'lease':
+                    # commit-and-push's own HARD repair check (repair_target_head_moved, kept from
+                    # dev) sees the moved branch before pubg_push; the other lease paths reach
+                    # pubg_push's lease_mismatch.
+                    check(tag + ': lease mismatch refuses', any(m in text for m in ('lease_mismatch', 'repair_target_lease_rejected', 'repair_target_head_moved')), text[-1500:])
+
+
+def core_script(body):
+    return 'set -uo pipefail\n. "$ARTIFACTS_DIR/evidence/pubg.core.sh"\n' + body + '\n'
+
+
+def scenario_pubg_core(tf):
+    """pubg_push itself: the ref shape, the default/base refusal, the full-history bound, no-op."""
+    with tf() as tmp:
+        f = Fixture(tmp)
+        f.commit_file('feature.txt', 'feature\n', 'feature')
+        for dest, why in [('main', 'not a run branch'), ('dev', 'the base branch'), ('release/x', 'not a run branch')]:
+            before = f.remote_refs()
+            rc, out, err = f.run('core-' + dest.replace('/', '-'), text=core_script('pubg_push HEAD %s' % dest))
+            check('pubg refuses %s (%s)' % (dest, why), rc == 1 and 'bad_ref' in err and f.remote_refs() == before, err)
+        cmd(['git', 'symbolic-ref', 'HEAD', 'refs/heads/feat/default'], f.bare)
+        f.git(['push', '-q', 'origin', f.base_sha + ':refs/heads/feat/default'])
+        before = f.remote_refs()
+        rc, out, err = f.run('core-default', text=core_script('pubg_push HEAD feat/default'))
+        check('pubg refuses the remote default branch', rc == 1 and 'default branch' in err and f.remote_refs() == before, err)
+        rc, out, err = f.run('core-ok', text=core_script('pubg_push HEAD feat/ok-thread-x'))
+        head = f.git(['rev-parse', 'HEAD'])
+        check('pubg publishes a clean run branch bounded by the base tip', rc == 0 and f.remote_tip('feat/ok-thread-x') == head and 'scanned=remote tip of base dev' in err, err)
+        check('pubg writes the published head', (f.art / 'evidence' / 'published.head').read_text().strip() == head)
+        calls = len(f.gh_calls())
+        rc, out, err = f.run('core-noop', text=core_script('pubg_push HEAD feat/ok-thread-x'))
+        check('pubg: a ref already at the SHA publishes nothing new and exits 0', rc == 0 and 'pubg_published:' in err and 'scanned=' not in err.split('pubg_published:')[-1], err)
+        check('pubg makes no gh call', len(f.gh_calls()) == calls)
+    with tf() as tmp:
+        f = Fixture(tmp)
+        # An unrelated history: no remote tip is an ancestor, so the whole history is scanned. The
+        # secret sits in the orphan root, two commits below the pushed SHA.
+        f.git(['switch', '-q', '--orphan', 'orphan'])
+        f.commit_file('cfg.txt', SECRET, 'orphan root with config')
+        f.commit_file('cfg.txt', 'clean = 1\n', 'clean config')
+        f.commit_file('other.txt', 'x\n', 'other')
+        before = f.remote_refs()
+        rc, out, err = f.run('core-full', text=core_script('pubg_push HEAD feat/orphan-thread-x'))
+        check('pubg: no provable bound scans the full history and refuses the old secret', rc == 1 and 'secret_found' in err and 'full history' in err and f.remote_refs() == before, err)
+        check('pubg: key text never printed (full history)', KEY not in out + err + f.record())
+    with tf() as tmp:
+        f = Fixture(tmp)
+        f.git(['switch', '-q', '--orphan', 'orphan'])
+        f.commit_file('a.txt', 'a\n', 'orphan a')
+        rc, out, err = f.run('core-full-clean', text=core_script('pubg_push HEAD feat/orphan-thread-y'))
+        check('pubg: a clean unrelated history is scanned in full, then pushed', rc == 0 and 'scanned=full history' in err and f.remote_tip('feat/orphan-thread-y') == f.git(['rev-parse', 'HEAD']), err)
+
+
+def rmtree_force(path):
+    """Delete a tree, including Git's read-only object files (Windows)."""
+    def onerror(func, p, exc):
+        os.chmod(p, 0o700)
+        func(p)
+    shutil.rmtree(path, onerror=onerror)
+
+
+def publish_through_open_pr(f):
+    f.commit_change()
+    f.set_out('block-reclassify', PROCEED)
+    f.outputs['diff-review-final'] = 'DIFF_REVIEW_FINAL=satisfied'
+    for name in ['noninteractive-salvage', 'commit-and-push', 'open-pr-if-needed']:
+        rc, out, err = f.run(name)
+        if rc != 0:
+            raise RuntimeError(name + ' failed: ' + out + err)
+
+
+def scenario_refused_edit(tf):
+    """Test 20, refused-push variants: an edit authored after publication is refused, preserved in
+    the host mount, and recovered from the bundle alone after the worktree is released."""
+    for variant in ['secret', 'lease', 'no-mount']:
+        with tf() as tmp:
+            f = Fixture(tmp)
+            publish_through_open_pr(f)
+            published = (f.art / 'evidence' / 'published.head').read_text().strip()
+            pr_before = f.prs()[0]
+            if variant == 'lease':
+                write_lf(f.wt / 'file', 'edited by the in-run Overseer\n')
+            else:
+                write_lf(f.wt / 'cfg.txt', SECRET)
+            f.git(['add', '-A'])
+            f.git(['commit', '-qm', 'fix: in-run Overseer edit\n\nCauldron-Role: overseer-repair'])
+            edit = f.git(['rev-parse', 'HEAD'])
+            authored = cmd(['git', 'diff', '--binary', edit + '^', edit], f.wt).stdout
+            if variant == 'no-mount':
+                shutil.rmtree(f.host)
+            lease = ' ' + 'f' * 40 if variant == 'lease' else ''
+            rc, out, err = f.run('look-push', text=core_script('pubg_push "$(git rev-parse HEAD)" %s%s' % (UNIQUE, lease)))
+            text = out + err + f.record()
+            tag = 'T20(%s)' % variant
+            check(tag + ' the push of the edit is refused (nonzero)', rc != 0, text[-1500:])
+            check(tag + ' the fake remote holds no commit of the edit', not f.remote_has(edit) and f.remote_tip(UNIQUE) == published)
+            check(tag + ' key text never printed', KEY not in text)
+            rc, out, err = f.run('hold-if-findings')
+            calls = f.gh_calls()
+            pr = f.prs()[0]
+            check(tag + ' hold-if-findings fails the run', rc != 0 and 'not the published head' in err, out + err)
+            check(tag + ' gh pr ready never called', not any(c[:2] == ['pr', 'ready'] for c in calls))
+            check(tag + ' the PR stays a draft at its last published head', pr['isDraft'] is True and pr['headRefOid'] == published and pr['number'] == pr_before['number'] and len(f.prs()) == 1)
+            bundle = f.host / RUN_ID / ('unpublished-%s.bundle' % edit[:12])
+            if variant == 'no-mount':
+                check(tag + ' the run record says the edit was not preserved, with the reason', 'pubg_not_preserved' in f.record() and edit in f.record() and 'absent' in f.record(), f.record())
+                continue
+            check(tag + ' the run record names the edit head SHA and the bundle path', ('pubg_preserved: bundle=%s head=%s' % (bundle.as_posix(), edit)) in f.record(), f.record())
+            check(tag + ' the bundle exists in the host mount', bundle.is_file())
+            rmtree_force(f.wt)  # the lane's cleanup releases the worktree
+            check(tag + ' the worktree is released', not f.wt.exists())
+            probe = f.t / 'probe'
+            cmd(['git', 'init', '-q', str(probe)], f.t)
+            check(tag + ' git bundle verify passes on the bundle alone', cmd(['git', 'bundle', 'verify', str(bundle)], probe, check_rc=False).returncode == 0)
+            rec = f.t / 'recovered.git'
+            cmd(['git', 'clone', '-q', '--bare', str(bundle), str(rec)], f.t)
+            check(tag + ' the clone has the edit commit at the recorded SHA', cmd(['git', 'cat-file', '-e', edit + '^{commit}'], rec, check_rc=False).returncode == 0)
+            check(tag + ' with the same trailer', 'Cauldron-Role: overseer-repair' in cmd(['git', 'log', '-1', '--format=%B', edit], rec).stdout)
+            check(tag + ' and its diff equals the authored change byte for byte', cmd(['git', 'diff', '--binary', edit + '^', edit], rec).stdout == authored)
+
+
+def scenario_rule_1b(tf):
+    """Rule 1b: a run with one failed node and no finding is labelled run:blocked before ready."""
+    for failed, want in [('checkpoint-push', True), ('', False)]:
+        with tf() as tmp:
+            f = Fixture(tmp)
+            publish_through_open_pr(f)
+            rc, out, err = f.run('patch-pr-body')
+            f.failed_nodes = failed
+            rc, out, err = f.run('hold-if-findings')
+            pr = f.prs()[0]
+            body = pr['body'].split('\n')
+            tag = '1b failed_nodes=%s' % (failed or "''")
+            check(tag + ': hold-if-findings exits 0 and readies the PR', rc == 0 and pr['isDraft'] is False, out + err)
+            if want:
+                check(tag + ': run:blocked and the banner are applied', 'run:blocked' in pr['labels'] and BANNER in body, str(pr['labels']))
+                check(tag + ': the failed node is the stated reason', 'recorded failed: checkpoint-push' in out, out)
+                calls = f.gh_calls()
+                label_idx = [i for i, c in enumerate(calls) if c[:2] == ['pr', 'edit'] and '--add-label' in c]
+                ready_idx = [i for i, c in enumerate(calls) if c[:2] == ['pr', 'ready']]
+                check(tag + ': labelled and read back before ready', label_idx and ready_idx and ready_idx[0] > label_idx[-1])
+            else:
+                check(tag + ': a clean PROCEED with no failed node is readied without run:blocked', 'run:blocked' not in pr['labels'] and BANNER not in body, str(pr['labels']) + out)
+
+
+def scenario_unpublished(tf):
+    """The ready check: an uncommitted change or an unpublished commit keeps the PR a draft."""
+    for kind in ['uncommitted', 'unpublished-commit']:
+        with tf() as tmp:
+            f = Fixture(tmp)
+            publish_through_open_pr(f)
+            if kind == 'uncommitted':
+                write_lf(f.wt / 'left-behind.txt', 'never published\n')
+            else:
+                f.commit_file('late.txt', 'late\n', 'late commit')
+            rc, out, err = f.run('hold-if-findings')
+            pr = f.prs()[0]
+            check('ready check (%s): hold-if-findings fails' % kind, rc != 0, out + err)
+            check('ready check (%s): no ready call, the PR stays a draft' % kind, not any(c[:2] == ['pr', 'ready'] for c in f.gh_calls()) and pr['isDraft'] is True)
+
+
 class TmpFactory:
     def __call__(self):
         return tempfile.TemporaryDirectory(prefix='.june-shape-', dir=ROOT, ignore_cleanup_errors=True)
@@ -533,6 +918,11 @@ def main():
         'salvage': lambda: scenario_salvage(tf),
         'evidence': lambda: once(tf, scenario_evidence),
         'returned': lambda: once(tf, scenario_returned),
+        'publication': lambda: scenario_publication(tf),
+        'pubg-core': lambda: scenario_pubg_core(tf),
+        'refused-edit': lambda: scenario_refused_edit(tf),
+        'rule-1b': lambda: scenario_rule_1b(tf),
+        'unpublished': lambda: scenario_unpublished(tf),
     }
     names = list(table) if which == 'all' else [which]
     for name in names:

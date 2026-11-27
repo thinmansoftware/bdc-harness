@@ -39,6 +39,155 @@ nodes:
         exit 1
       fi
       echo "preflight-github-auth PASS"
+      # ---- BEGIN pubg core (bdc-feature-development.yaml only; WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01) ----
+      # pubg_push <sha> <dest-branch> [<lease-sha>] is the ONE guarded publisher of target-repo
+      # code in this lane (Corrections B and D, desk point 1). In order:
+      #   1. Pin the destination: the ref must be a run, wip, backup or repair branch (never a
+      #      production, default or base branch); the remote tips T (dest) and B (run base) are
+      #      read with `git ls-remote <url>` now, never from local remote-tracking refs; with a
+      #      lease, T must equal the lease.
+      #   2. Pick a lower bound it can prove: T..sha, else B..sha, else the whole history of sha
+      #      (an unknown tip is fetched into a private ref to prove ancestry).
+      #   3. Scan that range with gitleaks, merge-commit patches included. A finding, a scan error
+      #      or a missing scanner refuses; the record names file and rule, never the value.
+      #   4. Push sha to the explicit fetch URL; it forces only with the exact repair lease.
+      #   5. On a refusal, save the commits no remote ref holds as a verified git bundle in the
+      #      private host mount, or say plainly that they were not preserved. No retry here.
+      # Returns 0 published, 1 refused (nothing written to GitHub), 2 the push itself failed
+      # after every check passed (not a refusal; the caller keeps its existing retry rule).
+      # Defined once, here; preflight-github-auth saves it for the nodes that publish.
+      pubg_record() {
+        printf '%s\n' "$1" >&2
+        if mkdir -p "${ARTIFACTS_DIR:-/nonexistent}/evidence" 2>/dev/null; then
+          printf '%s\n' "$1" >> "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg-record.txt" 2>/dev/null || true
+        fi
+      }
+      pubg_preserve() {
+        local sha="$1" reason="$2" rid h12 dir bundle extra="" count r
+        rid=$(basename "${ARTIFACTS_DIR:-unknown-run}")
+        h12=$(printf '%s' "$sha" | cut -c1-12)
+        # Commits no remote ref holds, measured against the remote itself.
+        count=$( { printf '%s\n' "$sha" HEAD; git ls-remote "${PUBG_URL:-}" 2>/dev/null | while read -r r _; do
+            if git cat-file -e "${r}^{commit}" 2>/dev/null; then printf '^%s\n' "$r"; fi
+          done; } | git rev-list --count --stdin 2>/dev/null) || count=""
+        if [ "$count" = "0" ]; then
+          pubg_record "pubg_preserve: nothing to preserve; every commit of ${sha} and HEAD is held by a remote ref (refusal: ${reason})"
+          return 0
+        fi
+        if [ ! -d /host-artifacts ]; then
+          pubg_record "pubg_not_preserved: the unpublished work (head ${sha}) was NOT preserved: the private host mount /host-artifacts is absent (refusal: ${reason})"
+          return 0
+        fi
+        dir="/host-artifacts/${rid}"
+        bundle="${dir}/unpublished-${h12}.bundle"
+        if ! mkdir -p "$dir" 2>/dev/null; then
+          pubg_record "pubg_not_preserved: the unpublished work (head ${sha}) was NOT preserved: cannot create ${dir} (refusal: ${reason})"
+          return 0
+        fi
+        if ! git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+          git update-ref "refs/pubg/unpublished-${h12}" "$sha" 2>/dev/null && extra="refs/pubg/unpublished-${h12}"
+        fi
+        if git bundle create /host-artifacts/"${rid}"/unpublished-"${h12}".bundle HEAD ${extra} >/dev/null 2>&1 \
+          && git bundle verify "$bundle" >/dev/null 2>&1; then
+          pubg_record "pubg_preserved: bundle=${bundle} head=${sha} reason=${reason}"
+        else
+          pubg_record "pubg_not_preserved: the unpublished work (head ${sha}) was NOT preserved: git bundle create or verify failed for ${bundle} (refusal: ${reason})"
+        fi
+        if [ -n "$extra" ]; then git update-ref -d "$extra" 2>/dev/null || true; fi
+        return 0
+      }
+      pubg_refuse() {
+        pubg_record "pubg_refused: ${1} dest=${PUBG_DEST:-} sha=${PUBG_SHA:-}"
+        pubg_preserve "${PUBG_SHA:-HEAD}" "$1"
+        return 1
+      }
+      pubg_have() {
+        # pubg_have <sha> <branch>: the commit is local, or fetching the remote branch into a
+        # private ref (FETCH_HEAD untouched) makes it local.
+        git cat-file -e "${1}^{commit}" 2>/dev/null && return 0
+        git fetch -q --no-write-fetch-head "${PUBG_URL:-}" "+refs/heads/${2}:refs/pubg/bound" >/dev/null 2>&1 || return 1
+        git update-ref -d refs/pubg/bound >/dev/null 2>&1 || true
+        git cat-file -e "${1}^{commit}" 2>/dev/null
+      }
+      pubg_push() {
+        local lease="${3:-}" base="${BASE_BRANCH:-}" remote="" t="" b="" def="" range="" label="" rep="" rc=0 out="" findings=""
+        PUBG_DEST="${2:-}"
+        PUBG_SHA=$(git rev-parse --verify -q "${1:-}^{commit}" 2>/dev/null) || PUBG_SHA="${1:-}"
+        PUBG_URL=$(git remote get-url origin 2>/dev/null) || PUBG_URL=""
+        printf '%s\n' "$PUBG_SHA" | grep -Eq '^[0-9a-f]{40}$' || { pubg_refuse "bad_ref: '${1:-}' is not a commit"; return 1; }
+        [ -n "$PUBG_URL" ] || { pubg_refuse "bad_ref: origin has no fetch URL"; return 1; }
+        # 1. Pin the destination.
+        if ! git check-ref-format --branch "$PUBG_DEST" >/dev/null 2>&1 \
+          || ! printf '%s\n' "$PUBG_DEST" | grep -Eq '^((feat|fix|wip|wo|backup)/[A-Za-z0-9._/-]+|archon/(thread|task-web-worker)-[A-Za-z0-9_-]+)$'; then
+          pubg_refuse "bad_ref: '${PUBG_DEST}' is not a run, wip, backup or repair branch"; return 1
+        fi
+        remote=$(git ls-remote --symref "$PUBG_URL" HEAD "refs/heads/${PUBG_DEST}" ${base:+"refs/heads/${base}"} 2>/dev/null) \
+          || { pubg_refuse "remote_unreadable: the remote tips could not be read"; return 1; }
+        def=$(printf '%s\n' "$remote" | sed -n 's|^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$|\1|p' | head -n 1)
+        t=$(printf '%s\n' "$remote" | awk -v r="refs/heads/${PUBG_DEST}" '$2 == r { print $1 }' | head -n 1)
+        if [ -n "$base" ]; then b=$(printf '%s\n' "$remote" | awk -v r="refs/heads/${base}" '$2 == r { print $1 }' | head -n 1); fi
+        if [ -n "$def" ] && [ "$PUBG_DEST" = "$def" ]; then pubg_refuse "bad_ref: '${PUBG_DEST}' is the default branch"; return 1; fi
+        if [ -n "$base" ] && [ "$PUBG_DEST" = "$base" ]; then pubg_refuse "bad_ref: '${PUBG_DEST}' is the run's base branch"; return 1; fi
+        if [ -n "$lease" ] && [ "$t" != "$lease" ]; then
+          pubg_refuse "lease_mismatch: repair_target_lease_rejected (remote tip ${t:-absent}, lease ${lease})"; return 1
+        fi
+        if [ -n "$t" ] && [ "$t" = "$PUBG_SHA" ]; then
+          range="none"
+        # 2. A lower bound it can prove.
+        elif [ -n "$t" ] && pubg_have "$t" "$PUBG_DEST" && git merge-base --is-ancestor "$t" "$PUBG_SHA" 2>/dev/null; then
+          range="${t}..${PUBG_SHA}"; label="remote tip of ${PUBG_DEST}"
+        elif [ -n "$b" ] && pubg_have "$b" "$base" && git merge-base --is-ancestor "$b" "$PUBG_SHA" 2>/dev/null; then
+          range="${b}..${PUBG_SHA}"; label="remote tip of base ${base}"
+        else
+          range="${PUBG_SHA}"; label="full history"
+        fi
+        if [ "$range" != "none" ]; then
+          # 3. Scan.
+          command -v gitleaks >/dev/null 2>&1 || { pubg_refuse "scanner_missing: gitleaks is not on PATH"; return 1; }
+          rep=$(mktemp "${TMPDIR:-/tmp}/pubg-report.XXXXXX") || { pubg_refuse "scan_error: no report file"; return 1; }
+          gitleaks git --redact --no-banner --report-format json --report-path "$rep" --log-opts "--diff-merges=separate ${range}" "$(git rev-parse --show-toplevel)" >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            findings=$(python3 -c 'import json, sys
+      try:
+          items = json.load(open(sys.argv[1]))
+      except Exception:
+          items = []
+      print("; ".join("file=%s rule=%s commit=%s" % (i.get("File", "?"), i.get("RuleID", "?"), str(i.get("Commit", ""))[:12]) for i in items if isinstance(i, dict)))' "$rep" 2>/dev/null) || findings=""
+            rm -f "$rep"
+            if [ -n "$findings" ]; then pubg_refuse "secret_found: ${findings} (scan of the ${label})"; return 1; fi
+            pubg_refuse "scan_error: gitleaks exited ${rc} on the ${label} range"; return 1
+          fi
+          rm -f "$rep"
+          pubg_record "pubg_scanned: ${label} (${range}) clean"
+          # 4. Push.
+          if [ -n "$lease" ]; then
+            out=$(git push --force-with-lease="refs/heads/${PUBG_DEST}:${lease}" "$PUBG_URL" "${PUBG_SHA}:refs/heads/${PUBG_DEST}" 2>&1) || rc=$?
+          else
+            out=$(git push "$PUBG_URL" "${PUBG_SHA}:refs/heads/${PUBG_DEST}" 2>&1) || rc=$?
+          fi
+          printf '%s\n' "$out" | sed -E 's#//[^/@[:space:]]*@#//***@#g' >&2
+          if [ "$rc" -ne 0 ]; then
+            if [ -n "$lease" ] && printf '%s\n' "$out" | grep -Eq 'stale info|\[rejected\]'; then
+              pubg_refuse "lease_mismatch: repair_target_lease_rejected at push (lease ${lease})"; return 1
+            fi
+            pubg_record "pubg_push_failed: dest=${PUBG_DEST} sha=${PUBG_SHA} (git push exited ${rc}; not a refusal)"
+            return 2
+          fi
+          git update-ref "refs/remotes/origin/${PUBG_DEST}" "$PUBG_SHA" >/dev/null 2>&1 || true
+        fi
+        if mkdir -p "${ARTIFACTS_DIR:-/nonexistent}/evidence" 2>/dev/null \
+          && printf '%s\n' "$PUBG_SHA" > "${ARTIFACTS_DIR:-/nonexistent}/evidence/published.head"; then
+          pubg_record "pubg_published: dest=${PUBG_DEST} sha=${PUBG_SHA}${label:+ scanned=${label}}${lease:+ lease=${lease}}"
+        else
+          pubg_record "pubg_published: dest=${PUBG_DEST} sha=${PUBG_SHA}; WARNING the published head could not be recorded, so hold-if-findings will keep the PR a draft"
+        fi
+        return 0
+      }
+      # ---- END pubg core ----
+      # Save the core for the nodes that publish (checkout-repair-target, checkpoint-push,
+      # commit-and-push, open-pr-if-needed); each sources this file before its first push.
+      mkdir -p "$ARTIFACTS_DIR/evidence"
+      declare -f pubg_record pubg_preserve pubg_refuse pubg_have pubg_push > "$ARTIFACTS_DIR/evidence/pubg.core.sh"
 
   - id: read-spec
     persona: xo
@@ -572,7 +721,7 @@ nodes:
         sha7=$(printf '%s' "$tip" | cut -c1-7)
         stamp=$(date -u +%Y%m%dT%H%M%SZ)
         ref="refs/heads/backup/${branch}-dirty-${sha7}-${stamp}"
-        git push origin "${commit}:${ref}" || return 1
+        pubg_push "$commit" "${ref#refs/heads/}" || return 1
         lines=$(git --no-optional-locks -C "$holder" status --porcelain | wc -l | tr -d ' ')
         rid8=$(printf '%s' "$best_id" | cut -c1-8)
         rdir="${art}/reclaimed-holder/${rid8:-unknown}"
@@ -739,7 +888,7 @@ nodes:
             sha7=$(printf '%s' "$holder_sha" | cut -c1-7)
             stamp=$(date -u +%Y%m%dT%H%M%SZ)
             backup_ref="refs/heads/backup/${branch}-${sha7}-${stamp}"
-            if ! git push origin "${holder_sha}:${backup_ref}"; then
+            if ! pubg_push "$holder_sha" "${backup_ref#refs/heads/}"; then
               rtw_refuse "backup push failed" || return
             fi
           fi
@@ -764,6 +913,12 @@ nodes:
         fi
       }
       # ---- END rtw core ----
+      # The guarded publisher (pubg core): defined once in preflight-github-auth and saved there.
+      if [ -s "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh" ]; then
+        . "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+      else
+        pubg_push() { echo "pubg_refused: the publication core was not saved by preflight-github-auth; nothing was pushed and the unpublished work was NOT preserved" >&2; return 1; }
+      fi
       rtw_checkout_repair_branch "$SPEC_REPAIR_BRANCH"
       git fetch origin "+refs/heads/${SPEC_REPAIR_BRANCH}:refs/remotes/origin/${SPEC_REPAIR_BRANCH}"
       git branch --set-upstream-to="origin/${SPEC_REPAIR_BRANCH}" "${SPEC_REPAIR_BRANCH}"
@@ -1361,31 +1516,23 @@ nodes:
           simulate completion. A commit must contain real, in-scope file changes.
         - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
 
-        ## Commit-and-push BEFORE exit (Patch 2, 2026-05-16)
-        Do not wait on remote CI: never loop on gh run view, gh run watch or gh pr checks inside implement. Run the tests locally, commit, push, emit the completion sentinels and exit; remote CI is judged after the PR opens.
-        When your implementation is complete, BEFORE emitting the sentinel below, run:
+        ## Commit BEFORE exit (Patch 2, 2026-05-16; publication removed by WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01)
+        When your implementation is complete, BEFORE emitting the sentinel below, commit your work:
 
         ```bash
-        BRANCH=$(git rev-parse --abbrev-ref HEAD)
         # Re-derive WO_ID locally (don't interpolate spec output - quote-safety)
         WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
         git add -A
         git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
 
         Implementation per WO spec. Self-verified within implement loop.
-        Workflow-time verify-* removed 2026-05-16 (Patch 1); PR-time gates handle validation.
 
         Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
-        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - operator must recover from worktree"
         ```
 
-        Why: workflow-time verify-* gates were removed (Patch 1). Even with them gone, if any
-        downstream node fails (sentinel mismatch, war-council-validator timeout, etc.), the
-        traditional commit-and-push node may be skipped. Committing + pushing HERE makes your
-        work durable regardless of what happens after this iteration ends.
-
-        Worst case: the downstream commit-and-push node runs and is a no-op because HEAD is
-        already pushed. Best case: your work is on origin even if everything else fails.
+        Do not publish anything yourself: do not send commits to any remote and do not open a
+        pull request. The harness scans your commits for secrets and publishes them through its
+        one guarded route after this loop ends.
 
         ## Completion mailbox -- REQUIRED before your sentinel (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01)
         Downstream bash gates NEVER read your narration; they read ONLY the file
@@ -1472,13 +1619,16 @@ nodes:
   # (verify-scope-to-changed-files) and WO-146 (npm->bun sweep) for the deeper structural fixes.
 
   # Cauldron resilience: commit + push WIP branch after implement loop exits.
-  # Best-effort only -- failure logged and silently tolerated (NOT load_bearing).
+  # Best-effort only -- a failed push is logged and tolerated (NOT load_bearing). A push the
+  # guarded publisher REFUSES (secret, scan error, missing scanner, bad ref) is HARD: the node
+  # fails and abort_run_on_failure ends the run (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01).
   # If container restarts after this node but before backstop, work survives on origin.
   # If nothing changed since last checkpoint, exits 0 silently.
   # Anchor: 2026-05-24 run 07415e9f lost local commit when container restarted before backstop.
   # WO-HARNESS-IMPLEMENT-CHECKPOINT-PUSH-01
   - id: checkpoint-push
     persona: overseer
+    abort_run_on_failure: true
     depends_on: [implement, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
     trigger_rule: all_done
@@ -1527,10 +1677,21 @@ nodes:
       Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>" \
         2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
 
-      if git push origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
+      # The guarded publisher (pubg core): defined once in preflight-github-auth and saved there.
+      if [ -s "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh" ]; then
+        . "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+      else
+        pubg_push() { echo "pubg_refused: the publication core was not saved by preflight-github-auth; nothing was pushed and the unpublished work was NOT preserved" >&2; return 1; }
+      fi
+      PUBG_RC=0
+      pubg_push "$(git rev-parse HEAD)" "$WIP_BRANCH" || PUBG_RC=$?
+      if [ "$PUBG_RC" -eq 0 ]; then
         echo "checkpoint-push: WIP branch pushed -- ${WIP_BRANCH}"
         echo "CHECKPOINT_BRANCH=${WIP_BRANCH}"
         echo "CHECKPOINT_SHA=$(git rev-parse HEAD)"
+      elif [ "$PUBG_RC" -eq 1 ]; then
+        echo "ERROR: checkpoint_publication_refused: the guarded publisher refused ${WIP_BRANCH}; nothing was pushed" >&2
+        exit 1
       else
         echo "WARN: checkpoint push failed -- work is local only; backstop will retry" >&2
       fi
@@ -5960,25 +6121,24 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
       # so the local archon/thread-<hash> branch lands on a unique remote name
       # (UNIQUE_BRANCH) and does not collide with other parallel runs.
+      # The guarded publisher (pubg core): defined once in preflight-github-auth and saved there.
+      if [ -s "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh" ]; then
+        . "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+      else
+        pubg_push() { echo "pubg_refused: the publication core was not saved by preflight-github-auth; nothing was pushed and the unpublished work was NOT preserved" >&2; return 1; }
+      fi
       PUSH_OK=false
       for attempt in 1 2 3; do
-        if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
-          if PUSH_OUT=$(git push --force-with-lease="refs/heads/${UNIQUE_BRANCH}:${REPAIR_TARGET_LEASE_SHA}" origin HEAD:"${UNIQUE_BRANCH}" 2>&1); then
-            printf '%s\n' "$PUSH_OUT"
-            PUSH_OK=true
-            break
-          fi
-          printf '%s\n' "$PUSH_OUT"
-          if printf '%s\n' "$PUSH_OUT" | grep -Eq 'stale info|\[rejected\]'; then
-            echo "repair_target_lease_rejected"
-            echo "ERROR: repair_target_lease_rejected: origin/${UNIQUE_BRANCH} moved since lease ${REPAIR_TARGET_LEASE_SHA}" >&2
-            exit 1
-          fi
-        else
-          if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
-            PUSH_OK=true
-            break
-          fi
+        PUBG_RC=0
+        pubg_push "$(git rev-parse HEAD)" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
+        if [ "$PUBG_RC" -eq 0 ]; then
+          PUSH_OK=true
+          break
+        fi
+        if [ "$PUBG_RC" -ne 2 ]; then
+          echo "publication_refused"
+          echo "ERROR: publication_refused: the guarded publisher refused HEAD -> ${UNIQUE_BRANCH}${REPAIR_TARGET_LEASE_SHA:+ (lease ${REPAIR_TARGET_LEASE_SHA})}; nothing was pushed" >&2
+          exit 1
         fi
         echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
         sleep $((attempt * 5))
@@ -6007,9 +6167,6 @@ nodes:
       fi
       echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
       echo "unique_branch=${UNIQUE_BRANCH}"
-      # TODO-SLICE2: pubg_push writes $ARTIFACTS_DIR/evidence/published.head; until then
-      # hold-if-findings reads the pushed SHA from this line.
-      echo "pushed_sha=${LOCAL_HEAD}"
 
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
@@ -6067,6 +6224,12 @@ nodes:
       # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
       # then re-push and re-verify before failing the PR-open precondition.
       LOCAL_HEAD="$(git rev-parse HEAD)"
+      # The guarded publisher (pubg core): defined once in preflight-github-auth and saved there.
+      if [ -s "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh" ]; then
+        . "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"
+      else
+        pubg_push() { echo "pubg_refused: the publication core was not saved by preflight-github-auth; nothing was pushed and the unpublished work was NOT preserved" >&2; return 1; }
+      fi
 
       wait_match() {
         local attempt remote
@@ -6086,23 +6249,16 @@ nodes:
         echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
         PUSH_OK=false
         for attempt in 1 2 3; do
-          if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
-            if PUSH_OUT=$(git push --force-with-lease="refs/heads/${UNIQUE_BRANCH}:${REPAIR_TARGET_LEASE_SHA}" origin HEAD:"${UNIQUE_BRANCH}" 2>&1); then
-              printf '%s\n' "$PUSH_OUT"
-              PUSH_OK=true
-              break
-            fi
-            printf '%s\n' "$PUSH_OUT"
-            if printf '%s\n' "$PUSH_OUT" | grep -Eq 'stale info|\[rejected\]'; then
-              echo "repair_target_lease_rejected"
-              echo "ERROR: repair_target_lease_rejected: origin/${UNIQUE_BRANCH} moved since lease ${REPAIR_TARGET_LEASE_SHA}" >&2
-              exit 1
-            fi
-          else
-            if git push origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then
-              PUSH_OK=true
-              break
-            fi
+          PUBG_RC=0
+          pubg_push "$LOCAL_HEAD" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
+          if [ "$PUBG_RC" -eq 0 ]; then
+            PUSH_OK=true
+            break
+          fi
+          if [ "$PUBG_RC" -ne 2 ]; then
+            echo "publication_refused"
+            echo "ERROR: publication_refused: the guarded publisher refused the re-push of ${LOCAL_HEAD} -> ${UNIQUE_BRANCH}${REPAIR_TARGET_LEASE_SHA:+ (lease ${REPAIR_TARGET_LEASE_SHA})}; nothing was pushed" >&2
+            exit 1
           fi
           echo "WARN: re-push attempt ${attempt} failed; retrying..." >&2
           sleep $((attempt * 5))
@@ -6456,9 +6612,13 @@ nodes:
       PR_OK=false
       # same-head-adopt: begin
       if rpr_find; then
-        # Only ordinary fast-forward pushes to a verified run-owned branch.
+        # Only ordinary fast-forward pushes to a verified run-owned branch, through the
+        # guarded publisher (with the exact repair lease on repair-in-place).
         if [ "$RPR_STATE" = "OPEN" ]; then
-          git push origin "HEAD:${RPR_BRANCH}"
+          if ! pubg_push "$(git rev-parse HEAD)" "$RPR_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"; then
+            echo "ERROR: publication_refused: the guarded publisher refused the adopt push to ${RPR_BRANCH}; nothing was pushed" >&2
+            exit 1
+          fi
         fi
         echo "PR_URL=$RPR_URL"
         echo "open-pr: adopted existing PR $RPR_URL (no create needed)."
@@ -7780,8 +7940,10 @@ nodes:
   # banner, both marker lines and the head SHA -- and only then makes the PR ready as the
   # run's last act and reads isDraft back. Any failed write or read-back fails the run and
   # leaves the PR a draft; there is no retry and no adoption. No timeout key.
+  # It depends (all_done) on every sink node of the DAG, so every node has settled when
+  # $_run.output.failed_nodes is substituted (rule 1b: any failed node holds the PR).
   - id: hold-if-findings
-    depends_on: [patch-pr-body, review-issue, blocked-issue, record-wo-completion-candidate, manifest-evidence-check, manifest-consistency-check, open-pr-if-needed, commit-and-push, noninteractive-salvage, block-reclassify, checkpoint-diff-repair, tests-blocked-report, capture-run-scope, checkpoint-push, derive-run-source-scope, ascii-autofix, ascii-gate, format-autofix]
+    depends_on: [patch-pr-body, review-issue, blocked-issue, record-wo-completion-candidate, repair-gate-fail, manifest-evidence-check, manifest-consistency-check, open-pr-if-needed, commit-and-push, noninteractive-salvage, block-reclassify, checkpoint-diff-repair, tests-blocked-report, capture-run-scope, checkpoint-push, derive-run-source-scope, ascii-autofix, ascii-gate, format-autofix]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -7832,23 +7994,24 @@ nodes:
         esac
       done
       if ls "$ARTIFACTS_DIR"/blocked-preserve/implement-iter-*/blocked-reason.txt >/dev/null 2>&1; then hif_hold "implement declared BLOCKED"; fi
+      # Rule 1b: ready without run:blocked only when no node of the run recorded failed
+      # (implement under all_done included). Every node has settled: this step depends, all_done,
+      # on every sink of the DAG before it.
+      HIF_FAILED_NODES=$_run.output.failed_nodes
+      [ -z "$HIF_FAILED_NODES" ] || hif_hold "node(s) recorded failed: ${HIF_FAILED_NODES}"
       HIF_HOLD=false
       [ -z "$HIF_REASONS" ] || HIF_HOLD=true
       echo "hold-if-findings: PR=${HIF_URL} hold=${HIF_HOLD}${HIF_REASONS:+ reasons: ${HIF_REASONS}}"
 
-      # -- The head this run published. TODO-SLICE2: pubg_push writes
-      #    $ARTIFACTS_DIR/evidence/published.head; until then the pushed SHA comes from
-      #    commit-and-push's output (pushed_sha=).
-      HIF_HEAD=""
-      if [ -s "$ARTIFACTS_DIR/evidence/published.head" ]; then
-        HIF_HEAD=$(head -n 1 "$ARTIFACTS_DIR/evidence/published.head" | tr -d '[:space:]')
-      fi
-      if [ -z "$HIF_HEAD" ]; then
-        HIF_HEAD=$(sed -n 's/^pushed_sha=//p' "$HIF_OUT/commit-and-push.out" 2>/dev/null | tail -n 1)
-      fi
+      # -- The head this run last published: every successful pubg_push records it. The PR head
+      #    must equal it, and the worktree must hold no unpublished commit and no uncommitted
+      #    change; otherwise the run fails and the PR stays a draft (1c).
+      HIF_HEAD=$(head -n 1 "$ARTIFACTS_DIR/evidence/published.head" 2>/dev/null | tr -d '[:space:]')
       printf '%s\n' "$HIF_HEAD" | grep -Eq '^[0-9a-f]{40}$' || hif_fail "published head SHA unknown; the PR stays a draft"
       HIF_LOCAL=$(git rev-parse HEAD 2>/dev/null || true)
-      [ "$HIF_LOCAL" = "$HIF_HEAD" ] || hif_fail "worktree HEAD ${HIF_LOCAL:-unknown} is not the published head ${HIF_HEAD}; the PR stays a draft"
+      [ "$HIF_LOCAL" = "$HIF_HEAD" ] || hif_fail "worktree HEAD ${HIF_LOCAL:-unknown} is not the published head ${HIF_HEAD} (an unpublished commit); the PR stays a draft"
+      HIF_DIRTY=$(git status --porcelain 2>/dev/null) || hif_fail "worktree status unreadable; the PR stays a draft"
+      [ -z "$HIF_DIRTY" ] || hif_fail "the worktree has uncommitted changes that were never published; the PR stays a draft"
 
       # -- Write every hold (labels by a separate edit; banner and markers in the body).
       HIF_BODY_NOW=$(gh pr view "$HIF_URL" --repo "$HIF_REPO" --json body --jq '.body') || hif_fail "PR body unreadable; the PR stays a draft"

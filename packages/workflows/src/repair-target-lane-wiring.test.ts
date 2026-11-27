@@ -119,7 +119,27 @@ describe('repair-target lane wiring', () => {
       const yaml = readLane(file);
       expect(yaml.split('# ---- BEGIN rtw core').length - 1, file).toBe(1);
       expect(yaml.split('# ---- BEGIN rta core').length - 1, file).toBe(1);
-      expect(rawCore(yaml, 'rtw'), file).toBe(rtwRef);
+      // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: bdc-feature-development.yaml routes both rtw
+      // backup pushes through pubg_push; for the rtw core only, it differs from the other 12 in
+      // exactly those two push lines.
+      if (file === 'bdc-feature-development.yaml') {
+        const own = rawCore(yaml, 'rtw');
+        expect(own, file).not.toContain('git push');
+        expect(
+          own
+            .replace(
+              'pubg_push "$commit" "${ref#refs/heads/}"',
+              'git push origin "${commit}:${ref}"'
+            )
+            .replace(
+              'pubg_push "$holder_sha" "${backup_ref#refs/heads/}"',
+              'git push origin "${holder_sha}:${backup_ref}"'
+            ),
+          file
+        ).toBe(rtwRef);
+      } else {
+        expect(rawCore(yaml, 'rtw'), file).toBe(rtwRef);
+      }
       expect(rawCore(yaml, 'rta'), file).toBe(rtaRef);
       const commit = nodeOf(nodesOf(file), 'commit-and-push', file);
       expect(commit.bash ?? '', file).toContain('rta_plan_authorizes');

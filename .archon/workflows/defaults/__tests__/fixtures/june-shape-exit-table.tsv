@@ -2,6 +2,7 @@
 # (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01, Correction A), in file order: step<TAB>reason-tag<TAB>fate.
 # Comment lines in the YAML are not exits and are not listed. june-shape-lane.sh Test 8 regenerates this list.
 # PENDING-SLICE3: diff-repair is replaced by the written-out repair rounds in a later slice of this WO.
+# Slice 2: publication_refused rows are pubg_push refusals (Corrections B and D); checkpoint-push ends the run (abort_run_on_failure).
 preflight-github-auth	no_github_access	HARD
 read-spec	no_authority_or_spec	HARD
 read-spec	no_authority_or_spec	HARD
@@ -26,6 +27,7 @@ repair-gate-fail	repair_target_missing_or_wrong	HARD
 repair-gate-fail	repair_target_missing_or_wrong	HARD
 capture-run-scope	worktree_unavailable_or_head_not_commit	HARD
 capture-run-scope	worktree_unavailable_or_head_not_commit	HARD
+checkpoint-push	publication_refused	HARD
 assert-implement-produced-work	git_cannot_count_work	HARD
 assert-implement-produced-work	git_cannot_count_work	HARD
 assert-implement-produced-work	git_cannot_count_work	HARD
@@ -64,11 +66,11 @@ commit-and-push	repair_target_authorization_or_lease	HARD
 commit-and-push	repair_target_authorization_or_lease	HARD
 commit-and-push	final_ref_shape	HARD
 commit-and-push	nothing_produced	HARD
-commit-and-push	repair_target_lease	HARD
+commit-and-push	publication_refused	HARD
 commit-and-push	push_failed_or_not_durable	HARD
 commit-and-push	push_failed_or_not_durable	HARD
 open-pr-if-needed	branch_not_handed_over	HARD
-open-pr-if-needed	repair_target_lease	HARD
+open-pr-if-needed	publication_refused	HARD
 open-pr-if-needed	branch_not_durable	HARD
 open-pr-if-needed	branch_not_durable	HARD
 open-pr-if-needed	no_target_repo	HARD
@@ -93,6 +95,7 @@ open-pr-if-needed	run_pr_record_or_ownership	HARD
 open-pr-if-needed	run_pr_record_or_ownership	HARD
 open-pr-if-needed	run_pr_record_or_ownership	HARD
 open-pr-if-needed	run_pr_record_or_ownership	HARD
+open-pr-if-needed	publication_refused	HARD
 open-pr-if-needed	new_pr_forbidden	HARD
 open-pr-if-needed	pr_create_failed	HARD
 hold-if-findings	hold_or_link_not_applied	HARD

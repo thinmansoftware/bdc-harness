@@ -12,6 +12,14 @@
 # (exit table, removed and added steps, Correction B), Test 10, Correction F lane (a question
 # with no code returns to its author). Test 9 lives in manifest-evidence-check.sh and
 # Test 11 in fallback-pr-suppressed.sh.
+# Slice 2 (the guarded publication core, pubg_push): Test 4 and Test 13 (every publication path:
+# checkpoint wip/, checkout-repair-target backup/, commit-and-push plain and lease, open-pr
+# recovery re-push and adopt push, each with a planted secret, a secret only local tracking refs
+# claim is on the remote, gitleaks absent, a bad ref, a stale lease where the path carries one,
+# and a secret only in a merge result), Test 14 (prompt and doc; the Overseer lookup is a bun test
+# in packages/overseer/src/__tests__/june-shape-agent-branch-link.test.ts), Test 20's refused-push
+# variants with bundle recovery after the worktree is released, the published-head ready check,
+# and rule 1b (a run with one failed node and no finding is held). gitleaks must be on PATH.
 #
 # Run: bash .archon/workflows/defaults/__tests__/june-shape-lane.sh
 # Optional: JUNE_SHAPE_ONLY=structural|fixture to run one half. Exits 1 on any failure. ASCII only.
@@ -140,6 +148,81 @@ structural() {
     assert_eq "$id skips a run returned to its author" "1" "$(count_in "BUILD_OUTCOME=RETURNED_TO_AUTHOR'" "$(node_block "$id")")"
   done
 
+  echo "--- Slice 2: one guarded publisher (pubg core), Corrections B and D (Tests 4, 13, 14) ---"
+  assert_eq "Stop 19: the pubg core exists once" "1" "$(count_w '# ---- BEGIN pubg core')"
+  assert_eq "Stop 4: one gitleaks git call" "1" "$(count_w 'gitleaks git')"
+  assert_eq "Stop 31: the scan includes merge-commit patches" "1" "$(count_w 'diff-merges=separate')"
+  assert_eq "Stop 33: a refused push is bundled into the host mount" "1" "$(count_w 'git bundle create /host-artifacts/')"
+  assert_eq "Stop 32: published.head written once (pubg) and read once (hold-if-findings)" "2" "$(count_w 'evidence/published.head')"
+  assert_eq "Stop 16: no push to the remote name" "0" "$(count_w 'git push origin')"
+  assert_eq "Stop 11: no git push -u origin" "0" "$(count_w 'git push -u origin')"
+  local pre core_free pushes
+  pre=$(node_block preflight-github-auth)
+  assert_eq "the pubg core lives in preflight-github-auth (the run's first node)" "1" "$(count_in '# ---- BEGIN pubg core' "$pre")"
+  assert_eq "preflight-github-auth saves the core for the publishing nodes" "1" "$(count_in 'declare -f pubg_record pubg_preserve pubg_refuse pubg_have pubg_push > "$ARTIFACTS_DIR/evidence/pubg.core.sh"' "$pre")"
+  core_free=$(tr -d '\r' < "$W" | awk '/# ---- BEGIN pubg core/ { c = 1 } !c { print } /# ---- END pubg core ----/ { c = 0 }')
+  pushes=$(printf '%s\n' "$core_free" | grep -v '^[[:space:]]*#' | grep -F 'git push' | grep -vF 'echo "ERROR: git push failed after 3 attempts' || true)
+  assert_eq "outside the pubg core, the only git push is the preflight dry run" 'if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then' "$(printf '%s\n' "$pushes" | sed 's/^[[:space:]]*//')"
+  assert_eq "exactly one PR creation call" "1" "$(printf '%s\n' "$core_free" | grep -cF '$(gh pr create --repo' || true)"
+  local id blk
+  for id in checkout-repair-target checkpoint-push commit-and-push open-pr-if-needed; do
+    blk=$(node_block "$id")
+    assert_eq "$id sources the saved pubg core" "1" "$(count_in '. "${ARTIFACTS_DIR:-/nonexistent}/evidence/pubg.core.sh"' "$blk")"
+    if [ "$(count_in 'pubg_push ' "$blk")" -ge 1 ]; then ok "$id publishes through pubg_push"; else bad "$id publishes through pubg_push"; fi
+  done
+  blk=$(node_block checkout-repair-target)
+  assert_eq "both rtw backup pushes go through pubg_push" "2" "$(printf '%s\n' "$blk" | grep -cE 'pubg_push "\$(commit|holder_sha)" "\$\{(ref|backup_ref)#refs/heads/\}"' || true)"
+  blk=$(node_block checkpoint-push)
+  assert_eq "a refused checkpoint push ends the run (abort_run_on_failure)" "1" "$(count_in 'abort_run_on_failure: true' "$blk")"
+  blk=$(node_block commit-and-push)
+  assert_eq "commit-and-push passes the repair lease to pubg_push" "1" "$(count_in 'pubg_push "$(git rev-parse HEAD)" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"' "$blk")"
+  blk=$(node_block open-pr-if-needed)
+  assert_eq "open-pr recovery re-push goes through pubg_push with the lease" "1" "$(count_in 'pubg_push "$LOCAL_HEAD" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"' "$blk")"
+  assert_eq "open-pr adopt push goes through pubg_push with the lease" "1" "$(count_in 'pubg_push "$(git rev-parse HEAD)" "$RPR_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"' "$blk")"
+  assert_eq "no slice-2 placeholder is left" "0" "$(count_w 'TODO-SLICE2')"
+  assert_eq "no pushed_sha fallback is left" "0" "$(count_w 'pushed_sha')"
+
+  echo "--- Test 14: the implement prompt has no push; the gap is recorded ---"
+  local impl_blk
+  impl_blk=$(node_block implement)
+  assert_eq "the implement prompt contains no git push" "0" "$(count_in 'git push' "$impl_blk")"
+  assert_eq "the implement prompt contains no push -u" "0" "$(count_in 'push -u' "$impl_blk")"
+  assert_eq "the implement prompt still forbids gh pr create" "1" "$(count_in 'Never run `gh pr create`' "$impl_blk")"
+  if grep -q "The agent's write authority is not confined" "$REPO_ROOT/docs/operations/merge-holds.md"; then
+    ok "docs/operations/merge-holds.md records the agent write-authority gap"
+  else
+    bad "docs/operations/merge-holds.md records the agent write-authority gap"
+  fi
+  if grep -q '`run:blocked` is machine-set and is the only hold this lane applies' "$REPO_ROOT/docs/operations/merge-holds.md"; then
+    ok "docs/operations/merge-holds.md records the rebuilt lane's run:blocked rule"
+  else
+    bad "docs/operations/merge-holds.md records the rebuilt lane's run:blocked rule"
+  fi
+
+  echo "--- Rule 1b wiring: hold-if-findings settles after every node ---"
+  hold=$(node_block hold-if-findings)
+  assert_eq "hold-if-findings reads \$_run.output.failed_nodes once" "1" "$(count_in 'HIF_FAILED_NODES=$_run.output.failed_nodes' "$hold")"
+  local missing
+  missing=$(tr -d '\r' < "$W" | awk '
+    /^  - id: / { id = substr($0, 9); ids[++n] = id; next }
+    /^    depends_on: \[/ { line = $0; sub(/^    depends_on: \[/, "", line); sub(/\][[:space:]]*$/, "", line)
+      k = split(line, d, /,[[:space:]]*/); for (i = 1; i <= k; i++) { if (id == "hold-if-findings") hif[d[i]] = 1; else used[d[i]] = 1 } }
+    END { for (i = 1; i <= n; i++) if (ids[i] != "hold-if-findings" && !(ids[i] in used) && !(ids[i] in hif)) print ids[i] }')
+  assert_eq "hold-if-findings depends on every sink node of the DAG" "" "$missing"
+
+  echo "--- The completion-ledger write is unchanged (outside the publication inventory) ---"
+  if git -C "$REPO_ROOT" cat-file -e 58251246^{commit} 2>/dev/null; then
+    # The contents PUT of one JSON record to the bdc-xo ledger: from its comment to the node end.
+    ledger_write() { awk '/# -- Write the pending file to bdc-xo via the contents API/ { c = 1 } c && /^  #/ { exit } c && NF { print }'; }
+    local dev_rec now_rec
+    dev_rec=$(git -C "$REPO_ROOT" show 58251246:.archon/workflows/defaults/bdc-feature-development.yaml | tr -d '\r' | awk '
+      $0 == "  - id: record-wo-completion-candidate" { c = 1; print; next } c && /^  - id: / { exit } c { print }' | ledger_write)
+    now_rec=$(node_block record-wo-completion-candidate | ledger_write)
+    if [ -n "$dev_rec" ] && [ "$dev_rec" = "$now_rec" ]; then ok "record-wo-completion-candidate ledger write is byte-identical to dev 58251246"; else bad "record-wo-completion-candidate ledger write changed"; fi
+  else
+    bad "dev 58251246 not reachable; cannot prove record-wo-completion-candidate unchanged"
+  fi
+
   echo "--- Test 12 (parity): the other 12 lane files are byte-identical to dev 58251246 ---"
   if git -C "$REPO_ROOT" cat-file -e 58251246^{commit} 2>/dev/null; then
     for lane in $OTHER_LANES; do
@@ -158,7 +241,7 @@ structural() {
 
 fixture() {
   local scenario out rc
-  for scenario in blocked hold-failures prod-guard markers repair scope returned; do
+  for scenario in blocked hold-failures prod-guard markers repair scope returned pubg-core publication refused-edit rule-1b unpublished; do
     echo "--- fixture scenario: $scenario ---"
     out=$(python3 "$FIXTURE" "$scenario" 2>&1); rc=$?
     printf '%s\n' "$out" | grep -E '^(PASS|FAIL): '
