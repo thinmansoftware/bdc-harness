@@ -1172,6 +1172,12 @@ def scenario_raced_hold(tmp, reapply_fails):
     edits = [call for call in f.gh_calls() if call[:2] == ['pr', 'edit'] and '--add-label' in call]
     check('raced removal gets exactly one re-application after push', len(edits) == 1 and f.remote_tip(UNIQUE) == head, out + err)
     check('post-push hold verification returns the expected status', (rc != 0 and 'publication_hold_failed' in err and 'run:blocked' not in pr['labels']) if reapply_fails else (rc == 0 and 'run:blocked' in pr['labels']), out + err)
+    if reapply_fails:
+        f.failed_nodes = 'open-pr-if-needed'
+        write_lf(f.art / 'run-pr.json', json.dumps({'url': pr['url'], 'repo': 'fixture/repo', 'head_branch': UNIQUE}))
+        prior_calls = f.gh_calls()
+        rc, out, err = f.run('hold-if-findings')
+        check('failed publication prevents another hold attempt or ready call', rc != 0 and f.gh_calls() == prior_calls, out + err)
 
 
 def scenario_adopted_idle(tmp):

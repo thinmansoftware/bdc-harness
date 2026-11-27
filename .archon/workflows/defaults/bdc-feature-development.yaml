@@ -55,7 +55,8 @@ nodes:
       #   5. On a refusal, save the commits no remote ref holds as a verified git bundle in the
       #      private host mount, or say plainly that they were not preserved. No retry here.
       # Returns 0 published, 1 refused (nothing written to GitHub), 2 the push itself failed
-      # after every check passed (not a refusal; the caller keeps its existing retry rule).
+      # after every check passed (the caller keeps its existing retry rule), or 3 when
+      # the ref advanced but the required existing PR hold could not be verified.
       # Defined once, here; preflight-github-auth saves it for the nodes that publish.
       pubg_record() {
         printf '%s\n' "$1" >&2
@@ -8168,6 +8169,12 @@ nodes:
         echo "ERROR: hold_if_findings: $1" >&2
         exit 1
       }
+      HIF_FAILED_NODES=$_run.output.failed_nodes
+      case ",$HIF_FAILED_NODES," in
+        *,commit-and-push,*|*,open-pr-if-needed,*)
+          hif_fail "publication step failed; do not retry a hold or make the PR ready"
+          ;;
+      esac
       HIF_RUN_ID=$(basename "$ARTIFACTS_DIR")
       HIF_OUT="${ARCHON_NODE_OUT:-/nonexistent}"
       HIF_BANNER='RUN BLOCKED -- not lane-verified'
@@ -8258,7 +8265,6 @@ nodes:
       # Rule 1b: ready without run:blocked only when no node of the run recorded failed
       # (implement under all_done included). Every node has settled: this step depends, all_done,
       # on every sink of the DAG before it.
-      HIF_FAILED_NODES=$_run.output.failed_nodes
       [ -z "$HIF_FAILED_NODES" ] || hif_hold "node(s) recorded failed: ${HIF_FAILED_NODES}"
       HIF_HOLD=false
       [ -z "$HIF_REASONS" ] || HIF_HOLD=true
