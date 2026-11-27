@@ -4770,11 +4770,20 @@ nodes:
     idle_timeout: 600000
     task_class: medium_work
     prompt: |
-      Repair the findings from $classify-diff-review.output on the current run branch.
+      Repair the original findings on the current run branch.
+      Original findings: $diff-review.output
+      Classifier verdict: $classify-diff-review.output
       Work order: $read-spec.output
       Commit the repair on the run branch.
       Record why the change was needed in the commit body.
       Do not publish from this step. Leave the committed head for independent review.
+      After the final commit, take DIFF_BASE from the original capture:
+      $capture-diff.output
+      Set DIFF_BASE to that exact SHA and run:
+        git diff --no-ext-diff "$DIFF_BASE" HEAD -- > "$ARTIFACTS_DIR/diff-round-1.patch"
+      Leave the patch in the run artifacts, outside the commit. Capture it even
+      if no new commit was needed. If returning a closed-list item, skip capture.
+
 
   - id: review-round-1
     provider: codex-native-strict
@@ -4806,7 +4815,9 @@ nodes:
             type: string
     prompt: |
       Independently inspect the current committed head against $read-spec.output.
-      Review the full diff from the run base, with special attention to the prior findings.
+      Read $ARTIFACTS_DIR/diff-round-1.patch for the committed diff from the original run base.
+      Preceding findings: $diff-review.output
+      If the patch is missing or unreadable, emit needs_revision and report the missing evidence.
       Do not edit any files. Approve only if the committed head resolves the findings.
 
   - id: repair-round-2
@@ -4821,6 +4832,13 @@ nodes:
       Commit the repair on the run branch.
       Record why the change was needed in the commit body.
       Do not publish from this step. Leave the committed head for independent review.
+      After the final commit, take DIFF_BASE from the original capture:
+      $capture-diff.output
+      Set DIFF_BASE to that exact SHA and run:
+        git diff --no-ext-diff "$DIFF_BASE" HEAD -- > "$ARTIFACTS_DIR/diff-round-2.patch"
+      Leave the patch in the run artifacts, outside the commit. Capture it even
+      if no new commit was needed. If returning a closed-list item, skip capture.
+
 
   - id: review-round-2
     provider: codex-native-strict
@@ -4852,7 +4870,9 @@ nodes:
             type: string
     prompt: |
       Independently inspect the current committed head against $read-spec.output.
-      Review the full diff from the run base, with special attention to the prior findings.
+      Read $ARTIFACTS_DIR/diff-round-2.patch for the committed diff from the original run base.
+      Preceding findings: $review-round-1.output
+      If the patch is missing or unreadable, emit needs_revision and report the missing evidence.
       Do not edit any files. Approve only if the committed head resolves the findings.
 
   - id: repair-round-3
@@ -4867,6 +4887,13 @@ nodes:
       Commit the repair on the run branch.
       Record why the change was needed in the commit body.
       Do not publish from this step. Leave the committed head for independent review.
+      After the final commit, take DIFF_BASE from the original capture:
+      $capture-diff.output
+      Set DIFF_BASE to that exact SHA and run:
+        git diff --no-ext-diff "$DIFF_BASE" HEAD -- > "$ARTIFACTS_DIR/diff-round-3.patch"
+      Leave the patch in the run artifacts, outside the commit. Capture it even
+      if no new commit was needed. If returning a closed-list item, skip capture.
+
 
   - id: review-round-3
     provider: codex-native-strict
@@ -4898,7 +4925,9 @@ nodes:
             type: string
     prompt: |
       Independently inspect the current committed head against $read-spec.output.
-      Review the full diff from the run base, with special attention to the prior findings.
+      Read $ARTIFACTS_DIR/diff-round-3.patch for the committed diff from the original run base.
+      Preceding findings: $review-round-2.output
+      If the patch is missing or unreadable, emit needs_revision and report the missing evidence.
       Do not edit any files. Approve only if the committed head resolves the findings.
 
   # checkpoint-diff-repair: commit any diff-repair fix to HEAD before capture-diff-final
@@ -5016,6 +5045,13 @@ nodes:
       as appropriate. Otherwise commit with trailer Cauldron-Role: overseer-repair.
       Record why the change was needed in the commit body.
       Do not publish from this step. Leave the committed head for independent review.
+      After the final commit, take DIFF_BASE from the original capture:
+      $capture-diff.output
+      Set DIFF_BASE to that exact SHA and run:
+        git diff --no-ext-diff "$DIFF_BASE" HEAD -- > "$ARTIFACTS_DIR/diff-round-4.patch"
+      Leave the patch in the run artifacts, outside the commit. Capture it even
+      if no new commit was needed. If returning a closed-list item, skip capture.
+
 
   - id: review-round-4
     provider: codex-native-strict
@@ -5047,7 +5083,9 @@ nodes:
             type: string
     prompt: |
       Independently inspect the current committed head against $read-spec.output.
-      Review the full diff from the run base, with special attention to the prior findings.
+      Read $ARTIFACTS_DIR/diff-round-4.patch for the committed diff from the original run base.
+      Preceding findings: $review-round-3.output
+      If the patch is missing or unreadable, emit needs_revision and report the missing evidence.
       Do not edit any files. Approve only if the committed head resolves the findings.
 
   - id: overseer-repair-round-5
@@ -5064,6 +5102,13 @@ nodes:
       as appropriate. Otherwise commit with trailer Cauldron-Role: overseer-repair.
       Record why the change was needed in the commit body.
       Do not publish from this step. Leave the committed head for independent review.
+      After the final commit, take DIFF_BASE from the original capture:
+      $capture-diff.output
+      Set DIFF_BASE to that exact SHA and run:
+        git diff --no-ext-diff "$DIFF_BASE" HEAD -- > "$ARTIFACTS_DIR/diff-round-5.patch"
+      Leave the patch in the run artifacts, outside the commit. Capture it even
+      if no new commit was needed. If returning a closed-list item, skip capture.
+
 
   - id: review-round-5
     provider: codex-native-strict
@@ -5095,7 +5140,9 @@ nodes:
             type: string
     prompt: |
       Independently inspect the current committed head against $read-spec.output.
-      Review the full diff from the run base, with special attention to the prior findings.
+      Read $ARTIFACTS_DIR/diff-round-5.patch for the committed diff from the original run base.
+      Preceding findings: $review-round-4.output
+      If the patch is missing or unreadable, emit needs_revision and report the missing evidence.
       Do not edit any files. Approve only if the committed head resolves the findings.
 
   # block-classify: emit ONE JSON line so downstream `when:` can read $block-classify.output.status

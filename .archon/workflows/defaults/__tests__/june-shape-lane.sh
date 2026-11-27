@@ -89,6 +89,18 @@ structural() {
   for round in 1 2 3 4 5; do
     assert_eq "round $round has an independent reviewer" "1" "$(count_in 'agent: codex-adversarial-reviewer' "$(node_block "review-round-$round")")"
   done
+  assert_eq "repair round 1 reads original findings" "1" "$(count_in '$diff-review.output' "$(node_block repair-round-1)")"
+  local repair prior review
+  for round in 1 2 3 4 5; do
+    repair="repair-round-$round"
+    if [ "$round" -ge 4 ]; then repair="overseer-$repair"; fi
+    prior='$diff-review.output'
+    if [ "$round" -gt 1 ]; then prior="\$review-round-$((round - 1)).output"; fi
+    review=$(node_block "review-round-$round")
+    assert_eq "repair round $round captures the committed diff" "1" "$(count_in "git diff --no-ext-diff \"\$DIFF_BASE\" HEAD -- > \"\$ARTIFACTS_DIR/diff-round-$round.patch\"" "$(node_block "$repair")")"
+    assert_eq "review round $round reads the new patch" "1" "$(count_in "\$ARTIFACTS_DIR/diff-round-$round.patch" "$review")"
+    assert_eq "review round $round reads preceding findings" "1" "$(count_in "Preceding findings: $prior" "$review")"
+  done
   local id
   for id in evidence-repair-start evidence-repair-final evidence-repair-verify implement-block-gate blocked-terminal-gate; do
     assert_eq "step $id is gone (no id line, no reference)" "0" "$(count_w "$id")"
