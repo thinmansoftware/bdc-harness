@@ -133,6 +133,28 @@ nodes:
         if [ -n "$lease" ] && [ "$t" != "$lease" ]; then
           pubg_refuse "lease_mismatch: repair_target_lease_rejected (remote tip ${t:-absent}, lease ${lease})"; return 1
         fi
+        # Before changing an existing PR branch, confirm every matching open PR is
+        # still draft or already carries the lane hold. Read the repo from the frozen
+        # authority spec so a suggestion from a model cannot redirect the check.
+        if [ "${PUBG_VERIFY_PR_HOLD:-0}" = 1 ] && [ -n "$t" ] && [ "$t" != "$PUBG_SHA" ]; then
+          local pr_repo pr_states
+          pr_repo=$(python3 - "${ARTIFACTS_DIR:?}/authority/work-order.md" <<'PY'
+      import re, sys
+      with open(sys.argv[1], encoding="utf-8") as spec:
+          for line in spec:
+              match = re.match(r"^\s*(?:target_repo:|\*\*Target [Rr]epo:\*\*|Target repo:)\s*`?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)`?\s*$", line)
+              if match:
+                  print(match.group(1))
+                  break
+      PY
+          ) || pr_repo=""
+          if [ -z "$pr_repo" ] ||
+             ! pr_states=$(gh pr list --repo "$pr_repo" --head "$PUBG_DEST" --state open --json isDraft,labels 2>/dev/null) ||
+             ! jq -e 'type == "array" and all(.[]; .isDraft == true or any(.labels[]?; .name == "run:blocked"))' <<< "$pr_states" >/dev/null 2>&1; then
+            pubg_refuse "unprotected_ready_pr: destination must be draft or already held before its head changes"
+            return 1
+          fi
+        fi
         if [ -n "$t" ] && [ "$t" = "$PUBG_SHA" ]; then
           range="none"
         # 2. A lower bound it can prove.
@@ -6176,7 +6198,7 @@ nodes:
       PUSH_OK=false
       for attempt in 1 2 3; do
         PUBG_RC=0
-        pubg_push "$(git rev-parse HEAD)" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
+        PUBG_VERIFY_PR_HOLD=1 pubg_push "$(git rev-parse HEAD)" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
         if [ "$PUBG_RC" -eq 0 ]; then
           PUSH_OK=true
           break
@@ -6309,7 +6331,7 @@ nodes:
         PUSH_OK=false
         for attempt in 1 2 3; do
           PUBG_RC=0
-          pubg_push "$LOCAL_HEAD" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
+          PUBG_VERIFY_PR_HOLD=1 pubg_push "$LOCAL_HEAD" "$UNIQUE_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}" || PUBG_RC=$?
           if [ "$PUBG_RC" -eq 0 ]; then
             PUSH_OK=true
             break
@@ -6674,7 +6696,7 @@ nodes:
         # Only ordinary fast-forward pushes to a verified run-owned branch, through the
         # guarded publisher (with the exact repair lease on repair-in-place).
         if [ "$RPR_STATE" = "OPEN" ]; then
-          if ! pubg_push "$(git rev-parse HEAD)" "$RPR_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"; then
+          if ! PUBG_VERIFY_PR_HOLD=1 pubg_push "$(git rev-parse HEAD)" "$RPR_BRANCH" "${REPAIR_TARGET_LEASE_SHA:-}"; then
             echo "ERROR: publication_refused: the guarded publisher refused the adopt push to ${RPR_BRANCH}; nothing was pushed" >&2
             exit 1
           fi
@@ -8126,11 +8148,11 @@ nodes:
             pubg_push "$@"
           }
           if [ -s "$ARTIFACTS_DIR/run-pr.json" ]; then
-            HIF_ADOPTED=$(jq -r '.branch // empty' "$ARTIFACTS_DIR/run-pr.json")
+            HIF_ADOPTED=$(jq -r '.head_branch // empty' "$ARTIFACTS_DIR/run-pr.json")
             HIF_BRANCH="${HIF_ADOPTED:-$HIF_BRANCH}"
           fi
           [ -z "$HIF_LEASE" ] || HIF_LEASE="$HIF_PREVIOUS"
-          pubg_push "$HIF_LOCAL" "$HIF_BRANCH" "$HIF_LEASE" || hif_fail "Overseer publication refused"
+          PUBG_VERIFY_PR_HOLD=1 pubg_push "$HIF_LOCAL" "$HIF_BRANCH" "$HIF_LEASE" || hif_fail "Overseer publication refused"
           HIF_CHANGE=true
           HIF_BANNER='Changed by the in-run Overseer after publication -- not reviewed in-run'
         fi
@@ -8149,8 +8171,14 @@ nodes:
       if [ -d "$ARTIFACTS_DIR/findings" ] && [ ! -r "$ARTIFACTS_DIR/findings" ]; then
         hif_hold "findings unreadable"
       fi
-      HIF_FINDINGS=$( { cat "$ARTIFACTS_DIR"/findings/*.txt 2>/dev/null; cat "$HIF_OUT"/*.out 2>/dev/null; } | grep -c '^FINDING=' || true)
-      [ "${HIF_FINDINGS:-0}" -eq 0 ] 2>/dev/null || hif_hold "${HIF_FINDINGS} finding(s)"
+      for hif_record in "$ARTIFACTS_DIR"/findings/*.txt "$HIF_OUT"/*.out; do
+        if [ ! -e "$hif_record" ] && [ ! -L "$hif_record" ]; then continue; fi
+        if [ ! -f "$hif_record" ] || ! hif_contents=$(cat "$hif_record" 2>/dev/null); then
+          hif_hold "unreadable record $(basename "$hif_record")"
+        elif grep -q '^FINDING=' <<< "$hif_contents"; then
+          hif_hold "finding in $(basename "$hif_record")"
+        fi
+      done
       if ls "$ARTIFACTS_DIR"/questions/*.md >/dev/null 2>&1; then hif_hold "question raised"; fi
       HIF_IMPL=$(cat "$HIF_OUT/implement.out" 2>/dev/null || true)
       if [ -z "$HIF_IMPL" ]; then hif_hold "implement did not complete"; fi

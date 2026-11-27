@@ -1137,6 +1137,51 @@ def scenario_idle_published(tmp):
     check('T20 the PR is ready and lists the Overseer change', not pr['isDraft'] and 'Changes made by the Overseer' in pr['body'])
 
 
+def scenario_unheld_adoption(tmp):
+    """An already-ready, unheld PR must not receive a new head from this lane."""
+    f = Fixture(tmp)
+    publish_through_open_pr(f)
+    before = f.remote_tip(UNIQUE)
+    state = json.loads(f.state.read_text())
+    state['prs'][0]['isDraft'] = False
+    f.state.write_text(json.dumps(state))
+    f.commit_change('unpublished change\n', 'fix: candidate')
+    rc, out, err = f.run('commit-and-push')
+    check('ready unheld PR refuses a new head before publication', rc != 0 and f.remote_tip(UNIQUE) == before and 'unprotected_ready_pr' in out + err, out + err)
+
+
+def scenario_adopted_idle(tmp):
+    """The guarded idle edit updates the branch actually recorded for the adopted PR."""
+    f = Fixture(tmp)
+    publish_through_open_pr(f)
+    pr = f.prs()[0]
+    branch = 'feat/adopted-thread-ab'
+    published = f.git(['rev-parse', 'HEAD'])
+    f.git(['push', '-q', 'origin', 'HEAD:refs/heads/' + branch])
+    state = json.loads(f.state.read_text())
+    state['prs'][0]['headRefName'] = branch
+    f.state.write_text(json.dumps(state))
+    write_lf(f.art / 'run-pr.json', json.dumps({
+        'number': pr['number'], 'url': pr['url'], 'head_branch': branch, 'repo': 'fixture/repo',
+    }))
+    f.commit_change('adopted branch repair\n', 'fix: adopted repair\n\nCauldron-Role: overseer-repair')
+    f.set_out('test-repair', 'IDLE_HANDOFF=true')
+    rc, out, err = f.run('hold-if-findings')
+    check('adopted idle repair advances only the recorded branch', rc == 0 and f.remote_tip(branch) == f.git(['rev-parse', 'HEAD']) and f.remote_tip(UNIQUE) == published, out + err)
+    check('adopted idle repair holds the same PR', len(f.prs()) == 1 and 'run:blocked' in f.prs()[0]['labels'])
+
+
+def scenario_unreadable_finding(tmp):
+    """A present record whose contents cannot be read must hold a clean PROCEED."""
+    f = Fixture(tmp)
+    publish_through_open_pr(f)
+    findings = f.art / 'findings'
+    findings.mkdir(exist_ok=True)
+    (findings / 'unreadable.txt').mkdir()
+    rc, out, err = f.run('hold-if-findings')
+    check('unreadable finding on clean PROCEED holds the PR', rc == 0 and 'run:blocked' in f.prs()[0]['labels'] and 'unreadable record' in out, out + err)
+
+
 def scenario_idle_no_code(tmp, cause):
     """No-code idle disposition, bdc-xo#6687 comment 7211103883."""
     f = Fixture(tmp)
@@ -1179,6 +1224,9 @@ def main():
         'empty-build': lambda: once(tf, scenario_empty_build),
         'wall-salvage': lambda: once(tf, scenario_wall_salvage),
         'idle-published': lambda: once(tf, scenario_idle_published),
+        'adopted-idle': lambda: once(tf, scenario_adopted_idle),
+        'unheld-adoption': lambda: once(tf, scenario_unheld_adoption),
+        'unreadable-finding': lambda: once(tf, scenario_unreadable_finding),
         'overseer-repairs': lambda: scenario_overseer_repairs(tf),
         'publication': lambda: scenario_publication(tf),
         'pubg-core': lambda: scenario_pubg_core(tf),

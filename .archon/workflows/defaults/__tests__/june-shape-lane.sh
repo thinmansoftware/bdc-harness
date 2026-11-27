@@ -17,7 +17,7 @@
 # recovery re-push and adopt push, each with a planted secret, a secret only local tracking refs
 # claim is on the remote, gitleaks absent, a bad ref, a stale lease where the path carries one,
 # and a secret only in a merge result), Test 14 (prompt and doc; the Overseer lookup is a bun test
-# in packages/overseer/src/__tests__/june-shape-agent-branch-link.test.ts), Test 20's refused-push
+# in packages/workflows/src/june-shape-agent-branch-link.test.ts), Test 20's refused-push
 # variants with bundle recovery after the worktree is released, the published-head ready check,
 # and rule 1b (a run with one failed node and no finding is held). gitleaks must be on PATH.
 #
@@ -258,7 +258,7 @@ structural() {
 
 fixture() {
   local scenario out rc
-  for scenario in blocked hold-failures prod-guard markers repair scope returned wall-salvage empty-build round-limit closed-list overseer-repairs idle-published idle-spec idle-environment idle-provider pubg-core scan-config tamper publication refused-edit rule-1b unpublished; do
+  for scenario in blocked hold-failures prod-guard markers repair scope returned wall-salvage empty-build round-limit closed-list overseer-repairs idle-published adopted-idle unheld-adoption unreadable-finding idle-spec idle-environment idle-provider pubg-core scan-config tamper publication refused-edit rule-1b unpublished; do
     echo "--- fixture scenario: $scenario ---"
     out=$(python3 "$FIXTURE" "$scenario" 2>&1); rc=$?
     printf '%s\n' "$out" | grep -E '^(PASS|FAIL): '

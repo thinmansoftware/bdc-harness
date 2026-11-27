@@ -10,7 +10,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   findOriginatingRunForPullRequest,
   type OriginatingRunCandidate,
-} from '../originating-run-lookup';
+} from '../../overseer/src/originating-run-lookup';
 
 const WORKTREE_BRANCH = 'archon/task-web-worker-1790865294847-n1qba8';
 
