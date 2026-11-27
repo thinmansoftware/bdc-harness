@@ -539,11 +539,10 @@ def scenario_salvage(tmp_factory):
 def scenario_evidence(tmp):
     """Test 9: evidence and consistency findings do not end the run; both go in the body."""
     f = Fixture(tmp)
-    f.commit_change()
-    f.set_out('block-reclassify', '{"status":"PROCEED"}')
-    f.set_out('diff-review', 'DIFF_REVIEW=satisfied')
-    for name in ['noninteractive-salvage', 'commit-and-push', 'open-pr-if-needed']:
-        f.run(name)
+    rc, out, err = open_pr_only(f, DECIDE, f.env['RECORDED_BASE_BRANCH'])
+    if rc != 0 or len(f.prs()) != 1 or not any(line.startswith('PR_URL=') for line in out.splitlines()):
+        raise RuntimeError('Test 9 needs a published fixture PR: ' + out + err)
+    write_lf(f.art / 'evidence' / 'published.head', f.remote_tip(UNIQUE) + '\n')
     f.set_out('run-stop-tests-final', 'TESTS_CLASS=CODE\nTESTS_STATUS=passed\nTESTS_EXIT=0')
     f.set_out('run-stop-greps', 'GREP_DECLARED=2\nGREP_STATUS=all_dropped\nGREP_EXECUTED=0\nGREP_DROPPED=2\nGREP_UNPARSED=0\nGREP_MISMATCH=0')
     f.set_out('stamp-manifest-evidence', 'Tests: 1/1 (fixture)\nGrep assertions: none executed')
