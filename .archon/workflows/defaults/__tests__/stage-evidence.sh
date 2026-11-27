@@ -127,7 +127,8 @@ check test "$out" = $'12\n11\n10\n9\n8\n7\n6\n5\n4\n3'
 check test ! -f "$ARTIFACTS_DIR/fired"
 check contains "$(cat "$ARTIFACTS_DIR/selection.calls" 2>/dev/null)" '--base dev --state open'
 if [ -f "$HERE/../bdc-evidence-replay.yaml" ]; then
-  python3 - "$LANE" "$HERE/../bdc-evidence-replay.yaml" <<'PY'
+  # The Codex lane retains the replay blocks that the rebuilt default lane removed.
+  python3 - "$HERE/../bdc-feature-development-codex.yaml" "$HERE/../bdc-evidence-replay.yaml" <<'PY'
 import sys, yaml
 a,b = [{n['id']:n for n in yaml.safe_load(open(p))['nodes']} for p in sys.argv[1:]]
 for name in ['resolve-test-command','run-stop-tests','classify-test-result','test-repair','run-stop-tests-final']:
