@@ -133,10 +133,30 @@ export async function reserveAutomaticFire(
       'SELECT * FROM tm_fire_admissions WHERE action_key=$1',
       [input.actionKey]
     );
-    // A replay reconciles the durable identity; it never gets a second invocation.
-    if (existing.rowCount) return { allowed: false, reason: 'daily_cap_existing_action' };
+    const row = existing.rows[0];
+    const retryUnstarted =
+      row?.state === 'released' &&
+      row.admitted_at === null &&
+      row.owner_token !== input.ownerToken &&
+      row.journal_id === input.journalId &&
+      row.cascade_id === input.cascadeId &&
+      row.source_thread_ref === input.sourceThreadRef;
+    if (row && !retryUnstarted) return { allowed: false, reason: 'daily_cap_existing_action' };
     const reason = await fireBudgetRefusal(query, input, false);
     if (reason) return { allowed: false, reason };
+    if (retryUnstarted) {
+      await query(
+        `UPDATE tm_fire_admissions SET owner_token=$1,utc_day=$2,state='reserved',reserved_at=$3,
+         updated_at=$3 WHERE action_key=$4`,
+        [
+          input.ownerToken,
+          new Date(input.now).toISOString().slice(0, 10),
+          input.now,
+          input.actionKey,
+        ]
+      );
+      return { allowed: true };
+    }
     await query(
       `INSERT INTO tm_fire_admissions(action_key,journal_id,source_thread_ref,owner_token,
        cascade_id,utc_day,state,reserved_at,updated_at)
@@ -1348,7 +1368,7 @@ export async function listPendingFireActions(): Promise<TmJournalEntry[]> {
 export async function transitionPendingFireAction(
   id: string,
   expectedProposalJson: string,
-  outcome: 'pending' | 'sent' | 'expired',
+  outcome: 'pending' | 'sent' | 'expired' | 'deferred',
   proposalJson: string
 ): Promise<boolean> {
   const result = await getDatabase().query(

@@ -17,6 +17,8 @@ import type { IDatabase } from './adapters/types';
 export interface WoClaimRow {
   wo_id: string;
   project: string;
+  target_repo: string | null;
+  target_branch: string | null;
   cascade_id: string;
   holder: string;
   state: 'active' | 'released';
@@ -31,16 +33,9 @@ export interface AcquireWoClaimResult {
   claim: WoClaimRow | null;
 }
 
-function isUniqueViolation(error: unknown): boolean {
-  const code = (error as { code?: unknown }).code;
-  if (code === '23505') return true;
-  const message = (error as { message?: unknown }).message;
-  return typeof message === 'string' && /UNIQUE constraint failed/i.test(message);
-}
-
 export async function findActiveWoClaim(
   woId: string,
-  db: IDatabase = getDatabase()
+  db: Pick<IDatabase, 'query'> = getDatabase()
 ): Promise<WoClaimRow | null> {
   const result = await db.query<WoClaimRow>(
     "SELECT * FROM cascade_wo_claims WHERE wo_id = $1 AND state = 'active' LIMIT 1",
@@ -54,21 +49,34 @@ export async function findActiveWoClaim(
  * dispatch re-acquires its own claim); refused while another cascade holds it.
  */
 export async function acquireWoClaim(
-  input: { woId: string; project: string; cascadeId: string; holder: string; now: string },
-  db: IDatabase = getDatabase()
+  input: {
+    woId: string;
+    project: string;
+    cascadeId: string;
+    holder: string;
+    now: string;
+    targetRepo?: string;
+    targetBranch?: string;
+  },
+  db: Pick<IDatabase, 'query'> = getDatabase()
 ): Promise<AcquireWoClaimResult> {
-  try {
-    await db.query(
-      `INSERT INTO cascade_wo_claims (wo_id, project, cascade_id, holder, state, claimed_at)
-       VALUES ($1, $2, $3, $4, 'active', $5)`,
-      [input.woId, input.project, input.cascadeId, input.holder, input.now]
-    );
-  } catch (error) {
-    if (!isUniqueViolation(error)) throw error;
-    const existing = await findActiveWoClaim(input.woId, db);
-    return { acquired: existing?.cascade_id === input.cascadeId, claim: existing };
-  }
-  return { acquired: true, claim: await findActiveWoClaim(input.woId, db) };
+  const result = await db.query(
+    `INSERT INTO cascade_wo_claims
+       (wo_id, project, cascade_id, holder, state, claimed_at, target_repo, target_branch)
+     VALUES ($1, $2, $3, $4, 'active', $5, $6, $7)
+     ON CONFLICT (wo_id) WHERE state = 'active' DO NOTHING`,
+    [
+      input.woId,
+      input.project,
+      input.cascadeId,
+      input.holder,
+      input.now,
+      input.targetRepo ?? null,
+      input.targetBranch ?? null,
+    ]
+  );
+  const claim = await findActiveWoClaim(input.woId, db);
+  return { acquired: result.rowCount > 0 || claim?.cascade_id === input.cascadeId, claim };
 }
 
 /** CAS release by the holding cascade only. Returns whether this call released it. */

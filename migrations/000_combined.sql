@@ -924,6 +924,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
 CREATE TABLE IF NOT EXISTS cascade_wo_claims (
   wo_id TEXT NOT NULL,
   project TEXT NOT NULL,
+  target_repo TEXT,
+  target_branch TEXT,
   cascade_id TEXT NOT NULL,
   holder TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('active', 'released')),

@@ -46,6 +46,17 @@ describe('checkFireEligibility', () => {
     );
     expect(result.evidence?.expectedSpec?.specRevision).toBe(SHA);
     expect(result.evidence?.expectedSpec?.specHash).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(result.evidence?.targetBranch).toBeUndefined();
+  });
+  test('carries the declared repair branch from the pinned spec to admission', async () => {
+    const result = await checkFireEligibility(
+      TITLE,
+      deps(`${SPEC}Repair target: PR #7 (branch repair/work)\n`)
+    );
+    expect(result.evidence).toMatchObject({
+      targetRepo: 'thinmansoftware/bdc-harness',
+      targetBranch: 'repair/work',
+    });
   });
   test('falls back to the exact secondary committed path', async () => {
     const configured = deps();

@@ -172,6 +172,24 @@ test('fresh pause or epoch drift refuses permission before the effect', async ()
   expect((await tm.authorizeAutomaticFire(input, db)).allowed).toBe(false);
 });
 
+test('only a new owner of the same unstarted fire can retry a released slot', async () => {
+  const input = await request('deferred-wip');
+  expect((await tm.reserveAutomaticFire(input, db)).allowed).toBe(true);
+  expect(await tm.releaseAutomaticFire(input, db)).toBe(true);
+  expect((await tm.reserveAutomaticFire(input, other)).allowed).toBe(false);
+  const retry = { ...input, ownerToken: 'fresh-owner' };
+  expect(
+    (await tm.reserveAutomaticFire({ ...retry, cascadeId: 'different-cascade' }, other)).allowed
+  ).toBe(false);
+  expect((await tm.reserveAutomaticFire(retry, other)).allowed).toBe(true);
+  expect((await tm.authorizeAutomaticFire(input, db)).allowed).toBe(false);
+  expect(await tm.releaseAutomaticFire(input, db)).toBe(false);
+  expect((await tm.authorizeAutomaticFire(retry, other)).allowed).toBe(true);
+  expect(
+    (await tm.reserveAutomaticFire({ ...retry, ownerToken: 'another-owner' }, db)).allowed
+  ).toBe(false);
+});
+
 test('reconciliation settlement cannot refund committed permission', async () => {
   const input = await request('settlement-refund');
   await tm.reserveAutomaticFire({ ...input, limit: 1 }, db);

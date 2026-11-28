@@ -42,6 +42,7 @@ import { matchProjectCodebase } from './project-codebase-match';
 import { IN_PROCESS_API_ORIGIN } from '../routes/in-process-authority';
 import { findActiveWoClaim } from '@archon/core/db/cascade-wo-claims';
 import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
+import { FireAdmissionDeferred } from '../cascade/fire-admission';
 import {
   approvalHandOffBoundS,
   isApprovalHandOff,
@@ -162,13 +163,21 @@ export interface CauldronFireConsumerDeps {
   checkFireEligibility: (issueTitle: string) => Promise<{
     eligible: boolean;
     reason?: string;
-    evidence?: { woId: string; project: string; expectedSpec?: unknown };
+    evidence?: {
+      woId: string;
+      project: string;
+      targetRepo?: string;
+      targetBranch?: string;
+      expectedSpec?: unknown;
+    };
   }>;
   fireCascade: (input: {
     woId: string;
     project: string;
     lane?: string;
     dispatchId: string;
+    targetRepo?: string;
+    targetBranch?: string;
     /** Called once PER run the cascade discovers, on every tier (Amendment 3). */
     onRunDiscovered?: (runId: string, tier: string | null) => void;
     /** The pinned spec identity from eligibility evidence (A5.2). */
@@ -593,6 +602,8 @@ async function handleFire(
       project: cmd.project,
       lane: cmd.lane,
       dispatchId: cmd.request_id,
+      targetRepo: evidence.targetRepo,
+      targetBranch: evidence.targetBranch,
       expectedSpec: evidence.expectedSpec,
       // Amendment 3: durable custody for EVERY run, on every tier.
       onRunDiscovered: (runId, tier) => {
@@ -610,6 +621,12 @@ async function handleFire(
       },
     });
   } catch (error) {
+    if (error instanceof FireAdmissionDeferred) {
+      log.info(error.details, `cauldron_fire.${error.reason}`);
+      const code = `fire_deferred:${error.reason}`;
+      await admissions.markRefused(cmd.request_id, { status_code: 409, code, now }, deps.db);
+      return { status: 409, code };
+    }
     // The cascade invocation threw before returning a result. We cannot prove
     // whether a run was created, so releasing the WO (markRefused) risks a
     // double-fire once any created run completes. Reconcile as `unknown`: the
@@ -1788,6 +1805,8 @@ export function createRealCauldronFireConsumerDeps(
           ? {
               woId: result.evidence.woId,
               project: result.evidence.project,
+              targetRepo: result.evidence.targetRepo,
+              targetBranch: result.evidence.targetBranch,
               expectedSpec: result.evidence.expectedSpec,
             }
           : undefined,
@@ -1796,6 +1815,7 @@ export function createRealCauldronFireConsumerDeps(
     fireCascade: async (
       input
     ): Promise<{ cascadeId: string; status: string; runId: string | null }> => {
+      if (!input.targetRepo) throw new FireAdmissionDeferred('repo_wip_unavailable');
       const entryOverride =
         input.lane === 'cursor' || input.lane === 'zero' ? input.lane : undefined;
       return fireCascadeUntilRunDiscovered(
@@ -1808,7 +1828,14 @@ export function createRealCauldronFireConsumerDeps(
           // A5.2: the spec revision eligibility verified is pinned for the build.
           expectedSpec: input.expectedSpec as Parameters<typeof runCascade>[0]['expectedSpec'],
           // A5.0: the shared database WO claim (also passed by Taskmaster).
-          deps: { ...cascadeWoClaimDeps(`t3:${leaseHolder}`) },
+          deps: {
+            ...cascadeWoClaimDeps(`t3:${leaseHolder}`, undefined, {
+              fireAdmission: {
+                target: { repo: input.targetRepo, branch: input.targetBranch },
+                env,
+              },
+            }),
+          },
           // Trust boundary (WO-HARNESS-T3-COMMAND-CONSUMER-01 runbook): the T3
           // command consumer fires on behalf of an authenticated ACTOR, never the
           // operator. It must NOT carry the operator token. Pass an explicit empty
