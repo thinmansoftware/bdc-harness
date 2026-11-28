@@ -31,6 +31,7 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'escalated', 'cancelle
  * `openNodeBudgetMs` option doc below for why the fallback is this generous.
  */
 export const DEFAULT_OPEN_NODE_BUDGET_MS = 3_600_000;
+export const DEFAULT_STALL_BUDGET_MS = 1_200_000;
 
 /**
  * Thrown by pollForTerminal when a run does not reach a terminal state within
@@ -368,17 +369,13 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     //      tighter stall budget.
     const events = detail.events ?? [];
     if (stallTimeoutMs > 0 && hasRunStarted(detail.run.status, events)) {
-      const openNodes = openNodeNames(events);
+      const { openNodes, budget } = resolveStallBudget(
+        events,
+        nodeTimeoutsMs,
+        stallTimeoutMs,
+        openNodeBudgetMs
+      );
       const openNode = openNodes.length > 0;
-      // For an open node, use its own configured timeout from the workflow
-      // definition when the caller supplied one (nodeTimeoutsMs); otherwise the
-      // generous openNodeBudgetMs default. Across a concurrent DAG layer take the
-      // largest so a long healthy node is not cut short by a shorter sibling
-      // (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2).
-      const openBudget = openNode
-        ? Math.max(...openNodes.map(({ name }) => nodeTimeoutsMs[name] ?? openNodeBudgetMs))
-        : 0;
-      const budget = openNode ? Math.max(stallTimeoutMs, openBudget) : stallTimeoutMs;
       const silentFor = Date.now() - lastActivityAt;
       if (silentFor >= budget) {
         const openNodesLabel =
@@ -508,6 +505,20 @@ function openNodeNames(
     }
   }
   return [...openSince.entries()].map(([name, openSinceMs]) => ({ name, openSinceMs }));
+}
+
+export function resolveStallBudget(
+  events: Parameters<typeof openNodeNames>[0],
+  nodeTimeoutsMs: Readonly<Record<string, number>>,
+  stallTimeoutMs = DEFAULT_STALL_BUDGET_MS,
+  openNodeBudgetMs = DEFAULT_OPEN_NODE_BUDGET_MS
+): { openNodes: ReturnType<typeof openNodeNames>; budget: number } {
+  const openNodes = openNodeNames(events);
+  const budget = Math.max(
+    stallTimeoutMs,
+    ...openNodes.map(({ name }) => nodeTimeoutsMs[name] ?? openNodeBudgetMs)
+  );
+  return { openNodes, budget };
 }
 
 async function fetchRunDetail(

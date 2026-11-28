@@ -7,6 +7,9 @@
   "exports": {
     ".": "./src/cascade.ts",
     "./cascade": "./src/cascade.ts",
+    "./poll": "./src/poll.ts",
+    "./node-timeouts": "./src/node-timeouts.ts",
+    "./fire": "./src/fire.ts",
     "./conductor": "./src/conductor.ts",
     "./headroom": "./src/headroom.ts",
     "./ladder": "./src/ladder.ts",

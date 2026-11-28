@@ -1385,7 +1385,10 @@ export async function acquireRecoveryExecutionClaim(
       }
 
       if (existing.status === 'active') {
-        if (existing.reconciliation_status === 'required') {
+        if (
+          existing.reconciliation_status === 'required' ||
+          existing.effect_attempt_state === 'armed'
+        ) {
           return {
             ok: false,
             code: 'reconciliation_required',
@@ -1413,7 +1416,8 @@ export async function acquireRecoveryExecutionClaim(
                  released_at = NULL, completed_at = NULL, external_effect_reference = NULL,
                  completion_evidence_json = NULL, reconciliation_evidence_json = NULL
            WHERE action_key = $8 AND status = 'active'
-             AND expires_at <= $6 AND reconciliation_status <> 'required'`,
+             AND expires_at <= $6 AND reconciliation_status <> 'required'
+              AND effect_attempt_state = 'none'`,
           [input.actor_principal, 'recovery', 'recovery', 1, nextToken, now, expiresAt, actionKey]
         );
         const row = await selectClaimByActionKey(query, actionKey);
@@ -1453,7 +1457,8 @@ export async function acquireRecoveryExecutionClaim(
                acquired_at = $6, renewed_at = NULL, expires_at = $7,
                released_at = NULL, completed_at = NULL, external_effect_reference = NULL,
                completion_evidence_json = NULL, reconciliation_evidence_json = NULL
-         WHERE action_key = $8 AND status = 'released'`,
+         WHERE action_key = $8 AND status = 'released'
+            AND reconciliation_status <> 'required' AND effect_attempt_state = 'none'`,
         [input.actor_principal, 'recovery', 'recovery', 1, nextToken, now, expiresAt, actionKey]
       );
       const row = await selectClaimByActionKey(query, actionKey);
@@ -1618,14 +1623,21 @@ export async function releaseRecoveryExecutionClaim(
     if (toNumber(claim.execution_fencing_token) !== input.execution_fencing_token) {
       return { ok: false, code: 'stale_fence', message: 'stale_execution_fence' };
     }
-    await query(
+    if (claim.reconciliation_status === 'required' || claim.effect_attempt_state !== 'none') {
+      return { ok: false, code: 'reconciliation_required', message: 'reconciliation_required' };
+    }
+    const updated = await query(
       `UPDATE board_execution_claims
          SET status = 'released', reconciliation_status = 'clear',
              effect_attempt_state = 'none', effect_attempt_id = NULL, effect_armed_at = NULL,
              released_at = $1
-       WHERE claim_id = $2 AND status = 'active' AND execution_fencing_token = $3`,
+       WHERE claim_id = $2 AND status = 'active' AND execution_fencing_token = $3
+         AND reconciliation_status <> 'required' AND effect_attempt_state = 'none'`,
       [now, input.claim_id, input.execution_fencing_token]
     );
+    if (updated.rowCount !== 1) {
+      return { ok: false, code: 'stale_fence', message: 'claim_release_conflict' };
+    }
     const row = await selectClaimById(query, input.claim_id);
     if (!row) return { ok: false, code: 'not_found', message: 'claim_not_found' };
     await appendClaimEventWithQuery(
@@ -1674,7 +1686,7 @@ export async function completeRecoveryExecutionClaim(
         message: 'external_effect_reference_required',
       };
     }
-    await query(
+    const updated = await query(
       `UPDATE board_execution_claims
          SET status = 'completed', reconciliation_status = 'clear',
              effect_attempt_state = 'completed', completed_at = $1,
@@ -1691,7 +1703,7 @@ export async function completeRecoveryExecutionClaim(
       ]
     );
     const row = await selectClaimById(query, input.claim_id);
-    if (row?.status !== 'completed') {
+    if (updated.rowCount !== 1 || row?.status !== 'completed') {
       return { ok: false, code: 'effect_attempt_mismatch', message: 'complete_conflict' };
     }
     await appendClaimEventWithQuery(
@@ -1717,6 +1729,12 @@ export async function completeRecoveryExecutionClaim(
 // ---------------------------------------------------------------------------
 // Read
 // ---------------------------------------------------------------------------
+
+export async function getRecoveryExecutionClaim(
+  identity: RecoveryClaimIdentity
+): Promise<ExecutionClaimResponse | null> {
+  return getExecutionClaim(recoveryActionIdentity(identity));
+}
 
 export async function getExecutionClaim(
   identity: ActionIdentity

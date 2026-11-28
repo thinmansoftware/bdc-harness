@@ -2,7 +2,12 @@
  * Database operations for workflow runs
  */
 import { pool, getDatabase, getDialect, getDatabaseType } from './connection';
-import type { IDatabase } from './adapters/types';
+import {
+  consumeWoRunAdmission,
+  currentWoRunAdmission,
+  persistWoRunAdmission,
+} from './wo-run-admissions';
+import type { IDatabase, QueryResult } from './adapters/types';
 import type {
   WorkflowRun,
   WorkflowRunStatus,
@@ -371,10 +376,13 @@ export async function createWorkflowRun(data: {
   working_path?: string;
   parent_conversation_id?: string;
 }): Promise<WorkflowRun> {
+  const admission = currentWoRunAdmission();
   // Serialize metadata with validation to catch circular references early
   let metadataJson: string;
   try {
-    metadataJson = JSON.stringify(data.metadata ?? {});
+    metadataJson = JSON.stringify(
+      admission ? { ...data.metadata, admitted_wo_id: admission.woId } : (data.metadata ?? {})
+    );
   } catch (serializeError) {
     const err = serializeError as Error;
 
@@ -398,25 +406,29 @@ export async function createWorkflowRun(data: {
       { err, metadataKeys: data.metadata ? Object.keys(data.metadata) : [] },
       'db.workflow_run_metadata_serialize_fallback'
     );
-    metadataJson = '{}';
+    metadataJson = JSON.stringify(admission ? { admitted_wo_id: admission.woId } : {});
   }
 
   try {
-    const result = await pool.query<WorkflowRun>(
-      `INSERT INTO remote_agent_workflow_runs
+    const insert = (query: typeof pool.query): Promise<QueryResult<WorkflowRun>> =>
+      query<WorkflowRun>(
+        `INSERT INTO remote_agent_workflow_runs
        (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
-      [
-        data.workflow_name,
-        data.conversation_id,
-        data.codebase_id ?? null,
-        data.user_message,
-        metadataJson,
-        data.working_path ?? null,
-        data.parent_conversation_id ?? null,
-      ]
-    );
+        [
+          data.workflow_name,
+          data.conversation_id,
+          data.codebase_id ?? null,
+          data.user_message,
+          metadataJson,
+          data.working_path ?? null,
+          data.parent_conversation_id ?? null,
+        ]
+      );
+    const result = admission
+      ? await persistWoRunAdmission(admission, insert)
+      : await insert(pool.query);
     const row = result.rows[0];
     if (!row) {
       throw new Error(
@@ -1808,8 +1820,114 @@ export async function findResumableRunByParentConversation(
   }
 }
 
+export interface OverseerResumeBinding {
+  run: WorkflowRun;
+  eventId: string;
+  eventTipId: string;
+  claimId: string;
+  effectAttemptId: string;
+  fence: number;
+  executionId: string;
+}
+
+/** Exact-run activation for recovery. An active but explicitly released stall is resumable. */
+export async function resumeOverseerWorkflowRun(
+  binding: OverseerResumeBinding
+): Promise<WorkflowRun> {
+  const db = getDatabase();
+  const { run } = binding;
+  const admission = currentWoRunAdmission();
+  const now = db.dialect === 'postgres' ? db.sql.now() : "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
+  return db.withTransaction(async query => {
+    if (admission) await consumeWoRunAdmission(db, query, admission);
+    const lock = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
+    const current = (
+      await query<WorkflowRun>(`SELECT * FROM remote_agent_workflow_runs WHERE id = $1${lock}`, [
+        run.id,
+      ])
+    ).rows[0];
+    if (!current) throw new Error('recovery_run_missing');
+    const row = normalizeWorkflowRun(current);
+    if (
+      row.status !== run.status ||
+      row.workflow_name !== run.workflow_name ||
+      row.working_path !== run.working_path ||
+      row.codebase_id !== run.codebase_id ||
+      normalizeNullableTimestamp(row.last_activity_at) !==
+        normalizeNullableTimestamp(run.last_activity_at) ||
+      !['failed', 'interrupted', 'running'].includes(row.status)
+    ) {
+      throw new Error('recovery_resume_target_changed');
+    }
+    const result = await query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'running', completed_at = NULL, started_at = ${db.sql.now()},
+           last_activity_at = ${db.sql.now()}
+       WHERE id = $1 AND status = $2
+         AND EXISTS (
+           SELECT 1 FROM board_execution_claims
+           WHERE claim_id = $3 AND execution_fencing_token = $4
+             AND effect_attempt_id = $5 AND environment = 'recovery'
+             AND action_kind = 'overseer_repair_refire'
+             AND status = 'active' AND effect_attempt_state = 'armed'
+             AND expires_at > ${now}
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM remote_agent_run_leases WHERE run_id = $1 AND released_at IS NULL
+         )
+         AND ($2 NOT IN ('running', 'interrupted') OR EXISTS (
+           SELECT 1 FROM remote_agent_run_leases WHERE run_id = $1 AND released_at IS NOT NULL
+         ))
+         AND NOT EXISTS (
+           SELECT 1 FROM remote_agent_workflow_runs WHERE id <> $1 AND working_path = $6
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM remote_agent_supervisor_incidents i
+           JOIN remote_agent_supervisor_repair_leases l ON l.incident_id = i.incident_id
+           WHERE i.run_id = $1 AND l.released_at IS NULL
+         )
+         AND $7 = (SELECT id FROM remote_agent_workflow_events
+                    WHERE workflow_run_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1)
+         AND NOT EXISTS (
+           SELECT 1 FROM remote_agent_workflow_events WHERE workflow_run_id = $1
+             AND event_type = 'run_outcome'
+         )`,
+      [
+        run.id,
+        run.status,
+        binding.claimId,
+        binding.fence,
+        binding.effectAttemptId,
+        run.working_path,
+        binding.eventTipId,
+      ]
+    );
+    if (result.rowCount !== 1) throw new Error('recovery_resume_custody_or_fence_changed');
+    await query(
+      `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_name, data)
+       VALUES ($1, $2, 'overseer_recovery_resumed', NULL, $3)`,
+      [
+        binding.executionId.replace(/^m31v2-execution-/, ''),
+        run.id,
+        JSON.stringify({
+          event_id: binding.eventId,
+          claim_id: binding.claimId,
+          execution_id: binding.executionId,
+        }),
+      ]
+    );
+    const activated = (
+      await query<WorkflowRun>('SELECT * FROM remote_agent_workflow_runs WHERE id = $1', [run.id])
+    ).rows[0];
+    if (!activated) throw new Error('recovery_resume_readback_missing');
+    return normalizeWorkflowRun(activated);
+  });
+}
+
 export async function resumeWorkflowRun(id: string): Promise<WorkflowRun> {
   const dialect = getDatabase().sql;
+  const admission = currentWoRunAdmission();
 
   // Split into UPDATE + SELECT to support both PostgreSQL and SQLite
   // (SQLite does not support RETURNING on UPDATE statements)
@@ -1827,16 +1945,21 @@ export async function resumeWorkflowRun(id: string): Promise<WorkflowRun> {
     // an active row semantically means "when did this active phase start."
     // The original creation time can be recovered from workflow_events
     // history if needed for analytics.
-    updateResult = await pool.query(
-      `UPDATE remote_agent_workflow_runs
-       SET status = 'running',
-           completed_at = NULL,
-           started_at = ${dialect.now()},
-           last_activity_at = ${dialect.now()}
-       WHERE id = $1
-         AND status IN ('failed', 'paused', 'waiting_provider', 'interrupted')`,
-      [id]
-    );
+    const activate = (query: typeof pool.query): Promise<QueryResult<unknown>> =>
+      query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'running',
+             completed_at = NULL,
+             started_at = ${dialect.now()},
+             last_activity_at = ${dialect.now()}
+             ${admission ? `, metadata = ${dialect.jsonMerge("COALESCE(metadata, '{}')", 2)}` : ''}
+         WHERE id = $1
+           AND status IN ('failed', 'paused', 'waiting_provider', 'interrupted')`,
+        admission ? [id, JSON.stringify({ admitted_wo_id: admission.woId })] : [id]
+      );
+    updateResult = admission
+      ? await persistWoRunAdmission(admission, activate)
+      : await activate(pool.query);
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, workflowRunId: id }, 'db.workflow_run_resume_failed');

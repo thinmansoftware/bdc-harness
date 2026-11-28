@@ -585,7 +585,8 @@ export async function handleRecordJudgeFirst(
     'overseer.judge_first.verdict_completed'
   );
 
-  // Tier >= 1 proposals are refused with a recorded refusal (v1 = Tier 0 only).
+  // Recovery decisions run upstream under M-31 v2. The judge's own
+  // execution path still records the existing Tier 1 refusal.
   if (
     !ruling.executableInV1 &&
     outcome.proposedAction !== 'none' &&

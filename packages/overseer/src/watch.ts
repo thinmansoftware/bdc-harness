@@ -147,14 +147,47 @@ export function recoverHeadBranchFromEvents(events: OverseerWorkflowEvent[]): st
 
 async function assessRun(
   run: OverseerRunRecord,
-  deps: OverseerRunStoreDeps & GitHubClientDeps
+  deps: OverseerRunStoreDeps & GitHubClientDeps,
+  recovery?: WatchRecovery
 ): Promise<WatchedRunRecord> {
   // A non-empty unique_branch= from the run's own events is the branch that
   // was actually pushed. It wins even when metadata already has head_branch.
   // When no event reports a branch, keep the metadata-derived head.
-  const recovered = recoverHeadBranchFromEvents(await deps.listRunEvents(run.id));
+  const events = await deps.listRunEvents(run.id);
+  const recovered = recoverHeadBranchFromEvents(events);
   if (recovered) run = { ...run, headBranch: recovered };
-  const prEvidence = await judgePullRequest(run, deps);
+  const isActive = run.status === 'running' || run.status === 'interrupted';
+  const recoveryEvent = recovery ? await recovery.selectEvent(run, events) : undefined;
+  const prEvidence =
+    isActive && !recoveryEvent
+      ? {
+          exists: false,
+          state: 'missing' as const,
+          mergeable: null,
+          checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+        }
+      : await judgePullRequest(run, deps);
+  const base = {
+    runId: run.id,
+    woId: run.woId,
+    repo: run.repo,
+    owner: run.owner,
+    status: run.status,
+    headBranch: run.headBranch,
+    workingPath: run.workingPath,
+    metadata: run.metadata,
+    prEvidence,
+  };
+  if (isActive || (recoveryEvent && prEvidence.state !== 'merged' && !isPrMergeReady(prEvidence))) {
+    return {
+      ...base,
+      action: recoveryEvent ? 'escalate' : 'ignore',
+      reason: recoveryEvent
+        ? 'persisted recovery evidence'
+        : 'active run without recovery evidence',
+      recoveryEvent,
+    };
+  }
 
   if (prEvidence.state === 'merged') {
     return {
@@ -244,7 +277,6 @@ async function assessRun(
   // with green PRs -- the original tail-node false-fail case -- and still tags them
   // errorClass: 'tail_node_false_fail'.)
 
-  const events = await deps.listRunEvents(run.id);
   const lastEvent = selectFailureEvent(events);
   const errorClass = classifyError({
     message: eventMessage(lastEvent),
@@ -288,7 +320,16 @@ export interface WatchHeartbeatLogger {
   warn?(obj: Record<string, unknown>, msg: string): void;
 }
 
+export interface WatchRecovery {
+  selectEvent(
+    run: OverseerRunRecord,
+    events: OverseerWorkflowEvent[]
+  ): Promise<OverseerWorkflowEvent | undefined>;
+  handle(record: WatchedRunRecord): Promise<boolean>;
+}
+
 export interface WatchOnceOptions {
+  recovery?: WatchRecovery;
   /** Injected logger for the heartbeat line; defaults to the module logger. */
   logger?: WatchHeartbeatLogger;
   /** Oldest-first per-tick cap; defaults to OVERSEER_WATCH_MAX_RUNS_PER_TICK (25). */
@@ -327,7 +368,11 @@ export async function watchOnce(
   // listRunsForWatch is oldest-first. Filter non-terminal rows, then continue the
   // current fair pass so permanently unmerged old rows cannot hide later work.
   const maxRunsPerTick = options.maxRunsPerTick ?? resolveWatchMaxRunsPerTick();
-  const allTerminalRuns = runs.filter(run => isTerminalStatus(run.status));
+  const allTerminalRuns = runs.filter(
+    run =>
+      isTerminalStatus(run.status) ||
+      (options.recovery && ['running', 'interrupted'].includes(run.status))
+  );
   let unevaluatedRuns = allTerminalRuns.filter(run => !evaluatedRunIdsThisPass.has(run.id));
   if (unevaluatedRuns.length === 0 && allTerminalRuns.length > 0) {
     evaluatedRunIdsThisPass.clear();
@@ -344,7 +389,7 @@ export async function watchOnce(
     // every future tick -- exactly the failure class #1348 already fixed one level
     // downstream in handleRecord. One bad run's lookup must never take down the watcher.
     try {
-      outcomes.push(await assessRun(run, deps));
+      outcomes.push(await assessRun(run, deps, options.recovery));
     } catch (error) {
       log.error(
         { err: error as Error, runId: run.id, woId: run.woId },
@@ -482,10 +527,12 @@ export async function watchLoop(
      */
     discovery?: WatchOnceOptions['discovery'];
     discoveryEnabled?: boolean;
+    recovery?: WatchRecovery;
   } = {}
 ): Promise<void> {
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
   const watchOptions: WatchOnceOptions = {
+    recovery: options.recovery,
     ...(options.discovery === undefined ? {} : { discovery: options.discovery }),
     ...(options.discoveryEnabled === undefined
       ? {}

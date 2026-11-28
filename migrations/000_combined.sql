@@ -203,6 +203,12 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
   archive_reason TEXT
 );
 
+CREATE TABLE IF NOT EXISTS wo_run_admissions (
+  wo_id TEXT PRIMARY KEY,
+  reservation_id TEXT NOT NULL,
+  expires_at_epoch BIGINT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
   ON remote_agent_workflow_runs(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_status

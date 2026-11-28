@@ -188,6 +188,7 @@ export interface WatchedRunRecord {
   prEvidence: PullRequestEvidence;
   decision?: DecisionResult;
   lastEvent?: OverseerWorkflowEvent;
+  recoveryEvent?: OverseerWorkflowEvent;
 }
 
 /**
