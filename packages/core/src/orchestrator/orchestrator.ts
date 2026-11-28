@@ -1,3 +1,4 @@
+import type { ValidatedWorkflowHandle } from '@archon/workflows/reliability/codex-only-binding';
 /**
  * Orchestrator - Main conversation handler
  * Routes slash commands and AI messages appropriately
@@ -237,6 +238,7 @@ export async function validateAndResolveIsolation(
  * Context for workflow routing - avoids passing many parameters
  */
 export interface WorkflowRoutingContext {
+  readonly validatedWorkflow?: ValidatedWorkflowHandle;
   readonly platform: IPlatformAdapter;
   readonly conversationId: string;
   readonly cwd: string;
@@ -557,7 +559,9 @@ export async function dispatchBackgroundWorkflow(
           ctx.conversationDbId,
           preCreatedRun,
           authoritySource,
-          ctx.modelOverride
+          ctx.modelOverride,
+          undefined,
+          ctx.validatedWorkflow
         );
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {

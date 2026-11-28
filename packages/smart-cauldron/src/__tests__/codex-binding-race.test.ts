@@ -82,3 +82,112 @@ describe('loaded dispatch definition binding', () => {
       })
     ).toBe(false));
 });
+test('uses one injected transport for preflight, revalidation, POST and discovery', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error('global transport forbidden');
+  }) as typeof fetch;
+  const calls: string[] = [];
+  const transport = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    calls.push(`${init?.method ?? 'GET'} ${url}`);
+    if (url.endsWith('/api/codebases'))
+      return Response.json([{ id: 'target', name: 'harness', default_cwd: '/work/harness' }]);
+    if (url.includes('/api/workflows/runs?'))
+      return Response.json({
+        runs: [
+          {
+            id: 'run',
+            workflow_name: 'bdc-feature-development-codex-only',
+            parent_conversation_id: 'parent',
+            codebase_id: 'target',
+          },
+        ],
+      });
+    if (init?.method === 'POST')
+      return Response.json({ dispatched: true, conversationId: 'conversation', id: 'parent' });
+    return Response.json({
+      filename: 'bdc-feature-development-codex-only.yaml',
+      source: 'bundled',
+      workflow: {
+        name: 'bdc-feature-development-codex-only',
+        description: 'test',
+        provider: 'codex',
+        nodes: [{ id: 'work', prompt: 'test' }],
+      },
+    });
+  }) as typeof fetch;
+  try {
+    const binding = await preflightCodexOnly('harness', 'http://test', 'token', transport);
+    const result = await fireTier({
+      project: 'harness',
+      woId: 'WO-TEST',
+      workflowName: 'bdc-feature-development-codex-only',
+      message: 'WO_ID=WO-TEST --project harness',
+      apiBaseUrl: 'http://test',
+      token: 'token',
+      validatedBinding: binding,
+      fetchImpl: transport,
+    });
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual([
+      'GET http://test/api/codebases',
+      'GET http://test/api/workflows/bdc-feature-development-codex-only?cwd=%2Fwork%2Fharness',
+      'GET http://test/api/codebases',
+      'GET http://test/api/workflows/bdc-feature-development-codex-only?cwd=%2Fwork%2Fharness',
+      'POST http://test/api/conversations',
+      'GET http://test/api/workflows/runs?codebaseId=target&limit=50',
+    ]);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+import * as v1 from '../../../workflows/src/reliability/codex-only-binding.js';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+for (const mutation of ['none', 'definition', 'registry'] as const) {
+  test(`v1 validated workflow handoff refuses changed identity: ${mutation}`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'codex-v1-handoff-'));
+    await mkdir(join(cwd, '.archon', 'agents'), { recursive: true });
+    const workflow = {
+      name: 'bdc-feature-development-codex-only',
+      description: 'test',
+      provider: 'codex',
+      nodes: [{ id: 'work', prompt: 'Original.' }],
+    };
+    const binding = {
+      project: 'harness',
+      codebaseId: 'target',
+      cwd,
+      workflowDigest: workflowDigest(workflow),
+    };
+    try {
+      const handle = await v1.captureValidatedWorkflow(
+        binding,
+        workflow,
+        '/workflow run bdc-feature-development-codex-only WO-TEST'
+      );
+      if (mutation === 'definition') workflow.nodes[0].prompt = 'Changed.';
+      if (mutation === 'registry')
+        await writeFile(
+          join(cwd, '.archon', 'agents', 'new-agent.md'),
+          '---\nname: new-agent\ntools: [Read]\n---\nChanged role.\n'
+        );
+      if (mutation === 'none') {
+        const captured = await v1.readValidatedWorkflow(handle, { codebaseId: 'target', cwd });
+        expect(captured.workflow.nodes[0].prompt).toBe('Original.');
+        expect(captured.binding).toEqual(binding);
+      } else
+        await expect(
+          v1.readValidatedWorkflow(handle, { codebaseId: 'target', cwd })
+        ).rejects.toThrow('codex_only_binding_changed');
+      await expect(
+        v1.readValidatedWorkflow(handle, { codebaseId: 'changed', cwd })
+      ).rejects.toThrow('codex_only_binding_changed');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}

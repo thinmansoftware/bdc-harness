@@ -1148,7 +1148,9 @@ describe('orchestrator-agent handleMessage', () => {
         expect.anything(), // parentConversationId -- web approval auto-resume
         undefined, // preCreatedRun
         undefined, // authoritySource
-        undefined // modelOverride
+        undefined, // modelOverride
+        undefined, // preparedBindings -- ordinary dispatch remains unprepared
+        undefined // validatedWorkflow -- ordinary dispatch has no restricted capsule
       );
     });
 
@@ -1179,7 +1181,9 @@ describe('orchestrator-agent handleMessage', () => {
         expect.anything(), // parentConversationId -- web approval auto-resume
         undefined, // preCreatedRun
         undefined, // authoritySource
-        undefined // modelOverride
+        undefined, // modelOverride
+        undefined, // preparedBindings -- ordinary dispatch remains unprepared
+        undefined // validatedWorkflow -- ordinary dispatch has no restricted capsule
       );
     });
 

@@ -89,6 +89,8 @@ export const CODEX_ONLY_DISPATCH_CAPABILITY = 'codex-only-v1';
 // ---------------------------------------------------------------------------
 
 export interface CascadeDeps {
+  /** One invocation transport for Codex-only preflight and dispatch. */
+  dispatchFetch?: typeof fetch;
   /** Verify that the selected workflow lane is available before any provider fire. */
   preflight?: (tier: LadderTier) => Promise<void>;
   fire?: typeof fireTier;
@@ -580,16 +582,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     throw new Error('codex_only_invalid_options');
   }
   const codexOnly = opts.codexOnly === true;
-  let dispatchBinding: CodexOnlyDispatchBinding | undefined;
   if (opts.dispatchBinding !== undefined) {
     const parsed = dispatchBindingSchema.safeParse(opts.dispatchBinding);
     if (!codexOnly || !parsed.success || parsed.data.project !== opts.project) {
       throw new Error('codex_only_invalid_options');
     }
-    // Snapshot before any await; normalize key order without changing comparison values.
-    dispatchBinding = parsed.data;
-    // Never admit a bound live request while downstream execution could drop its restriction.
-    if (opts.dryRun !== true) throw new Error('codex_only_binding_not_supported');
+    // Retired comparison form: never admit it, including dry-run dispatch.
+    // v1 is the only dispatch identity; retain classification of legacy inputs.
+    throw new Error('codex_only_binding_not_supported');
   }
   const {
     woId,
@@ -683,7 +683,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       validatedBinding = await preflightCodexOnly(
         project ?? '',
         apiBaseUrl,
-        token ?? process.env.ARCHON_OPERATOR_TOKEN ?? ''
+        token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
+        opts.deps?.dispatchFetch ?? fetch
       );
   }
   const ruleset = opts.deps?.ruleset ?? loadRuleset();
@@ -940,7 +941,6 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         tags: [...(tags ?? [])].sort(),
         entryOverride: entryOverride ?? null,
         ...(codexOnly ? { codexOnly: true as const } : {}),
-        ...(dispatchBinding ? { dispatchBinding } : {}),
         dryRun: true,
       },
       createdAt,
@@ -984,7 +984,6 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         tags: [...(tags ?? [])].sort(),
         entryOverride: entryOverride ?? null,
         ...(codexOnly ? { codexOnly: true as const } : {}),
-        ...(dispatchBinding ? { dispatchBinding } : {}),
         dryRun: false,
       },
       createdAt,
@@ -1120,7 +1119,6 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           tags: [...(tags ?? [])].sort(),
           entryOverride: entryOverride ?? null,
           ...(codexOnly ? { codexOnly: true as const } : {}),
-          ...(dispatchBinding ? { dispatchBinding } : {}),
           dryRun: false,
         },
         createdAt,
@@ -1598,7 +1596,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         if (decision.declaration) message = `${message}\n${decision.declaration}`;
       }
       const fireResult: FireResult = await fireImpl({
-        ...(validatedBinding ? { validatedBinding } : {}),
+        ...(validatedBinding
+          ? { validatedBinding, fetchImpl: opts.deps?.dispatchFetch ?? fetch }
+          : {}),
         workflowName: tier.workflowName,
         woId,
         project,

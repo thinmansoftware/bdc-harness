@@ -1,5 +1,7 @@
 import {
   matchesCodexOnlyBinding,
+  captureValidatedWorkflow,
+  type ValidatedWorkflowContext,
   type CodexOnlyBinding,
 } from '../../../workflows/src/reliability/codex-only-binding.js';
 /**
@@ -4091,6 +4093,7 @@ export function registerApiRoutes(
         valid: true;
         isolationHints?: HandleMessageContext['isolationHints'];
         workflow?: WorkflowDefinition;
+        validatedWorkflow?: ValidatedWorkflowContext['validatedWorkflow'];
       }
     | { valid: false; error: string; httpStatus?: number }
   > {
@@ -4185,6 +4188,9 @@ export function registerApiRoutes(
     if (workflow.name === 'bdc-feature-development-codex-only') {
       return { valid: false, error: 'Codex-only dispatch is not available yet.' };
     }
+    const validatedWorkflow = codexOnlyBinding
+      ? await captureValidatedWorkflow(codexOnlyBinding, workflow, message)
+      : undefined;
     const xaiRefusal = openRouterXaiRefusalForRun(workflow, modelOverride);
     if (xaiRefusal) {
       return { valid: false, error: xaiRefusal };
@@ -4206,20 +4212,20 @@ export function registerApiRoutes(
       getLog().info({ workflowName }, 'codex_dispatch_gate_consult');
       try {
         const gate = await checkCodexDispatchGate();
-        if (gate.fresh) return { valid: true, isolationHints, workflow };
+        if (gate.fresh) return { valid: true, isolationHints, workflow, validatedWorkflow };
         getLog().warn({ workflowName, reason: gate.reason }, 'codex_dispatch_gate_refused');
       } catch (error) {
         getLog().warn({ err: error, workflowName }, 'codex_dispatch_gate_failed');
       }
       return { valid: false, error: 'codex_auth_stale', httpStatus: 503 };
     }
-    return { valid: true, isolationHints, workflow };
+    return { valid: true, isolationHints, workflow, validatedWorkflow };
   }
 
   async function dispatchToOrchestrator(
     conversationId: string,
     message: string,
-    extraContext?: Omit<HandleMessageContext, 'isolationHints'>,
+    extraContext?: Omit<HandleMessageContext, 'isolationHints'> & ValidatedWorkflowContext,
     filesToCleanup?: { files: AttachedFile[]; uploadDir: string },
     isolationHintsOverride?: HandleMessageContext['isolationHints']
   ): Promise<{ accepted: boolean; status: string }> {
@@ -4786,6 +4792,7 @@ export function registerApiRoutes(
       // validateWorkflowRunTarget. The single validated isolation-hints object is
       // captured here and threaded into dispatch (never re-parsed).
       let dispatchIsolationHints: HandleMessageContext['isolationHints'];
+      let dispatchValidatedWorkflow: ValidatedWorkflowContext['validatedWorkflow'];
       if (message) {
         const check = await validateWorkflowRunTarget(
           message,
@@ -4797,6 +4804,7 @@ export function registerApiRoutes(
           return c.json({ accepted: false, dispatched: false, error: check.error }, 400);
         }
         dispatchIsolationHints = check.isolationHints;
+        dispatchValidatedWorkflow = check.validatedWorkflow;
       }
 
       const conversationId = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -4835,7 +4843,7 @@ export function registerApiRoutes(
         const result = await dispatchToOrchestrator(
           conversation.platform_conversation_id,
           message,
-          undefined,
+          dispatchValidatedWorkflow ? { validatedWorkflow: dispatchValidatedWorkflow } : undefined,
           undefined,
           dispatchIsolationHints
         );

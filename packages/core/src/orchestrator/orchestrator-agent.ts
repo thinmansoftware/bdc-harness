@@ -1,3 +1,9 @@
+import {
+  readValidatedWorkflow,
+  validatedWorkflowIdentity,
+  type ValidatedWorkflowContext,
+  type ValidatedWorkflowHandle,
+} from '@archon/workflows/reliability/codex-only-binding';
 /**
  * Orchestrator Agent - Main entry point for AI-powered message routing
  *
@@ -250,7 +256,8 @@ async function dispatchOrchestratorWorkflow(
   userMessage: string,
   isolationHints?: HandleMessageContext['isolationHints'],
   modelOverride?: ModelOverride,
-  announceStart = false
+  announceStart = false,
+  validatedWorkflow?: ValidatedWorkflowHandle
 ): Promise<void> {
   if (workflow.name === 'bdc-feature-development-codex-only') {
     await platform.sendMessage(
@@ -416,7 +423,9 @@ async function dispatchOrchestratorWorkflow(
         conversation.id, // parentConversationId -- enables approve/reject auto-resume
         undefined,
         undefined,
-        modelOverride
+        modelOverride,
+        undefined,
+        validatedWorkflow
       );
     } else {
       await dispatchBackgroundWorkflow(
@@ -428,6 +437,7 @@ async function dispatchOrchestratorWorkflow(
           conversationDbId: conversation.id,
           codebaseId: codebase.id,
           availableWorkflows: [workflow],
+          validatedWorkflow,
           isolationHints,
           modelOverride,
         },
@@ -449,7 +459,9 @@ async function dispatchOrchestratorWorkflow(
       conversation.id, // parentConversationId -- enables approve/reject auto-resume
       undefined,
       undefined,
-      modelOverride
+      modelOverride,
+      undefined,
+      validatedWorkflow
     );
   }
 }
@@ -659,7 +671,7 @@ export async function handleMessage(
   platform: IPlatformAdapter,
   conversationId: string,
   message: string,
-  context?: HandleMessageContext
+  context?: HandleMessageContext & ValidatedWorkflowContext
 ): Promise<void> {
   const {
     issueContext,
@@ -686,6 +698,32 @@ export async function handleMessage(
       conversationId
     );
 
+    if (context?.validatedWorkflow) {
+      const identity = validatedWorkflowIdentity(context.validatedWorkflow);
+      const registered = await codebaseDb.getCodebase(identity.codebaseId);
+      if (conversation.codebase_id !== registered?.id)
+        throw new Error('codex_only_binding_changed');
+      const validated = await readValidatedWorkflow(context.validatedWorkflow, {
+        codebaseId: registered.id,
+        cwd: registered.default_cwd,
+      });
+      if (validated.message !== message) throw new Error('codex_only_binding_changed');
+      const args = /^\/workflow\s+run\s+\S+\s*(.*)$/s.exec(message.trim())?.[1];
+      if (args === undefined) throw new Error('codex_only_binding_changed');
+      await dispatchOrchestratorWorkflow(
+        platform,
+        conversationId,
+        conversation,
+        registered,
+        validated.workflow,
+        args,
+        isolationHints,
+        modelOverride,
+        true,
+        context.validatedWorkflow
+      );
+      return;
+    }
     // Check paused continuation before any title-provider or approval effects.
     // Conversation creation and thread inheritance have already happened above.
     let pausedRun: Awaited<ReturnType<typeof workflowDb.getPausedWorkflowRun>> = null;

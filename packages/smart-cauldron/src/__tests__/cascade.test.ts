@@ -179,28 +179,35 @@ describe('binding-v2 durable replay foundation', () => {
     return join(opts.outDir!, `dispatch-${digest}`, 'cascade-record.json');
   }
 
-  test('persists the complete comparison snapshot before admission callback', async () => {
+  test('retired v2 cannot enter even dry-run dispatch', async () => {
+    let admitted = 0;
     const opts = options();
-    const admissions: boolean[] = [];
-    opts.onAdmission = (record, created) => {
-      expect(record.request.dispatchBinding).toEqual(binding());
-      admissions.push(created);
+    opts.onAdmission = () => {
+      admitted++;
     };
-    const record = await runCascade(opts);
-    expect(record.status).toBe('planned');
-    expect(record.request).toEqual({
-      woClass: 'CODE',
-      tags: ['mechanical'],
-      entryOverride: 'codex',
-      codexOnly: true,
-      dispatchBinding: binding(),
-      dryRun: true,
-    });
-    expect(JSON.parse(await readFile(recordPath(opts), 'utf8'))).toEqual(record);
-    expect(admissions).toEqual([true]);
+    await expect(runCascade(opts)).rejects.toThrow('codex_only_binding_not_supported');
+    expect(admitted).toBe(0);
   });
 
-  test('reordered identical binding replays without overwrite or successor', async () => {
+  async function seedHistoricalV2(opts: RunCascadeOptions): Promise<CascadeRunRecord> {
+    const record = await runCascade({ ...opts, dispatchBinding: undefined });
+    record.request.dispatchBinding = binding();
+    await writeFile(recordPath(opts), JSON.stringify(record, null, 2) + '\n');
+    return record;
+  }
+
+  test('retired comparison form refuses before record creation or admission callback', async () => {
+    const opts = options();
+    const admissions: boolean[] = [];
+    opts.onAdmission = (_record, created) => {
+      admissions.push(created);
+    };
+    await expect(runCascade(opts)).rejects.toThrow('codex_only_binding_not_supported');
+    await expect(readFile(recordPath(opts), 'utf8')).rejects.toThrow();
+    expect(admissions).toEqual([]);
+  });
+
+  test('reordered retired binding refuses without overwrite or successor', async () => {
     const opts = options();
     const admissions: boolean[] = [];
     let fires = 0;
@@ -209,26 +216,26 @@ describe('binding-v2 durable replay foundation', () => {
       fires++;
       return makeFireOk('must-not-fire');
     };
-    const first = await runCascade(opts);
+    const first = await seedHistoricalV2(opts);
     const bytes = await readFile(recordPath(opts), 'utf8');
     const reordered = Object.fromEntries(
       Object.entries(binding()).reverse()
     ) as CodexOnlyDispatchBinding;
-    const replay = await runCascade({ ...opts, dispatchBinding: reordered });
-    expect(replay).toEqual(first);
+    await expect(runCascade({ ...opts, dispatchBinding: reordered })).rejects.toThrow(
+      'codex_only_binding_not_supported'
+    );
     expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
-    expect(admissions).toEqual([true, false]);
+    expect(admissions).toEqual([true]);
     expect(fires).toBe(0);
     expect(Object.keys(first.request.dispatchBinding!)).toEqual(Object.keys(binding()));
   });
 
-  test('caller mutation cannot change the parsed durable snapshot', async () => {
+  test('caller mutation cannot persist a retired binding', async () => {
     const opts = options();
     const pending = runCascade(opts);
     opts.dispatchBinding!.codebaseId = 'caller-replacement';
-    const record = await pending;
-    expect(record.request.dispatchBinding).toEqual(binding());
-    expect(JSON.parse(await readFile(recordPath(opts), 'utf8'))).toEqual(record);
+    await expect(pending).rejects.toThrow('codex_only_binding_not_supported');
+    await expect(readFile(recordPath(opts), 'utf8')).rejects.toThrow();
   });
 
   test('changed comparison fields conflict without replacing the existing record', async () => {
@@ -237,7 +244,7 @@ describe('binding-v2 durable replay foundation', () => {
     opts.onAdmission = () => {
       admissions++;
     };
-    await runCascade(opts);
+    await seedHistoricalV2(opts);
     const bytes = await readFile(recordPath(opts), 'utf8');
     for (const change of [
       { codebaseId: 'replacement-id' },
@@ -252,7 +259,7 @@ describe('binding-v2 durable replay foundation', () => {
           project: change.project ?? opts.project,
           dispatchBinding: { ...binding(), ...change },
         })
-      ).rejects.toThrow('dispatch identity conflict');
+      ).rejects.toThrow('codex_only_binding_not_supported');
       expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
     }
     for (const codexOnly of [true, undefined, false]) {
@@ -274,7 +281,7 @@ describe('binding-v2 durable replay foundation', () => {
         await writeFile(recordPath(opts), JSON.stringify(historical, null, 2) + '\n');
       }
       const bytes = await readFile(recordPath(opts), 'utf8');
-      await expect(runCascade(opts)).rejects.toThrow('dispatch identity conflict');
+      await expect(runCascade(opts)).rejects.toThrow('codex_only_binding_not_supported');
       expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
     }
   );
