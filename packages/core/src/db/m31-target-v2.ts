@@ -385,7 +385,8 @@ function validateTarget(target: M31ActionTargetV2): void {
   }
   if (target.target_kind === 'workflow_run') {
     if (
-      !UUID_RE.test(target.run_id) ||
+      // SQLite workflow-run primary keys use lower(hex(randomblob(16))).
+      (!UUID_RE.test(target.run_id) && !/^[0-9a-f]{32}$/.test(target.run_id)) ||
       !target.wo_id ||
       !target.workflow_name ||
       !target.status ||
@@ -1201,6 +1202,44 @@ export async function compareAndConsumeM31ProposalV2(input: {
   });
 }
 
+async function readRecoveryAttemptWindow(
+  query: TxQuery,
+  repository: string,
+  woId: string,
+  excluding: string | null
+): Promise<{ count: number; unresolved: boolean }> {
+  const postgres = getDatabase().dialect === 'postgres';
+  const wo = postgres
+    ? "p.target_identity_json->>'wo_id'"
+    : "json_extract(p.target_identity_json, '$.wo_id')";
+  const cutoff = postgres
+    ? "NOW() - INTERVAL '24 hours'"
+    : "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours')";
+  const { rows } = await query<{ n: number | string; unresolved: number | string }>(
+    `SELECT COALESCE(SUM(CASE WHEN r.created_at >= ${cutoff} THEN 1 ELSE 0 END),0) AS n,
+       COALESCE(MAX(CASE WHEN EXISTS (
+         SELECT 1 FROM overseer_m31_execution_receipts_v2 outcome
+         WHERE outcome.execution_id = p.execution_id
+           AND outcome.event_type IN ('effect_succeeded','effect_failed','effect_reconciled_succeeded','effect_reconciled_failed')
+       ) THEN 0 ELSE 1 END),0) AS unresolved
+     FROM overseer_m31_action_proposals_v2 p
+     JOIN overseer_m31_execution_receipts_v2 r ON r.execution_id = p.execution_id
+     WHERE p.repository = $1 AND ${wo} = $2 AND p.target_kind = 'workflow_run'
+       AND p.action_kind IN ('REPAIR','REFIRE') AND r.event_type = 'effect_reserved'
+       AND ($3 = '' OR p.execution_id <> $3)`,
+    [repository, woId, excluding ?? '']
+  );
+  return { count: Number(rows[0]?.n ?? 0), unresolved: Number(rows[0]?.unresolved ?? 0) === 1 };
+}
+
+export async function getM31RecoveryAttemptWindow(
+  repository: string,
+  woId: string
+): Promise<{ count: number; unresolved: boolean }> {
+  const db = getDatabase();
+  return readRecoveryAttemptWindow(db.query.bind(db), repository, woId, null);
+}
+
 export async function reserveM31ExecutionEffectV2(input: {
   permit: M31ActionPermitV2;
   adapter_name: string;
@@ -1209,6 +1248,7 @@ export async function reserveM31ExecutionEffectV2(input: {
   evidence: unknown;
   /** Test-only database clock seam. Never exposed by an HTTP schema. */
   test_clock_now?: string;
+  recovery_attempt_limit?: number;
 }): Promise<Result<M31ExecutionReceiptEventV2>> {
   return withV2Transaction(async query => {
     const row = (
@@ -1228,6 +1268,29 @@ export async function reserveM31ExecutionEffectV2(input: {
       return { ok: false as const, failure: 'live_state_mismatch' as const };
     if (Date.parse(now) > Date.parse(input.permit.valid_until))
       return { ok: false as const, failure: 'observation_stale' as const };
+    if (input.recovery_attempt_limit !== undefined) {
+      if (
+        proposal.target.target_kind !== 'workflow_run' ||
+        !['REPAIR', 'REFIRE'].includes(proposal.action_kind)
+      ) {
+        return { ok: false as const, failure: 'action_target_mismatch' as const };
+      }
+      if (getDatabase().dialect === 'postgres') {
+        await query(
+          "SELECT pg_advisory_xact_lock(hashtextextended('overseer-recovery:' || $1, 0))",
+          [`${proposal.repository}:${proposal.target.wo_id}`]
+        );
+      }
+      const priorAttempts = await readRecoveryAttemptWindow(
+        query,
+        proposal.repository,
+        proposal.target.wo_id,
+        proposal.execution_id
+      );
+      if (priorAttempts.unresolved || priorAttempts.count >= input.recovery_attempt_limit) {
+        return { ok: false as const, failure: 'evidence_conflicting' as const };
+      }
+    }
     const prior = (
       await query<ReceiptRow>(
         'SELECT * FROM overseer_m31_execution_receipts_v2 WHERE execution_id=$1 AND event_sequence=1',

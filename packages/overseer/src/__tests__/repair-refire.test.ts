@@ -687,7 +687,9 @@ describe('Test 5 - semantic repair', () => {
 
 describe('repair disposition routes through in-place repair only', () => {
   test('repair uses dispatchInPlaceRepair and never touches on-ramp or conductor', async () => {
-    const harness = makeHarness();
+    const harness = makeHarness({
+      inPlaceRepairResult: { ...succeededOnRamp(), successor_run_id: null },
+    });
     const assessment = assessRepairRefireCandidate(baseAssessInput({ repairable_in_place: true }));
     expect(assessment.disposition).toBe('repair');
 
@@ -695,6 +697,7 @@ describe('repair disposition routes through in-place repair only', () => {
 
     expect(result.disposition).toBe('repair');
     expect(result.outcome).toBe('succeeded');
+    expect(result.successor_run_id).toBeNull();
     // The distinct in-place repair seam is invoked exactly once.
     expect(harness.spies.startInPlaceRepair).toHaveBeenCalledTimes(1);
     // Replacement-run paths are never touched by a repair disposition.
@@ -731,6 +734,7 @@ describe('thrown adapter dependency closes the reservation', () => {
     // Idempotency is not committed on a thrown dispatch, so a fresh attempt
     // with the same key would re-run the gate chain.
     expect(harness.spies.commitIdem).toHaveBeenCalledTimes(0);
+    expect(harness.deps.executionClaim?.release).not.toHaveBeenCalled();
   });
 
   test('thrown conductor cascade also records effect_indeterminate primary outcome', async () => {
@@ -874,7 +878,7 @@ describe('salvage receipt and on-ramp result invariants', () => {
     ).toBe(false);
   });
 
-  test('invalid dependency result fails closed and records no primary outcome', async () => {
+  test('invalid dependency result records uncertainty and leaves the claim armed', async () => {
     const harness = makeHarness({
       onRampResult: {
         schema_version: 'overseer-first-refire-on-ramp-result-v1',
@@ -890,7 +894,8 @@ describe('salvage receipt and on-ramp result invariants', () => {
       harness.deps
     );
     expect(result.outcome).toBe('invalid_dependency_result');
-    expect(harness.effectLedger).toEqual(['effect_reserved']);
+    expect(harness.effectLedger).toEqual(['effect_reserved', 'effect_indeterminate']);
+    expect(harness.deps.executionClaim?.release).not.toHaveBeenCalled();
     expect(harness.effectLedger.filter(e => e === 'effect_succeeded')).toHaveLength(0);
   });
 });

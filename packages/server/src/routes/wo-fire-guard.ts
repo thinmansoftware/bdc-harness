@@ -9,9 +9,7 @@
  * Anchor: bdc-xo#1546 concurrent multi-lane builds of the same WO.
  */
 
-import { listWorkflowRuns } from '@archon/core/db/workflows';
-
-const LIVE_STATUSES = ['running', 'pending', 'paused'] as const;
+import { getDatabase } from '@archon/core/db/connection';
 
 export function extractWoIdFromMessage(message: string): string | null {
   const m = /\b(WO-[A-Z][A-Z0-9-]*-\d+)\b/.exec(message);
@@ -36,10 +34,10 @@ export interface LiveWoRun {
  * Returns live runs whose user_message claims the same WO_ID.
  */
 export async function findLiveRunsForWo(woId: string): Promise<LiveWoRun[]> {
-  const runs = await listWorkflowRuns({
-    status: [...LIVE_STATUSES],
-    limit: 100,
-  });
+  const { rows: runs } = await getDatabase().query<LiveWoRun & { user_message: string | null }>(
+    `SELECT id, status, workflow_name, user_message FROM remote_agent_workflow_runs
+     WHERE status IN ('running', 'pending', 'paused', 'waiting_provider', 'interrupted')`
+  );
   const escaped = woId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const re = new RegExp(`(?:^|[^A-Za-z0-9-])${escaped}(?:[^A-Za-z0-9-]|$)`);
   return runs
@@ -49,4 +47,26 @@ export async function findLiveRunsForWo(woId: string): Promise<LiveWoRun[]> {
       status: r.status,
       workflow_name: r.workflow_name,
     }));
+}
+
+/** Shared admission boundary for POST /run and exact-target recovery. */
+export async function dispatchGuardedWoRun<T>(input: {
+  woId: string | null;
+  authorizeConcurrent?: boolean;
+  excludeRunId?: string;
+  revalidate?: () => Promise<boolean>;
+  dispatch: () => Promise<T>;
+}): Promise<
+  | { ok: true; result: T }
+  | { ok: false; error: 'duplicate_wo_live' | 'recovery_target_changed'; liveRuns: LiveWoRun[] }
+> {
+  const liveRuns =
+    input.woId && !input.authorizeConcurrent
+      ? (await findLiveRunsForWo(input.woId)).filter(run => run.id !== input.excludeRunId)
+      : [];
+  if (liveRuns.length) return { ok: false, error: 'duplicate_wo_live', liveRuns };
+  if (input.revalidate && !(await input.revalidate())) {
+    return { ok: false, error: 'recovery_target_changed', liveRuns: [] };
+  }
+  return { ok: true, result: await input.dispatch() };
 }

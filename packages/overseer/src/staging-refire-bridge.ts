@@ -52,14 +52,9 @@ export async function executeM42Slice8BStagingRefireBridge(
   const adapter = createCauldronRefireBridgeAdapter({
     admitRun:
       options.admitRun ??
-      (async (request): Promise<CauldronAdmissionResultV1> => ({
-        status: 'admitted',
-        runId: 'fake-staging-refire-1',
-        providerRequestId: 'fake-staging-refire-1',
-        admittedAt: '2026-07-17T12:02:00.000Z',
-        bindingEvidence: request.inputs,
-        reason: 'accepted',
-      })),
+      (async (): Promise<CauldronAdmissionResultV1> => {
+        throw new Error('staging_refire_transport_required');
+      }),
     getAdmissionByExecutionId:
       options.getAdmissionByExecutionId ??
       (async (): Promise<CauldronAdmissionResultV1 | null> => null),

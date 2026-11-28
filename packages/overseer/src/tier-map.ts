@@ -30,9 +30,10 @@ const REQUIRED_TIER_BY_ACTION: Record<string, number> = {
   comment_findings: 0,
   flag_merge_ready: 0,
   escalate_with_evidence: 0,
-  // Everything below exists so a model proposing it maps to a refusal, not a gap.
-  merge: 1,
+  // Recovery uses the independently authorized M-31 v2 watch path.
   repair_refire: 1,
+  // Other Tier 1 recommendations have their own execution gates.
+  merge: 1,
   refresh_rebase: 1,
   branch_refresh: 1,
   lifecycle: 1,

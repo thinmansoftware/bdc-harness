@@ -324,7 +324,16 @@ async function executeSiblingRefire(
   manifest: M42Slice8BManifestPayload,
   executionId: string
 ): ReturnType<typeof executeM42Slice8BStagingRefireBridge> {
-  return executeM42Slice8BStagingRefireBridge(manifest, executionId);
+  return executeM42Slice8BStagingRefireBridge(manifest, executionId, {
+    admitRun: async request => ({
+      status: 'admitted',
+      runId: `synthetic-${executionId}`,
+      providerRequestId: `synthetic-${executionId}`,
+      admittedAt: '2026-07-17T12:02:00.000Z',
+      bindingEvidence: request.inputs,
+      reason: 'fake_canary_admission',
+    }),
+  });
 }
 
 async function exerciseFusionBudgetAuthorizationReceiptPath(

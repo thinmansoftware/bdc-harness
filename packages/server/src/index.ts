@@ -92,6 +92,7 @@ import {
 } from '@archon/workflows/reliability/seat-usage';
 import {
   createRuntimeMergeManager,
+  composeOverseerRecovery,
   startOverseerRuntime,
   stopOverseerRuntime,
 } from './overseer-runtime';
@@ -208,7 +209,9 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function startOverseerRuntimeWithRealMergeManager(): void {
+function startOverseerRuntimeWithRealMergeManager(
+  transport: ReturnType<typeof registerApiRoutes>
+): void {
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
   const realAdapterRequested =
     !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
@@ -219,7 +222,12 @@ function startOverseerRuntimeWithRealMergeManager(): void {
   const deps = resolveDefaultDeps();
   const mergeManager = createRuntimeMergeManager(deps);
   startOverseerRuntime({
-    serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
+    serviceOptions: {
+      deps,
+      mergeCoordinator: mergeManager,
+      mergeBridgeEnabled: true,
+      ...composeOverseerRecovery(transport),
+    },
   });
 }
 
@@ -319,8 +327,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
     process.exit(1);
   }
-
-  startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
   logConfig(config);
@@ -598,7 +604,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
 
   // Register Web UI API routes
-  registerApiRoutes(app, webAdapter, lockManager, activePlatforms);
+  const recoveryTransport = registerApiRoutes(app, webAdapter, lockManager, activePlatforms);
+  startOverseerRuntimeWithRealMergeManager(recoveryTransport);
 
   // GitHub webhook endpoint
   if (github) {

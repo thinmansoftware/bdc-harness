@@ -797,7 +797,10 @@ export async function executeWorkflow(
   parentConversationId?: string,
   preCreatedRun?: WorkflowRun,
   authoritySource?: RunAuthorityDispatch,
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  recoveryResume?: {
+    activate: () => Promise<WorkflowRun>;
+  }
 ): Promise<WorkflowExecutionResult> {
   // Never strip a persisted restriction through a generic provider-wait/recovery entry.
   let isProviderWait = false;
@@ -862,7 +865,29 @@ export async function executeWorkflow(
   // not rediscover by path: another historical failed row may exist on the same
   // worktree. The status transition is a DB compare-and-swap, so cancellation
   // that wins before this point cannot be resurrected by a late wake callback.
-  if (isProviderWait && preCreatedRun !== undefined) {
+  if (recoveryResume) {
+    if (
+      !preCreatedRun ||
+      isProviderWait ||
+      preCreatedRun.working_path !== cwd ||
+      preCreatedRun.workflow_name !== workflow.name ||
+      preCreatedRun.codebase_id !== codebaseId
+    ) {
+      return { success: false, error: 'recovery_resume_binding_mismatch' };
+    }
+    try {
+      dagPriorCompletedNodes = await deps.store.getCompletedDagNodeOutputs(preCreatedRunId);
+      if (!(dagPriorCompletedNodes instanceof Map) || dagPriorCompletedNodes.size === 0) {
+        return { success: false, error: 'recovery_resume_outputs_unavailable' };
+      }
+      workflowRun = await recoveryResume.activate();
+      if (workflowRun.id !== preCreatedRunId || workflowRun.status !== 'running') {
+        return { success: false, error: 'recovery_resume_activation_unverified' };
+      }
+    } catch {
+      return { success: false, error: 'recovery_resume_activation_refused' };
+    }
+  } else if (isProviderWait && preCreatedRun !== undefined) {
     let priorCompletedCount: number;
     try {
       dagPriorCompletedNodes = await deps.store.getCompletedDagNodeOutputs(preCreatedRunId);

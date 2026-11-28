@@ -14,6 +14,19 @@ import {
   type MergeSweepLivenessMonitor,
 } from '@archon/overseer';
 
+import {
+  createOverseerWatchRecovery,
+  type OverseerRecoveryTransport,
+  type RecoveryGitHubReads,
+} from './overseer-recovery';
+
+export function composeOverseerRecovery(
+  transport: OverseerRecoveryTransport,
+  github?: RecoveryGitHubReads
+): Pick<OverseerServiceOptions, 'recovery'> {
+  return { recovery: createOverseerWatchRecovery(transport, github) };
+}
+
 const log = createLogger('server/overseer-runtime');
 
 /** Bind the merge gate to the real run/event store, including missing-row detection. */
@@ -87,7 +100,7 @@ interface OverseerRuntimeDeps {
   readonly runService?: typeof runOverseerService;
   readonly serviceOptions?: Pick<
     OverseerServiceOptions,
-    'deps' | 'mergeCoordinator' | 'mergeBridgeEnabled'
+    'deps' | 'mergeCoordinator' | 'mergeBridgeEnabled' | 'recovery'
   >;
   readonly logger?: RuntimeLogger;
   readonly supervisor?: OverseerSupervisorOptions;

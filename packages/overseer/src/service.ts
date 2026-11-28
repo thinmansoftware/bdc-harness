@@ -38,6 +38,7 @@ import {
 import { permitFromMetadata } from './permit';
 import { runReconcileOnce } from './reconcile';
 import { watchLoop } from './watch';
+import type { WatchRecovery } from './watch';
 import type {
   DeterministicMergeHandoff,
   GitHubClientDeps,
@@ -88,6 +89,7 @@ export type OverseerWiredAdapterKind = 'fake' | 'real' | 'none';
 export type MergeReadyCoordinator = (record: WatchedRunRecord) => Promise<unknown>;
 
 export interface OverseerServiceOptions {
+  recovery?: WatchRecovery;
   once?: boolean;
   enabled?: boolean;
   dryRun?: boolean;
@@ -268,12 +270,22 @@ export async function handleRecord(
   dryRun: boolean,
   actor: string,
   mergeCoordinator?: MergeReadyCoordinator,
-  deterministicMergeHandoff?: DeterministicMergeHandoff
+  deterministicMergeHandoff?: DeterministicMergeHandoff,
+  recovery?: WatchRecovery
 ): Promise<void> {
   if (emergencyStopEngaged()) {
     log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
     return;
   }
+  if (!dryRun && recovery) {
+    try {
+      if (await recovery.handle(record)) return;
+    } catch {
+      log.error({ runId: record.runId }, 'overseer.recovery_case_read_or_write_failed');
+      return;
+    }
+  }
+  if (record.status === 'running' || record.status === 'interrupted') return;
   if (judgeFirstEnabled()) {
     // Per-record isolation. On 2026-07-30 a single verdict-store query error
     // escaped this call, propagated out of watchLoop, and runOverseerService
@@ -604,7 +616,14 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (adapterKind === 'real' && (!options.deps || !options.mergeCoordinator)) {
     throw new Error('overseer_real_adapter_requires_qualified_coordinator');
   }
-  const deps = options.deps ?? resolveDefaultDeps();
+  const baseDeps = options.deps ?? resolveDefaultDeps();
+  const deps = options.recovery
+    ? {
+        ...baseDeps,
+        listRunsForWatch: (): ReturnType<typeof listRunsForOverseerWatch> =>
+          listRunsForOverseerWatch(true),
+      }
+    : baseDeps;
   const defaultMergeBridgeRun = githubCanDriveMergeBridge(deps)
     ? createMergeExecutionBridgeRun(deps)
     : undefined;
@@ -625,11 +644,13 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
         dryRun,
         'overseer-service',
         options.mergeCoordinator,
-        deterministicMergeHandoff
+        deterministicMergeHandoff,
+        options.recovery
       ),
     {
       intervalMs: options.intervalMs,
       once: options.once,
+      recovery: options.recovery,
       signal: coupledAbort.signal,
     }
   );

@@ -261,6 +261,9 @@ export interface WorkflowRoutingContext {
    */
   readonly isolationHints?: IsolationHints;
   readonly modelOverride?: ModelOverride;
+  readonly recoveryAdmission?: {
+    readonly check: (isolatedPath: string) => Promise<void>;
+  };
 }
 
 const execFileAsync = promisify(execFile);
@@ -413,6 +416,10 @@ export async function dispatchBackgroundWorkflow(
       workerHints
     );
     workerCwd = result.cwd;
+    if (ctx.recoveryAdmission) {
+      if (!result.env || workerCwd === ctx.cwd) throw new Error('recovery_isolation_missing');
+      await ctx.recoveryAdmission.check(workerCwd);
+    }
     const resolvedBranch = result.env?.branch_name.trim();
     if (resolvedBranch) isolationBranch = resolvedBranch;
     await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
@@ -468,35 +475,36 @@ export async function dispatchBackgroundWorkflow(
   // dispatch.
   const workflowDeps = createWorkflowDeps();
   let effectiveUserMessage = ctx.originalMessage;
-  try {
-    const { prepareDispatchWithEscalation } = await import('../escalation');
-    const workflowDb = await import('../db/workflows');
-    const workflowEventDb = await import('../db/workflow-events');
-    const linkerStore = {
-      listWorkflowRuns: workflowDb.listWorkflowRuns,
-      listWorkflowEvents: workflowEventDb.listWorkflowEvents,
-      updateWorkflowRun: workflowDb.updateWorkflowRun,
-    };
-    const prepared = await prepareDispatchWithEscalation(ctx.originalMessage, linkerStore);
-    effectiveUserMessage = prepared.userMessage;
-    if (prepared.link.escalatedRunIds.length > 0) {
-      getLog().info(
-        {
-          woId: prepared.link.woId,
-          escalatedRunIds: prepared.link.escalatedRunIds,
-          packetChars: prepared.link.packet.length,
-          workflowName: workflow.name,
-        },
-        'orchestrator.escalation_linked'
+  if (!ctx.recoveryAdmission)
+    try {
+      const { prepareDispatchWithEscalation } = await import('../escalation');
+      const workflowDb = await import('../db/workflows');
+      const workflowEventDb = await import('../db/workflow-events');
+      const linkerStore = {
+        listWorkflowRuns: workflowDb.listWorkflowRuns,
+        listWorkflowEvents: workflowEventDb.listWorkflowEvents,
+        updateWorkflowRun: workflowDb.updateWorkflowRun,
+      };
+      const prepared = await prepareDispatchWithEscalation(ctx.originalMessage, linkerStore);
+      effectiveUserMessage = prepared.userMessage;
+      if (prepared.link.escalatedRunIds.length > 0) {
+        getLog().info(
+          {
+            woId: prepared.link.woId,
+            escalatedRunIds: prepared.link.escalatedRunIds,
+            packetChars: prepared.link.packet.length,
+            workflowName: workflow.name,
+          },
+          'orchestrator.escalation_linked'
+        );
+      }
+    } catch (error) {
+      getLog().warn(
+        { err: toError(error), workflowName: workflow.name },
+        'orchestrator.escalation_link_failed'
       );
+      // Non-fatal: proceed with original message
     }
-  } catch (error) {
-    getLog().warn(
-      { err: toError(error), workflowName: workflow.name },
-      'orchestrator.escalation_link_failed'
-    );
-    // Non-fatal: proceed with original message
-  }
 
   // 8. Pre-create workflow run row so the UI can fetch it immediately.
   // Without this, navigating to the execution page before executeWorkflow's
@@ -536,6 +544,7 @@ export async function dispatchBackgroundWorkflow(
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, workflowName: workflow.name }, 'pre_create_workflow_run_failed');
+    if (ctx.recoveryAdmission) throw new Error('recovery_successor_persistence_failed');
     // Non-fatal: executeWorkflow will create its own row as fallback
   }
 

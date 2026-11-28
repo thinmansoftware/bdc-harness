@@ -490,6 +490,8 @@ export interface RunCascadeOptions {
    * the run is still running or paused. A throwing callback never affects the
    * cascade.
    */
+  /** Recovery has one admitted successor. The caller owns subsequent evidence checks. */
+  admitOnly?: boolean;
   onRunDiscovered?: (runId: string, cascadeId: string, tierName: string) => void;
   /**
    * Passed through to the poller: a normally-terminal status that is a
@@ -1618,6 +1620,17 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         } catch {
           // Observation hook only; never alters the climb.
         }
+      }
+
+      if (opts.admitOnly) {
+        if (!fireResult.ok) {
+          attempt.outcome = 'infra-error';
+          attempt.infraErrorReason = fireResult.infraError;
+          attempt.completedAt = new Date().toISOString();
+          status = 'infra-alert';
+        }
+        await checkpoint();
+        break;
       }
 
       // Infra error: alert + stop (do NOT count as "too hard")

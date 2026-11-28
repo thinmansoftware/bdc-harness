@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 
@@ -81,7 +81,7 @@ interface WorkflowEventRow {
   event_type: string;
   step_name: string | null;
   data: unknown;
-  created_at: string;
+  created_at: string | Date;
 }
 
 function parseObject(value: unknown): Record<string, unknown> {
@@ -189,7 +189,12 @@ function normalizeEvent(row: WorkflowEventRow): OverseerWorkflowEventRow {
     event_type: row.event_type,
     step_name: row.step_name,
     data: parseObject(row.data),
-    created_at: row.created_at,
+    created_at:
+      row.created_at instanceof Date
+        ? row.created_at.toISOString()
+        : /^\d{4}-\d{2}-\d{2} /.test(row.created_at)
+          ? row.created_at.replace(' ', 'T') + 'Z'
+          : row.created_at,
   };
 }
 
@@ -219,29 +224,47 @@ const UNCONDITIONAL_TERMINAL_OVERSEER_ACTIONS = [
   'escalate_with_evidence', // escalation posted once -- human owns it now
   'escalation_denied',
   'tier_refused',
+  'recovery_closed',
 ] as const;
 
-export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
+export async function listRunsForOverseerWatch(
+  includeRecovery = false
+): Promise<OverseerWatchRun[]> {
   const placeholders = UNCONDITIONAL_TERMINAL_OVERSEER_ACTIONS.map(() => '?').join(', ');
   const result = await getDatabase().query<WorkflowRunRow>(
     `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
             c.name AS codebase_name
      FROM remote_agent_workflow_runs r
      LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
-     WHERE r.status IN ('completed', 'failed', 'escalated', 'cancelled')
+     WHERE (
+       (r.status IN ('completed', 'failed', 'escalated', 'cancelled')
+        AND NOT EXISTS (
+          SELECT 1 FROM overseer_actions oa
+          WHERE oa.run_id = r.id AND oa.action IN (${placeholders})
+        ))
+       OR (? = 1 AND NOT EXISTS (
+         SELECT 1 FROM overseer_actions oa
+         WHERE oa.run_id = r.id AND oa.action = 'recovery_closed'
+       ) AND (
+         r.status IN ('running', 'interrupted')
+         OR EXISTS (
+           SELECT 1 FROM overseer_actions oa
+           WHERE oa.run_id = r.id AND oa.action = 'recovery_case'
+         )
+       ))
+     )
        -- Synthetic discovery-PR parent rows (workflow_name = 'pr-discovery') are
        -- not real work: excluding them keeps the watch loop from re-judging a
        -- hand-opened PR that already has its own verdict recorded directly.
        AND r.workflow_name != 'pr-discovery'
-       AND NOT EXISTS (
-         SELECT 1 FROM overseer_actions oa
-         WHERE oa.run_id = r.id
-           AND oa.action IN (${placeholders})
-       )
        -- comment_findings retires the run only when no safe unactioned
        -- observe/healthy verdict is still waiting for green evidence.
        AND NOT (
-         EXISTS (
+         NOT EXISTS (
+           SELECT 1 FROM overseer_actions rc
+           WHERE rc.run_id = r.id AND rc.action = 'recovery_case'
+         )
+         AND EXISTS (
            SELECT 1 FROM overseer_actions cf
            WHERE cf.run_id = r.id
              AND cf.action = 'comment_findings'
@@ -255,9 +278,44 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
          )
        )
      ORDER BY COALESCE(r.completed_at, r.last_activity_at, r.started_at) ASC`,
-    [...UNCONDITIONAL_TERMINAL_OVERSEER_ACTIONS]
+    [...UNCONDITIONAL_TERMINAL_OVERSEER_ACTIONS, includeRecovery ? 1 : 0]
   );
   return result.rows.map(normalizeRun);
+}
+
+/** One immutable record per run and recovery stage, shared by all watch processes. */
+export async function recordOverseerRecoveryStage(
+  runId: string,
+  woId: string,
+  stage: 'observed' | 'case' | 'request' | 'result' | 'handoff' | 'closed',
+  value: string
+): Promise<string> {
+  const db = getDatabase();
+  const digest = createHash('sha256').update(`overseer-recovery:${stage}:${runId}`).digest('hex');
+  const id = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`;
+  return db.withTransaction(async query => {
+    await query(
+      `INSERT INTO overseer_actions (id, run_id, wo_id, class, action, result)
+       VALUES ($1, $2, $3, 'recovery', $4, $5)
+       ON CONFLICT (id) DO NOTHING`,
+      [id, runId, woId, `recovery_${stage}`, value]
+    );
+    const result = await query<{ result: string }>(
+      'SELECT result FROM overseer_actions WHERE id = $1 AND run_id = $2',
+      [id, runId]
+    );
+    if (!result.rows[0]) throw new Error('recovery_stage_unreadable');
+    return result.rows[0].result;
+  });
+}
+
+export async function getOverseerRecoveryStages(runId: string): Promise<Record<string, string>> {
+  const result = await getDatabase().query<{ action: string; result: string }>(
+    `SELECT action, result FROM overseer_actions WHERE run_id = $1
+     AND action IN ('recovery_observed', 'recovery_case', 'recovery_handoff', 'recovery_closed')`,
+    [runId]
+  );
+  return Object.fromEntries(result.rows.map(row => [row.action, row.result]));
 }
 
 export async function getOverseerWatchRunById(runId: string): Promise<OverseerWatchRun | null> {
@@ -432,7 +490,7 @@ export async function listRunEventsForOverseer(runId: string): Promise<OverseerW
     `SELECT id, workflow_run_id, event_type, step_name, data, created_at
      FROM remote_agent_workflow_events
      WHERE workflow_run_id = $1
-     ORDER BY created_at ASC`,
+     ORDER BY created_at ASC, id ASC`,
     [runId]
   );
   return result.rows.map(normalizeEvent);

@@ -21,6 +21,7 @@ import {
   markExecutionReconciliationRequired,
   validateRecoveryExecutionFence,
   releaseExecutionClaim,
+  releaseRecoveryExecutionClaim,
   renewExecutionClaim,
   resolveExecutionReconciliation,
   validateExecutionFence,
@@ -615,6 +616,38 @@ describe('execution claims db', () => {
     });
     expect(staleFence.ok).toBe(false);
     if (!staleFence.ok) expect(staleFence.code).toBe('authority_rejected');
+  });
+
+  test('armed recovery stays fenced after release and lease expiry', async () => {
+    const identity = {
+      repository: 'thinmansoftware/bdc-harness',
+      wo_id: 'WO-RECOVERY-ARMED',
+      execution_id: 'exec-recovery-armed',
+      target_digest: sha256('target-armed'),
+      actor_principal: 'overseer-a',
+    };
+    const first = await acquireRecoveryExecutionClaim(identity);
+    if (!first.ok) throw new Error(first.message);
+    const proof = {
+      claim_id: first.claim.claim_id,
+      execution_fencing_token: first.claim.execution_fencing_token,
+      actor_principal: identity.actor_principal,
+    };
+    const armed = await validateRecoveryExecutionFence(proof);
+    expect(armed.ok).toBe(true);
+    expect(await releaseRecoveryExecutionClaim(proof)).toMatchObject({
+      ok: false,
+      code: 'reconciliation_required',
+    });
+    await db.query('UPDATE board_execution_claims SET expires_at=$1 WHERE claim_id=$2', [
+      '2000-01-01T00:00:00.000Z',
+      proof.claim_id,
+    ]);
+    expect(await acquireRecoveryExecutionClaim(identity)).toMatchObject({
+      ok: false,
+      code: 'reconciliation_required',
+      holder: { reconciliation_status: 'required', effect_attempt_state: 'armed' },
+    });
   });
 
   // Test 10 -- Pre-claim rejection dedup and manual initiation writer

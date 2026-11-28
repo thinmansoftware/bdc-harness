@@ -85,21 +85,27 @@ const LOWER_HEX_64 = /^[0-9a-f]{64}$/;
 /**
  * Validate an on-ramp dependency result against the frozen Section 7.5
  * NULL/status matrix. Any other combination is an invalid dependency result
- * that fails closed and records no primary outcome.
+ * that fails closed and records an indeterminate outcome.
  */
-export function isValidOnRampResult(result: FirstRefireOnRampResultV1): boolean {
+export function isValidOnRampResult(result: FirstRefireOnRampResultV1, inPlace = false): boolean {
+  if (!result || typeof result !== 'object' || typeof result.reason !== 'string') return false;
   if (result.schema_version !== 'overseer-first-refire-on-ramp-result-v1') return false;
   if (result.reason.length === 0) return false;
-  if (!LOWER_HEX_64.test(result.evidence_digest)) return false;
+  if (typeof result.evidence_digest !== 'string' || !LOWER_HEX_64.test(result.evidence_digest))
+    return false;
   const successor = result.successor_run_id;
   const effect = result.external_effect_reference;
   switch (result.status) {
     case 'succeeded':
-      return successor !== null && successor.length > 0 && effect !== null && effect.length > 0;
+      return (
+        (inPlace ? successor === null : typeof successor === 'string' && successor.length > 0) &&
+        typeof effect === 'string' &&
+        effect.length > 0
+      );
     case 'failed':
       return successor === null && effect === null;
     case 'indeterminate':
-      return successor === null && effect !== null && effect.length > 0;
+      return successor === null && typeof effect === 'string' && effect.length > 0;
     default:
       return false;
   }
@@ -487,6 +493,12 @@ export interface RepairRefireExecutionDeps {
   readonly circuit: RepairRefireCircuitDeps;
   readonly recorder: RepairRefireDispositionRecorder;
   readonly executionClaim?: RepairRefireExecutionClaimDeps;
+  readonly adapterName?: string;
+  /** Called under the armed claim, before the adapter is allowed to act. */
+  readonly beforeDispatch?: (
+    claim: ExecutionClaimResponse,
+    effectAttemptId: string
+  ) => Promise<void>;
   /** Injected lower-case 64-hex SHA-256 over a canonical string. */
   readonly sha256hex: (input: string) => string;
 }
@@ -604,7 +616,7 @@ export async function executeRepairRefire(
   const reservation = await deps.gate.reserveEffect({
     proposal_id: input.proposal_id,
     execution_id: input.execution_id,
-    adapter_name: ADAPTER_NAME,
+    adapter_name: deps.adapterName ?? ADAPTER_NAME,
   });
   if (!reservation.ok) {
     return record(
@@ -674,6 +686,7 @@ export async function executeRepairRefire(
   // would violate the frozen receipt-chain contract.
   let dispatched: FirstRefireOnRampResultV1;
   try {
+    await deps.beforeDispatch?.(claim.claim, fence.effect_attempt_id);
     switch (assessment.disposition) {
       case 'repair':
         dispatched = await deps.adapter.dispatchInPlaceRepair(request);
@@ -686,28 +699,26 @@ export async function executeRepairRefire(
         dispatched = await deps.adapter.dispatchFirstAttempt(request);
         break;
     }
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
+  } catch {
+    const reason = 'recovery_transport_outcome_unknown';
     await deps.gate.appendOutcome({
       execution_id: input.execution_id,
       outcome: 'effect_indeterminate',
       reason,
       external_effect_reference: null,
     });
-    await claimDeps.release({
-      claim_id: claim.claim.claim_id,
-      execution_fencing_token: claim.claim.execution_fencing_token,
-      actor_principal: input.actor,
-    });
     return record(deps, assessment.disposition, 'indeterminate', null, predecessor, null, reason);
   }
 
-  if (!isValidOnRampResult(dispatched)) {
-    // Fail closed on an invalid dependency result; record no primary outcome.
-    await claimDeps.release({
-      claim_id: claim.claim.claim_id,
-      execution_fencing_token: claim.claim.execution_fencing_token,
-      actor_principal: input.actor,
+  if (
+    !isValidOnRampResult(dispatched, assessment.disposition === 'repair') ||
+    (dispatched.successor_run_id !== null && dispatched.successor_run_id === predecessor)
+  ) {
+    await deps.gate.appendOutcome({
+      execution_id: input.execution_id,
+      outcome: 'effect_indeterminate',
+      reason: 'invalid_dependency_result',
+      external_effect_reference: null,
     });
     return record(
       deps,
@@ -720,14 +731,25 @@ export async function executeRepairRefire(
     );
   }
 
-  await deps.gate.appendOutcome({
+  const outcomeReceipt = await deps.gate.appendOutcome({
     execution_id: input.execution_id,
     outcome: primaryOutcomeType(dispatched.status),
     reason: dispatched.reason,
     external_effect_reference: dispatched.external_effect_reference,
   });
-  if (dispatched.external_effect_reference) {
-    await claimDeps.complete({
+  if (!outcomeReceipt.ok) {
+    return record(
+      deps,
+      assessment.disposition,
+      'indeterminate',
+      null,
+      predecessor,
+      null,
+      'outcome_receipt_missing'
+    );
+  }
+  if (dispatched.status === 'succeeded' && dispatched.external_effect_reference) {
+    const completion = await claimDeps.complete({
       claim_id: claim.claim.claim_id,
       execution_fencing_token: claim.claim.execution_fencing_token,
       effect_attempt_id: fence.effect_attempt_id,
@@ -738,16 +760,24 @@ export async function executeRepairRefire(
         successor_run_id: dispatched.successor_run_id,
         reason: dispatched.reason,
         evidence_digest: dispatched.evidence_digest,
+        target_digest: input.target_digest,
       },
     });
-  } else {
-    await claimDeps.release({
-      claim_id: claim.claim.claim_id,
-      execution_fencing_token: claim.claim.execution_fencing_token,
-      actor_principal: input.actor,
-    });
+    if (!completion.ok) {
+      return record(
+        deps,
+        assessment.disposition,
+        'indeterminate',
+        null,
+        predecessor,
+        null,
+        'claim_completion_missing'
+      );
+    }
   }
-  await deps.idempotency.commit(input.idempotency_key, dispatched);
+  if (dispatched.status !== 'indeterminate') {
+    await deps.idempotency.commit(input.idempotency_key, dispatched);
+  }
 
   return record(
     deps,

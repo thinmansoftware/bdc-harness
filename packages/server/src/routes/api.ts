@@ -39,6 +39,12 @@ import {
   withSyncedManagedSource,
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
+import { getDatabase } from '@archon/core/db/connection';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { dispatchBackgroundWorkflow } from '@archon/core/orchestrator';
+import { hashWorkflowDefinition } from '@archon/workflows/reliability/runtime-revisions';
+import type { OverseerRecoveryTransport } from '../overseer-recovery';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import { releaseWoLocksForRun } from '@archon/smart-cauldron/wo-lock';
 import { conductorSeatUsage } from '../services/conductor-seat-usage';
@@ -68,7 +74,11 @@ import {
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { parseWorkflowRunBranchOverride } from './workflow-run-branch-override';
-import { extractWoIdFromMessage, findLiveRunsForWo, isCascadeClimbMessage } from './wo-fire-guard';
+import {
+  dispatchGuardedWoRun,
+  extractWoIdFromMessage,
+  isCascadeClimbMessage,
+} from './wo-fire-guard';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
@@ -3416,7 +3426,7 @@ export function registerApiRoutes(
   activePlatforms?: readonly string[],
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
-): void {
+): OverseerRecoveryTransport {
   registeredWebAdapter = webAdapter;
   const dispatchPrincipalTransportCredentials = new WeakMap<Request, DispatchPrincipalCredential>();
 
@@ -4085,7 +4095,8 @@ export function registerApiRoutes(
     message: string,
     codebaseId?: string | null,
     modelOverride?: ModelOverride,
-    codexOnlyBinding?: CodexOnlyBinding
+    codexOnlyBinding?: CodexOnlyBinding,
+    exactRecovery = false
   ): Promise<
     | {
         valid: true;
@@ -4142,9 +4153,11 @@ export function registerApiRoutes(
     // (run 8849e767, WO-HARNESS-A2-ENGAGES-ALL-REPOS-01).
     let workflows: WorkflowDefinition[];
     try {
-      const discovery = await withSyncedManagedSource(cwd, cwd, () =>
-        discoverWorkflowsWithConfig(cwd, loadConfig)
-      );
+      const discovery = exactRecovery
+        ? await discoverWorkflowsWithConfig(cwd, loadConfig)
+        : await withSyncedManagedSource(cwd, cwd, () =>
+            discoverWorkflowsWithConfig(cwd, loadConfig)
+          );
       workflows = discovery.workflows.map(ws => ws.workflow);
     } catch (error) {
       getLog().warn({ err: error, cwd, workflowName }, 'dispatch_precheck_discovery_failed');
@@ -7096,31 +7109,29 @@ export function registerApiRoutes(
       const allowConcurrent =
         c.req.header('x-archon-allow-concurrent') === '1' ||
         c.req.header('x-archon-allow-concurrent') === 'true';
-      if (!allowConcurrent && !isCascadeClimbMessage(message)) {
-        const woId = conductor?.woId ?? extractWoIdFromMessage(message);
-        if (woId) {
-          const live = await findLiveRunsForWo(woId);
-          if (live.length > 0) {
-            getLog().warn(
-              { woId, liveRunIds: live.map(r => r.id), workflowName },
-              'wo_duplicate_fire_refused'
-            );
-            return c.json(
-              {
-                accepted: false,
-                error: 'duplicate_wo_live',
-                woId,
-                liveRuns: live,
-                hint: 'Cancel the live run or pass x-archon-allow-concurrent: 1 if you own the race',
-              },
-              409
-            );
-          }
-        }
+      const woId = conductor?.woId ?? extractWoIdFromMessage(message);
+      const guarded = await dispatchGuardedWoRun({
+        woId,
+        authorizeConcurrent: allowConcurrent || isCascadeClimbMessage(message),
+        dispatch: () => dispatchToOrchestrator(conversationId, fullMessage, { modelOverride }),
+      });
+      if (!guarded.ok) {
+        getLog().warn(
+          { woId, liveRunIds: guarded.liveRuns.map(run => run.id), workflowName },
+          'wo_duplicate_fire_refused'
+        );
+        return c.json(
+          {
+            accepted: false,
+            error: guarded.error,
+            woId,
+            liveRuns: guarded.liveRuns,
+            hint: 'Cancel the live run or pass x-archon-allow-concurrent: 1 if you own the race',
+          },
+          409
+        );
       }
-
-      const result = await dispatchToOrchestrator(conversationId, fullMessage, { modelOverride });
-      return c.json(result);
+      return c.json(guarded.result);
     } catch (error) {
       getLog().error({ err: error }, 'run_workflow_failed');
       return apiError(c, 500, 'Failed to run workflow');
@@ -8742,6 +8753,118 @@ export function registerApiRoutes(
     const result = await checkForUpdate(appVersion);
     return c.json(result ?? noUpdate);
   });
+
+  return {
+    async fire(binding): Promise<string | null> {
+      const codebase = await codebaseDb.getCodebase(binding.codebaseId);
+      if (!codebase) return null;
+      const check = await validateWorkflowRunTarget(
+        `/workflow run ${binding.workflowName} ${binding.message}`,
+        binding.codebaseId,
+        undefined,
+        undefined,
+        true
+      );
+      if (
+        !check.valid ||
+        !check.workflow ||
+        check.workflow.name !== binding.workflowName ||
+        hashWorkflowDefinition(check.workflow) !== binding.workflowRevision
+      )
+        return null;
+      const workflow = check.workflow;
+      const guarded = await dispatchGuardedWoRun({
+        woId: binding.woId,
+        excludeRunId: binding.runId,
+        revalidate: binding.revalidate,
+        dispatch: async () => {
+          const parent = await conversationDb.getOrCreateConversation('web', binding.platformId);
+          await conversationDb.updateConversation(parent.id, {
+            codebase_id: binding.codebaseId,
+            cwd: codebase.default_cwd,
+          });
+          await dispatchBackgroundWorkflow(
+            {
+              platform: webAdapter,
+              conversationId: binding.platformId,
+              conversationDbId: parent.id,
+              cwd: codebase.default_cwd,
+              codebaseId: binding.codebaseId,
+              originalMessage: binding.message,
+              availableWorkflows: [workflow],
+              recoveryAdmission: {
+                check: async cwd => {
+                  const { stdout } = await promisify(execFile)('git', ['rev-parse', 'HEAD'], {
+                    cwd,
+                    timeout: 15000,
+                  });
+                  const checked = await dispatchGuardedWoRun({
+                    woId: binding.woId,
+                    excludeRunId: binding.runId,
+                    revalidate: binding.revalidate,
+                    dispatch: async () => true,
+                  });
+                  if (!checked.ok || stdout.trim() !== binding.baseSha) {
+                    throw new Error('recovery_successor_base_or_custody_changed');
+                  }
+                },
+              },
+            },
+            workflow
+          );
+          const { rows } = await getDatabase().query<{ id: string }>(
+            'SELECT id FROM remote_agent_workflow_runs WHERE parent_conversation_id=$1',
+            [parent.id]
+          );
+          return rows.length === 1 ? (rows[0]?.id ?? null) : null;
+        },
+      });
+      return guarded.ok ? guarded.result : null;
+    },
+    async resume(run, workflow, activate): Promise<void> {
+      if (!run.working_path || !run.codebase_id) throw new Error('recovery_worktree_missing');
+      const worker = await conversationDb.getConversationById(run.conversation_id);
+      const parent = run.parent_conversation_id
+        ? await conversationDb.getConversationById(run.parent_conversation_id)
+        : null;
+      if (worker?.platform_type !== 'web' || parent?.platform_type !== 'web') {
+        throw new Error('recovery_worker_or_parent_missing');
+      }
+      webAdapter.setConversationDbId(worker.platform_conversation_id, worker.id);
+      const unsubscribe = webAdapter.setupEventBridge(
+        worker.platform_conversation_id,
+        parent.platform_conversation_id
+      );
+      let activated: (() => void) | undefined;
+      const activation = new Promise<void>(resolve => {
+        activated = resolve;
+      });
+      const execution = executeWorkflow(
+        createWorkflowDeps(),
+        webAdapter,
+        worker.platform_conversation_id,
+        run.working_path,
+        workflow,
+        run.user_message,
+        worker.id,
+        run.codebase_id,
+        undefined,
+        undefined,
+        parent.id,
+        run,
+        undefined,
+        undefined,
+        {
+          activate: async () => {
+            const resumed = await activate();
+            activated?.();
+            return resumed;
+          },
+        }
+      ).finally(unsubscribe);
+      await Promise.race([activation, execution]);
+    },
+  };
 }
 
 function readProjectRecord(codebase: {
