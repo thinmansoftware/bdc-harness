@@ -112,8 +112,15 @@ interface Node {
 const lanes = readdirSync(laneRoot).filter(
   file =>
     file.endsWith('.yaml') &&
-    readFileSync(join(laneRoot, file), 'utf8').includes('kind: manifest_v2')
+    readFileSync(join(laneRoot, file), 'utf8').includes('kind: manifest_v2') &&
+    // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane removed the evidence repair.
+    file !== 'bdc-feature-development.yaml'
 );
+test('bdc-feature-development.yaml (rebuilt lane) carries no evidence repair step or call', () => {
+  const text = readFileSync(join(laneRoot, 'bdc-feature-development.yaml'), 'utf8');
+  expect(text.includes('evidence-repair')).toBe(false);
+  expect(text.includes('EVIDENCE_ONLY_REPAIR')).toBe(false);
+});
 const bash = process.platform === 'win32' ? 'C:/Program Files/Git/bin/bash.exe' : 'bash';
 function execute(
   node: Node,

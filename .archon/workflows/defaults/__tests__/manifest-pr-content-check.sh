@@ -39,8 +39,10 @@ DEFAULTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$DEFAULTS_DIR/../../.." && pwd)"
 export BDC_PR_FILES_HELPER="$REPO_ROOT/scripts/gh-pr-files.sh"
 
+# bdc-feature-development.yaml is excluded from this parity (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01):
+# its block records PR_CONTENT_ERROR as a finding instead of failing the run
+# (june-shape-fixture.py evidence, Test 9).
 MCC_SISTER=(
-  bdc-feature-development.yaml
   bdc-feature-development-astra.yaml
   bdc-feature-development-codex.yaml
   bdc-feature-development-codex-only.yaml
@@ -62,7 +64,7 @@ extract_pr_block() {
   ' "$1" | sed 's/^      //'
 }
 
-echo "--- Parity: 12 manifest-pr-content-check blocks byte-identical ---"
+echo "--- Parity: 11 manifest-pr-content-check blocks byte-identical (rebuilt lane excluded) ---"
 REF=""
 REF_NAME=""
 for f in "${MCC_SISTER[@]}"; do

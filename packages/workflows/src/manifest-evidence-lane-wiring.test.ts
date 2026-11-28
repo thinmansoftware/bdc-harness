@@ -116,10 +116,21 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
       it('preserves canonical project-map resolver and runner mechanics', () => {
         const canonical = laneNodes('bdc-feature-development-codex.yaml');
         const resolver = node(nodes, 'resolve-test-command', file);
-        expect(resolver.bash).toBe(node(canonical, 'resolve-test-command', 'canonical').bash);
+        // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane drops only the replay-checkout
+        // lines of the removed evidence repair; everything else is the canonical text.
+        const replay =
+          '# Replay consumers run in the owned clone; feature lanes keep their cwd.\n' +
+          'if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then\n' +
+          '  cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1\n' +
+          'fi\n';
+        const expected = (bash: string | undefined): string | undefined =>
+          file === 'bdc-feature-development.yaml' ? (bash ?? '').replace(replay, '') : bash;
+        expect(resolver.bash).toBe(
+          expected(node(canonical, 'resolve-test-command', 'canonical').bash)
+        );
         expect(resolver.depends_on).toEqual(['format-autofix']);
         expect(node(nodes, 'run-stop-tests', file).bash).toBe(
-          node(canonical, 'run-stop-tests', 'canonical').bash
+          expected(node(canonical, 'run-stop-tests', 'canonical').bash)
         );
       });
 
@@ -149,10 +160,14 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         const n = node(nodes, 'run-stop-greps', file);
         // implement-block-gate (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01): the
         // stop greps do not run after a declared implement BLOCKED, so the node waits on the gate.
+        // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane has no implement-block-gate; the
+        // stop greps skip only on a run returned to its author (assert-implement-produced-work).
         expect(n.depends_on).toEqual([
           'format-autofix',
           'run-stop-tests-final',
-          'implement-block-gate',
+          file === 'bdc-feature-development.yaml'
+            ? 'assert-implement-produced-work'
+            : 'implement-block-gate',
         ]);
         expect(n.timeout).toBe(600000);
         // WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01: the whitespace split and the
@@ -192,7 +207,14 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         expect(check.bash).toContain('$stamp-manifest-evidence.output');
         const patch = node(nodes, 'patch-pr-body', file);
         expect(patch.depends_on).toContain('manifest-evidence-check');
-        expect(patch.when).toContain("$manifest-evidence-check.output == 'OK'");
+        if (file === 'bdc-feature-development.yaml') {
+          // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the evidence check records a finding instead of
+          // failing; patch-pr-body runs for every opened or adopted PR (june-shape-lane.sh Test 9).
+          expect(patch.when).toBe("$open-pr-if-needed.output != ''");
+          expect(check.bash).toContain('FINDING=%s');
+        } else {
+          expect(patch.when).toContain("$manifest-evidence-check.output == 'OK'");
+        }
       });
 
       it('no consumer other than stamp-manifest-evidence reads the raw $build-manifest.output', () => {
@@ -230,7 +252,9 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
     expect(expectedPbb).toContain('pbb_mark_blocked()');
     expect(expectedPbb).toContain('RUN BLOCKED -- not lane-verified');
     expect(expectedPbb).toContain('run:blocked');
-    for (const file of EXPECTED_LANES) {
+    // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane drops the pbb core; its checked
+    // variant is hold-if-findings (june-shape-lane.sh Tests 1 and 2).
+    for (const file of EXPECTED_LANES.filter(name => name !== 'bdc-feature-development.yaml')) {
       const nodes = laneNodes(file);
       const patch = node(nodes, 'patch-pr-body', file);
       expect(coreOf(patch.bash ?? '', 'pbb')).toBe(expectedPbb);

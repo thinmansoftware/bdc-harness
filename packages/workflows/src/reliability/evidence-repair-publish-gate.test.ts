@@ -113,7 +113,9 @@ test('every REVIEW-publishing or completing node is gated by the evidence-repair
       }
     }
   }
-  expect(lanesWithVerify).toBe(13);
+  // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt bdc-feature-development.yaml removed the
+  // evidence repair (its five steps); the other 12 lanes keep it unchanged.
+  expect(lanesWithVerify).toBe(12);
   expect(checked).toBeGreaterThan(0);
   expect(failures).toEqual([]);
 });

@@ -119,7 +119,27 @@ describe('repair-target lane wiring', () => {
       const yaml = readLane(file);
       expect(yaml.split('# ---- BEGIN rtw core').length - 1, file).toBe(1);
       expect(yaml.split('# ---- BEGIN rta core').length - 1, file).toBe(1);
-      expect(rawCore(yaml, 'rtw'), file).toBe(rtwRef);
+      // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: bdc-feature-development.yaml routes both rtw
+      // backup pushes through pubg_push; for the rtw core only, it differs from the other 12 in
+      // exactly those two push lines.
+      if (file === 'bdc-feature-development.yaml') {
+        const own = rawCore(yaml, 'rtw');
+        expect(own, file).not.toContain('git push');
+        expect(
+          own
+            .replace(
+              'pubg_push "$commit" "${ref#refs/heads/}"',
+              'git push origin "${commit}:${ref}"'
+            )
+            .replace(
+              'pubg_push "$holder_sha" "${backup_ref#refs/heads/}"',
+              'git push origin "${holder_sha}:${backup_ref}"'
+            ),
+          file
+        ).toBe(rtwRef);
+      } else {
+        expect(rawCore(yaml, 'rtw'), file).toBe(rtwRef);
+      }
       expect(rawCore(yaml, 'rta'), file).toBe(rtaRef);
       const commit = nodeOf(nodesOf(file), 'commit-and-push', file);
       expect(commit.bash ?? '', file).toContain('rta_plan_authorizes');
@@ -133,8 +153,11 @@ describe('repair-target lane wiring', () => {
       const yaml = readLane(file);
       const nodes = nodesOf(file);
 
-      // 1a: exactly two node-out reads of decide-push-target.out and no old decide heredoc.
-      expect(yaml.split('ARCHON_NODE_OUT/decide-push-target.out').length - 1, file).toBe(2);
+      // 1a: two handoff sites. The rebuilt lane also checks file existence before opening the PR.
+      const expectedReferences = file === 'bdc-feature-development.yaml' ? 3 : 2;
+      expect(yaml.split('ARCHON_NODE_OUT/decide-push-target.out').length - 1, file).toBe(
+        expectedReferences
+      );
       expect(yaml, file).not.toContain('BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET');
 
       // 1a: commit-and-push reads both node-output files with explicit non-empty fail-closed checks.
@@ -144,7 +167,15 @@ describe('repair-target lane wiring', () => {
         'DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"'
       );
       expect(commitBash, file).toContain('DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")');
-      expect(commitBash, file).toContain('if [ ! -s "$DECIDE_OUT_FILE" ]; then');
+      if (file === 'bdc-feature-development.yaml') {
+        // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01 exit table (W:5693/5829 DERIVE): a missing push
+        // target is an in-node default; commit-and-push derives the branch and continues.
+        expect(commitBash, file).toContain('if [ -s "$DECIDE_OUT_FILE" ]; then');
+        expect(commitBash, file).toContain('handed over no push target');
+        expect(commitBash, file).toContain('deriving the branch in-node');
+      } else {
+        expect(commitBash, file).toContain('if [ ! -s "$DECIDE_OUT_FILE" ]; then');
+      }
       expect(commitBash, file).toContain('PLAN_REVIEW_OUT_FILE="$ARCHON_NODE_OUT/plan-review.out"');
       expect(commitBash, file).toContain('PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")');
       expect(commitBash, file).toContain('if [ ! -s "$PLAN_REVIEW_OUT_FILE" ]; then');

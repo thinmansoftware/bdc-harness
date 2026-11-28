@@ -20,11 +20,13 @@ const lanes = readdirSync(lanesDir).filter(
 
 function publication(file: string, context: string | null, lease = '', removeGuard = false) {
   const yaml = readFileSync(join(lanesDir, file), 'utf8').replaceAll('\r', '');
-  const create = yaml.indexOf('          CREATE_OUT=$(gh pr create');
-  expect(create).toBeGreaterThan(0);
-  const marker = yaml.lastIndexOf('          # held-draft-repair-no-create: begin', create);
+  const create = /^ +CREATE_OUT=\$\(gh pr create\b[^\n]*$/m.exec(yaml);
+  if (!create) throw new Error(`${file}: PR create command not found`);
+  const marker = yaml.lastIndexOf('# held-draft-repair-no-create: begin', create.index);
+  expect(marker, file).toBeGreaterThan(0);
+  if (file === 'bdc-feature-development.yaml') expect(create[0]).toContain(' --draft ');
   const fragment = yaml
-    .slice(marker < 0 || removeGuard ? create : marker, yaml.indexOf('\n', create))
+    .slice(removeGuard ? create.index : marker, create.index + create[0].length)
     .replace(/^      /gm, '');
   const root = mkdtempSync(join(tmpdir(), 'held-repair-publish-'));
   try {

@@ -18,7 +18,6 @@ const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 const LANE_FILES = readdirSync(LANES_DIR)
   .filter(file => /^bdc-feature-development(?:-.*)?\.yaml$/.test(file))
-  .filter(file => readFileSync(join(LANES_DIR, file), 'utf8').includes('- id: diff-repair'))
   .sort();
 const EXPECTED_LANES = [
   'bdc-feature-development-astra.yaml',
@@ -83,7 +82,12 @@ describe('diff-repair checkpoint and salvage', () => {
       const path = join(LANES_DIR, file);
       const workflow = parse(readFileSync(path, 'utf8')) as WorkflowDocument;
       const node = (id: string) => workflow.nodes.find(item => item.id === id);
-      expect(node('checkpoint-diff-repair')?.depends_on).toContain('diff-repair');
+      if (file === 'bdc-feature-development.yaml') {
+        expect(node('checkpoint-diff-repair')?.depends_on).toContain('review-round-3');
+        expect(node('overseer-repair-round-4')?.depends_on).toContain('checkpoint-diff-repair');
+      } else {
+        expect(node('checkpoint-diff-repair')?.depends_on).toContain('diff-repair');
+      }
       expect(node('capture-diff-final')?.depends_on).toContain('checkpoint-diff-repair');
       expect(node('noninteractive-salvage')?.bash).toContain('SALVAGE=preserved_uncommitted:');
       expect(node('checkpoint-diff-repair')?.bash).not.toContain('git add -A');

@@ -67,9 +67,37 @@ for failed runs: a run recorded failed is no longer merged on a green PR alone.
 
 ## Fallback PRs are drafts
 
-The `noninteractive-salvage` node of all 13 `bdc-feature-development*.yaml` lanes opens its
+The `noninteractive-salvage` node of the 12 other `bdc-feature-development-*.yaml` lanes opens its
 "FALLBACK: opus-repaired build needs human review" PR with `--draft`, so no automatic path can approve or merge
-it; a person marks it ready.
+it; a person marks it ready. The rebuilt `bdc-feature-development.yaml` lane does not: its salvage commits
+only, and the run's single PR follows the rule below.
+
+## The rebuilt bdc-feature-development lane (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01)
+
+- `run:blocked` is machine-set and is the only hold this lane applies. The lane opens its PR as a draft, writes
+  `run:blocked` and the banner `RUN BLOCKED -- not lane-verified` when the run is not a clean PROCEED (a
+  finding, a review status other than PROCEED, a question, or any node of the run recorded failed), reads them
+  back, and only then makes the PR ready as the run's last act. A run that cannot write or read back a hold
+  ends failed and leaves its PR a draft.
+- `merge-hold` stays John's. The lane never applies it.
+- An `Evidence-Adjudication: <40-char head SHA>` comment clears eligible run-origin evidence reasons.
+- Removing `run:blocked` is a separate authorized human action.
+- Never merge a PR carrying `run:blocked`, `merge-hold` or `owner:reworking`, or one whose title starts
+  `FALLBACK:`.
+
+The lane itself writes target-repo code to GitHub only through its guarded publisher, `pubg_push` (a
+gitleaks scan of the outgoing range, bounded from the remote, before every push; a refused push is saved as a
+git bundle under `/host-artifacts/<run id>/`), and through its one draft PR creation.
+
+**The agent's write authority is not confined (an existing gap, not closed by this lane).** The `implement`
+agent runs in a clone whose origin URL carries the run's GitHub token, with `gh` in the same environment, so
+it can push or open a PR with the run's own identity, around `pubg_push` and its scan. The lane removed the
+instruction to push from the `implement` prompt, but no boundary confines the agent to the guarded publisher.
+What limits the damage today: every PR the lane itself opens stays a draft until its holds are verified, and
+a branch the agent pushes from the run's worktree (`archon/task-web-worker-<id>`) is linked to the run by the
+Overseer's worktree-path lookup (`findOriginatingRunForPullRequest`), so the run's holds apply. A PR the agent
+opens on a branch name of its own choosing is not covered. Closing the gap means running `implement` without
+GitHub write credentials, a separate harness work order.
 
 ## Checks
 

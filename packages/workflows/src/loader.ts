@@ -20,8 +20,14 @@ import {
   modelReasoningEffortSchema,
   webSearchModeSchema,
   runAuthorityPolicySchema,
+  unattendedQuestionsModeSchema,
+  idleHandoffModeSchema,
 } from './schemas/workflow';
-import type { RunAuthorityPolicy } from './schemas/workflow';
+import type {
+  RunAuthorityPolicy,
+  UnattendedQuestionsMode,
+  IdleHandoffMode,
+} from './schemas/workflow';
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { z } from '@hono/zod-openapi';
 
@@ -640,6 +646,45 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       runAuthority = runAuthorityResult.data;
     }
 
+    // Parse the two opt-in engine keys of WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01.
+    // FAIL CLOSED like run_authority: a misspelled value must not silently fall
+    // back to the default behavior the author opted out of.
+    let unattendedQuestions: UnattendedQuestionsMode | undefined;
+    if (raw.unattended_questions !== undefined) {
+      const parsed = unattendedQuestionsModeSchema.safeParse(raw.unattended_questions);
+      if (!parsed.success) {
+        getLog().warn(
+          { filename, value: raw.unattended_questions },
+          'invalid_unattended_questions_value'
+        );
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error: 'Invalid unattended_questions value: expected report',
+            errorType: 'validation_error',
+          },
+        };
+      }
+      unattendedQuestions = parsed.data;
+    }
+    let idleHandoff: IdleHandoffMode | undefined;
+    if (raw.idle_handoff !== undefined) {
+      const parsed = idleHandoffModeSchema.safeParse(raw.idle_handoff);
+      if (!parsed.success) {
+        getLog().warn({ filename, value: raw.idle_handoff }, 'invalid_idle_handoff_value');
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error: 'Invalid idle_handoff value: expected overseer',
+            errorType: 'validation_error',
+          },
+        };
+      }
+      idleHandoff = parsed.data;
+    }
+
     return {
       workflow: {
         name: raw.name,
@@ -657,6 +702,8 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         ...(targetRepo !== undefined ? { target_repo: targetRepo } : {}),
         ...(policyFile !== undefined ? { policyFile } : {}),
         ...(runAuthority !== undefined ? { run_authority: runAuthority } : {}),
+        ...(unattendedQuestions !== undefined ? { unattended_questions: unattendedQuestions } : {}),
+        ...(idleHandoff !== undefined ? { idle_handoff: idleHandoff } : {}),
         // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: carry workflow-root failover
         // defaults through to the executor so nodes can inherit them. Identity of
         // failover_provider was validated above; failover_model is a free SDK

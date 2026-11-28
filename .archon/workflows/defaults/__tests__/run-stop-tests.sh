@@ -134,12 +134,16 @@ for lane in $LANES; do
   assert_eq "dprep count $lane" "2" "$(grep -c 'BEGIN dprep core' "$DEFAULTS/$lane")"
   assert_eq "dprep occ1 $lane" "$DPREP_CORE" "$(extract_core_nth "$DEFAULTS/$lane" dprep 1)"
   assert_eq "dprep occ2 $lane" "$DPREP_CORE" "$(extract_core_nth "$DEFAULTS/$lane" dprep 2)"
-  impl_dep="$(awk '
+  impl_dep="$(tr -d '\r' < "$DEFAULTS/$lane" | awk '
     $0 ~ /^  - id: implement$/ { hit = 1; next }
     hit && $0 ~ /^    depends_on:/ { print; exit }
     hit && $0 ~ /^  - id: / { exit }
-  ' "$DEFAULTS/$lane")"
-  assert_eq "implement depends_on $lane" "    depends_on: [prep-dependencies, repair-gate]" "$impl_dep"
+  ')"
+  expected_impl_dep="    depends_on: [prep-dependencies, repair-gate]"
+  if [ "$lane" = "bdc-feature-development.yaml" ]; then
+    expected_impl_dep="    depends_on: [prep-dependencies, lane-scope-check, repair-gate]"
+  fi
+  assert_eq "implement depends_on $lane" "$expected_impl_dep" "$impl_dep"
 done
 
 echo "--- rst_class ---"
@@ -1140,7 +1144,17 @@ for lane in $LANES; do
     n && $0 == "    bash: |" { b = 1; next }
     b
   ' | sed 's/^      //')"
-  assert_eq "resolve-test-command parity $lane" "$RTC_BASH" "$lane_rtc"
+  if [ "$lane" = "bdc-feature-development.yaml" ]; then
+    # The rebuilt lane removes replay checkout. Every other resolver line stays in parity.
+    expected_rtc="$(printf '%s\n' "$RTC_BASH" | awk '
+      /^# Replay consumers run in the owned clone; feature lanes keep their cwd\.$/ { replay = 1; next }
+      replay && /^fi$/ { replay = 0; next }
+      !replay
+    ')"
+    assert_eq "resolve-test-command without replay checkout $lane" "$expected_rtc" "$lane_rtc"
+  else
+    assert_eq "resolve-test-command parity $lane" "$RTC_BASH" "$lane_rtc"
+  fi
 done
 RBIN="$(mktemp -d)"
 RMAP_JSON='{"comicstoreos-provisioner":{"repo":"thinmansoftware/comicstoreos-provisioner","test_command":"npm test"},"shopops-storefront":{"repo":"thinmansoftware/shopops-storefront","test_command":"bun test lib"},"fuelglass":{"repo":"https://github.com/thinmansoftware/fuelglass.git","test_command":"npm run fuel-test"}}'

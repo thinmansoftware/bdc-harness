@@ -67,9 +67,15 @@ describe('open-pr owned ancestor adoption', () => {
 
   test('Test 5: all lanes carry the guard and the bundle is regenerated', () => {
     expect(LANE_FILES.length).toBe(13);
+    // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt bdc-feature-development.yaml makes one
+    // draft create with no in-run retry (Correction E amendment 1c), so its guard text differs;
+    // it keeps both markers (checked below) and the other 12 stay identical.
     const guards = LANE_FILES.map(file => laneGuard(file));
+    const shared = LANE_FILES.filter(file => file !== 'bdc-feature-development.yaml').map(file =>
+      laneGuard(file)
+    );
+    for (const fileGuard of shared) expect(fileGuard).toBe(shared[0]);
     for (const fileGuard of guards) {
-      expect(fileGuard).toBe(guards[0]);
       expect(fileGuard.split('# same-head-adopt: begin').length - 1).toBe(1);
       expect(fileGuard.split('# same-head-adopt: end').length - 1).toBe(1);
       expect(fileGuard.split(GUARD_BEGIN).length - 1).toBe(1);

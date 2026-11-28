@@ -36,8 +36,9 @@ assert_nonzero() {
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# bdc-feature-development.yaml is excluded (WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01): an
+# unresolved WO_ID there records checkpoint_skipped as a finding (exit-table FINDING row).
 SISTER=(
-  bdc-feature-development.yaml
   bdc-feature-development-codex.yaml
   bdc-feature-development-codex-only.yaml
   bdc-feature-development-fusion-cx-qwen.yaml

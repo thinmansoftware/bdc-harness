@@ -154,3 +154,4 @@ scripts/dispatch-worker/transcripts/
 # GitHub App private keys (secrets/ on the host): never track (bdc-xo#5444)
 secrets/
 *.private-key.pem
+.june-shape-*/

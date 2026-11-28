@@ -56,7 +56,11 @@ function assertOpenPrGuard(node: string): void {
   expect(node).toContain('p["baseRefName"] == os.environ["RPR_BASE"]');
   expect(node).not.toContain('gh pr edit');
   expect(node).not.toContain('.[0].url // empty');
-  expect(node).toContain('--base "$BASE_BRANCH"');
+  // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane reads its local base as ${BASE_BRANCH}
+  // (the engine substitutes a bare $BASE_BRANCH token before bash runs).
+  expect(node.includes('--base "$BASE_BRANCH"') || node.includes('--base "${BASE_BRANCH}"')).toBe(
+    true
+  );
   expect(node).not.toContain('${BASE_BRANCH:+--base');
   expect(node).not.toContain('${BASE_BRANCH:-dev}');
 }
@@ -267,8 +271,13 @@ describe('existing PR base verification', () => {
       existingPrGuard(readFileSync(join(DEFAULTS_DIR, file), 'utf8'))
     );
     expect(guards).toHaveLength(13);
+    // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane's guard (one draft create, no retry)
+    // differs; the other 12 stay identical and every lane keeps the base predicate.
+    const shared = LANE_FILES.filter(file => file !== 'bdc-feature-development.yaml').map(file =>
+      existingPrGuard(readFileSync(join(DEFAULTS_DIR, file), 'utf8'))
+    );
+    for (const guard of shared) expect(guard).toBe(shared[0]);
     for (const guard of guards) {
-      expect(guard).toBe(guards[0]);
       expect(guard).toContain('p["baseRefName"] == os.environ["RPR_BASE"]');
       expect(guard).not.toContain('gh pr edit');
     }

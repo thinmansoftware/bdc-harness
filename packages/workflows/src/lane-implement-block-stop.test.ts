@@ -110,7 +110,54 @@ describe('lane lists', () => {
   });
 });
 
-for (const lane of LANES) {
+// WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt bdc-feature-development.yaml has no
+// implement-block-gate. A declared implement BLOCKED with code is salvaged, published and held
+// (block-classify reads the executor's blocked-reason file itself); with no code, the run goes back
+// to its author, and every repair, push, commit and PR node skips on that one outcome.
+const REBUILT = 'bdc-feature-development.yaml';
+const REBUILT_GATED = [
+  ...GATED.filter(id => id !== 'diff-repair' && id !== 'opus-repair'),
+  'repair-round-1',
+];
+const RETURN_COND = "$assert-implement-produced-work.output != 'BUILD_OUTCOME=RETURNED_TO_AUTHOR'";
+describe(`${REBUILT} (rebuilt lane)`, () => {
+  const nodes = loadNodes(REBUILT);
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  test('has no implement-block-gate and no node refers to it', () => {
+    expect(byId.has(GATE_ID)).toBe(false);
+    expect(byId.has('diff-repair')).toBe(false);
+    expect(byId.has('opus-repair')).toBe(false);
+    expect(readFileSync(join(defaultsDir, REBUILT), 'utf8').includes(GATE_ID)).toBe(false);
+  });
+  test('every entry point carries the returned-to-author gate on every OR clause', () => {
+    for (const id of REBUILT_GATED) {
+      const when = String(byId.get(id)?.when);
+      for (const clause of when.split(' || ')) {
+        expect(clause.includes(RETURN_COND), `${id} clause "${clause}"`).toBe(true);
+      }
+    }
+  });
+  test('a run returned to its author skips every guarded entry point', () => {
+    const outputs = out({
+      ...TERMINAL,
+      'assert-implement-produced-work': 'BUILD_OUTCOME=RETURNED_TO_AUTHOR',
+    });
+    for (const id of REBUILT_GATED) {
+      expect(holds(String(byId.get(id)?.when), outputs), `${id} must not run`).toBe(false);
+    }
+  });
+  test('a blocked run with code still reaches commit-and-push and open-pr-if-needed (HOLD)', () => {
+    const outputs = out({
+      ...TERMINAL,
+      'assert-implement-produced-work': 'BUILD_OUTCOME=REAL_BUILD',
+    });
+    for (const id of ['noninteractive-salvage', 'commit-and-push', 'open-pr-if-needed']) {
+      expect(holds(String(byId.get(id)?.when), outputs), `${id} must run`).toBe(true);
+    }
+  });
+});
+
+for (const lane of LANES.filter(name => name !== REBUILT)) {
   describe(lane, () => {
     const nodes = loadNodes(lane);
     const byId = new Map(nodes.map(n => [n.id, n]));

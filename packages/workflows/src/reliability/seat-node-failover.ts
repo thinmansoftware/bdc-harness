@@ -33,12 +33,21 @@ export const REVIEW_NODE_IDS: readonly string[] = [
   'apply-diff-review-final',
 ];
 
+/** Independent repair reviewers in the June-shape default lane. */
+export const REPAIR_REVIEW_NODE_IDS: readonly string[] = [
+  'review-round-1',
+  'review-round-2',
+  'review-round-3',
+  'review-round-4',
+  'review-round-5',
+];
+
 /** Reason a review node refuses rather than reroute to Claude (D0). */
 export const REVIEW_FAILOVER_CLAUDE_REFUSED_D0 = 'review_failover_claude_refused_d0';
 
-/** True when the node id is one of REVIEW_NODE_IDS. */
+/** True when the node id is a registered review seat. */
 export function isReviewNodeId(nodeId: string): boolean {
-  return REVIEW_NODE_IDS.includes(nodeId);
+  return REVIEW_NODE_IDS.includes(nodeId) || REPAIR_REVIEW_NODE_IDS.includes(nodeId);
 }
 
 /** True when the node is a review node (D0 applies: never reroute it to Claude). */

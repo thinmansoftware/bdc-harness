@@ -78,12 +78,16 @@ export type {
 export {
   modelReasoningEffortSchema,
   webSearchModeSchema,
+  unattendedQuestionsModeSchema,
+  idleHandoffModeSchema,
   workflowBaseSchema,
   workflowDefinitionSchema,
 } from './workflow';
 export type {
   ModelReasoningEffort,
   WebSearchMode,
+  UnattendedQuestionsMode,
+  IdleHandoffMode,
   WorkflowBase,
   WorkflowDefinition,
 } from './workflow';

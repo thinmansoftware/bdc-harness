@@ -24,6 +24,7 @@
 import { describe, it, expect } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { REPAIR_REVIEW_NODE_IDS } from './reliability/seat-node-failover';
 
 const LANES_DIR = join(import.meta.dir, '..', '..', '..', '.archon/workflows/defaults');
 
@@ -95,7 +96,7 @@ const LANES: ReadonlyArray<{
   },
   {
     file: 'bdc-feature-development.yaml',
-    seats: FOUR_SEATS,
+    seats: ['diff-review', ...REPAIR_REVIEW_NODE_IDS, 'apply-diff-review-final'],
     terra: 'gpt-5.6-terra',
     failover: KIMI_FAILOVER,
   },
@@ -147,12 +148,18 @@ describe('review seats fail closed (no Claude fallback)', () => {
           expect(node?.failover_provider, `${id}:failover_provider`).toBe(failover.provider);
           expect(node?.failover_model, `${id}:failover_model`).toBe(failover.model);
           // failover_agent rides only on the four code-review seats.
-          const agent = (FOUR_SEATS as readonly string[]).includes(id) ? failover.agent : undefined;
+          const agent =
+            (FOUR_SEATS as readonly string[]).includes(id) || REPAIR_REVIEW_NODE_IDS.includes(id)
+              ? failover.agent
+              : undefined;
           expect(node?.failover_agent, `${id}:failover_agent`).toBe(agent);
         }
         if (node?.agent || node?.persona) {
           expect(node?.model, `${id}:model`).toBe(
-            REVIEWER_SOL_IDS.has(id) && REVIEWER_SOL_LANES.has(file) ? 'gpt-6.1-sol' : terra
+            (REVIEWER_SOL_IDS.has(id) || REPAIR_REVIEW_NODE_IDS.includes(id)) &&
+              REVIEWER_SOL_LANES.has(file)
+              ? 'gpt-6.1-sol'
+              : terra
           );
         }
       }

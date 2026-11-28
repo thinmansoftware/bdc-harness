@@ -336,11 +336,20 @@ PBB_SUM="$(printf '%s\n' "$PBB_CORE" | cksum)"
 for lane in $LANES; do
   LANE_N=$((LANE_N + 1))
   assert_eq "mec core byte-identical: $lane" "$MEC_SUM" "$(extract_core "$DEFAULTS/$lane" mec | cksum)"
-  assert_eq "pbb core byte-identical: $lane" "$PBB_SUM" "$(extract_core "$DEFAULTS/$lane" pbb | cksum)"
   assert_file_has "NOT_GATED: in $lane" "NOT_GATED:" "$DEFAULTS/$lane"
   assert_file_has "run:blocked in $lane" "run:blocked" "$DEFAULTS/$lane"
-  assert_file_has "patch-pr-body calls pbb_mark_blocked in $lane" 'pbb_mark_blocked "$STATUS" "$NP_URL" "$NP_REPO"' "$DEFAULTS/$lane"
   WHENLINE="$(tr -d '\r' < "$DEFAULTS/$lane" | awk '/^  - id: /{id=$3} id=="patch-pr-body" && /^    when:/ {print; exit}')"
+  if [ "$lane" = "bdc-feature-development.yaml" ]; then
+    # WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: the rebuilt lane drops the pbb core (unchanged
+    # for the other 12); its checked variant is hold-if-findings, and patch-pr-body runs for
+    # every PR the run opened or adopted (june-shape-lane.sh, Tests 1, 2 and 9).
+    assert_eq "pbb core removed from the rebuilt lane: $lane" "" "$(extract_core "$DEFAULTS/$lane" pbb)"
+    assert_file_has "hold-if-findings applies run:blocked in $lane" 'gh pr edit "$HIF_URL" --repo "$HIF_REPO" --add-label run:blocked' "$DEFAULTS/$lane"
+    assert_contains "patch-pr-body runs for every opened or adopted PR in $lane" "\$open-pr-if-needed.output != ''" "$WHENLINE"
+    continue
+  fi
+  assert_eq "pbb core byte-identical: $lane" "$PBB_SUM" "$(extract_core "$DEFAULTS/$lane" pbb | cksum)"
+  assert_file_has "patch-pr-body calls pbb_mark_blocked in $lane" 'pbb_mark_blocked "$STATUS" "$NP_URL" "$NP_REPO"' "$DEFAULTS/$lane"
   assert_contains "patch-pr-body when accepts OK in $lane" "\$manifest-evidence-check.output == 'OK'" "$WHENLINE"
   assert_contains "patch-pr-body when accepts NOT_GATED:BLOCKED in $lane" "\$manifest-evidence-check.output == 'NOT_GATED:BLOCKED'" "$WHENLINE"
 done

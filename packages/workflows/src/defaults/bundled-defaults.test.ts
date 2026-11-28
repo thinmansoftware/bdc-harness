@@ -234,8 +234,16 @@ describe('bundled-defaults', () => {
             expect(implementNode.idle_timeout).toBe(lane.implementIdle);
           }
 
-          expect(implement.split(REMOTE_CI_MARKER).length - 1).toBe(1);
-          expect(content.split(REMOTE_CI_MARKER).length - 1).toBe(1);
+          if (lane.name === 'bdc-feature-development') {
+            expect(implement).toMatch(
+              /leave\s+PR-body publication and check observation to the mechanical nodes/
+            );
+            expect(implement).toContain('trigger/rerun CI from implement.');
+            expect(implement).not.toContain(REMOTE_CI_MARKER);
+          } else {
+            expect(implement.split(REMOTE_CI_MARKER).length - 1).toBe(1);
+            expect(content.split(REMOTE_CI_MARKER).length - 1).toBe(1);
+          }
         });
       }
     });
@@ -311,7 +319,25 @@ describe('bundled-defaults', () => {
         });
       }
 
-      for (const name of [...REASONING_BOUND, ...OPEN_MODEL]) {
+      const rebuilt = 'bdc-feature-development';
+      const legacyLanes = [...REASONING_BOUND, ...OPEN_MODEL].filter(name => name !== rebuilt);
+
+      it('pins all rebuilt AI steps to ten minutes and keeps manifest evidence mechanical', () => {
+        const workflow = parseBundledWorkflow(rebuilt);
+        expect(workflow.idle_handoff).toBe('overseer');
+        expect(workflow.nodes.some(node => node.id === 'diff-repair')).toBe(false);
+        const aiNodes = workflow.nodes.filter(node => 'prompt' in node || 'loop' in node);
+        expect(aiNodes.map(node => node.id)).toContain('repair-round-1');
+        expect(aiNodes.map(node => node.id)).toContain('overseer-idle-look');
+        for (const node of aiNodes) {
+          expect(node.idle_timeout, node.id).toBe(600000);
+        }
+        const manifest = getWorkflowNode(workflow, 'build-manifest');
+        expect('evidence' in manifest).toBe(true);
+        expect(manifest.idle_timeout).toBeUndefined();
+      });
+
+      for (const name of legacyLanes) {
         for (const nodeId of OUT_OF_SCOPE_NODES) {
           it(`${name} does not apply the plan-review/implement idle timeout to ${nodeId}`, () => {
             withDefaultLoopIterationIdleEnv(() => {
@@ -330,7 +356,7 @@ describe('bundled-defaults', () => {
         }
       }
 
-      for (const name of [...REASONING_BOUND, ...OPEN_MODEL]) {
+      for (const name of legacyLanes) {
         it(`${name} diffRepairIdleCeiling sets the diff-repair idle and wall ceilings`, () => {
           const content = BUNDLED_WORKFLOWS[name];
           const nodeSource = extractWorkflowNode(content, 'diff-repair');

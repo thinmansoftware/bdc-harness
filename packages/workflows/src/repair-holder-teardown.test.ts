@@ -556,7 +556,25 @@ describe('repair holder teardown -- rtw core (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-
         .filter(f => f.startsWith('bdc-feature-development') && f.endsWith('.yaml'))
         .sort()
     ).toEqual(LANES);
-    const blocks = LANES.map(file => extractRtwCore(readFileSync(join(LANES_DIR, file), 'utf8')));
+    // WO-HARNESS-JUNE-SHAPE-LANE-REBUILD-01: bdc-feature-development.yaml routes both rtw
+    // backup pushes through its guarded publisher (pubg_push), so for the rtw core only that
+    // lane is compared against itself below and the other 12 stay byte-identical.
+    const PUBG_LANE = 'bdc-feature-development.yaml';
+    const blocks = LANES.filter(file => file !== PUBG_LANE).map(file =>
+      extractRtwCore(readFileSync(join(LANES_DIR, file), 'utf8'))
+    );
+    const pubgBlock = extractRtwCore(readFileSync(join(LANES_DIR, PUBG_LANE), 'utf8'));
+    expect(pubgBlock).toContain('rtw_backup_dirty_holder');
+    expect(pubgBlock).not.toContain('git push');
+    expect(pubgBlock.split('pubg_push ').length - 1).toBe(2);
+    expect(
+      pubgBlock
+        .replace('pubg_push "$commit" "${ref#refs/heads/}"', 'git push origin "${commit}:${ref}"')
+        .replace(
+          'pubg_push "$holder_sha" "${backup_ref#refs/heads/}"',
+          'git push origin "${holder_sha}:${backup_ref}"'
+        )
+    ).toBe(blocks[0] as string);
     for (const block of blocks) {
       expect(block).toBe(blocks[0] as string);
       expect(block).toContain('rtw_wait_for_holder_exit');

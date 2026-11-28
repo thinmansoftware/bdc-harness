@@ -56,8 +56,9 @@ describe('test-repair keeps the builder binding without a persona', () => {
 
     test(`${file}: the real repair resolver retains the builder model`, () => {
       const binding = resolveNode(workflow, 'test-repair');
-      const builderNode = workflow.nodes.find(node => node.id === 'diff-repair');
-      if (!builderNode) throw new Error(`Missing diff-repair in ${file}`);
+      const builderId = file === 'bdc-feature-development.yaml' ? 'repair-round-1' : 'diff-repair';
+      const builderNode = workflow.nodes.find(node => node.id === builderId);
+      if (!builderNode) throw new Error(`Missing ${builderId} in ${file}`);
       const builder = resolveModelForNode({
         nodeId: builderNode.id,
         nodeProvider: builderNode.provider,
