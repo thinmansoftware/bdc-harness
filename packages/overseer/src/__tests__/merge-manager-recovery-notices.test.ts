@@ -971,8 +971,10 @@ describe('WO-HARNESS-MERGE-MANAGER-RECOVERY-01', () => {
     }
   }, 180_000);
 
-  test('Test 7: Only the bdc-harness dev docs-only entry changes', () => {
-    // Every entry as it was at bdc-harness dev 0a3c2e30, except bdc-harness dev docsOnly.
+  test('Test 7: Policy snapshot is the recovery baseline plus harness dev docs-only and desk staging', () => {
+    // Every entry as it was at bdc-harness dev 0a3c2e30, except:
+    // - bdc-harness dev docsOnly (WO-HARNESS-MERGE-MANAGER-RECOVERY-01)
+    // - receiving-shipping-desk staging (bdc-xo#5853; staging does not install a Workroom build)
     expect(JSON.parse(JSON.stringify(DEFAULT_MERGE_REPO_POLICY))).toEqual({
       'thinmansoftware/bdc-harness': {
         dev: { unattended: true, docsOnly: 'merge' },
@@ -992,6 +994,9 @@ describe('WO-HARNESS-MERGE-MANAGER-RECOVERY-01', () => {
       'thinmansoftware/shopops-storefront': {
         staging: { unattended: true, docsOnly: 'skip' },
         master: { unattended: false, docsOnly: 'skip' },
+      },
+      'thinmansoftware/receiving-shipping-desk': {
+        staging: { unattended: true, docsOnly: 'merge' },
       },
       'thinmansoftware/bdc-xo': {
         main: { unattended: true, docsOnly: 'merge' },
