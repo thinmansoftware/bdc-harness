@@ -93,7 +93,14 @@ import {
 } from './escalation-dedupe';
 import { pageOnce } from '../dispatch/worker-heartbeat-alarm';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
-import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
+import {
+  cascadeWoClaimDeps,
+  defaultRunReader,
+  isCascadeHolding,
+  reconcileRetainedWoClaims,
+  type ClaimRunReader,
+} from '../cascade/wo-claim';
+import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -135,15 +142,19 @@ function defaultConfigWarn(variable: string, raw: string, fallback: number): voi
 /** Conservative faucet bound for newly eligible work, within the shared cap. */
 export const MAX_FIRES_PER_TICK = 3;
 
-/** Ratified M-155 daily bound; invalid input closes the automatic faucet. */
-export function resolveTaskmasterFireDailyLimit(
-  value: string | undefined = process.env.TASKMASTER_FIRE_MAX_PER_DAY
-): number {
-  if (value === undefined) return 2;
-  if (!/^\d+$/.test(value)) return 0;
-  const limit = Number(value);
-  return Number.isSafeInteger(limit) ? limit : 0;
-}
+/**
+ * John's answer B (2026-11-23, PR 6440 comment 7094544309; WO-HARNESS-TASKMASTER-NO-DAILY-
+ * FIRE-CAP-01): after two automatic fires of ONE work order in a UTC day that end with no pull
+ * request, Taskmaster stops firing that work order for the rest of the day and sends one
+ * message saying so. Nothing else is limited, and there is no daily cap. A fixed number, read
+ * from no setting: changing it is a spec change put to John first ("No hidden limits").
+ */
+export const MAX_NO_PR_FIRES_PER_WO_PER_DAY = 2;
+
+/** Escalation reason of the one per-work-order stop message (John's answer B). */
+export const WO_NO_PR_FIRES_STOP_REASON = 'wo_no_pr_fires_stop';
+/** Cascade run statuses after which a fire can no longer open a pull request (incl. escalated). */
+const TERMINAL_FIRE_RUN_STATUSES = new Set<string>(TERMINAL_WORKFLOW_STATUSES);
 
 /**
  * Per-tick cap on blocker_report sends (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01).
@@ -188,6 +199,11 @@ export interface TaskmasterState {
   reconciled: boolean;
   /** Last tick on which a budget hold was made visible. */
   lastHoldMonitorTick: number | null;
+  /**
+   * Fire journal ids already logged at info today as not counted toward John's no-PR stop for
+   * a fail-open reason (Board desk R7). Cleared when the UTC day changes.
+   */
+  noPrSkipLogged: { day: string; ids: Set<string> };
 }
 
 export function createTaskmasterState(intervalMs: number): TaskmasterState {
@@ -197,6 +213,7 @@ export function createTaskmasterState(intervalMs: number): TaskmasterState {
     pendingConfirm: new Map(),
     reconciled: false,
     lastHoldMonitorTick: null,
+    noPrSkipLogged: { day: '', ids: new Set() },
   };
 }
 
@@ -280,6 +297,8 @@ export interface TaskmasterDeps {
     | 'updateAutomaticFireExpectation'
   >;
   readFireCascade?: typeof readCascadeRecord;
+  /** One workflow run for John's no-PR stop (wo-claim's run reader); null when unreadable. */
+  readFireRun?: ClaimRunReader;
   /** Test seam: release retained shared WO claims whose runs are all terminal. */
   reconcileWoClaims?: () => Promise<string[]>;
   now?: () => Date;
@@ -2125,16 +2144,27 @@ export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise
   return result;
 }
 
+/** The run a no-PR fire belongs to: its cascade id when journaled, else its journal id. */
+function noPrFireRunLabel(action: taskmasterDb.TmJournalEntry): string {
+  try {
+    const parsed = JSON.parse(action.proposal_json) as { cascadeId?: unknown } | null;
+    if (parsed && typeof parsed.cascadeId === 'string' && parsed.cascadeId) return parsed.cascadeId;
+  } catch {
+    // Malformed history still names the journal row.
+  }
+  return action.id;
+}
+
 async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<TickResult> {
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
   const fireBudget = deps.fireBudget ?? (!deps.db ? taskmasterDb : undefined);
   const readFire = deps.readFireCascade ?? readCascadeRecord;
-  let fireHistoryReady = false;
+  // History reconciliation keeps custody of earlier admissions. Its failure is logged and
+  // no longer withholds new automatic fires (WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01).
   if (fireBudget && resolveFireVerbEnabled()) {
     try {
       await reconcileAutomaticFires(dal, fireBudget, readFire, now());
-      fireHistoryReady = true;
     } catch (error) {
       log.error({ err: error as Error }, 'taskmaster.fire_history_unknown');
     }
@@ -2250,6 +2280,138 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   // 4. Journal lookback: dedupe set + per-item 24h intervention counts.
   const lookback = await dal.getActionsSince(new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString());
+  // John's answer B: today's automatic fires per WORK ORDER (woId + project from the fire's own
+  // evidence, so two issue threads naming one work order share one count) whose build ended
+  // with no pull request. A 'sent' fire row proves admission only, so a fire with a cascade is
+  // counted only when its cascade evidence is terminal and shows no PR; running, PR-opening and
+  // unreadable cascades are not counted. A 'failed' fire row with no cascade never started a
+  // build and is counted as a no-PR fire. A deferred row never fired.
+  const todayUtc = new Date(nowMs).toISOString().slice(0, 10);
+  const noPrFiresTodayByScope = new Map<string, taskmasterDb.TmJournalEntry[]>();
+  const readFireRun = deps.readFireRun ?? defaultRunReader;
+  const noPrCascadeEnded = async (
+    firstCascadeId: string
+  ): Promise<true | { reason: string; failOpen: boolean }> => {
+    const runIds: string[] = [];
+    const visited = new Set<string>();
+    let cascadeId: string | null = firstCascadeId;
+    let lastStatus = '';
+    while (cascadeId !== null) {
+      if (visited.has(cascadeId)) {
+        return { reason: 'cascade_chain_invalid', failOpen: true };
+      }
+      visited.add(cascadeId);
+      let record: Awaited<ReturnType<typeof readFire>> = null;
+      try {
+        record = await readFire(cascadeId);
+      } catch {
+        record = null;
+      }
+      if (!record) return { reason: 'cascade_record_unreadable', failOpen: true };
+      lastStatus = record.status;
+      for (const attempt of record.attempts ?? []) {
+        if (typeof attempt?.runId === 'string' && attempt.runId) runIds.push(attempt.runId);
+      }
+      const resume: unknown = record.frontierApproval?.resumeCascadeId;
+      cascadeId = typeof resume === 'string' && resume ? resume : null;
+    }
+    if (isCascadeHolding(lastStatus)) {
+      return { reason: `cascade_not_finished:${lastStatus}`, failOpen: false };
+    }
+    if (runIds.length === 0) return { reason: 'cascade_no_runs', failOpen: true };
+    for (const runId of runIds) {
+      let run: Awaited<ReturnType<ClaimRunReader>> = null;
+      try {
+        run = await readFireRun(runId);
+      } catch {
+        run = null;
+      }
+      if (run === null) return { reason: 'run_status_unreadable', failOpen: true };
+      // Board desk R9: a failed run that is an approval hand-off can still resume (wo-claim).
+      if (run.approvalHandOff)
+        return { reason: 'run_not_finished:approval_handoff', failOpen: false };
+      if (!TERMINAL_FIRE_RUN_STATUSES.has(run.status)) {
+        return { reason: `run_not_finished:${run.status}`, failOpen: false };
+      }
+    }
+    return true;
+  };
+  // Board desk R6 and R7: every fire row of today that the count skips is logged with its
+  // reason. A normal state (a PR opened, a build still running) is logged at debug. A fail-open
+  // reason is logged at info once per journal id per UTC day.
+  if (state.noPrSkipLogged.day !== todayUtc) {
+    state.noPrSkipLogged = { day: todayUtc, ids: new Set() };
+  }
+  const skipNoPrFire = (
+    action: taskmasterDb.TmJournalEntry,
+    reason: string,
+    failOpen: boolean
+  ): void => {
+    if (!failOpen) {
+      log.debug({ journalId: action.id, reason }, 'taskmaster.no_pr_fire_not_counted');
+      return;
+    }
+    if (state.noPrSkipLogged.ids.has(action.id)) return;
+    state.noPrSkipLogged.ids.add(action.id);
+    log.info({ journalId: action.id, reason }, 'taskmaster.no_pr_fire_not_counted');
+  };
+  for (const action of lookback) {
+    if (action.action_type !== 'fire_cauldron') continue;
+    if (action.outcome !== 'sent' && action.outcome !== 'failed') continue;
+    if (action.created_at.slice(0, 10) !== todayUtc) continue;
+    let woId: unknown;
+    let project: unknown;
+    let cascadeId: unknown;
+    try {
+      const parsed = JSON.parse(action.proposal_json) as {
+        cascadeId?: unknown;
+        fireEvidence?: { woId?: unknown; project?: unknown };
+      } | null;
+      woId = parsed?.fireEvidence?.woId;
+      project = parsed?.fireEvidence?.project;
+      cascadeId = parsed?.cascadeId;
+    } catch {
+      skipNoPrFire(action, 'proposal_unreadable', true);
+      continue;
+    }
+    if (typeof woId !== 'string' || !woId || typeof project !== 'string' || !project) {
+      skipNoPrFire(action, 'fire_identity_missing', true);
+      continue;
+    }
+    if (typeof cascadeId === 'string' && cascadeId) {
+      let run: { status: string; prOpened?: boolean } | null = null;
+      try {
+        run = await getFireRunEvidence(woId, cascadeId, project);
+      } catch {
+        run = null;
+      }
+      if (!run) {
+        skipNoPrFire(action, 'cascade_evidence_unreadable', true);
+        continue;
+      }
+      if (run.prOpened === true) {
+        skipNoPrFire(action, 'pull_request_opened', false);
+        continue;
+      }
+      // Board desk R8: the cascade has ended only by the claim-release definition
+      // (cascade/wo-claim.ts): the record at the end of its resume chain is not holding, and
+      // every run recorded anywhere in the chain is terminal. The rolled-up evidence status
+      // above says completed when ANY run completed, so it cannot decide this.
+      const ended = await noPrCascadeEnded(cascadeId);
+      if (ended !== true) {
+        skipNoPrFire(action, ended.reason, ended.failOpen);
+        continue;
+      }
+    } else if (action.outcome !== 'failed') {
+      skipNoPrFire(action, 'sent_without_cascade', true);
+      continue;
+    }
+    const scope = fireScopeKey(woId, project);
+    const rows = noPrFiresTodayByScope.get(scope) ?? [];
+    rows.push(action);
+    noPrFiresTodayByScope.set(scope, rows);
+  }
+  const noPrStopProposedScopes = new Set<string>();
   const actionsByKey = new Map<string, taskmasterDb.TmJournalEntry>();
   const interventions24hByThread = new Map<string, number>();
   // Most recent 'sent' blocker_report per canonical ref (72h cooldown input).
@@ -2572,8 +2734,15 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         );
       }
     }
+    const noPrScope =
+      fireResult.eligible && fireResult.evidence
+        ? fireScopeKey(fireResult.evidence.woId, fireResult.evidence.project)
+        : null;
+    const noPrFiresToday = noPrScope ? (noPrFiresTodayByScope.get(noPrScope) ?? []) : [];
+    const noPrStop = noPrScope !== null && noPrFiresToday.length >= MAX_NO_PR_FIRES_PER_WO_PER_DAY;
     const fireEligibleResolved =
       fireResult.eligible &&
+      !noPrStop &&
       !unknownFireScope &&
       !(
         fireResult.evidence &&
@@ -2612,6 +2781,27 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     });
     if (proposal) {
       proposals.push(proposal);
+    }
+    if (noPrStop && noPrScope !== null && !noPrStopProposedScopes.has(noPrScope)) {
+      noPrStopProposedScopes.add(noPrScope);
+      // One loud message on Taskmaster's escalation route to the desk (t3-desktop), idempotent
+      // per work order per UTC day (John's answer B).
+      const woId = fireResult.evidence?.woId ?? (item as ListedThread).title ?? item.ref;
+      const runs = noPrFiresToday.map(noPrFireRunLabel).join(', ');
+      proposals.push({
+        type: 'escalate_p0',
+        threadRef: item.ref,
+        // The guard allows escalate_p0 only to the T3 desktop route (guard.ts).
+        recipient: 't3-desktop',
+        body:
+          `Taskmaster stopped automatic fires of ${woId} (${item.ref}) for the rest of ${todayUtc} UTC: ` +
+          `its last ${noPrFiresToday.length} automatic fires today ended with no pull request (${runs}). ` +
+          "John's rule (2026-11-23): two no-PR automatic fires of one work order in a UTC day stop that " +
+          'work order for the day. Nothing else is limited; it can fire again tomorrow.',
+        idempotencyKey: `tm:${WO_NO_PR_FIRES_STOP_REASON}:${fireResult.evidence?.woId}:${fireResult.evidence?.project}:${todayUtc}`,
+        actsImmediately: true,
+        reason: WO_NO_PR_FIRES_STOP_REASON,
+      });
     }
 
     // blocker_report is computed IN ADDITION to computeNextAction (it never
@@ -2752,7 +2942,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       const candidateOwnRow = Boolean(proposal.remediationCandidateId && existingAction);
       if (!candidateOwnRow) {
         const reason = proposal.reason ?? reasonForThreadRef(canonicalProposalRef);
-        if (reason) {
+        if (reason && reason !== WO_NO_PR_FIRES_STOP_REASON) {
           const decision = decideEscalation({
             threadRef: canonicalProposalRef,
             reason,
@@ -3040,7 +3230,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         : undefined;
     try {
       const escalationIssue =
-        proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
+        proposal.type === 'escalate_p0' &&
+        proposal.reason !== WO_NO_PR_FIRES_STOP_REASON &&
+        resolveEscalateToIssueEnabled()
           ? parseGithubThreadRef(proposal.threadRef)
           : null;
       if (escalationIssue) {
@@ -3112,11 +3304,13 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         await dal.updateActionOutcome(journalRow.id, 'sent', escalationSentJson);
         await dal.gradeAction(journalRow.id, 'delivered_to_issue');
       } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
-        if (!fireBudget || !fireHistoryReady) {
+        if (!fireBudget) {
+          // A real reservation-store outage still refuses, under its own reason, so it is
+          // never counted as a daily-budget deferral.
           await dal.updateActionOutcome(
             journalRow.id,
             'deferred',
-            JSON.stringify({ ...proposal, reason: 'daily_cap_history_or_store_unavailable' })
+            JSON.stringify({ ...proposal, reason: 'fire_store_unavailable' })
           );
           result.deferred += 1;
           continue;
@@ -3128,7 +3322,6 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           ownerToken: randomUUID(),
           cascadeId: proposal.idempotencyKey,
           epoch,
-          limit: resolveTaskmasterFireDailyLimit(),
           now: now().toISOString(),
           clock: () => now().toISOString(),
         };
@@ -3189,7 +3382,6 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
               const decision = await fireBudget.authorizeAutomaticFire({
                 ...reservation,
                 now: now().toISOString(),
-                limit: resolveTaskmasterFireDailyLimit(),
               });
               if (!decision.allowed || !decision.admission)
                 throw new Error(decision.reason ?? 'automatic_fire_permission_missing');

@@ -78,18 +78,23 @@ async function request(key: string): Promise<AutomaticFireRequest> {
     ownerToken: randomUUID(),
     cascadeId: key,
     epoch: 1,
-    limit: 2,
     now,
   };
 }
-test('real PostgreSQL pools serialize twelve competitors for one remaining slot', async () => {
-  const used = await request('first');
-  expect((await reserveAutomaticFire(used, first)).allowed).toBe(true);
+test('real PostgreSQL pools: twelve distinct actions all reserve; one action has one winner', async () => {
+  // No daily cap (WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01): distinct actions never compete.
   const inputs = await Promise.all(Array.from({ length: 12 }, (_, i) => request(`race-${i}`)));
   const results = await Promise.all(
     inputs.map((input, i) => reserveAutomaticFire(input, i % 2 ? first : second))
   );
-  expect(results.filter(result => result.allowed)).toHaveLength(1);
+  expect(results.filter(result => result.allowed)).toHaveLength(12);
+  // Single use: the same action key under twelve owner tokens grants exactly one reservation.
+  const same = await request('same-key-race');
+  const contenders = Array.from({ length: 12 }, (_, i) => ({ ...same, ownerToken: `owner-${i}` }));
+  const raced = await Promise.all(
+    contenders.map((input, i) => reserveAutomaticFire(input, i % 2 ? first : second))
+  );
+  expect(raced.filter(result => result.allowed)).toHaveLength(1);
 });
 test('PostgreSQL replay grants one invocation; rebooking uses the admission day and survives restart', async () => {
   const input = await request('same');
@@ -127,7 +132,7 @@ test('PostgreSQL replay grants one invocation; rebooking uses the admission day 
   const a = { ...(await request('next')), now: '2026-10-19T00:01:00.000Z' };
   const b = { ...(await request('overflow')), now: '2026-10-19T00:01:00.000Z' };
   expect((await reserveAutomaticFire(a, first)).allowed).toBe(true);
-  expect((await reserveAutomaticFire(b, second)).allowed).toBe(false);
+  expect((await reserveAutomaticFire(b, second)).allowed).toBe(true);
 });
 test('PostgreSQL epoch fence and definitive no-permission release preserve unknown capacity', async () => {
   const input = await request('pause');
@@ -137,7 +142,7 @@ test('PostgreSQL epoch fence and definitive no-permission release preserve unkno
   expect(await releaseAutomaticFire(input, first)).toBe(true);
 });
 
-test('PostgreSQL excludes only proven pre-effect expirations from legacy history', async () => {
+test('PostgreSQL legacy history, proven or unknown, never blocks a distinct fire', async () => {
   const expired = await request('stale-before-effect');
   await first!.query("UPDATE tm_journal SET outcome='expired',proposal_json=$1 WHERE id=$2", [
     JSON.stringify({ reason: 'stale_epoch_before_effect' }),
@@ -148,14 +153,13 @@ test('PostgreSQL excludes only proven pre-effect expirations from legacy history
   expect((await authorizeAutomaticFire(input, first)).allowed).toBe(true);
   const unknown = await request('unknown-expiration');
   await first!.query("UPDATE tm_journal SET outcome='expired' WHERE id=$1", [unknown.journalId]);
-  expect(await reserveAutomaticFire(await request('blocked-by-unknown'), second)).toEqual({
-    allowed: false,
-    reason: 'daily_cap_legacy_history_unknown',
+  expect(await reserveAutomaticFire(await request('not-blocked-by-unknown'), second)).toEqual({
+    allowed: true,
   });
 });
 
 test('PostgreSQL unowned settlement never releases reserved or committed permission', async () => {
-  const input = { ...(await request('settlement-refund')), limit: 1 };
+  const input = await request('settlement-refund');
   await reserveAutomaticFire(input, first);
   await settleAutomaticFire(
     { actionKey: input.actionKey, cascadeId: input.cascadeId, state: 'released' },
@@ -180,15 +184,17 @@ test('PostgreSQL unowned settlement never releases reserved or committed permiss
     second
   );
   expect((await listAutomaticFireAdmissions(first))[0]).toEqual(row);
+  // Not refunded is shown by the unchanged row; a distinct action is never refused.
+  expect((await reserveAutomaticFire(await request('replacement'), second)).allowed).toBe(true);
   expect(
-    (await reserveAutomaticFire({ ...(await request('replacement')), limit: 1 }, second)).allowed
-  ).toBe(false);
+    (await listAutomaticFireAdmissions(first)).find(r => r.action_key === input.actionKey)
+  ).toEqual(row);
 });
 
 test.each([true, false])(
   'PostgreSQL owned release and authorization serialize: releaseFirst=%s',
   async releaseFirst => {
-    const input = { ...(await request('release-race')), limit: 1 };
+    const input = await request('release-race');
     await reserveAutomaticFire(input, first);
     const release = () => releaseAutomaticFire(input, second);
     const authorize = () => authorizeAutomaticFire(input, first);
@@ -204,8 +210,6 @@ test.each([true, false])(
     ).rows[0]!;
     expect(row.state).toBe(released ? 'released' : 'unknown');
     expect(row.admitted_at === null).toBe(released);
-    expect(
-      (await reserveAutomaticFire({ ...(await request('after-race')), limit: 1 }, second)).allowed
-    ).toBe(released);
+    expect((await reserveAutomaticFire(await request('after-race'), second)).allowed).toBe(true);
   }
 );

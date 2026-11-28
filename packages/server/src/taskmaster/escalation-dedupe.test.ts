@@ -7,8 +7,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
   decideEscalation,
+  ESCALATION_REASONS,
   FAILED_BACKOFF_ENV,
   MARKER_WINDOW_ENV,
+  reasonOfRow,
   resolveEscalationCooldowns,
   SENT_WINDOW_ENV,
   type EscalationJournalRow,
@@ -227,5 +229,29 @@ describe('escalation-dedupe: Test 12, a row with no reason gets one from thread_
         }).action
       ).toBe('skip');
     }
+  });
+});
+
+describe("escalation-dedupe: John's per-work-order stop reason (WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01)", () => {
+  const REF = 'gh:thinmansoftware/bdc-harness#504';
+
+  test('escalation-dedupe: every listed reason is read back from a row as itself', () => {
+    for (const reason of ESCALATION_REASONS) {
+      expect(reasonOfRow(row(REF, 'sent', 1, { reason }))).toBe(reason);
+    }
+    expect(reasonOfRow(row(REF, 'sent', 1, { reason: 'wo_no_pr_fires_stop' }))).toBe(
+      'wo_no_pr_fires_stop'
+    );
+  });
+
+  test('escalation-dedupe: a sent stop row does not hold back an unclaimed_p0 for the same thread', () => {
+    const decision = decideEscalation({
+      threadRef: REF,
+      reason: 'unclaimed_p0',
+      nowMs: NOW,
+      rows: [row(REF, 'sent', 1, { reason: 'wo_no_pr_fires_stop' })],
+      settings: DEFAULTS,
+    });
+    expect(decision).toEqual({ action: 'send' });
   });
 });

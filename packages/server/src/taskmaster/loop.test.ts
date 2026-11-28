@@ -77,6 +77,21 @@ import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import * as taskmasterConnection from '@archon/core/db/connection';
 import * as fireBudgetDb from '@archon/core/db/taskmaster';
 
+// Shared real-loop fixture (moved for WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 Stop 3,
+// so daily-fire-cap.test.ts can drive the same tick without importing this test file).
+import {
+  T0,
+  TODAY_KEY,
+  type FakeWorld,
+  makeWorld,
+  budgetStores,
+  fixtureFireBudget,
+  makeDeps,
+  seedDigestSent,
+  EXPECTED_SPEC,
+  makeListedThread,
+} from '../test/taskmaster-loop-world';
+
 describe('Taskmaster reset visibility and canary', () => {
   test('legacy_unverified receipts are never post-cutover evidence', () => {
     const cutover = '2026-09-23T16:00:00.000Z';
@@ -232,396 +247,6 @@ describe('Taskmaster reset visibility and canary', () => {
   );
 });
 
-const T0 = Date.parse('2026-08-07T12:00:00.000Z');
-const TODAY_KEY = new Date(T0).toISOString().slice(0, 10);
-
-interface FakeWorld {
-  expectations: Map<string, TmExpectation>;
-  journal: TmJournalEntry[];
-  control: TmControlState;
-  sentMessages: Array<{
-    idempotency_key: string;
-    recipient: string;
-    body: string;
-    createdAt: string;
-    // M-155 Amendment 03: optional ack timestamp for the sent dispatch row,
-    // used by the default getDispatchMessageById mock to drive 'unheard' grading.
-    acknowledged_at?: string | null;
-  }>;
-  nowMs: number;
-  recordCalls: number;
-  adoptionRows: TmAdoptionRow[];
-  adoptionMeta: {
-    committed_snapshot_id: string | null;
-    rebuilt_at: string | null;
-    row_count: number | null;
-    source_commit: string | null;
-    complete: number;
-  };
-}
-
-function makeWorld(): FakeWorld {
-  return {
-    expectations: new Map(),
-    journal: [],
-    control: {
-      pause_state: 'RUNNING',
-      pause_scope: null,
-      pause_reason: null,
-      pause_actor: null,
-      epoch: 0,
-      updated_at: new Date(T0).toISOString(),
-    },
-    sentMessages: [],
-    nowMs: T0,
-    recordCalls: 0,
-    adoptionRows: [],
-    adoptionMeta: {
-      committed_snapshot_id: null,
-      rebuilt_at: null,
-      row_count: null,
-      source_commit: null,
-      complete: 0,
-    },
-  };
-}
-
-const budgetStores = new WeakMap<FakeWorld, SqliteAdapter>();
-const openedBudgetStores: SqliteAdapter[] = [];
-afterAll(async () => {
-  for (const db of openedBudgetStores) await db.close();
-});
-function fixtureFireBudget(world: FakeWorld): NonNullable<TaskmasterDeps['fireBudget']> {
-  const database = async (): Promise<SqliteAdapter> => {
-    let db = budgetStores.get(world);
-    if (!db) {
-      db = new SqliteAdapter(':memory:');
-      budgetStores.set(world, db);
-      openedBudgetStores.push(db);
-    }
-    await db.query('UPDATE tm_control SET pause_state=$1,epoch=$2 WHERE id=1', [
-      world.control.pause_state,
-      world.control.epoch,
-    ]);
-    for (const row of world.journal)
-      await db.query(
-        `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET outcome=$6,proposal_json=$4`,
-        [
-          row.id,
-          row.thread_ref,
-          row.action_type,
-          row.proposal_json,
-          row.idempotency_key,
-          row.outcome,
-          row.created_at,
-        ]
-      );
-    return db;
-  };
-  return {
-    reserveAutomaticFire: async input => fireBudgetDb.reserveAutomaticFire(input, await database()),
-    authorizeAutomaticFire: async input =>
-      fireBudgetDb.authorizeAutomaticFire(input, await database()),
-    releaseAutomaticFire: async input => fireBudgetDb.releaseAutomaticFire(input, await database()),
-    settleAutomaticFire: async input => fireBudgetDb.settleAutomaticFire(input, await database()),
-    seedAutomaticFireHistory: async input =>
-      fireBudgetDb.seedAutomaticFireHistory(input, await database()),
-    listAutomaticFireAdmissions: async () =>
-      fireBudgetDb.listAutomaticFireAdmissions(await database()),
-    updateAutomaticFireExpectation: async input =>
-      fireBudgetDb.updateAutomaticFireExpectation(input, await database()),
-  };
-}
-function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): TaskmasterDeps {
-  let journalSeq = world.journal.length;
-  const dal = {
-    listPendingFireActions: async () =>
-      world.journal.filter(row => row.action_type === 'fire_cauldron' && row.outcome === 'pending'),
-    transitionPendingFireAction: async (
-      id: string,
-      expectedJson: string,
-      outcome: 'pending' | 'sent' | 'expired',
-      proposalJson: string
-    ) => {
-      const row = world.journal.find(row => row.id === id);
-      if (
-        !row ||
-        row.action_type !== 'fire_cauldron' ||
-        row.outcome !== 'pending' ||
-        row.proposal_json !== expectedJson
-      )
-        return false;
-      row.outcome = outcome;
-      row.proposal_json = proposalJson;
-      return true;
-    },
-    registerExpectation: async (data: {
-      action_ref?: string | null;
-      dispatch_ref: string;
-      recipient: string;
-      evidence_json: string;
-      due_at: string;
-      on_absence: 'redispatch' | 'escalate' | 'give_up';
-      max_retries: number;
-    }) => {
-      const key = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
-      const prior = world.expectations.get(key);
-      if (prior) return prior.id;
-      const row: TmExpectation = {
-        ...data,
-        id: `expectation-${world.expectations.size + 1}`,
-        retries: 0,
-        status: 'pending',
-        evidence_pointer: null,
-        registered_by: 'taskmaster',
-        self_supervised: 0,
-        created_at: new Date(world.nowMs).toISOString(),
-        updated_at: new Date(world.nowMs).toISOString(),
-      };
-      world.expectations.set(key, row);
-      return row.id;
-    },
-    getExpectationByRegistrationKey: async (key: string) => world.expectations.get(key) ?? null,
-    recordAction: async (data: {
-      thread_ref: string;
-      action_type: TmActionType;
-      proposal_json: string;
-      idempotency_key?: string | null;
-      before_hash?: string | null;
-      proof_predicate?: string | null;
-      proof_deadline_at?: string | null;
-      outcome: TmActionOutcome;
-    }): Promise<TmJournalEntry> => {
-      world.recordCalls += 1;
-      journalSeq += 1;
-      const row: TmJournalEntry = {
-        id: `journal-${journalSeq}`,
-        created_at: new Date(world.nowMs).toISOString(),
-        thread_ref: data.thread_ref,
-        action_type: data.action_type,
-        proposal_json: data.proposal_json,
-        idempotency_key: data.idempotency_key ?? null,
-        before_hash: data.before_hash ?? null,
-        proof_predicate: data.proof_predicate ?? null,
-        proof_deadline_at: data.proof_deadline_at ?? null,
-        outcome: data.outcome,
-        graded_at: null,
-        grade: null,
-      };
-      world.journal.push(row);
-      return row;
-    },
-    updateActionOutcome: async (id: string, outcome: TmActionOutcome, proposalJson?: string) => {
-      const row = world.journal.find(j => j.id === id) ?? null;
-      if (row) {
-        row.outcome = outcome;
-        if (proposalJson !== undefined) row.proposal_json = proposalJson;
-      }
-      return row;
-    },
-    gradeAction: async (id: string, grade: TmGrade) => {
-      const row = world.journal.find(j => j.id === id) ?? null;
-      if (row) {
-        row.grade = grade;
-        row.graded_at = new Date(world.nowMs).toISOString();
-      }
-      return row;
-    },
-    getActionsSince: async (sinceIso: string) =>
-      world.journal.filter(j => j.created_at >= sinceIso),
-    getActionByIdempotencyKey: async (key: string) =>
-      world.journal.find(j => j.idempotency_key === key) ?? null,
-    getPauseState: async () => world.control,
-    setPauseState: async (data: {
-      pause_state: TmControlState['pause_state'];
-      pause_scope?: string | null;
-      pause_reason?: string | null;
-      pause_actor: string;
-      incrementEpoch?: boolean;
-    }) => {
-      world.control = {
-        pause_state: data.pause_state,
-        pause_scope: data.pause_scope ?? null,
-        pause_reason: data.pause_reason ?? null,
-        pause_actor: data.pause_actor,
-        epoch: world.control.epoch + (data.incrementEpoch ? 1 : 0),
-        updated_at: new Date(world.nowMs).toISOString(),
-      };
-      return world.control;
-    },
-    expireParkedActions: async () => {
-      let count = 0;
-      for (const row of world.journal) {
-        if (
-          row.outcome === 'parked' ||
-          (row.outcome === 'pending' && row.action_type !== 'fire_cauldron')
-        ) {
-          row.outcome = 'expired';
-          count += 1;
-        }
-      }
-      return count;
-    },
-    beginAdoptionSnapshot: async () => `snap-${world.nowMs}-${world.adoptionRows.length}`,
-    upsertAdoptionRow: async (snapshotId: string, row: Omit<TmAdoptionRow, 'snapshot_id'>) => {
-      const full: TmAdoptionRow = { ...row, snapshot_id: snapshotId };
-      const idx = world.adoptionRows.findIndex(
-        r => r.snapshot_id === snapshotId && r.thread_ref === row.thread_ref
-      );
-      if (idx >= 0) world.adoptionRows[idx] = full;
-      else world.adoptionRows.push(full);
-    },
-    commitAdoptionSnapshot: async (snapshotId: string, sourceCommit?: string | null) => {
-      world.adoptionRows = world.adoptionRows.filter(r => r.snapshot_id === snapshotId);
-      world.adoptionMeta = {
-        committed_snapshot_id: snapshotId,
-        rebuilt_at: new Date(world.nowMs).toISOString(),
-        row_count: world.adoptionRows.length,
-        source_commit: sourceCommit ?? null,
-        complete: 1,
-      };
-    },
-    abandonAdoptionSnapshot: async (snapshotId: string) => {
-      world.adoptionRows = world.adoptionRows.filter(r => r.snapshot_id !== snapshotId);
-    },
-    getAdoption: async () => {
-      const id = world.adoptionMeta.committed_snapshot_id;
-      if (!id) return [];
-      return world.adoptionRows.filter(r => r.snapshot_id === id);
-    },
-    getAdoptionMeta: async () => ({
-      id: 1,
-      committed_snapshot_id: world.adoptionMeta.committed_snapshot_id,
-      rebuilt_at: world.adoptionMeta.rebuilt_at,
-      row_count: world.adoptionMeta.row_count,
-      source_commit: world.adoptionMeta.source_commit,
-      complete: world.adoptionMeta.complete,
-    }),
-  };
-
-  const okHeadroom: HeadroomReading = {
-    state: 'OK',
-    tokensRemaining: 500_000,
-    isUnknown: false,
-    source: 'local_artifacts',
-    observedAt: new Date(T0).toISOString(),
-  };
-
-  return {
-    now: () => new Date(world.nowMs),
-    db: dal,
-    // Most fire fixtures model a created workflow; no-run/corruption tests
-    // override this independent SOR proof instead of treating admission as proof.
-    readFireCascadeEvidence: async (identity: { cascadeId: string }) => ({
-      earliestRunId: `actual-${identity.cascadeId}`,
-      completedRunId: null,
-      status: 'running',
-      prOpened: false,
-    }),
-    getDispatchReceiptCutoverAt: async () => new Date(T0 - 86_400_000).toISOString(),
-    headroom: async () => okHeadroom,
-    createTask: (async (
-      _context: unknown,
-      data: { idempotency_key: string; recipient: string; body: string },
-      fence?: {
-        taskmasterPausedEpoch: number;
-        taskmasterPausedState?: string;
-        taskmasterPausedScope?: string | null;
-      }
-    ) => {
-      // Fake the Dispatch boundary; its real SQLite/PG transaction has DAL
-      // tests. Mirror the real fence exactly: the notice is refused unless the
-      // live control row still matches the authorized state, scope and epoch.
-      if (
-        fence &&
-        (world.control.pause_state !== fence.taskmasterPausedState ||
-          (world.control.pause_scope ?? null) !== (fence.taskmasterPausedScope ?? null) ||
-          world.control.epoch !== fence.taskmasterPausedEpoch)
-      ) {
-        return null;
-      }
-      world.sentMessages.push({
-        idempotency_key: data.idempotency_key,
-        recipient: data.recipient,
-        body: data.body,
-        createdAt: new Date(world.nowMs).toISOString(),
-      });
-      return { id: `msg-${world.sentMessages.length}`, status: 'queued' } as never;
-    }) as unknown as TaskmasterDeps['createTask'],
-    findEffectByIdempotencyKey: async (key: string) => {
-      const found = world.sentMessages.find(m => m.idempotency_key === key);
-      // Use the idempotency_key as the dispatch id so the default
-      // getDispatchMessageById below can map effect.id back to the sent row
-      // for M-155 Amendment 03 'unheard' grading.
-      return found
-        ? { id: found.idempotency_key, status: 'queued', createdAt: found.createdAt }
-        : null;
-    },
-    // M-155 Amendment 03: synthesize the sent dispatch row from world.sentMessages
-    // (keyed by idempotency_key == effect.id). acknowledged_at defaults to null
-    // (unacked) unless a test seeds it.
-    getDispatchMessageById: (async (id: string) => {
-      const found = world.sentMessages.find(m => m.idempotency_key === id);
-      if (!found) return null;
-      return {
-        id,
-        recipient: found.recipient,
-        resolved_recipient: null,
-        acknowledged_at: found.acknowledged_at ?? null,
-        addressed_at: null,
-        addressed_by: null,
-      };
-    }) as unknown as TaskmasterDeps['getDispatchMessageById'],
-    // M-155 Amendment 03: mirror the seeded principal delivery modes
-    // (packages/core/src/db/adapters/sqlite.ts). operator + xo are
-    // drain_on_start; unknown recipients default to drain_on_start (matching
-    // the migration 040 backfill), so a message is 'heard' only when a test
-    // both seeds acknowledged_at AND routes to a non-draining recipient.
-    assessDispatchRecipient: (async (recipient: string) => {
-      const nonDrain: Record<string, DispatchDeliveryMode> = {
-        overseer: 'notify_only',
-        cauldron: 'notify_only',
-        claude: 'worker_poll',
-        codex: 'worker_poll',
-        'major-build': 'worker_poll',
-        'captain-ci': 'worker_poll',
-        board: 'alias_resolved',
-      };
-      const canonical = recipient.trim().toLowerCase();
-      const delivery_mode = nonDrain[canonical] ?? 'drain_on_start';
-      return { ok: true, canonical_principal: canonical, delivery_mode, reason: null };
-    }) as unknown as TaskmasterDeps['assessDispatchRecipient'],
-    listUndeliveredRulings: async () => [],
-    listThreads: async () => [],
-    // Default no-op evidence so adoption refresh never hits the network in unit tests.
-    getGithubIssueEvidence: async () => null,
-    ...overrides,
-    fireBudget: overrides.fireBudget ?? fixtureFireBudget(world),
-    readFireCascade: overrides.readFireCascade ?? (async () => null),
-    ...(overrides.runCascade
-      ? {
-          runCascade: (async options => {
-            const provenance = await options.beforeAdmission?.();
-            const normalize = (
-              record: Awaited<ReturnType<NonNullable<TaskmasterDeps['runCascade']>>>
-            ) => ({
-              ...record,
-              cascadeId: options.dispatchId!,
-              automaticFireAdmission: provenance,
-              attempts: record.attempts ?? [{ runId: record.cascadeId }],
-            });
-            const record = await overrides.runCascade!({
-              ...options,
-              onAdmission: (record, created) => options.onAdmission?.(normalize(record), created),
-            });
-            return normalize(record);
-          }) as NonNullable<TaskmasterDeps['runCascade']>,
-        }
-      : {}),
-  };
-}
-
 /**
  * Fake GitHub-issue escalation delivery seam
  * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Records posted comments; its
@@ -661,24 +286,6 @@ function makeIssueCommentSink(
       now: () => new Date(world.nowMs),
     },
   };
-}
-
-/** Seed today's digest as already sent so tests can assert exact send counts. */
-function seedDigestSent(world: FakeWorld): void {
-  world.journal.push({
-    id: 'journal-digest-seed',
-    created_at: new Date(world.nowMs).toISOString(),
-    thread_ref: `digest:${TODAY_KEY}`,
-    action_type: 'digest',
-    proposal_json: '{}',
-    idempotency_key: `tm:digest:${TODAY_KEY}`,
-    before_hash: null,
-    proof_predicate: null,
-    proof_deadline_at: null,
-    outcome: 'sent',
-    graded_at: null,
-    grade: null,
-  });
 }
 
 function ruling(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
@@ -870,11 +477,6 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
   });
 });
 
-const EXPECTED_SPEC = {
-  specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
-  specRevision: 'a'.repeat(40),
-  specHash: `sha256:${'b'.repeat(64)}`,
-};
 describe('fire_cauldron loop', () => {
   test.each(['refused', 'planned'] as const)(
     'definitive pre-permission %s releases only the owned reservation',
@@ -1353,7 +955,7 @@ describe('fire_cauldron loop', () => {
     }
   });
 
-  test('daily cap dispatches P0 and P1 first and preserves overflow across ticks and restart', async () => {
+  test('per-tick ceiling dispatches in priority order and drains overflow on the next tick, with no daily cap', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1402,22 +1004,33 @@ describe('fire_cauldron loop', () => {
       });
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
-      expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-510', 'WO-HARNESS-EXAMPLE-511']);
-      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(3);
+      // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01: 3 per tick, in priority order.
+      expect(admitted).toEqual([
+        'WO-HARNESS-EXAMPLE-510',
+        'WO-HARNESS-EXAMPLE-511',
+        'WO-HARNESS-EXAMPLE-512',
+      ]);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(2);
 
       world.nowMs += 60_000;
       await tick(state, deps);
-      expect(admitted).toHaveLength(2);
+      // The overflow drains on the next tick; no daily budget holds it.
+      expect(admitted).toHaveLength(5);
+      expect(admitted.slice(3).sort()).toEqual([
+        'WO-HARNESS-EXAMPLE-513',
+        'WO-HARNESS-EXAMPLE-514',
+      ]);
       world.nowMs += 60_000;
       await tick(createTaskmasterState(60_000), deps);
-      expect(admitted).toHaveLength(2);
+      expect(admitted).toHaveLength(5);
+      expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
   });
 
-  test('prior same-day unresolved automatic fires close the daily faucet', async () => {
+  test('prior same-day unresolved automatic fires of other work no longer stop a new fire', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1429,16 +1042,18 @@ describe('fire_cauldron loop', () => {
         isUnclaimedP0: true,
         title: 'WO-HARNESS-EXAMPLE-01 urgent build',
       });
+      // The two earlier fires belong to a different work order. The same-work-order
+      // case is John's per-work-order stop (Test 7), not this test.
       for (const n of [1, 2]) {
         world.journal.push({
           id: `same-day-fire-${n}`,
           created_at: new Date(T0 - n * 60_000).toISOString(),
-          thread_ref: item.ref,
+          thread_ref: 'gh:thinmansoftware/bdc-harness#503',
           action_type: 'fire_cauldron',
           proposal_json: JSON.stringify({
             type: 'fire_cauldron',
             cascadeId: `old-cascade-${n}`,
-            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-00' },
           }),
           idempotency_key: `old-fire-${n}`,
           before_hash: null,
@@ -1474,8 +1089,611 @@ describe('fire_cauldron loop', () => {
           }) as NonNullable<TaskmasterDeps['runCascade']>,
         })
       );
-      expect(admissions).toBe(0);
+      expect(admissions).toBe(1);
       expect(world.journal.filter(row => row.action_type === 'fire_cauldron')).toHaveLength(3);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('UTC rollover does not reintroduce a budget: 3 per tick either side of 00:00Z, no daily deferral', async () => {
+    // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 Test 2.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const beforeMidnight = Date.parse('2026-08-07T23:59:30.000Z');
+      const afterMidnight = Date.parse('2026-08-08T00:00:30.000Z');
+      world.nowMs = beforeMidnight;
+      const threads = [601, 602, 603, 604, 605, 606].map(number =>
+        makeListedThread({
+          ref: `gh:thinmansoftware/bdc-harness#${number}`,
+          priority: 'P0',
+          isUnclaimed: true,
+          isUnclaimedP0: true,
+          title: `WO-HARNESS-EXAMPLE-${number} build`,
+          lastActivityAt: new Date(beforeMidnight).toISOString(),
+        })
+      );
+      const admittedAt: Array<{ woId: string; day: string }> = [];
+      const deps = makeDeps(world, {
+        listThreads: async () => threads,
+        // A work order already admitted has its build running, so it is not eligible again;
+        // that is the only gate here besides the per-tick ceiling.
+        checkFireEligibility: async title => {
+          const woId = title.split(' ')[0]!;
+          if (admittedAt.some(entry => entry.woId === woId)) return { eligible: false };
+          return {
+            eligible: true,
+            evidence: {
+              woId,
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(world.nowMs).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+              specSource: 'repo-path',
+            },
+          };
+        },
+        runCascade: (async options => {
+          admittedAt.push({
+            woId: options.woId,
+            day: new Date(world.nowMs).toISOString().slice(0, 10),
+          });
+          const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      expect(admittedAt).toHaveLength(3);
+      expect(admittedAt.every(entry => entry.day === '2026-08-07')).toBe(true);
+
+      world.nowMs = afterMidnight;
+      await tick(state, deps);
+      expect(admittedAt).toHaveLength(6);
+      expect(admittedAt.slice(3).every(entry => entry.day === '2026-08-08')).toBe(true);
+      // Six distinct work orders, none admitted twice across the rollover.
+      expect(new Set(admittedAt.map(entry => entry.woId)).size).toBe(6);
+      expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
+      const fireRows = world.journal.filter(
+        row => row.action_type === 'fire_cauldron' && row.outcome !== 'deferred'
+      );
+      expect(fireRows.filter(row => row.created_at.startsWith('2026-08-07'))).toHaveLength(3);
+      expect(fireRows.filter(row => row.created_at.startsWith('2026-08-08'))).toHaveLength(3);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop: two no-PR fires of one work order in a UTC day stop it for the day, with one message", async () => {
+    // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 Test 7 (John's answer B).
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const a = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const b = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#505',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-02 urgent build',
+      });
+      for (const n of [1, 2]) {
+        world.journal.push({
+          id: `same-day-fire-${n}`,
+          created_at: new Date(T0 - n * 60_000).toISOString(),
+          thread_ref: a.ref,
+          action_type: 'fire_cauldron',
+          proposal_json: JSON.stringify({
+            type: 'fire_cauldron',
+            cascadeId: `old-cascade-${n}`,
+            fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01', project: 'bdc-harness' },
+          }),
+          idempotency_key: `old-fire-${n}`,
+          before_hash: null,
+          proof_predicate: null,
+          proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+          outcome: 'sent',
+          graded_at: null,
+          grade: null,
+        });
+      }
+      const admitted: string[] = [];
+      const deps = makeDeps(world, {
+        listThreads: async () => [a, b],
+        getFireRunEvidence: async () => ({ status: 'completed', prOpened: false }),
+        readFireCascade: (async (cascadeId: string) =>
+          endedCascadeRecord(cascadeId)) as unknown as TaskmasterDeps['readFireCascade'],
+        checkFireEligibility: async title => ({
+          eligible: true,
+          evidence: {
+            woId: title.split(' ')[0]!,
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(T0).toISOString(),
+            noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
+          },
+        }),
+        runCascade: (async options => {
+          admitted.push(options.woId);
+          const record = {
+            cascadeId: `new-${options.woId}-${admitted.length}`,
+            status: 'running',
+          } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const stops = (): TmJournalEntry[] =>
+        world.journal.filter(
+          row =>
+            row.action_type === 'escalate_p0' && row.proposal_json.includes('wo_no_pr_fires_stop')
+        );
+
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-02']);
+      expect(stops()).toHaveLength(1);
+      // Delivered on the tick the stop first trips, ahead of the ordinary unclaimed_p0 page.
+      const stopKey = `tm:wo_no_pr_fires_stop:WO-HARNESS-EXAMPLE-01:bdc-harness:${TODAY_KEY}`;
+      expect(stops()[0]!.outcome).toBe('sent');
+      expect(stops()[0]!.idempotency_key).toBe(stopKey);
+      const stopDispatches = world.sentMessages.filter(m => m.idempotency_key === stopKey);
+      expect(stopDispatches).toHaveLength(1);
+      expect(stopDispatches[0]!.recipient).toBe('t3-desktop');
+      const body = (JSON.parse(stops()[0]!.proposal_json) as { body: string }).body;
+      expect(body).toContain('WO-HARNESS-EXAMPLE-01');
+      expect(body).toContain('old-cascade-1');
+      expect(body).toContain('old-cascade-2');
+
+      // Later the same day: still stopped, and no second message.
+      world.nowMs += 60 * 60_000;
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted.filter(id => id === 'WO-HARNESS-EXAMPLE-01')).toHaveLength(0);
+      expect(stops()).toHaveLength(1);
+      expect(world.sentMessages.filter(m => m.idempotency_key === stopKey)).toHaveLength(1);
+
+      // The next UTC day: the work order can fire again.
+      world.nowMs += 24 * 60 * 60_000;
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted.filter(id => id === 'WO-HARNESS-EXAMPLE-01')).toHaveLength(1);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  /** A cascade record that has ended: status won, one recorded run, no resume link. */
+  function endedCascadeRecord(
+    cascadeId: string,
+    status = 'won',
+    runIds: string[] = [`run-${cascadeId}`],
+    resumeCascadeId?: string
+  ): unknown {
+    return {
+      cascadeId,
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      project: 'bdc-harness',
+      status,
+      request: { dryRun: false },
+      attempts: runIds.map(runId => ({ workflowName: 'bdc-feature-development-cursor', runId })),
+      ...(resumeCascadeId !== undefined ? { frontierApproval: { resumeCascadeId } } : {}),
+    };
+  }
+
+  function noPrStopWorld(
+    fires: Array<{ ref: string; cascadeId: string }>,
+    threads: ListedThread[],
+    runEvidence: (cascadeId: string) => { status: string; prOpened?: boolean } | null,
+    chain: {
+      records?: Record<string, unknown>;
+      runStatus?: Record<string, string | { status: string; approvalHandOff: boolean } | null>;
+    } = {}
+  ): {
+    world: FakeWorld;
+    deps: TaskmasterDeps;
+    admitted: string[];
+    stops: () => TmJournalEntry[];
+  } {
+    const world = makeWorld();
+    seedDigestSent(world);
+    fires.forEach((fire, n) => {
+      world.journal.push({
+        id: `scoped-fire-${n}`,
+        created_at: new Date(T0 - (n + 1) * 60_000).toISOString(),
+        thread_ref: fire.ref,
+        action_type: 'fire_cauldron',
+        proposal_json: JSON.stringify({
+          type: 'fire_cauldron',
+          cascadeId: fire.cascadeId,
+          fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01', project: 'bdc-harness' },
+        }),
+        idempotency_key: `scoped-fire-${n}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+    });
+    const admitted: string[] = [];
+    const deps = makeDeps(world, {
+      listThreads: async () => threads,
+      getFireRunEvidence: async (_woId, cascadeId) => runEvidence(cascadeId),
+      readFireCascade: (async (cascadeId: string) =>
+        chain.records && cascadeId in chain.records
+          ? chain.records[cascadeId]
+          : endedCascadeRecord(cascadeId)) as unknown as TaskmasterDeps['readFireCascade'],
+      readFireRun: async (runId: string) => {
+        const entry =
+          chain.runStatus && runId in chain.runStatus ? chain.runStatus[runId] : 'completed';
+        if (entry === null || entry === undefined) return null;
+        return typeof entry === 'string' ? { status: entry, approvalHandOff: false } : entry;
+      },
+      checkFireEligibility: async title => ({
+        eligible: true,
+        evidence: {
+          woId: title.split(' ')[0]!,
+          targetRepo: 'thinmansoftware/bdc-harness',
+          project: 'bdc-harness',
+          specVerifiedAt: new Date(T0).toISOString(),
+          noOpenOrMergedPr: true,
+          expectedSpec: EXPECTED_SPEC,
+        },
+      }),
+      runCascade: (async options => {
+        admitted.push(options.woId);
+        const record = {
+          cascadeId: `new-${options.woId}-${admitted.length}`,
+          status: 'running',
+        } as never;
+        options.onAdmission?.(record, true);
+        return record;
+      }) as NonNullable<TaskmasterDeps['runCascade']>,
+    });
+    const stops = (): TmJournalEntry[] =>
+      world.journal.filter(
+        row =>
+          row.action_type === 'escalate_p0' && row.proposal_json.includes('wo_no_pr_fires_stop')
+      );
+    return { world, deps, admitted, stops };
+  }
+
+  test("John's per-work-order stop counts by work order, not by issue thread: two threads naming one WO share one count and one message", async () => {
+    // Overseer App review of PR 1626 at 67934ae3, finding 1.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const first = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const second = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-xo#9504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 same work order, second issue',
+      });
+      const { world, deps, admitted, stops } = noPrStopWorld(
+        [
+          { ref: first.ref, cascadeId: 'scoped-cascade-1' },
+          { ref: second.ref, cascadeId: 'scoped-cascade-2' },
+        ],
+        [first, second],
+        () => ({ status: 'completed', prOpened: false })
+      );
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted).toEqual([]);
+      expect(stops()).toHaveLength(1);
+      const key = `tm:wo_no_pr_fires_stop:WO-HARNESS-EXAMPLE-01:bdc-harness:${TODAY_KEY}`;
+      expect(world.sentMessages.filter(m => m.idempotency_key === key)).toHaveLength(1);
+      expect(
+        world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:wo_no_pr_fires_stop:'))
+      ).toHaveLength(1);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop logs an unreadable fire row once per UTC day, not every tick", async () => {
+    // Board desk R7 on PR 1626 at 9e2e951a.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+    const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
+      streamSymbol
+    ];
+    const chunks: string[] = [];
+    const originalWrite = stream.write;
+    stream.write = (chunk: string) => {
+      chunks.push(String(chunk));
+      return true;
+    };
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const { world, deps } = noPrStopWorld(
+        [{ ref: thread.ref, cascadeId: 'cascade-unreadable' }],
+        [thread],
+        () => null
+      );
+      const logged = (): number =>
+        chunks.filter(
+          chunk =>
+            chunk.includes('taskmaster.no_pr_fire_not_counted') &&
+            chunk.includes('scoped-fire-0') &&
+            chunk.includes('cascade_evidence_unreadable')
+        ).length;
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      world.nowMs += 60_000;
+      await tick(state, deps);
+      expect(logged()).toBe(1);
+    } finally {
+      stream.write = originalWrite;
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop does not count a fire whose resumed cascade still has a running run", async () => {
+    // Board desk R8 (Overseer App review at a846c1ba): evidence says completed when ANY run
+    // completed; the cascade has ended only when every run in its resume chain is terminal.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const world = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'chain-a' },
+          { ref: thread.ref, cascadeId: 'chain-b' },
+        ],
+        [thread],
+        () => ({ status: 'completed', prOpened: false }),
+        {
+          records: {
+            'chain-a': endedCascadeRecord('chain-a', 'frontier-approved', ['run-a1'], 'chain-a2'),
+            'chain-a2': endedCascadeRecord('chain-a2', 'won', ['run-a2']),
+            'chain-b': endedCascadeRecord('chain-b', 'frontier-approved', ['run-b1'], 'chain-b2'),
+            'chain-b2': endedCascadeRecord('chain-b2', 'won', ['run-b2']),
+          },
+          runStatus: {
+            'run-a1': 'completed',
+            'run-a2': 'running',
+            'run-b1': 'completed',
+            'run-b2': 'running',
+          },
+        }
+      );
+      await tick(createTaskmasterState(60_000), world.deps);
+      expect(world.stops()).toHaveLength(0);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop does not count a failed run that is an approval hand-off", async () => {
+    // Board desk R9 on PR 1626 at ea31afc2: wo-claim's run reader treats a failed run whose
+    // approvalHandOff is true as resumable, so the cascade has not ended.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const world = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'handoff-1' },
+          { ref: thread.ref, cascadeId: 'handoff-2' },
+        ],
+        [thread],
+        () => ({ status: 'failed', prOpened: false }),
+        {
+          records: {
+            'handoff-1': endedCascadeRecord('handoff-1', 'spec-repair', ['run-h1']),
+            'handoff-2': endedCascadeRecord('handoff-2', 'spec-repair', ['run-h2']),
+          },
+          runStatus: {
+            'run-h1': { status: 'failed', approvalHandOff: true },
+            'run-h2': { status: 'failed', approvalHandOff: true },
+          },
+        }
+      );
+      await tick(createTaskmasterState(60_000), world.deps);
+      expect(world.stops()).toHaveLength(0);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop does not count a recovery-delegated cascade", async () => {
+    // Board desk R8: recovery-delegated is in the claim-release holding set, so it has not ended.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const world = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'delegated-1' },
+          { ref: thread.ref, cascadeId: 'delegated-2' },
+        ],
+        [thread],
+        () => ({ status: 'failed', prOpened: false }),
+        {
+          records: {
+            'delegated-1': endedCascadeRecord('delegated-1', 'recovery-delegated', ['run-d1']),
+            'delegated-2': endedCascadeRecord('delegated-2', 'recovery-delegated', ['run-d2']),
+          },
+          runStatus: { 'run-d1': 'failed', 'run-d2': 'failed' },
+        }
+      );
+      await tick(createTaskmasterState(60_000), world.deps);
+      expect(world.stops()).toHaveLength(0);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop counts a spec-repair cascade whose runs are all terminal with no PR", async () => {
+    // Board desk R8: spec-repair is outside the holding set, so with every run terminal and no
+    // PR it has ended. The run-level evidence reads running so the old rolled-up check refuses it.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const world = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'repair-1' },
+          { ref: thread.ref, cascadeId: 'repair-2' },
+        ],
+        [thread],
+        () => ({ status: 'running', prOpened: false }),
+        {
+          records: {
+            'repair-1': endedCascadeRecord('repair-1', 'spec-repair', ['run-r1']),
+            'repair-2': endedCascadeRecord('repair-2', 'spec-repair', ['run-r2']),
+          },
+          runStatus: { 'run-r1': 'failed', 'run-r2': 'escalated' },
+        }
+      );
+      await tick(createTaskmasterState(60_000), world.deps);
+      expect(world.stops()).toHaveLength(1);
+      expect(world.admitted).toEqual([]);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop counts escalated no-PR builds as finished", async () => {
+    // Board desk R4 on PR 1626 at 9401eae7: an escalated run is terminal, and the escalation
+    // linker can relabel gate-rejected failures as escalated.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const { deps, admitted, stops } = noPrStopWorld(
+        [
+          { ref: thread.ref, cascadeId: 'cascade-escalated-1' },
+          { ref: thread.ref, cascadeId: 'cascade-escalated-2' },
+        ],
+        [thread],
+        () => ({ status: 'escalated', prOpened: false })
+      );
+      await tick(createTaskmasterState(60_000), deps);
+      expect(stops()).toHaveLength(1);
+      expect(admitted).toEqual([]);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test("John's per-work-order stop counts only fires whose build ended with no pull request", async () => {
+    // Overseer App review of PR 1626 at 67934ae3, finding 2: a 'sent' fire row proves
+    // admission, not a finished no-PR build.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const thread = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#504',
+        priority: 'P0',
+        isUnclaimedP0: true,
+        title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+      });
+      const fires = [
+        { ref: thread.ref, cascadeId: 'cascade-running' },
+        { ref: thread.ref, cascadeId: 'cascade-running-2' },
+        { ref: thread.ref, cascadeId: 'cascade-pr' },
+        { ref: thread.ref, cascadeId: 'cascade-unknown' },
+      ];
+      const evidence: Record<string, { status: string; prOpened?: boolean } | null> = {
+        'cascade-running': { status: 'running', prOpened: false },
+        'cascade-running-2': { status: 'running', prOpened: false },
+        'cascade-pr': { status: 'completed', prOpened: true },
+        'cascade-unknown': null,
+      };
+      // Shadow-review finding (bdc-xo#6468 comment 7128422721): the running cases must
+      // really be running. Their cascade records and runs say so, so the loop's own
+      // not-finished check excludes them, not the evidence's rolled-up status. Two of
+      // them: if running cascades were ever counted, the count would reach the stop of 2.
+      const running = {
+        records: {
+          'cascade-running': endedCascadeRecord('cascade-running', 'running'),
+          'cascade-running-2': endedCascadeRecord('cascade-running-2', 'running'),
+        },
+        runStatus: {
+          'run-cascade-running': 'running',
+          'run-cascade-running-2': 'running',
+        },
+      };
+      const notFinished = noPrStopWorld(
+        fires,
+        [thread],
+        cascadeId => evidence[cascadeId] ?? null,
+        running
+      );
+      await tick(createTaskmasterState(60_000), notFinished.deps);
+      // None of the four is a finished no-PR build, so the work order is not stopped.
+      expect(notFinished.stops()).toHaveLength(0);
+
+      // Control: the same three fires, each a finished build with no PR, do stop it.
+      const finished = noPrStopWorld(fires, [thread], () => ({
+        status: 'completed',
+        prOpened: false,
+      }));
+      await tick(createTaskmasterState(60_000), finished.deps);
+      expect(finished.stops()).toHaveLength(1);
+      expect(finished.admitted).toEqual([]);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
@@ -1681,7 +1899,8 @@ describe('fire_cauldron loop', () => {
           },
         })
       );
-      expect(evidenceCalls).toBe(1);
+      // One read for John's per-work-order no-PR count (today's fire rows) and one for grading.
+      expect(evidenceCalls).toBe(2);
       expect(world.journal.find(row => row.id === testCase.id)?.grade).toBe(testCase.grade);
     }
   });
@@ -2213,13 +2432,17 @@ describe('pending fire custody', () => {
   });
 
   test.each([
-    [2, 2],
-    [5, 3],
+    [undefined, 3],
+    ['0', 3],
+    ['NaN', 3],
+    ['2', 3],
+    ['5', 3],
   ])(
-    'unconfirmed admissions obey daily limit %i and per-tick ceiling (%i)',
+    'the retired daily setting (%s) has no effect; the per-tick ceiling gives %i fires',
     async (limit, expected) => {
       const previous = process.env.TASKMASTER_FIRE_MAX_PER_DAY;
-      process.env.TASKMASTER_FIRE_MAX_PER_DAY = String(limit);
+      if (limit === undefined) delete process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+      else process.env.TASKMASTER_FIRE_MAX_PER_DAY = limit;
       try {
         const world = makeWorld();
         seedDigestSent(world);
@@ -2252,6 +2475,56 @@ describe('pending fire custody', () => {
       }
     }
   );
+
+  test('a failed fire-history reconciliation no longer blocks new automatic fires', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      listThreads: async () => [
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#801',
+          priority: 'P0',
+          isUnclaimedP0: true,
+          title: 'WO-HARNESS-CUSTODY-01',
+        }),
+      ],
+      readFireCascadeEvidence: async () => {
+        throw new Error('not ready');
+      },
+    });
+    const budget = fixture.deps.fireBudget!;
+    fixture.deps.fireBudget = {
+      ...budget,
+      listAutomaticFireAdmissions: async () => {
+        throw new Error('history unavailable');
+      },
+    };
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(1);
+    expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
+  });
+
+  test('a missing reservation store still refuses, under the fire_store_unavailable reason', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      listThreads: async () => [
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#802',
+          priority: 'P0',
+          isUnclaimedP0: true,
+          title: 'WO-HARNESS-CUSTODY-02',
+        }),
+      ],
+    });
+    fixture.deps.fireBudget = undefined;
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+    const deferred = world.journal.filter(row => row.outcome === 'deferred');
+    expect(deferred.length).toBeGreaterThan(0);
+    expect(deferred.every(row => row.proposal_json.includes('fire_store_unavailable'))).toBe(true);
+    expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
+  });
 
   function seedPending(world: FakeWorld, ageDays = 8): TmJournalEntry {
     const key = 'tm:fire:old-custody';
@@ -4538,18 +4811,6 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
 // Adoption projection (WO-HARNESS-TASKMASTER-ADOPTION-PROJECTION-01)
 // Section 11 scenarios -- every test name includes "adoption" or "canonicaliz"
 // ---------------------------------------------------------------------------
-
-function makeListedThread(overrides: Partial<ListedThread> & { ref: string }): ListedThread {
-  return {
-    priority: 'P1',
-    lastActivityAt: new Date(T0).toISOString(),
-    recipient: 'xo',
-    title: 'untitled',
-    ownerLogin: null,
-    labels: ['wo', 'prio:P1'],
-    ...overrides,
-  };
-}
 
 function makeEvidence(overrides: Partial<GithubIssueEvidence> = {}): GithubIssueEvidence {
   return {

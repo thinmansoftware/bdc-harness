@@ -30,7 +30,6 @@ export interface AutomaticFireRequest {
   ownerToken: string;
   cascadeId: string;
   epoch: number;
-  limit: number;
   now: string;
   /** Admission-time clock sampled only after the shared DB lock is acquired. */
   clock?: () => string;
@@ -77,52 +76,23 @@ async function fireBudgetTransaction<T>(
     ? withOverseerControlPlaneImmediateTransaction(db, locked)
     : db.withTransaction(locked);
 }
+/**
+ * WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 (John, 2026-11-23): there is no daily cap on
+ * automatic fires. The only refusal left here is the pause/epoch guard, read under the
+ * shared control-row lock. Earlier unknown, reserved or unmatched history never refuses a
+ * distinct action: an unknown admission blocks only a replay of its own action_key (the
+ * existing-key refusal in reserveAutomaticFire) and keeps its custody row.
+ */
 async function fireBudgetRefusal(
   query: OverseerControlPlaneQuery,
-  input: AutomaticFireRequest,
-  excludeSelf: boolean
+  input: AutomaticFireRequest
 ): Promise<string | null> {
-  if (!Number.isSafeInteger(input.limit) || input.limit <= 0)
-    return 'daily_cap_disabled_or_invalid';
   const control = await query<{ pause_state: string; epoch: number | string }>(
     'SELECT pause_state,epoch FROM tm_control WHERE id=1'
   );
   if (control.rows[0]?.pause_state !== 'RUNNING' || Number(control.rows[0]?.epoch) !== input.epoch)
     return 'daily_cap_pause_or_epoch';
-  const day = new Date(input.now).toISOString().slice(0, 10);
-  const unknownHistory = await query<{ action_key: string }>(
-    `SELECT action_key FROM tm_fire_admissions WHERE state='unknown'
-     AND owner_token='legacy-reconciliation' AND utc_day=$1 LIMIT 1`,
-    [day]
-  );
-  if (unknownHistory.rowCount) return 'daily_cap_legacy_history_unknown';
-  const legacy = await query<{ outcome: string; proposal_json: string }>(
-    `SELECT j.outcome,j.proposal_json FROM tm_journal j LEFT JOIN tm_fire_admissions a
-       ON a.action_key=j.idempotency_key
-     WHERE j.action_type='fire_cauldron' AND j.created_at >= $1
-       AND j.outcome IN ('sent','failed','expired') AND a.action_key IS NULL`,
-    [`${day}T00:00:00.000Z`]
-  );
-  for (const row of legacy.rows) {
-    // Reconciliation skips this explicit pre-effect expiration. Match it here
-    // without weakening sent/failed history or relying on dialect JSON casts.
-    if (row.outcome === 'expired') {
-      try {
-        const proposal = JSON.parse(row.proposal_json) as { reason?: unknown } | null;
-        if (proposal?.reason === 'stale_epoch_before_effect') continue;
-      } catch {
-        // Malformed history is unknown, never proof that no effect occurred.
-      }
-    }
-    return 'daily_cap_legacy_history_unknown';
-  }
-  const count = await query<{ total: number | string }>(
-    `SELECT COUNT(*) AS total FROM tm_fire_admissions
-     WHERE (state IN ('reserved','unknown') OR (state='admitted' AND utc_day=$1))
-       AND ($2 = '' OR action_key <> $2)`,
-    [day, excludeSelf ? input.actionKey : '']
-  );
-  return Number(count.rows[0]?.total ?? input.limit) >= input.limit ? 'daily_cap_exhausted' : null;
+  return null;
 }
 export async function reserveAutomaticFire(
   input: AutomaticFireRequest,
@@ -135,7 +105,7 @@ export async function reserveAutomaticFire(
     );
     // A replay reconciles the durable identity; it never gets a second invocation.
     if (existing.rowCount) return { allowed: false, reason: 'daily_cap_existing_action' };
-    const reason = await fireBudgetRefusal(query, input, false);
+    const reason = await fireBudgetRefusal(query, input);
     if (reason) return { allowed: false, reason };
     await query(
       `INSERT INTO tm_fire_admissions(action_key,journal_id,source_thread_ref,owner_token,
@@ -173,20 +143,10 @@ export async function authorizeAutomaticFire(
       row.source_thread_ref !== input.sourceThreadRef
     )
       return { allowed: false, reason: 'daily_cap_not_owned_reservation' };
-    let stableDay = false;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const reason = await fireBudgetRefusal(query, input, true);
-      const freshTime = input.clock?.() ?? input.now;
-      if (freshTime.slice(0, 10) !== input.now.slice(0, 10)) {
-        input = { ...input, now: freshTime };
-        continue;
-      }
-      if (reason) return { allowed: false, reason };
-      input = { ...input, now: freshTime };
-      stableDay = true;
-      break;
-    }
-    if (!stableDay) return { allowed: false, reason: 'daily_cap_clock_unstable' };
+    const reason = await fireBudgetRefusal(query, input);
+    if (reason) return { allowed: false, reason };
+    // Provenance records the actual permission time, sampled after the lock.
+    input = { ...input, now: input.clock?.() ?? input.now };
     const admission: AutomaticFireProvenance = {
       source: 'taskmaster',
       actionKey: input.actionKey,
@@ -197,7 +157,7 @@ export async function authorizeAutomaticFire(
       admittedAt: input.now,
     };
     // Permission commits before filesystem admission/provider work. A lost result
-    // remains UNKNOWN and counted, not automatically refunded after a timeout.
+    // remains UNKNOWN (custody kept, never refunded), but it counts against nothing.
     await query(
       `UPDATE tm_fire_admissions SET state='unknown',utc_day=$1,admitted_at=$2,updated_at=$2
        WHERE action_key=$3 AND owner_token=$4 AND state='reserved'`,

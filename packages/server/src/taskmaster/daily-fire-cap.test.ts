@@ -11,14 +11,21 @@ import { reserveAutomaticFire, authorizeAutomaticFire } from '@archon/core/db/ta
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import * as loop from './loop';
 import { createRecord, writeRecord } from '../../../smart-cauldron/src/recorder';
+import type { FakeWorld } from '../test/taskmaster-loop-world';
+import {
+  EXPECTED_SPEC,
+  makeDeps,
+  makeListedThread,
+  makeWorld,
+  seedDigestSent,
+} from '../test/taskmaster-loop-world';
 
-test('daily cap defaults to two and invalid configuration fails closed', () => {
-  expect(loop.resolveTaskmasterFireDailyLimit(undefined)).toBe(2);
-  expect(loop.resolveTaskmasterFireDailyLimit('0')).toBe(0);
-  expect(loop.resolveTaskmasterFireDailyLimit('5')).toBe(5);
-  for (const input of ['-1', '1.5', 'NaN', '', '2oops', '9007199254740992']) {
-    expect(loop.resolveTaskmasterFireDailyLimit(input)).toBe(0);
-  }
+test('there is no daily cap: the retired setting has no reader; the per-WO stop is a fixed 2', () => {
+  // WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 (John, 2026-11-23): TASKMASTER_FIRE_MAX_PER_DAY is
+  // no longer read, and John's answer B is a constant, read from no setting.
+  expect('resolveTaskmasterFireDailyLimit' in loop).toBe(false);
+  expect(loop.MAX_FIRES_PER_TICK).toBe(3);
+  expect(loop.MAX_NO_PR_FIRES_PER_WO_PER_DAY).toBe(2);
 });
 
 function fakeCascade(outDir: string): RunCascadeOptions {
@@ -351,7 +358,6 @@ test('production cascade awaits preflight then rebooks actual UTC admission day 
       ownerToken: 'test-owner',
       cascadeId: 'cap-test',
       epoch: 1,
-      limit: 2,
       now: clock,
     };
     expect((await reserveAutomaticFire(input, db)).allowed).toBe(true);
@@ -462,7 +468,6 @@ test.each([
       ownerToken: 'actual-owner',
       cascadeId: 'cap-test',
       epoch: 1,
-      limit: 1,
       now: day,
     };
     expect((await reserveAutomaticFire(input, db)).allowed).toBe(true);
@@ -576,7 +581,7 @@ test.each([
           db
         )
       ).allowed
-    ).toBe(scenario === 'matching-permission');
+    ).toBe(true); // No daily cap: a distinct action is never refused (custody checks above stay).
     expect(effects).toBe(0);
     expect(await readCascadeRecord('cap-test', directory)).toEqual(prior);
   } finally {
@@ -734,7 +739,6 @@ test.each([
           ownerToken: `real-owner:${key}`,
           cascadeId: key,
           epoch: 1,
-          limit: 2,
           now: day,
         };
         // Permission is genuine but its returned provenance was lost before recording.
@@ -779,23 +783,29 @@ test.each([
       ).rejects.toThrow('isolated-reconciliation-stop');
     };
     await reconcile(day);
+    // No daily cap: unresolved legacy history keeps its custody (asserted below) but never
+    // refuses a distinct action.
+    await db.query(
+      `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,
+      idempotency_key,outcome,created_at) VALUES ('same-day','same-day','fire_cauldron','{}','same-day','pending',$1)`,
+      [day]
+    );
     expect(
       (
         await reserveAutomaticFire(
           {
             actionKey: 'same-day',
-            journalId: 'unused',
-            sourceThreadRef: 'unused',
+            journalId: 'same-day',
+            sourceThreadRef: 'same-day',
             ownerToken: 'unused',
-            cascadeId: 'unused',
+            cascadeId: 'same-day',
             epoch: 1,
-            limit: 2,
             now: day,
           },
           db
         )
       ).allowed
-    ).toBe(false);
+    ).toBe(true);
     await db.close();
     db = new SqliteAdapter(join(directory, 'isolated.db'));
     const nextDay = '2026-10-19T12:00:00.000Z';
@@ -814,12 +824,11 @@ test.each([
           ownerToken: 'new-owner',
           cascadeId: key,
           epoch: 1,
-          limit: 2,
           now: nextDay,
         },
         db
       );
-      expect(decision.allowed).toBe(scenario.startsWith('proved') && key !== 'today-overflow');
+      expect(decision.allowed).toBe(true);
     }
     const legacy = (await taskmasterDb.listAutomaticFireAdmissions(db)).filter(row =>
       row.action_key.startsWith('legacy-')
@@ -874,3 +883,369 @@ test.each([
     await removeLegacyFixture(directory);
   }
 });
+
+// ---------------------------------------------------------------------------
+// WO-HARNESS-TASKMASTER-NO-DAILY-FIRE-CAP-01 Stop 3: spec Tests 1 and 2 at their stated
+// size, through the real loop.tick with the fire budget on a temporary SQLite FILE.
+// The world and the other dependencies are the shared fake world
+// (../test/taskmaster-loop-world), whose runCascade wrapper asks the loop's real
+// beforeAdmission (authorizeAutomaticFire) for permission before the fake effect, so
+// every counted fire carries real ledger permission evidence in the file database.
+// Added on the acting XO's ruling, bdc-xo#6468 comment 7128535988.
+// ---------------------------------------------------------------------------
+
+function fileFireBudget(
+  world: FakeWorld,
+  db: SqliteAdapter,
+  // Runs after a reservation commits and before permission is asked: the asynchronous
+  // gap a test may use to move the clock.
+  afterReserve: () => void = () => {},
+  // Receives the provenance each granted permission returns (what the loop records).
+  onPermission: (cascadeId: string, utcDay: string) => void = () => {}
+): NonNullable<loop.TaskmasterDeps['fireBudget']> {
+  // Mirror the fake world's control row and journal into the file database before each
+  // call, exactly as the in-memory fixture does, so reservations join their journal rows.
+  const sync = async (): Promise<SqliteAdapter> => {
+    await db.query('UPDATE tm_control SET pause_state=$1,epoch=$2 WHERE id=1', [
+      world.control.pause_state,
+      world.control.epoch,
+    ]);
+    for (const row of world.journal)
+      await db.query(
+        `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET outcome=$6,proposal_json=$4`,
+        [
+          row.id,
+          row.thread_ref,
+          row.action_type,
+          row.proposal_json,
+          row.idempotency_key,
+          row.outcome,
+          row.created_at,
+        ]
+      );
+    return db;
+  };
+  return {
+    reserveAutomaticFire: async input => {
+      const decision = await taskmasterDb.reserveAutomaticFire(input, await sync());
+      afterReserve();
+      return decision;
+    },
+    authorizeAutomaticFire: async input => {
+      const decision = await taskmasterDb.authorizeAutomaticFire(input, await sync());
+      if (decision.allowed && decision.admission)
+        onPermission(input.cascadeId, decision.admission.utcDay);
+      return decision;
+    },
+    releaseAutomaticFire: async input => taskmasterDb.releaseAutomaticFire(input, await sync()),
+    settleAutomaticFire: async input => taskmasterDb.settleAutomaticFire(input, await sync()),
+    seedAutomaticFireHistory: async input =>
+      taskmasterDb.seedAutomaticFireHistory(input, await sync()),
+    listAutomaticFireAdmissions: async () => taskmasterDb.listAutomaticFireAdmissions(await sync()),
+    updateAutomaticFireExpectation: async input =>
+      taskmasterDb.updateAutomaticFireExpectation(input, await sync()),
+  };
+}
+
+function realLoopFixture(
+  world: FakeWorld,
+  db: SqliteAdapter,
+  numbers: number[],
+  afterReserve?: () => void
+): {
+  deps: loop.TaskmasterDeps;
+  invocations: Array<{ woId: string; cascadeId: string }>;
+  permissionDay: Map<string, string>;
+} {
+  const threads = numbers.map(number =>
+    makeListedThread({
+      ref: `gh:thinmansoftware/bdc-harness#${number}`,
+      priority: 'P0',
+      isUnclaimed: true,
+      isUnclaimedP0: true,
+      title: `WO-HARNESS-CAP-${number} build`,
+      lastActivityAt: new Date(world.nowMs).toISOString(),
+    })
+  );
+  const invocations: Array<{ woId: string; cascadeId: string }> = [];
+  const permissionDay = new Map<string, string>();
+  const deps = makeDeps(world, {
+    listThreads: async () => threads,
+    fireBudget: fileFireBudget(world, db, afterReserve, (cascadeId, utcDay) =>
+      permissionDay.set(cascadeId, utcDay)
+    ),
+    // A work order already admitted has its build running, so it is not eligible again;
+    // that and the per-tick ceiling are the only gates.
+    checkFireEligibility: async title => {
+      const woId = title.split(' ')[0]!;
+      if (invocations.some(entry => entry.woId === woId)) return { eligible: false };
+      return {
+        eligible: true,
+        evidence: {
+          woId,
+          targetRepo: 'thinmansoftware/bdc-harness',
+          project: 'bdc-harness',
+          specVerifiedAt: new Date(world.nowMs).toISOString(),
+          noOpenOrMergedPr: true,
+          expectedSpec: EXPECTED_SPEC,
+          specSource: 'repo-path',
+        },
+      };
+    },
+    // The fake effect. The shared wrapper has already obtained real permission.
+    runCascade: (async options => {
+      invocations.push({ woId: options.woId, cascadeId: options.dispatchId! });
+      const record = { cascadeId: options.dispatchId, status: 'running' } as never;
+      options.onAdmission?.(record, true);
+      return record;
+    }) as NonNullable<loop.TaskmasterDeps['runCascade']>,
+  });
+  return { deps, invocations, permissionDay };
+}
+
+/** Ledger rows that carry permission (authorized: unknown until settled, or admitted). */
+async function permittedRows(db: SqliteAdapter): Promise<taskmasterDb.AutomaticFireAdmission[]> {
+  return (await taskmasterDb.listAutomaticFireAdmissions(db)).filter(
+    row => (row.state === 'unknown' || row.state === 'admitted') && row.admitted_at !== null
+  );
+}
+
+test('spec Test 1: three consecutive ticks fire exactly 3 each, 9 distinct P0 work orders, real ledger permission, no daily deferral', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'tm-cap-spec1-'));
+  const db = new SqliteAdapter(join(directory, 'budget.db'));
+  const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+  process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+  try {
+    const world = makeWorld();
+    seedDigestSent(world);
+    world.nowMs = Date.parse('2026-08-07T10:00:00.000Z');
+    const numbers = [701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711];
+    const { deps, invocations } = realLoopFixture(world, db, numbers);
+    const state = loop.createTaskmasterState(60_000);
+    const perTick: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const before = invocations.length;
+      await loop.tick(state, deps);
+      perTick.push(invocations.length - before);
+      world.nowMs += 60_000;
+    }
+    // Exactly three per tick on the same UTC day: nine, never two (the old daily cap).
+    expect(perTick).toEqual([3, 3, 3]);
+    expect(new Set(invocations.map(entry => entry.woId)).size).toBe(9);
+    expect(new Set(invocations.map(entry => entry.cascadeId)).size).toBe(9);
+    // Ledger permission evidence in the file database: one permitted row per invocation.
+    const rows = await permittedRows(db);
+    expect(rows.map(row => row.cascade_id).sort()).toEqual(
+      invocations.map(entry => entry.cascadeId).sort()
+    );
+    expect(rows.every(row => row.utc_day === '2026-08-07')).toBe(true);
+    // No daily-budget deferral anywhere.
+    expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
+  } finally {
+    if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    await db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('spec Test 2: ticks straddling 00:00Z, with permission asked after midnight for a reservation made before it, fire 3 each and record the actual permission day', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'tm-cap-spec2-'));
+  const db = new SqliteAdapter(join(directory, 'budget.db'));
+  const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+  process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+  try {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const beforeMidnight = Date.parse('2026-08-07T23:59:00.000Z');
+    const lastSecond = Date.parse('2026-08-07T23:59:59.500Z');
+    const afterMidnight = Date.parse('2026-08-08T00:00:01.000Z');
+    world.nowMs = beforeMidnight;
+    let crossMidnight = false;
+    const { deps, invocations, permissionDay } = realLoopFixture(
+      world,
+      db,
+      [801, 802, 803, 804, 805, 806, 807, 808, 809],
+      () => {
+        // The asynchronous gap between reservation and permission crosses midnight.
+        if (crossMidnight) world.nowMs = afterMidnight;
+      }
+    );
+    const state = loop.createTaskmasterState(60_000);
+    await loop.tick(state, deps);
+    expect(invocations).toHaveLength(3);
+
+    world.nowMs = lastSecond;
+    crossMidnight = true;
+    await loop.tick(state, deps);
+    crossMidnight = false;
+    expect(invocations).toHaveLength(6);
+
+    world.nowMs = afterMidnight + 60_000;
+    await loop.tick(state, deps);
+    expect(invocations).toHaveLength(9);
+    expect(new Set(invocations.map(entry => entry.woId)).size).toBe(9);
+
+    // Provenance records the actual permission day (the admission the loop stores):
+    // the first tick before midnight, everything permitted after midnight on 2026-08-08.
+    const rows = await permittedRows(db);
+    expect(rows).toHaveLength(9);
+    expect(invocations.map(entry => permissionDay.get(entry.cascadeId))).toEqual([
+      '2026-08-07',
+      '2026-08-07',
+      '2026-08-07',
+      '2026-08-08',
+      '2026-08-08',
+      '2026-08-08',
+      '2026-08-08',
+      '2026-08-08',
+      '2026-08-08',
+    ]);
+    // The crossing really happened: a fire reserved on 2026-08-07 was permitted on 2026-08-08.
+    const crossed = rows.filter(
+      row =>
+        row.reserved_at.startsWith('2026-08-07') &&
+        permissionDay.get(row.cascade_id) === '2026-08-08'
+    );
+    expect(crossed.length).toBeGreaterThanOrEqual(1);
+    // No rollover capacity check and no daily-budget deferral.
+    expect(world.journal.some(row => row.proposal_json.includes('daily_cap'))).toBe(false);
+  } finally {
+    if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    await db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test.each([[undefined], ['0'], ['NaN'], ['2']])(
+  'spec Test 3: unknown history preserves custody without a global stop (old setting: %s)',
+  async limit => {
+    const directory = mkdtempSync(join(tmpdir(), 'tm-cap-spec3-'));
+    const db = new SqliteAdapter(join(directory, 'budget.db'));
+    const priorEnabled = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    const priorLimit = process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    if (limit === undefined) delete process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+    else process.env.TASKMASTER_FIRE_MAX_PER_DAY = limit;
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const oldDay = '2026-08-06T12:00:00.000Z';
+      const earlierTick = '2026-08-07T11:59:00.000Z';
+      const seedJournal = (
+        key: string,
+        number: number,
+        createdAt: string,
+        outcome: 'pending' | 'sent',
+        malformed = false
+      ) => {
+        const threadRef = `gh:thinmansoftware/bdc-harness#${number}`;
+        const row: taskmasterDb.TmJournalEntry = {
+          id: key,
+          created_at: createdAt,
+          thread_ref: threadRef,
+          action_type: 'fire_cauldron',
+          proposal_json: malformed
+            ? '{'
+            : JSON.stringify({
+                type: 'fire_cauldron',
+                idempotencyKey: key,
+                cascadeId: key,
+                recipient: 'xo',
+                fireEvidence: { woId: `WO-HARNESS-CAP-${number}`, project: 'bdc-harness' },
+              }),
+          idempotency_key: key,
+          before_hash: null,
+          proof_predicate: 'actual workflow completion',
+          proof_deadline_at: new Date(world.nowMs + 86_400_000).toISOString(),
+          outcome,
+          graded_at: null,
+          grade: null,
+        };
+        world.journal.push(row);
+        return {
+          actionKey: key,
+          cascadeId: key,
+          journalId: row.id,
+          sourceThreadRef: threadRef,
+          ownerToken: `historical-owner:${key}`,
+          epoch: world.control.epoch,
+          now: createdAt,
+        };
+      };
+      // Same WO as new work, but its journal no longer holds that scope.
+      const unknown = seedJournal('old-unknown', 901, oldDay, 'sent');
+      // An unresolved pending fire still holds its own WO, even across ticks.
+      const reserved = seedJournal('old-reserved', 902, earlierTick, 'pending');
+      const legacy = seedJournal('old-legacy', 903, earlierTick, 'sent');
+      const malformed = seedJournal('old-malformed', 904, earlierTick, 'sent', true);
+
+      const { deps, invocations } = realLoopFixture(world, db, [901, 902]);
+      const budget = deps.fireBudget!;
+      expect((await budget.reserveAutomaticFire(unknown)).allowed).toBe(true);
+      expect((await budget.authorizeAutomaticFire(unknown)).allowed).toBe(true);
+      expect((await budget.reserveAutomaticFire(reserved)).allowed).toBe(true);
+      const original = await taskmasterDb.listAutomaticFireAdmissions(db);
+      expect(original.map(row => [row.action_key, row.state]).sort()).toEqual([
+        ['old-reserved', 'reserved'],
+        ['old-unknown', 'unknown'],
+      ]);
+
+      const cascadesRead: string[] = [];
+      deps.readFireCascadeEvidence = async ({ cascadeId }) => {
+        cascadesRead.push(cascadeId);
+        throw new Error('fixture: cascade evidence missing');
+      };
+      deps.checkExpectations = async () => {};
+      deps.escalationDelivery = {
+        listIssueComments: async () => [],
+        postIssueComment: async () => {},
+        posterLogin: async () => 'fixture',
+      };
+      await loop.tick(loop.createTaskmasterState(60_000), deps);
+
+      expect(invocations).toEqual([{ woId: 'WO-HARNESS-CAP-901', cascadeId: expect.any(String) }]);
+      const [fire] = invocations;
+      expect(fire!.cascadeId).not.toBe(unknown.cascadeId);
+      expect(cascadesRead).toContain(reserved.cascadeId);
+      expect(world.journal.find(row => row.id === reserved.journalId)?.outcome).toBe('pending');
+
+      const rows = await taskmasterDb.listAutomaticFireAdmissions(db);
+      for (const row of original) {
+        expect(rows.find(candidate => candidate.action_key === row.action_key)).toEqual(row);
+      }
+      expect(rows.find(row => row.action_key === legacy.actionKey)).toMatchObject({
+        state: 'unknown',
+        journal_id: legacy.journalId,
+        cascade_id: legacy.cascadeId,
+        owner_token: 'legacy-reconciliation',
+      });
+      expect(world.journal.find(row => row.id === malformed.journalId)).toMatchObject({
+        outcome: 'sent',
+        proposal_json: '{',
+      });
+      const newRows = rows.filter(row => row.cascade_id === fire!.cascadeId);
+      expect(newRows).toHaveLength(1);
+      expect(newRows[0]!.action_key).not.toBe(unknown.actionKey);
+      expect(newRows[0]!.admitted_at).not.toBeNull();
+
+      expect(
+        await budget.reserveAutomaticFire({ ...unknown, now: new Date(world.nowMs).toISOString() })
+      ).toEqual({
+        allowed: false,
+        reason: 'daily_cap_existing_action',
+      });
+      expect(await taskmasterDb.listAutomaticFireAdmissions(db)).toEqual(rows);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toEqual([]);
+    } finally {
+      if (priorEnabled === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorEnabled;
+      if (priorLimit === undefined) delete process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+      else process.env.TASKMASTER_FIRE_MAX_PER_DAY = priorLimit;
+      await db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+);
