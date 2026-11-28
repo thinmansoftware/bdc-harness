@@ -40,6 +40,7 @@ import {
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { getDatabase } from '@archon/core/db/connection';
+import { currentWoRunAdmission, withWoRunAdmission } from '@archon/core/db/wo-run-admissions';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dispatchBackgroundWorkflow } from '@archon/core/orchestrator';
@@ -77,7 +78,9 @@ import { parseWorkflowRunBranchOverride } from './workflow-run-branch-override';
 import {
   dispatchGuardedWoRun,
   extractWoIdFromMessage,
+  findLiveRunsForWo,
   isCascadeClimbMessage,
+  type DeferWoAdmissionRelease,
 } from './wo-fire-guard';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
@@ -4234,7 +4237,8 @@ export function registerApiRoutes(
     message: string,
     extraContext?: Omit<HandleMessageContext, 'isolationHints'>,
     filesToCleanup?: { files: AttachedFile[]; uploadDir: string },
-    isolationHintsOverride?: HandleMessageContext['isolationHints']
+    isolationHintsOverride?: HandleMessageContext['isolationHints'],
+    deferWoAdmissionRelease?: DeferWoAdmissionRelease
   ): Promise<{ accepted: boolean; status: string }> {
     // Default: thread isolation keyed to this conversation. When an atomic fire
     // supplied a validated `--from origin/<branch>` override, use its task hints
@@ -4244,7 +4248,9 @@ export function registerApiRoutes(
       isolationHintsOverride
         ? { ...isolationHintsOverride, workflowId: conversationId }
         : { workflowType: 'thread', workflowId: conversationId };
-    const result = await lockManager.acquireLock(conversationId, async () => {
+    const admission = currentWoRunAdmission();
+    const handled = deferWoAdmissionRelease ? Promise.withResolvers<undefined>() : undefined;
+    const handler = async (): Promise<void> => {
       // Emit lock:true at handler start so the UI knows processing has begun.
       // Fire-and-forget -- if no SSE stream is connected yet, the event is buffered.
       webAdapter.emitLockEvent(conversationId, true);
@@ -4294,7 +4300,11 @@ export function registerApiRoutes(
           );
         }
       }
-    });
+    };
+    const result = await lockManager.acquireLock(conversationId, () =>
+      withWoRunAdmission(admission, handler).finally(() => handled?.resolve(undefined))
+    );
+    if (handled) deferWoAdmissionRelease?.(handled.promise);
 
     if (result.status === 'queued-conversation' || result.status === 'queued-capacity') {
       // Intentionally fire-and-forget: the lock-acquire signal (locked: true) is sent
@@ -4845,19 +4855,42 @@ export function registerApiRoutes(
           );
         }
 
-        const result = await dispatchToOrchestrator(
-          conversation.platform_conversation_id,
-          message,
-          undefined,
-          undefined,
-          dispatchIsolationHints
-        );
+        // Conductor fires each tier through this endpoint, including when
+        // the cascade was started by POST /run.
+        const woId = WORKFLOW_RUN_COMMAND.test(message.trim())
+          ? extractWoIdFromMessage(message)
+          : null;
+        const guarded = await dispatchGuardedWoRun({
+          woId,
+          authorizeConcurrent: isCascadeClimbMessage(message),
+          dispatch: deferRelease =>
+            dispatchToOrchestrator(
+              conversation.platform_conversation_id,
+              message,
+              undefined,
+              undefined,
+              dispatchIsolationHints,
+              deferRelease
+            ),
+        });
+        if (!guarded.ok) {
+          return c.json(
+            {
+              accepted: false,
+              dispatched: false,
+              error: guarded.error,
+              woId,
+              liveRuns: guarded.liveRuns,
+            },
+            409
+          );
+        }
 
         return c.json({
           conversationId: conversation.platform_conversation_id,
           id: conversation.id,
           dispatched: true,
-          ...result,
+          ...guarded.result,
         });
       }
 
@@ -7113,7 +7146,15 @@ export function registerApiRoutes(
       const guarded = await dispatchGuardedWoRun({
         woId,
         authorizeConcurrent: allowConcurrent || isCascadeClimbMessage(message),
-        dispatch: () => dispatchToOrchestrator(conversationId, fullMessage, { modelOverride }),
+        dispatch: deferRelease =>
+          dispatchToOrchestrator(
+            conversationId,
+            fullMessage,
+            { modelOverride },
+            undefined,
+            undefined,
+            deferRelease
+          ),
       });
       if (!guarded.ok) {
         getLog().warn(
@@ -7126,7 +7167,10 @@ export function registerApiRoutes(
             error: guarded.error,
             woId,
             liveRuns: guarded.liveRuns,
-            hint: 'Cancel the live run or pass x-archon-allow-concurrent: 1 if you own the race',
+            hint:
+              guarded.error === 'wo_admission_in_progress'
+                ? 'Retry after the current dispatch has finished admitting its run'
+                : 'Cancel the live run or pass x-archon-allow-concurrent: 1 if you own the race',
           },
           409
         );
@@ -8798,13 +8842,11 @@ export function registerApiRoutes(
                     cwd,
                     timeout: 15000,
                   });
-                  const checked = await dispatchGuardedWoRun({
-                    woId: binding.woId,
-                    excludeRunId: binding.runId,
-                    revalidate: binding.revalidate,
-                    dispatch: async () => true,
-                  });
-                  if (!checked.ok || stdout.trim() !== binding.baseSha) {
+                  if (
+                    stdout.trim() !== binding.baseSha ||
+                    (await findLiveRunsForWo(binding.woId)).some(run => run.id !== binding.runId) ||
+                    !(await binding.revalidate())
+                  ) {
                     throw new Error('recovery_successor_base_or_custody_changed');
                   }
                 },

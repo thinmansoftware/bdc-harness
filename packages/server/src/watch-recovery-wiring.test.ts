@@ -18,7 +18,12 @@ import {
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
 } from '@archon/core/db/overseer';
-import { createRunAuthority, getRunAuthority, getWorkflowRun } from '@archon/core/db/workflows';
+import {
+  createRunAuthority,
+  createWorkflowRun,
+  getRunAuthority,
+  getWorkflowRun,
+} from '@archon/core/db/workflows';
 import {
   getM31ActionProposalV2,
   listM31ExecutionReceiptEventsV2,
@@ -474,6 +479,211 @@ test('WATCH_RECOVERY_01 exact resume and guarded first refire', async () => {
     expect(rows).toHaveLength(0);
   }
   expect(calls).toBe(0);
+});
+
+test('POST /run refuses the same WO while Overseer recovery is paused before persistence', async () => {
+  const woId = await seed('admission-race');
+  const conversationId = 'admission-race-post';
+  const conversation = await getOrCreateConversation('web', conversationId);
+  await sql(
+    "UPDATE remote_agent_conversations SET codebase_id='codebase', title='Fixture' WHERE id=$1",
+    [conversation.id]
+  );
+  const app = new OpenAPIHono();
+  const locks = new ConversationLockManager();
+  // Keep POST's handler queued if it is incorrectly admitted. The HTTP response
+  // itself must refuse the competing request before it reaches the queue.
+  const occupied = Promise.withResolvers<void>();
+  await locks.acquireLock(conversationId, () => occupied.promise);
+  registerApiRoutes(
+    app,
+    { setConversationDbId: () => {}, emitLockEvent: () => {} } as unknown as WebAdapter,
+    locks
+  );
+  const entered = Promise.withResolvers<void>();
+  const persist = Promise.withResolvers<void>();
+  resumeCompletes = false;
+  const recovery = tick(github, {
+    ...transport,
+    async resume(run, workflow, activate) {
+      entered.resolve();
+      await persist.promise;
+      await transport.resume(run, workflow, activate);
+    },
+  });
+  const post = async (): Promise<Response> => {
+    await Promise.race([
+      entered.promise,
+      recovery.then(() => {
+        throw new Error('recovery did not reach persistence');
+      }),
+    ]);
+    try {
+      return await app.request(`/api/workflows/${WORKFLOW}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId, message: `WO_ID=${woId}` }),
+      });
+    } finally {
+      persist.resolve();
+    }
+  };
+  try {
+    const [response] = await Promise.all([post(), recovery]);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      accepted: false,
+      error: 'wo_admission_in_progress',
+    });
+    expect(locks.getStats().queuedTotal).toBe(0);
+    const { rows } = await getDatabase().query<{ id: string; status: string }>(
+      'SELECT id, status FROM remote_agent_workflow_runs WHERE user_message = $1',
+      [`WO_ID=${woId}`]
+    );
+    expect(rows).toEqual([{ id: runId('admission-race'), status: 'running' }]);
+  } finally {
+    if (locks.getStats().queuedTotal === 0) occupied.resolve();
+  }
+});
+
+test('a queued POST /run holds admission against the Overseer refire transport', async () => {
+  const workflowName = 'admission-fixture';
+  const woId = 'WO-RECOVERY-QUEUED-01';
+  const conversationId = 'admission-queued-post';
+  const message = `WO_ID=${woId}`;
+  writeFileSync(
+    join(path, '.archon', 'workflows', `${workflowName}.yaml`),
+    `name: ${workflowName}
+description: Queued admission fixture
+interactive: true
+worktree:
+  enabled: false
+nodes:
+  - id: verify
+    bash: echo verified
+`
+  );
+  const conversation = await getOrCreateConversation('web', conversationId);
+  await sql(
+    "UPDATE remote_agent_conversations SET codebase_id='codebase', cwd=$1, title='Fixture' WHERE id=$2",
+    [path, conversation.id]
+  );
+  const app = new OpenAPIHono();
+  const locks = new ConversationLockManager();
+  const occupied = Promise.withResolvers<void>();
+  const handled = Promise.withResolvers<void>();
+  await locks.acquireLock(conversationId, () => occupied.promise);
+  const recovery = registerApiRoutes(
+    app,
+    {
+      emitLockEvent: (_id: string, locked: boolean) => {
+        if (!locked) handled.resolve();
+      },
+      sendMessage: async () => {},
+      setConversationDbId: () => {},
+      getPlatformType: () => 'web',
+      getStreamingMode: () => 'batch',
+    } as unknown as WebAdapter,
+    locks
+  );
+  try {
+    const response = await app.request(`/api/workflows/${workflowName}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId, message }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ accepted: true, status: 'queued-conversation' });
+    const tierResponse = await app.request('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        codebaseId: 'codebase',
+        message: `/workflow run ${workflowName} ${message}`,
+      }),
+    });
+    expect(tierResponse.status).toBe(409);
+    expect(await tierResponse.json()).toMatchObject({
+      dispatched: false,
+      error: 'wo_admission_in_progress',
+    });
+    let revalidationCalls = 0;
+    expect(
+      await recovery.fire({
+        runId: runId('no-predecessor'),
+        codebaseId: 'codebase',
+        workflowName: WORKFLOW,
+        workflowRevision,
+        baseSha: base,
+        platformId: 'admission-queued-refire',
+        woId,
+        message,
+        revalidate: async () => {
+          revalidationCalls++;
+          return false;
+        },
+      })
+    ).toBeNull();
+    expect(revalidationCalls).toBe(0);
+  } finally {
+    occupied.resolve();
+    if (locks.getStats().queuedTotal > 0) await handled.promise;
+  }
+  const { rows } = await getDatabase().query(
+    "SELECT workflow_name, json_extract(metadata, '$.admitted_wo_id') AS wo_id FROM remote_agent_workflow_runs WHERE user_message = $1",
+    [message]
+  );
+  expect(rows).toEqual([{ workflow_name: workflowName, wo_id: woId }]);
+});
+
+test('an expired dispatch cannot persist a run or release its replacement reservation', async () => {
+  const woId = 'WO-RECOVERY-EXPIRED-01';
+  const conversation = await getOrCreateConversation('web', 'expired-admission');
+  const createRun = () =>
+    createWorkflowRun({
+      workflow_name: WORKFLOW,
+      conversation_id: conversation.id,
+      user_message: `WO_ID=${woId}`,
+    });
+  const entered = Promise.withResolvers<void>();
+  const continueStaleDispatch = Promise.withResolvers<void>();
+  const stale = dispatchGuardedWoRun({
+    woId,
+    async dispatch() {
+      entered.resolve();
+      await continueStaleDispatch.promise;
+      return createRun();
+    },
+  });
+  const staleOutcome = stale.then(
+    () => null,
+    (error: unknown) => error
+  );
+  try {
+    await Promise.race([entered.promise, stale]);
+    await sql('UPDATE wo_run_admissions SET expires_at_epoch = 0 WHERE wo_id = $1', [woId]);
+    const replacement = await dispatchGuardedWoRun({
+      woId,
+      async dispatch() {
+        continueStaleDispatch.resolve();
+        const failure = await staleOutcome;
+        expect(failure).toBeInstanceOf(Error);
+        expect(String(failure)).toContain('wo_run_admission_expired_or_lost');
+        const third = await dispatchGuardedWoRun({ woId, dispatch: createRun });
+        expect(third).toMatchObject({ ok: false, error: 'wo_admission_in_progress' });
+        return createRun();
+      },
+    });
+    expect(replacement.ok).toBe(true);
+    const { rows } = await getDatabase().query(
+      'SELECT id FROM remote_agent_workflow_runs WHERE user_message = $1',
+      [`WO_ID=${woId}`]
+    );
+    expect(rows).toHaveLength(1);
+  } finally {
+    continueStaleDispatch.resolve();
+    await staleOutcome;
+  }
 });
 
 test('WATCH_RECOVERY_02 released stall resumes and final handback stays closed to repair', async () => {

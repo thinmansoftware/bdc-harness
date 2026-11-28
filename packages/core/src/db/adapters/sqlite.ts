@@ -1619,6 +1619,12 @@ export class SqliteAdapter implements IDatabase {
         archive_reason TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS wo_run_admissions (
+        wo_id TEXT PRIMARY KEY,
+        reservation_id TEXT NOT NULL,
+        expires_at_epoch INTEGER NOT NULL
+      );
+
       -- Workflow events table
       CREATE TABLE IF NOT EXISTS remote_agent_workflow_events (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),

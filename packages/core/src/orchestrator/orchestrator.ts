@@ -48,6 +48,7 @@ import * as db from '../db/conversations';
 import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
+import { currentWoRunAdmission, withWoRunAdmission } from '../db/wo-run-admissions';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { parseDeclaredBaseBranch } from '@archon/workflows/reliability/run-authority';
 import {
@@ -544,12 +545,15 @@ export async function dispatchBackgroundWorkflow(
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, workflowName: workflow.name }, 'pre_create_workflow_run_failed');
-    if (ctx.recoveryAdmission) throw new Error('recovery_successor_persistence_failed');
+    if (ctx.recoveryAdmission)
+      throw new Error('recovery_successor_persistence_failed', { cause: err });
+    if (currentWoRunAdmission()) throw err;
     // Non-fatal: executeWorkflow will create its own row as fallback
   }
 
-  // 9. Fire-and-forget: run workflow in background
-  void (async (): Promise<void> => {
+  // 9. The pre-created row carries admission now. The executor may replace it
+  // with a resumed row and no longer needs the consumed reservation.
+  void withWoRunAdmission(undefined, async (): Promise<void> => {
     try {
       try {
         const result = await executeWorkflow(
@@ -651,7 +655,7 @@ export async function dispatchBackgroundWorkflow(
     } catch (outerError) {
       getLog().error({ err: toError(outerError) }, 'background_workflow_unhandled_error');
     }
-  })();
+  });
 }
 
 /**

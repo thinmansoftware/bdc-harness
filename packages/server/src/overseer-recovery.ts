@@ -972,24 +972,17 @@ async function executeCase(
       canonicalStringify(eligible.evidence.expectedSpec) !== canonicalStringify(spec)
     )
       return null;
-    const dispatched = await dispatchGuardedWoRun({
+    return transport.fire({
+      runId: candidate.run.id,
+      codebaseId: authority.codebaseId,
+      workflowName: authority.workflowName,
+      workflowRevision: authority.workflowRevision,
+      baseSha: authority.baseSha,
+      platformId: recoveryPlatformId(proposal.execution_id),
       woId: recovery.woId,
-      excludeRunId: candidate.run.id,
+      message: buildFireMessage(recovery.woId, candidate.project, undefined, spec),
       revalidate,
-      dispatch: () =>
-        transport.fire({
-          runId: candidate.run.id,
-          codebaseId: authority.codebaseId,
-          workflowName: authority.workflowName,
-          workflowRevision: authority.workflowRevision,
-          baseSha: authority.baseSha,
-          platformId: recoveryPlatformId(proposal.execution_id),
-          woId: recovery.woId,
-          message: buildFireMessage(recovery.woId, candidate.project, undefined, spec),
-          revalidate,
-        }),
     });
-    return dispatched.ok ? dispatched.result : null;
   };
 
   const adapter = createRepairRefireAdapter({
