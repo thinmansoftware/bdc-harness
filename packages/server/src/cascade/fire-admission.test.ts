@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { IDatabase } from '@archon/core';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { acquireWoClaim, releaseWoClaim } from '@archon/core/db/cascade-wo-claims';
 import { resolveAgent, loadAgentRegistry } from '@archon/workflows/agents/registry';
@@ -170,6 +171,100 @@ describe('Cauldron fire admission', () => {
     }
   });
 
+  test.each(['pull', 'branch'] as const)(
+    'refreshes a stale %s read when a concurrent SQLite fire commits first',
+    async kind => {
+      const branch = kind === 'branch' ? BRANCH : undefined;
+      if (branch) execFileSync('git', ['init', '--initial-branch', 'dev', directory]);
+      const otherDb = new SqliteAdapter(join(directory, 'admission.sqlite'));
+      const snapshotTaken = Promise.withResolvers<void>();
+      const finishRead = Promise.withResolvers<void>();
+      let remoteChanged = false;
+      const readGitHub = async (url: string) => {
+        const isPullRead = url.includes('/pulls?');
+        if (remoteChanged) {
+          return evidence(
+            branch ? [] : [pull(1)],
+            branch ? [{ ref: `refs/heads/${branch}` }] : []
+          )(url);
+        }
+        if (isPullRead === !branch) {
+          snapshotTaken.resolve();
+          await finishRead.promise;
+        }
+        return Response.json([]);
+      };
+      const pending = admit({ target: { repo: REPO, branch }, readGitHub }).catch(
+        (error: unknown) => error
+      );
+      try {
+        await Promise.race([snapshotTaken.promise, pending]);
+        const first = await admit({
+          db: otherDb,
+          woId: 'WO-NEW-02',
+          cascadeId: 'cascade-other',
+        });
+        expect(first.acquired).toBe(true);
+        remoteChanged = true;
+        finishRead.resolve();
+        expect(await pending).toMatchObject(
+          branch
+            ? { reason: 'target_branch_unreclaimable', details: { branch } }
+            : { reason: 'repo_wip_cap', details: { active: 2, cap: 2 } }
+        );
+        expect((await db.query('SELECT wo_id FROM cascade_wo_claims')).rows).toEqual([
+          { wo_id: 'WO-NEW-02' },
+        ]);
+      } finally {
+        finishRead.resolve();
+        await pending;
+        await otherDb.close();
+      }
+    }
+  );
+
+  test.each(['pull', 'branch'] as const)(
+    'checks GitHub for a %s that appears while waiting for the Postgres advisory lock',
+    async kind => {
+      const branch = kind === 'branch' ? BRANCH : undefined;
+      if (branch) execFileSync('git', ['init', '--initial-branch', 'dev', directory]);
+      else await seedClaim();
+      let lockAcquired = false;
+      const postgres: IDatabase = {
+        dialect: 'postgres',
+        sql: db.sql,
+        query: db.query.bind(db),
+        close: db.close.bind(db),
+        withTransaction: fn =>
+          db.withTransaction(query =>
+            fn((sql, params) => {
+              if (sql.startsWith('SELECT pg_advisory_xact_lock')) {
+                expect(params).toEqual([`cauldron-wip:${REPO}`]);
+                lockAcquired = true;
+                return Promise.resolve({ rows: [], rowCount: 0 });
+              }
+              return query(sql, params);
+            })
+          ),
+      };
+      const readGitHub = (url: string) =>
+        evidence(
+          lockAcquired && !branch ? [pull(1)] : [],
+          lockAcquired && branch ? [{ ref: `refs/heads/${branch}` }] : []
+        )(url);
+      await expect(
+        admit({ db: postgres, target: { repo: REPO, branch }, readGitHub })
+      ).rejects.toMatchObject(
+        branch
+          ? { reason: 'target_branch_unreclaimable', details: { branch } }
+          : { reason: 'repo_wip_cap', details: { active: 2, cap: 2 } }
+      );
+      expect((await db.query('SELECT wo_id FROM cascade_wo_claims')).rows).toHaveLength(
+        branch ? 0 : 1
+      );
+    }
+  );
+
   test('preserves WO claim idempotency without firing a competing cascade', async () => {
     await seedClaim('WO-NEW-01');
     const readGitHub = async () => {
@@ -244,12 +339,17 @@ describe('Cauldron fire admission', () => {
 
   test('defers if a claim is released while the PR snapshot is in flight', async () => {
     await seedClaim();
-    const readGitHub = async () => {
-      await releaseWoClaim({ woId: 'WO-OLD-01', cascadeId: 'cascade-old', now: NOW }, db);
-      return Response.json([]);
-    };
-    await expect(admit({ readGitHub })).rejects.toMatchObject({ reason: 'repo_wip_changed' });
-    expect((await admit()).acquired).toBe(true);
+    const otherDb = new SqliteAdapter(join(directory, 'admission.sqlite'));
+    try {
+      const readGitHub = async () => {
+        await releaseWoClaim({ woId: 'WO-OLD-01', cascadeId: 'cascade-old', now: NOW }, otherDb);
+        return Response.json([]);
+      };
+      await expect(admit({ readGitHub })).rejects.toMatchObject({ reason: 'repo_wip_changed' });
+      expect((await admit()).acquired).toBe(true);
+    } finally {
+      await otherDb.close();
+    }
   });
 
   test('rejects missing or malformed evidence and an unbound repository', async () => {

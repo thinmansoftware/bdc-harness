@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { SQLiteError } from 'bun:sqlite';
 import type { IDatabase } from '@archon/core';
 import {
   acquireWoClaim,
@@ -260,29 +261,41 @@ export async function acquireAdmittedWoClaim(input: {
         });
       });
     const releasedBefore = await releasedCount(db.query.bind(db));
-    const signal = AbortSignal.timeout(10_000);
-    const pulls = await openPulls(repo, read, signal);
-    if (branch) {
-      if (pulls.some(pull => pull.headRepo === repo && pull.branch === branch))
-        throw new FireAdmissionDeferred('target_branch_open', details);
-      await verifyBranch(repo, branch, codebase.default_cwd, read, signal);
-    }
-    return await db.withTransaction(
-      async query => {
+    const admit = (): Promise<AcquireWoClaimResult> =>
+      db.withTransaction(async query => {
         if (db.dialect === 'postgres')
           await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
             `cauldron-wip:${repo}`,
           ]);
         const existing = await findActiveWoClaim(input.woId, { query });
         if (existing) return { acquired: existing.cascade_id === input.cascadeId, claim: existing };
+        const signal = AbortSignal.timeout(10_000);
+        const pulls = await openPulls(repo, read, signal);
+        if (branch) {
+          if (pulls.some(pull => pull.headRepo === repo && pull.branch === branch))
+            throw new FireAdmissionDeferred('target_branch_open', details);
+          await verifyBranch(repo, branch, codebase.default_cwd, read, signal);
+        }
         const active = await activeWork(query, repo, codebases, pulls, branch);
         if (releasedBefore !== (await releasedCount(query)))
           throw new FireAdmissionDeferred('repo_wip_changed', details);
         if (active >= cap) throw new FireAdmissionDeferred('repo_wip_cap', { ...details, active });
         return acquireWoClaim({ ...input, targetRepo: repo, targetBranch: branch }, { query });
-      },
-      { immediate: true }
-    );
+      });
+    try {
+      return await admit();
+    } catch (error) {
+      // SQLite's first claim read pins a WAL snapshot without a write lock. If
+      // another writer wins, SQLite rejects the upgrade. Retry once from a new
+      // transaction so the claim check and GitHub evidence are both refreshed.
+      if (
+        db.dialect !== 'sqlite' ||
+        !(error instanceof SQLiteError) ||
+        !error.code?.startsWith('SQLITE_BUSY')
+      )
+        throw error;
+      return await admit();
+    }
   } catch (error) {
     if (error instanceof FireAdmissionDeferred) throw error;
     throw new FireAdmissionDeferred('repo_wip_unavailable', details);
