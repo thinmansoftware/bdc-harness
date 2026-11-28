@@ -1,6 +1,7 @@
 import { matchesWoToken } from './wo-token';
 import type { ResolveOriginatingWoId } from './sibling-wo-id';
 import { resolveProjectBase } from './project-bases';
+import { MERGE_HOLD_LABEL } from './merge-holds';
 
 const log: ReconcileLogger = {
   warn(fields, message) {
@@ -106,6 +107,8 @@ export interface ReconcileRepoOpenPullRequest {
   number: number;
   body?: string | null;
   headRefName: string;
+  headSha: string | null;
+  labels: readonly string[] | null;
   isDraft: boolean;
   headRepository: { owner: string; repo: string } | null;
   /**
@@ -113,6 +116,24 @@ export interface ReconcileRepoOpenPullRequest {
    * field; a missing or unparseable time is not created-before-merge.
    */
   createdAt?: string | null;
+}
+
+interface SupersessionHead {
+  headSha: string;
+  baseSha: string;
+  baseRef: string;
+}
+
+interface SupersessionTarget {
+  owner: string;
+  repo: string;
+  number: number;
+}
+
+interface SupersessionCommit {
+  sha: string;
+  tree: { sha: string };
+  parents: { sha: string }[];
 }
 
 export interface ReconcileTrackerIssue {
@@ -272,13 +293,15 @@ export interface ReconcileDeps {
     owner: string;
     repo: string;
   }) => Promise<ReconcileRepoOpenPullRequest[] | PagedRead<ReconcileRepoOpenPullRequest>>;
-  /** Comment and close one pull request. A throw writes no supersede action row. */
-  closePullRequest?: (input: {
-    owner: string;
-    repo: string;
-    number: number;
-    comment: string;
-  }) => Promise<void>;
+  /** Prove the landed tree contains the candidate's exact deliverable. */
+  proveSupersession?: (
+    merged: ReconcileMergedPullRequest,
+    candidate: ReconcileRepoOpenPullRequest
+  ) => Promise<SupersessionHead | null>;
+  /** Recheck head and labels immediately before closing. False writes no success receipt. */
+  closePullRequest?: (
+    input: SupersessionTarget & SupersessionHead & { comment: string }
+  ) => Promise<boolean>;
   /**
    * True when this sibling PR already has a reconcile_supersede_close row for
    * this WO. Defaults to the existing action lookup.
@@ -329,8 +352,29 @@ export interface OctokitLike {
         merged?: boolean;
         merge_commit_sha?: string | null;
         merged_at?: string | null;
-        base?: { ref?: string | null } | null;
+        base?: { ref?: string | null; sha?: string } | null;
+        head?: { sha?: string } | null;
+        draft?: boolean;
+        labels?: { name?: string | null }[];
+        changed_files?: number;
       };
+    }>;
+  };
+  git?: {
+    getCommit(input: Record<string, unknown>): Promise<{
+      data: SupersessionCommit;
+    }>;
+    getTree(input: Record<string, unknown>): Promise<{
+      data: {
+        sha: string;
+        truncated?: boolean;
+        tree: { path?: string; mode?: string; type?: string; sha?: string }[];
+      };
+    }>;
+  };
+  repos?: {
+    compareCommitsWithBasehead(input: Record<string, unknown>): Promise<{
+      data: { files?: { filename: string; status: string; previous_filename?: string }[] };
     }>;
   };
   issues: {
@@ -457,9 +501,12 @@ function withPassSharing(deps: ReconcileDeps, counts: Record<string, number>): R
   if (deps.closePullRequest) {
     const close = deps.closePullRequest;
     const counted = result.closePullRequest;
-    result.closePullRequest = async (input): Promise<void> => {
-      await (counted ?? close)(input);
-      closedThisPass.add(`${input.owner}/${input.repo}#${String(input.number)}`.toLowerCase());
+    result.closePullRequest = async (input): Promise<boolean> => {
+      const closed = await (counted ?? close)(input);
+      if (closed) {
+        closedThisPass.add(`${input.owner}/${input.repo}#${String(input.number)}`.toLowerCase());
+      }
+      return closed;
     };
   }
   return result;
@@ -1243,7 +1290,15 @@ async function closeSupersededSiblingPullRequests(
   deps: ReconcileDeps,
   logger: ReconcileLogger
 ): Promise<SupersedeOutcome> {
-  if (!deps.listOpenPullRequestsInRepo || !deps.closePullRequest) return 'continue';
+  if (
+    !deps.listOpenPullRequestsInRepo ||
+    !deps.closePullRequest ||
+    !deps.proveSupersession ||
+    !deps.listPullRequestFiles ||
+    !pr.mergeCommitSha
+  ) {
+    return 'continue';
+  }
   const projectBase = resolveProjectBase(pr.owner, pr.repo);
   if (projectBase === null || projectBase !== (pr.baseRef ?? null)) return 'continue';
   const prRef = `${pr.owner}/${pr.repo}#${pr.number}`;
@@ -1251,29 +1306,27 @@ async function closeSupersededSiblingPullRequests(
   const stems = extractDeclaredWoStems(pr.body ?? '').filter(stem => !skipped.has(stem));
   if (stems.length === 0) return 'continue';
 
-  // SPEC-ONLY GUARD (same rule as the tracker path). A merge that only lands a
-  // WO spec document is not completion evidence, so it closes no sibling. A
-  // truncated or failed file list cannot prove otherwise: close nothing.
-  if (deps.listPullRequestFiles) {
-    let changedPaths: string[];
-    try {
-      const read = asPagedRead(await deps.listPullRequestFiles(pr));
-      if (read.truncated) {
-        logger.warn({ prRef }, 'overseer.reconcile.supersede_skipped_file_list_truncated');
-        return 'continue';
-      }
-      changedPaths = read.items;
-    } catch (error) {
+  // A spec-only or ancestry-only merge cannot supersede an implementation.
+  try {
+    const read = asPagedRead(await deps.listPullRequestFiles(pr));
+    if (read.truncated) {
+      logger.warn({ prRef }, 'overseer.reconcile.supersede_skipped_file_list_truncated');
+      return 'continue';
+    }
+    if (read.items.length === 0) return 'continue';
+    if (isSpecOnlyChangeSet(read.items)) {
       logger.warn(
-        { err: error as Error, prRef },
-        'overseer.reconcile.supersede_skipped_file_list_failed'
+        { prRef, changedPaths: read.items },
+        'overseer.reconcile.supersede_skipped_spec_only_merge'
       );
       return 'continue';
     }
-    if (isSpecOnlyChangeSet(changedPaths)) {
-      logger.warn({ prRef, changedPaths }, 'overseer.reconcile.supersede_skipped_spec_only_merge');
-      return 'continue';
-    }
+  } catch (error) {
+    logger.warn(
+      { err: error as Error, prRef },
+      'overseer.reconcile.supersede_skipped_file_list_failed'
+    );
+    return 'continue';
   }
 
   let listed: PagedRead<ReconcileRepoOpenPullRequest>;
@@ -1300,7 +1353,13 @@ async function closeSupersededSiblingPullRequests(
 
   for (const candidate of listed.items) {
     if (candidate.number === pr.number) continue;
-    if (candidate.isDraft) continue;
+    if (
+      candidate.isDraft ||
+      !candidate.headSha ||
+      !candidate.labels ||
+      hasMergeHold(candidate.labels)
+    )
+      continue;
     if (!headIsTargetRepo(candidate, pr.owner, pr.repo)) continue;
     let woId = firstMatchedSupersedeStem(candidate, stems);
     let matchedThroughRun = false;
@@ -1331,12 +1390,16 @@ async function closeSupersededSiblingPullRequests(
         `This PR's branch ${candidate.headRefName} is kept; reopen the PR if it is still wanted.`
       : `Superseded by #${String(pr.number)}`;
     try {
-      await deps.closePullRequest({
+      const proof = await deps.proveSupersession(pr, candidate);
+      if (!proof) continue;
+      const closed = await deps.closePullRequest({
         owner: pr.owner,
         repo: pr.repo,
         number: candidate.number,
+        ...proof,
         comment,
       });
+      if (!closed) continue;
     } catch (error) {
       if (isRateLimitError(error)) {
         logger.warn(
@@ -1660,7 +1723,6 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       hasCloseBeenRecorded: async () => false,
       hasKeywordMissingBeenNoted: async () => false,
       listOpenPullRequestsInRepo: async () => [],
-      closePullRequest: async () => undefined,
       hasSupersedeBeenRecorded: async () => false,
       insertAction: insertDefaultOverseerAction,
       log,
@@ -1771,21 +1833,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     hasMergedBeenNoted: hasDefaultMergedBeenNoted,
     listOpenPullRequestsInRepo: async (input): Promise<PagedRead<ReconcileRepoOpenPullRequest>> =>
       listRepoOpenPullRequests(await getOctokit(), input.owner, input.repo),
-    closePullRequest: async (input): Promise<void> => {
-      const client = await getOctokit();
-      await client.issues.createComment({
-        owner: input.owner,
-        repo: input.repo,
-        issue_number: input.number,
-        body: input.comment,
-      });
-      await client.issues.update({
-        owner: input.owner,
-        repo: input.repo,
-        issue_number: input.number,
-        state: 'closed',
-      });
-    },
+    proveSupersession: async (pr, candidate) =>
+      proveSupersession(await getOctokit(), pr, candidate),
+    closePullRequest: async input => closeSupersededPullRequest(await getOctokit(), input, log),
     hasSupersedeBeenRecorded: hasDefaultSupersedeBeenRecorded,
     resolveOriginatingWoId: resolveDefaultOriginatingWoId,
     removeTrackerLabel: async (input): Promise<void> => {
@@ -1872,6 +1922,137 @@ export function asPagedRead<T>(value: T[] | PagedRead<T>): PagedRead<T> {
   return Array.isArray(value) ? { items: value, truncated: false } : value;
 }
 
+function readLabelNames(labels: unknown): string[] | null {
+  if (!Array.isArray(labels)) return null;
+  const names = labels.map(label => (label as { name?: unknown } | null)?.name);
+  return names.every((name): name is string => typeof name === 'string') ? names : null;
+}
+
+function hasMergeHold(labels: readonly string[]): boolean {
+  return labels.some(label => label.trim().toLowerCase() === MERGE_HOLD_LABEL);
+}
+
+function isObjectSha(sha: unknown): sha is string {
+  return typeof sha === 'string' && /^[a-f0-9]{40}$/.test(sha);
+}
+
+async function readSupersessionHead(
+  octokit: OctokitLike,
+  { owner, repo, number }: SupersessionTarget,
+  headSha: string,
+  baseRef: string
+): Promise<{ baseSha: string; changedFiles: number | undefined } | null> {
+  const { data } = await octokit.pulls.get({ owner, repo, pull_number: number });
+  const labels = readLabelNames(data.labels);
+  if (
+    data.state !== 'open' ||
+    data.draft !== false ||
+    !labels ||
+    hasMergeHold(labels) ||
+    data.head?.sha !== headSha ||
+    data.base?.ref !== baseRef ||
+    !isObjectSha(data.base.sha)
+  ) {
+    return null;
+  }
+  return { baseSha: data.base.sha, changedFiles: data.changed_files };
+}
+
+/** Prove content inclusion by file object and mode. Ancestry can survive a dropped change. */
+export async function proveSupersession(
+  octokit: OctokitLike,
+  merged: ReconcileMergedPullRequest,
+  candidate: ReconcileRepoOpenPullRequest
+): Promise<SupersessionHead | null> {
+  const { owner, repo, mergeCommitSha, baseRef } = merged;
+  const headSha = candidate.headSha;
+  if (
+    !octokit.git ||
+    !octokit.repos ||
+    !isObjectSha(headSha) ||
+    !isObjectSha(mergeCommitSha) ||
+    !baseRef
+  ) {
+    return null;
+  }
+  const target = { owner, repo, number: candidate.number };
+  const current = await readSupersessionHead(octokit, target, headSha, baseRef);
+  if (!current?.changedFiles || current.changedFiles >= 300) return null;
+  const { baseSha, changedFiles } = current;
+
+  const git = octokit.git;
+  const readCommit = async (commitSha: string): Promise<SupersessionCommit | null> => {
+    const { data } = await git.getCommit({ owner, repo, commit_sha: commitSha });
+    return data.sha === commitSha && isObjectSha(data.tree?.sha) ? data : null;
+  };
+  const landed = await readCommit(mergeCommitSha);
+  const parentSha = landed?.parents?.[0]?.sha;
+  if (!landed || !isObjectSha(parentSha)) return null;
+  const parent = await readCommit(parentSha);
+  if (!parent || landed.tree.sha === parent.tree.sha) return null;
+
+  // Compare immutable SHAs. GitHub's first page carries the entire file list up to 300.
+  const { data } = await octokit.repos.compareCommitsWithBasehead({
+    owner,
+    repo,
+    basehead: `${baseSha}...${headSha}`,
+    per_page: 1,
+    page: 1,
+  });
+  if (!Array.isArray(data.files) || data.files.length !== changedFiles) return null;
+  const head = await readCommit(headSha);
+  if (!head) return null;
+  const readTree = async (treeSha: string): Promise<Map<string, string> | null> => {
+    const { data: tree } = await git.getTree({ owner, repo, tree_sha: treeSha, recursive: '1' });
+    if (tree.sha !== treeSha || tree.truncated !== false || !Array.isArray(tree.tree)) return null;
+    const entries = new Map<string, string>();
+    for (const entry of tree.tree) {
+      if (!entry.path || !entry.mode || !entry.type || !isObjectSha(entry.sha)) return null;
+      if (entry.type !== 'tree')
+        entries.set(entry.path, `${entry.mode}:${entry.type}:${entry.sha}`);
+    }
+    return entries;
+  };
+  const headTree = await readTree(head.tree.sha);
+  const landedTree = await readTree(landed.tree.sha);
+  if (!headTree || !landedTree) return null;
+  const seen = new Set<string>();
+  for (const { filename, status, previous_filename: previous } of data.files) {
+    if (!filename || seen.has(filename)) return null;
+    seen.add(filename);
+    if (status === 'removed') {
+      if (headTree.has(filename) || landedTree.has(filename)) return null;
+      continue;
+    }
+    if (!['added', 'modified', 'changed', 'renamed', 'copied'].includes(status)) return null;
+    const expected = headTree.get(filename);
+    if (!expected || landedTree.get(filename) !== expected) return null;
+    if (status === 'renamed' && (!previous || headTree.has(previous) || landedTree.has(previous))) {
+      return null;
+    }
+  }
+  return { headSha, baseSha, baseRef };
+}
+
+export async function closeSupersededPullRequest(
+  octokit: OctokitLike,
+  input: SupersessionTarget & SupersessionHead & { comment: string },
+  logger: ReconcileLogger
+): Promise<boolean> {
+  const { owner, repo, number, headSha, baseSha, baseRef, comment } = input;
+  const current = await readSupersessionHead(octokit, input, headSha, baseRef);
+  if (current?.baseSha !== baseSha) return false;
+
+  const target = { owner, repo, issue_number: number };
+  await octokit.issues.update({ ...target, state: 'closed' });
+  try {
+    await octokit.issues.createComment({ ...target, body: comment });
+  } catch (error) {
+    logger.warn({ err: error as Error, ...target }, 'overseer.reconcile.supersede_comment_failed');
+  }
+  return true;
+}
+
 function mapRepoOpenPullRequest(row: Record<string, unknown>): ReconcileRepoOpenPullRequest | null {
   if (typeof row.number !== 'number' || !Number.isSafeInteger(row.number)) return null;
   const head =
@@ -1888,7 +2069,9 @@ function mapRepoOpenPullRequest(row: Record<string, unknown>): ReconcileRepoOpen
     number: row.number,
     body: typeof row.body === 'string' ? row.body : null,
     headRefName,
-    isDraft: row.draft === true,
+    headSha: typeof head?.sha === 'string' ? head.sha : null,
+    labels: readLabelNames(row.labels),
+    isDraft: row.draft !== false,
     headRepository: owner.length > 0 && repo.length > 0 ? { owner, repo } : null,
     createdAt: typeof row.created_at === 'string' ? row.created_at : null,
   };

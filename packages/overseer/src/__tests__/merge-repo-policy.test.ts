@@ -23,6 +23,16 @@ describe('default merge repo policy -- staging lineages', () => {
     });
   });
 
+  test('receiving-shipping-desk permits unattended code and docs merges only on staging', () => {
+    const desk = 'thinmansoftware/receiving-shipping-desk';
+    expect(getRepoBasePolicy(desk, 'staging', policy)).toEqual({
+      unattended: true,
+      docsOnly: 'merge',
+    });
+    expect(getRepoBasePolicy(desk, 'main', policy)).toBeUndefined();
+    expect(unattendedBasesForRepo(desk, policy)).toEqual(['staging']);
+  });
+
   test('lspro-react keeps dev unattended and shopops-storefront is a known repo', () => {
     expect(getRepoBasePolicy('thinmansoftware/lspro-react', 'dev', policy)?.unattended).toBe(true);
     expect(hasRepoPolicyEntry('thinmansoftware/shopops-storefront', policy)).toBe(true);
@@ -95,6 +105,7 @@ describe('provisioner main and the additive environment value', () => {
         'thinmansoftware/bdc-xo',
         'thinmansoftware/comicstoreos-provisioner',
         'thinmansoftware/lspro-react',
+        'thinmansoftware/receiving-shipping-desk',
         'thinmansoftware/shopops',
         'thinmansoftware/shopops-storefront',
       ].sort()
@@ -153,23 +164,25 @@ describe('provisioner main and the additive environment value', () => {
 const LIVE_ENV_2026_11_12 =
   '{"thinmansoftware/bdc-harness":{"dev":{"unattended":true,"docs_only":"skip"},"staging":{"unattended":true,"docs_only":"skip"},"main":{"unattended":false,"docs_only":"skip"}},"thinmansoftware/shopops":{"staging":{"unattended":true,"docs_only":"skip"},"master":{"unattended":false,"docs_only":"skip"}},"thinmansoftware/lspro-react":{"dev":{"unattended":true,"docs_only":"skip"},"staging":{"unattended":true,"docs_only":"skip"},"main":{"unattended":false,"docs_only":"skip"},"lspro/comics-integration":{"unattended":true,"docs_only":"skip"}},"thinmansoftware/shopops-storefront":{"staging":{"unattended":true,"docs_only":"skip"},"master":{"unattended":false,"docs_only":"skip"}},"thinmansoftware/bdc-xo":{"main":{"unattended":true,"docs_only":"merge"}},"thinmansoftware/bdc-ci":{"main":{"unattended":false,"docs_only":"skip"}},"thinmansoftware/bdc-shopify-app":{"main":{"unattended":false,"docs_only":"skip"}}}';
 
-describe('making the environment value additive does not widen merge authority', () => {
+describe('additive environment policy admits only the intended additional bases', () => {
   const PROV = 'thinmansoftware/comicstoreos-provisioner';
+  const DESK = 'thinmansoftware/receiving-shipping-desk';
   const liveValue = JSON.parse(LIVE_ENV_2026_11_12) as Record<string, Record<string, unknown>>;
   const effective = resolveMergeRepoPolicy({ rawPolicy: LIVE_ENV_2026_11_12 });
 
-  test('the only repository in the default that the live value lacks is the provisioner, and only main', () => {
+  test('the default adds only provisioner main and desk staging to the historical environment', () => {
     const missing = Object.keys(DEFAULT_MERGE_REPO_POLICY)
       .filter(repo => !Object.hasOwn(liveValue, repo))
       .sort();
-    expect(missing).toEqual([PROV]);
+    expect(missing).toEqual([PROV, DESK]);
     expect(Object.keys(DEFAULT_MERGE_REPO_POLICY[PROV] ?? {})).toEqual(['main']);
     expect(DEFAULT_MERGE_REPO_POLICY[PROV]?.main).toEqual({ unattended: true, docsOnly: 'skip' });
   });
 
-  test('the effective policy under the live value differs from the live value only by the provisioner entry', () => {
+  test('the effective policy preserves every repository in the historical environment', () => {
     const asLive = JSON.parse(JSON.stringify(effective)) as Record<string, unknown>;
     delete asLive[PROV];
+    delete asLive[DESK];
     // Re-express the live value in the parsed shape (docs_only -> docsOnly) and compare repo by repo.
     for (const [repo, bases] of Object.entries(liveValue)) {
       const expected = Object.fromEntries(
@@ -194,7 +207,7 @@ describe('making the environment value additive does not widen merge authority',
     ];
     for (const [repo, base] of production)
       expect(getRepoBasePolicy(repo, base, effective)?.unattended ?? false).toBe(false);
-    // the provisioner is the only unattended base that is not in the live value
+    // Only provisioner main and desk staging gain unattended coverage.
     const unattended = (policyToCheck: typeof effective): string[] =>
       Object.entries(policyToCheck)
         .flatMap(([repo, bases]) =>
@@ -204,6 +217,9 @@ describe('making the environment value additive does not widen merge authority',
         )
         .sort();
     const live = unattended(parseMergeRepoPolicy(LIVE_ENV_2026_11_12));
-    expect(unattended(effective).filter(entry => !live.includes(entry))).toEqual([`${PROV}:main`]);
+    expect(unattended(effective).filter(entry => !live.includes(entry))).toEqual([
+      `${PROV}:main`,
+      `${DESK}:staging`,
+    ]);
   });
 });

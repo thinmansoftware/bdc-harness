@@ -15,6 +15,7 @@ import {
   type MergeProvenanceResult,
 } from './merge-provenance';
 import { mergeHoldReason } from './merge-holds';
+import { conclusionIsPassing } from './pr-review-check-ingest';
 import { eventMessage } from './watch';
 import { isRunTerminal } from './originating-run-lookup';
 import type { OriginatingRun, OriginatingRunLookupInput } from './originating-run-lookup';
@@ -1062,7 +1063,7 @@ async function mergePreconditionMiss(
   if (holdReason) return holdReason;
   if (
     checks.length === 0 ||
-    checks.some(check => check.conclusion !== 'success' || check.head_sha !== headSha)
+    checks.some(check => !conclusionIsPassing(check.conclusion) || check.head_sha !== headSha)
   ) {
     return 'required_checks_not_green_on_head';
   }

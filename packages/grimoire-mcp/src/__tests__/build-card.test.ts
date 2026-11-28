@@ -18,6 +18,7 @@ function deps(overrides: Partial<GitHubSnapshot> = {}, event: any = { runs: [], 
     reviews: [approved],
     checkRuns: [{ name: 'test', status: 'completed', conclusion: 'success' }],
     statuses: [],
+    requiredContexts: ['test'],
     checks: [{ name: 'test', kind: 'run', state: 'success', required: true }],
     woId: 'WO-XO-EXAMPLE-01',
     issue: 3258,
@@ -55,6 +56,32 @@ describe('card composition', () => {
     expect(card.owner).toEqual({ who: 'codex-seat', source: 'issue_assignee' });
     expect(card.wo.issue).toBe(3258);
   });
+  test('non-required red runs and statuses remain visible without blocking merge', async () => {
+    const optional = { name: 'preview', kind: 'run', state: 'failure', required: false } as const;
+    const card = await buildBlockedPrCard(
+      'thinmansoftware/bdc-harness#1',
+      deps({
+        requiredContexts: ['test', 'Windows CI gate'],
+        checkRuns: [
+          { name: 'test', status: 'completed', conclusion: 'neutral' },
+          { name: 'Windows CI gate', status: 'completed', conclusion: 'skipped' },
+          { name: 'preview', status: 'completed', conclusion: 'failure' },
+        ],
+        statuses: [{ context: 'deployment preview', state: 'failure' }],
+        checks: [optional],
+      })
+    );
+    expect(card.blocker_class).toBe('merge_ready');
+    expect(card.checks_verdict).toBe('OK');
+    expect(card.checks).toContainEqual(optional);
+  });
+  test('required check names match case-insensitively and failures still block', async () => {
+    const card = await buildBlockedPrCard(
+      'thinmansoftware/bdc-harness#1',
+      deps({ checkRuns: [{ name: ' TEST ', status: 'completed', conclusion: 'failure' }] })
+    );
+    expect(card.blocker_class).toBe('checks_red');
+  });
   test('findings use first ten list lines', async () => {
     const review = { ...approved, state: 'CHANGES_REQUESTED', body: '- one\ntext\n2. two' };
     const card = await buildBlockedPrCard(
@@ -80,7 +107,11 @@ describe('card composition', () => {
   test('pending commit status is checks pending', async () => {
     const card = await buildBlockedPrCard(
       'thinmansoftware/bdc-harness#1',
-      deps({ checkRuns: [], statuses: [{ context: 'deploy', state: 'pending' }] })
+      deps({
+        requiredContexts: ['deploy'],
+        checkRuns: [],
+        statuses: [{ context: 'deploy', state: 'pending' }],
+      })
     );
     expect(card.blocker_class).toBe('checks_pending');
   });

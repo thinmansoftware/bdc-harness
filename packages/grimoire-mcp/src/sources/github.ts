@@ -16,8 +16,8 @@ export interface GitHubSnapshot {
   checkRuns: RawCheckRun[];
   statuses: RawStatus[];
   checks: CardCheck[];
-  /** Required contexts with no check run or status on the exact head. */
-  requiredMissing?: string[];
+  /** Authoritative base-branch check names. Null means the lookup was unavailable. */
+  requiredContexts: readonly string[] | null;
   woId: string | null;
   issue: number | null;
   issueAssignee: string | null;
@@ -124,7 +124,7 @@ export async function readGitHub(
     const checkRuns = latestAttemptPerCheck(allCheckRuns);
     // Fail closed: merge readiness needs a KNOWN required-context set. The resolver
     // turns fetch errors into state 'unknown', so a cap hit inside it is re-raised here.
-    let required: Set<string> | null = null;
+    let required: readonly string[] | null = null;
     let requiredStatus: SourceStatus = 'ok';
     try {
       const resolution = await resolveRequiredContexts({
@@ -139,7 +139,7 @@ export async function readGitHub(
         throw new GitHubUnavailableError(
           'GitHub request cap exceeded while retrieving required contexts'
         );
-      if (resolution.state === 'known') required = new Set(resolution.contexts);
+      if (resolution.state === 'known') required = resolution.contexts;
       else
         requiredStatus = `unavailable: required contexts ${resolution.state}: ${resolution.reason}`;
     } catch (error) {
@@ -147,10 +147,13 @@ export async function readGitHub(
       requiredStatus = `unavailable: required contexts lookup failed: ${error instanceof Error ? error.message : 'unknown error'}`;
     }
     const reported = new Set([
-      ...checkRuns.map(c => c.name ?? ''),
-      ...statuses.map(s => s.context ?? ''),
+      ...checkRuns.map(c => (c.name ?? '').trim().toLowerCase()),
+      ...statuses.map(s => (s.context ?? '').trim().toLowerCase()),
     ]);
-    const requiredMissing = required ? [...required].filter(ctx => !reported.has(ctx)).sort() : [];
+    const requiredMissing = required
+      ? required.filter(ctx => !reported.has(ctx.trim().toLowerCase())).sort()
+      : [];
+    const requiredNames = required && new Set(required.map(ctx => ctx.trim().toLowerCase()));
     if (!issue && woId) {
       const search = await call('linked WO search', () =>
         client.search.issuesAndPullRequests({
@@ -172,13 +175,13 @@ export async function readGitHub(
         name: c.name ?? '?',
         kind: 'run' as const,
         state: c.status === 'completed' ? (c.conclusion ?? 'unknown') : (c.status ?? 'unknown'),
-        required: required ? required.has(c.name ?? '') : null,
+        required: requiredNames?.has((c.name ?? '').trim().toLowerCase()) ?? null,
       })),
       ...statuses.map(s => ({
         name: s.context ?? '?',
         kind: 'status' as const,
         state: s.state ?? 'unknown',
-        required: required ? required.has(s.context ?? '') : null,
+        required: requiredNames?.has((s.context ?? '').trim().toLowerCase()) ?? null,
       })),
       ...requiredMissing.map(name => ({
         name,
@@ -193,7 +196,7 @@ export async function readGitHub(
       checkRuns,
       statuses,
       checks: displayed,
-      requiredMissing,
+      requiredContexts: required,
       woId,
       issue,
       issueAssignee,
@@ -211,6 +214,7 @@ export async function readGitHub(
       checkRuns: [],
       statuses: [],
       checks: [],
+      requiredContexts: null,
       woId,
       issue,
       issueAssignee: null,

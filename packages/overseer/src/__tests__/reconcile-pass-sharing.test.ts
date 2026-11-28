@@ -23,6 +23,8 @@ function openPr(
     number,
     body,
     headRefName,
+    headSha: 'a'.repeat(40),
+    labels: [],
     isDraft: false,
     headRepository: { owner: 'thinmansoftware', repo },
     createdAt: '2026-07-17T11:00:00Z',
@@ -45,8 +47,15 @@ function sharingDeps(input: {
     if (input.listError?.(calls)) throw new Error('list failed');
     return input.opens[request.repo] ?? [];
   };
+  deps.listPullRequestFiles = async () => ['src/index.ts'];
+  deps.proveSupersession = async (_merged, candidate) => ({
+    headSha: candidate.headSha!,
+    baseSha: 'b'.repeat(40),
+    baseRef: 'dev',
+  });
   deps.closePullRequest = async request => {
     closes.push({ repo: request.repo, number: request.number, comment: request.comment });
+    return true;
   };
   deps.hasSupersedeBeenRecorded = async ({ prRef, woId }) =>
     deps.actions.some(

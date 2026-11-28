@@ -7,6 +7,7 @@ import {
 } from '../merge-manager.ts';
 import type { QualifiedMergeEvidence } from '../actions/merge-ready.ts';
 import type { GrokDispositionReceipt, WatchedRunRecord } from '../types.ts';
+import { REQUIRED_CHECK_NAME, requiredCheckCases } from './fixtures/required-check-decisions';
 
 const RUN_HEAD_SHA = 'a'.repeat(40);
 
@@ -106,43 +107,65 @@ describe('merge manager mode resolution', () => {
 });
 
 describe('merge manager', () => {
-  test('staging and dev-effect merge candidates are judged, executed, and recorded', async () => {
-    const assembled = evidence({ resulting_deployment_effect: 'none' });
-    const insertOverseerAction = mock(async () => undefined);
-    const judge = mock(async input => approveReceipt(input));
-    const execute = mock(async () => ({ merged: true, message: 'fake_merge_accepted' }));
-    const mergePullRequest = mock(async () => ({ merged: false }));
-    const manager = createMergeManager({
-      readRunEvents: async () => [],
-      mode: 'execute',
-      mutationsEnabled: true,
-      allowedBases: ['dev', 'staging'],
-      reviewGateLogin: 'thinman-review-gate[bot]',
-      listPullRequestReviews: async () => [
-        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
-      ],
-      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'c'.repeat(64) }),
-      judge,
-      execute,
-      insertOverseerAction,
-      findPullRequest: async () => record.prEvidence,
-      mergePullRequest,
-      readWorktreeHeadSha,
-    });
+  test.each(requiredCheckCases)(
+    'Rule 4 merge-manager parity: $name',
+    async ({ status, conclusion, outcome, stale }) => {
+      const assembled = evidence({
+        resulting_deployment_effect: 'none',
+        required_checks: status
+          ? [
+              {
+                name: REQUIRED_CHECK_NAME,
+                conclusion: conclusion ?? status,
+                head_sha: stale ? 'b'.repeat(40) : RUN_HEAD_SHA,
+              },
+            ]
+          : [],
+      });
+      const insertOverseerAction = mock(async () => undefined);
+      const judge = mock(async input => approveReceipt(input));
+      const execute = mock(async () => ({ merged: true, message: 'fake_merge_accepted' }));
+      const mergePullRequest = mock(async () => ({ merged: false }));
+      const manager = createMergeManager({
+        readRunEvents: async () => [],
+        mode: 'execute',
+        mutationsEnabled: true,
+        allowedBases: ['dev', 'staging'],
+        reviewGateLogin: 'thinman-review-gate[bot]',
+        listPullRequestReviews: async () => [
+          { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+        ],
+        assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'c'.repeat(64) }),
+        judge,
+        execute,
+        insertOverseerAction,
+        findPullRequest: async () => record.prEvidence,
+        mergePullRequest,
+        readWorktreeHeadSha,
+      });
 
-    const result = await manager(record);
+      const result = await manager(record);
 
-    expect(result.status).toBe('executed');
-    expect(judge).toHaveBeenCalledTimes(1);
-    expect(execute).toHaveBeenCalledWith(assembled);
-    expect(mergePullRequest).not.toHaveBeenCalled();
-    expect(insertOverseerAction).toHaveBeenCalledWith(
-      expect.objectContaining({
-        action: 'merged',
-        result: expect.stringContaining('fake_merge_accepted'),
-      })
-    );
-  });
+      if (outcome !== 'pass') {
+        expect(result).toMatchObject({
+          status: 'held',
+          reason: 'required_checks_not_green_on_head',
+        });
+        expect(execute).not.toHaveBeenCalled();
+        return;
+      }
+      expect(result.status).toBe('executed');
+      expect(judge).toHaveBeenCalledTimes(1);
+      expect(execute).toHaveBeenCalledWith(assembled);
+      expect(mergePullRequest).not.toHaveBeenCalled();
+      expect(insertOverseerAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'merged',
+          result: expect.stringContaining('fake_merge_accepted'),
+        })
+      );
+    }
+  );
 
   test('hold-canary + judge approve logs would_comment/would_merge and never merges', async () => {
     const assembled = evidence({ resulting_deployment_effect: 'none' });

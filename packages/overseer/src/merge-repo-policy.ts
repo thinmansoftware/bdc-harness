@@ -38,6 +38,10 @@ export const DEFAULT_MERGE_REPO_POLICY: MergeRepoPolicy = Object.freeze({
     staging: Object.freeze({ unattended: true, docsOnly: 'skip' }),
     master: Object.freeze({ unattended: false, docsOnly: 'skip' }),
   }),
+  // bdc-xo#5853: staging merges do not install a Workroom build.
+  'thinmansoftware/receiving-shipping-desk': Object.freeze({
+    staging: Object.freeze({ unattended: true, docsOnly: 'merge' }),
+  }),
   'thinmansoftware/bdc-xo': Object.freeze({
     main: Object.freeze({ unattended: true, docsOnly: 'merge' }),
   }),

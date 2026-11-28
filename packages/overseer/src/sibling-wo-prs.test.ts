@@ -39,6 +39,8 @@ function openPr(
     number,
     body,
     headRefName,
+    headSha: 'a'.repeat(40),
+    labels: [],
     isDraft: false,
     headRepository: { owner: 'thinmansoftware', repo: 'bdc-harness' },
     createdAt: '2026-07-17T11:00:00Z',
@@ -59,8 +61,15 @@ function siblingDeps(input: {
   const pullCloses: Array<{ number: number; comment: string }> = [];
   const resolveCalls: number[] = [];
   deps.listOpenPullRequestsInRepo = async () => input.opens;
+  deps.listPullRequestFiles = async () => ['src/index.ts'];
+  deps.proveSupersession = async (_merged, candidate) => ({
+    headSha: candidate.headSha!,
+    baseSha: 'b'.repeat(40),
+    baseRef: 'dev',
+  });
   deps.closePullRequest = async close => {
     pullCloses.push({ number: close.number, comment: close.comment });
+    return true;
   };
   deps.hasSupersedeBeenRecorded = async ({ prRef, woId }) =>
     deps.actions.some(

@@ -1,3 +1,8 @@
+import {
+  REQUIRED_CHECK_NAME,
+  reportedChecksForHead,
+  requiredCheckCases,
+} from './fixtures/required-check-decisions';
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
@@ -1781,6 +1786,28 @@ describe('merge execution bridge required contexts', () => {
     resetRequiredContextsAttemptCounters();
     delete process.env[REQUIRED_CONTEXTS_OVERRIDE_ENV];
     delete process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV];
+  });
+
+  test.each(requiredCheckCases)('Rule 4 execution bridge parity: $name', async checkCase => {
+    const h = harness(
+      [verdict('required-parity')],
+      greenPr({
+        checks: { total: 2, passed: 1, failed: 1, pending: 0 },
+        checkRuns: reportedChecksForHead(checkCase),
+        mergeableState: 'unstable',
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup([REQUIRED_CHECK_NAME]) }
+    );
+    await evaluate(h);
+    const pass = checkCase.outcome === 'pass';
+    expect(h.merges).toBe(pass ? 1 : 0);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({
+        mutationSent: pass,
+        reason: pass ? 'merge_executed' : 'required_checks_not_success',
+      })
+    );
   });
 
   test('non-required cancelled check does not block when required checks succeed', async () => {

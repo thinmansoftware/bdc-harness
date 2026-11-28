@@ -1,3 +1,4 @@
+import { conclusionIsPassing } from '@archon/overseer/pr-review-check-ingest';
 import type {
   BlockedPrCard,
   BlockerClass,
@@ -36,34 +37,42 @@ export function reviewVerdict(reviews: RawReview[], head: string, bot = OVERSEER
     : OK;
 }
 
-export function checksVerdict(checkRuns: RawCheckRun[], statuses: RawStatus[]): string {
-  if (!checkRuns.length && !statuses.length) return 'no checks reported for head';
+export function checksVerdict(
+  checkRuns: RawCheckRun[],
+  statuses: RawStatus[],
+  requiredContexts: readonly string[] | null
+): string {
+  if (!requiredContexts) return 'required checks unavailable';
+  const required = new Map(requiredContexts.map(name => [name.trim().toLowerCase(), name]));
+  const reported = new Set<string>();
   const bad: string[] = [];
   for (const c of checkRuns) {
+    const key = (c.name ?? '').trim().toLowerCase();
+    if (!required.has(key)) continue;
+    reported.add(key);
     if (c.status !== 'completed') bad.push(`${c.name}=${c.status}`);
-    else if (!['success', 'skipped', 'neutral'].includes(c.conclusion ?? ''))
-      bad.push(`${c.name}=${c.conclusion}`);
+    else if (!conclusionIsPassing(c.conclusion)) bad.push(`${c.name}=${c.conclusion}`);
   }
-  const latest = new Map<string | undefined, RawStatus>();
+  const latest = new Map<string, RawStatus>();
   for (const s of statuses) {
-    const held = latest.get(s.context);
-    if (!held || (s.updated_at ?? '') > (held.updated_at ?? '')) latest.set(s.context, s);
+    const key = (s.context ?? '').trim().toLowerCase();
+    if (!required.has(key)) continue;
+    reported.add(key);
+    const held = latest.get(key);
+    if (!held || (s.updated_at ?? '') > (held.updated_at ?? '')) latest.set(key, s);
   }
-  for (const [ctx, s] of latest) if (s.state !== 'success') bad.push(`${ctx}=${s.state}`);
-  return bad.length ? `checks not green: ${bad.sort().join(', ')}` : OK;
-}
-
-// Card-only addition on top of merge_guard_decide: a branch-protection required
-// context that never reported on the exact head is not evidence of green.
-export function withRequiredContexts(verdict: string, missingRequired: readonly string[]): string {
-  if (!missingRequired.length) return verdict;
-  const missing = `required checks not reported: ${[...missingRequired].sort().join(', ')}`;
-  return verdict === OK ? missing : `${verdict}; ${missing}`;
+  for (const s of latest.values()) if (s.state !== 'success') bad.push(`${s.context}=${s.state}`);
+  const missing = [...required].filter(([key]) => !reported.has(key)).map(([, name]) => name);
+  const messages = [
+    bad.length && `checks not green: ${bad.sort().join(', ')}`,
+    missing.length && `required checks not reported: ${missing.sort().join(', ')}`,
+  ].filter(Boolean);
+  return messages.join('; ') || OK;
 }
 
 function checksStillWaiting(verdict: string): boolean {
   return (
-    verdict.startsWith('no checks reported for head') ||
+    verdict === 'required checks unavailable' ||
     verdict.startsWith('required checks not reported') ||
     verdict.includes('in_progress') ||
     verdict.includes('queued') ||
