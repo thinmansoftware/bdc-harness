@@ -107,6 +107,29 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('T3 fire outcome marker schema', () => {
+    test('migration 070, combined schema, and SQLite bootstrap carry the outcome marker', () => {
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '070_t3_command_outcome.sql'),
+        'utf8'
+      );
+      const combined = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+      const sqlite = readFileSync(resolve(import.meta.dir, 'sqlite.ts'), 'utf8');
+
+      // Static text parity only; the engine proof is t3-command-admissions.postgres.test.ts.
+      for (const schema of [migration, combined, sqlite]) {
+        expect(schema).toContain('outcome_message_id');
+        expect(schema).toContain('pre-outcome-backfill');
+      }
+      for (const schema of [migration, combined]) {
+        expect(schema).toContain('table_schema = current_schema()');
+      }
+    });
+  });
+
   describe('Board authority foundation schema', () => {
     test('numbered migration, combined schema, and SQLite bootstrap define authority tables', () => {
       const migration = readFileSync(

@@ -228,6 +228,13 @@ export interface CauldronFireConsumerDeps {
   getRunBranch: (runId: string) => Promise<string | null>;
   /** The PR identity read from GitHub with the service identity. */
   getPullRequest: (repo: string, number: number) => Promise<PullRequestIdentity | null>;
+
+  // --- Run outcome message (WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01) ---
+  /**
+   * The fire's outcome when its cascade has ENDED, else null. Throws when the
+   * cascade record exists but cannot be read (corrupt or wrong identity).
+   */
+  getFireOutcome: (row: T3CommandAdmissionRow) => Promise<FireOutcome | null>;
 }
 
 // --------------------------------------------------------------------------
@@ -1413,6 +1420,171 @@ let tickInFlight = false;
  * still executing -- e.g. a fire awaiting run discovery -- is a no-op, so no
  * second tick can re-read and answer a command whose decision is in progress.
  */
+// --------------------------------------------------------------------------
+// Run outcome message (WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01)
+// --------------------------------------------------------------------------
+
+/**
+ * Cascade statuses after which the cascade does no more (the spec's excerpt H).
+ * `planned`, `running` and `pending-frontier-approval` are not ended;
+ * `frontier-approved` hands off to the resumed cascade and is followed.
+ */
+export const ENDED_CASCADE_STATUSES: ReadonlySet<string> = new Set([
+  'won',
+  'blocked',
+  'spec-repair',
+  'recovery-delegated',
+  'infra-alert',
+  'frontier-rejected',
+  'cancelled',
+  'gate-misfire',
+  'refused',
+]);
+/** At most this many frontier-approved hand-offs are followed. */
+const MAX_APPROVAL_HOPS = 3;
+const PR_URL_LINE = /PR_URL=(https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+)/g;
+
+/** How a fire ended, read from its cascade record. */
+export interface FireOutcome {
+  cascadeId: string;
+  cascadeStatus: string;
+  winningTier: string | null;
+  attempts: number;
+  /** The LAST attempt's run (null when the cascade ran none). */
+  runId: string | null;
+  runStatus: string | null;
+  prUrl: string | null;
+}
+
+/** The reads the production extraction needs; the factory binds the defaults. */
+export interface FireOutcomeReads {
+  /** Cascade record directory; undefined = readCascadeRecord's default. */
+  cascadeRecordDir?: string;
+  getRunStatus: (runId: string) => Promise<string | null>;
+  listRunEvents: (
+    runId: string
+  ) => Promise<readonly { event_type: string; step_name?: string | null; data: unknown }[]>;
+}
+
+function eventNodeOutput(data: unknown): string {
+  let value: unknown = data;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value) as unknown;
+    } catch {
+      return '';
+    }
+  }
+  const output = (value as { node_output?: unknown } | null)?.node_output;
+  return typeof output === 'string' ? output : '';
+}
+
+/** The run's PR link: the last PR_URL= line of its open-pr-if-needed node (excerpt D). */
+async function readRunPrUrl(runId: string, reads: FireOutcomeReads): Promise<string | null> {
+  const events = await reads.listRunEvents(runId);
+  let prUrl: string | null = null;
+  for (const event of events) {
+    if (event.event_type !== 'node_completed' || event.step_name !== 'open-pr-if-needed') continue;
+    for (const match of eventNodeOutput(event.data).matchAll(PR_URL_LINE)) prUrl = match[1];
+  }
+  return prUrl;
+}
+
+/**
+ * The production extraction: read the fire's cascade record, follow up to three
+ * `frontier-approved` hand-offs, and when the cascade has ENDED report its last
+ * attempt's run, that run's status and its PR link. Null when there is no record
+ * or the cascade has not ended. A record that exists but cannot be read throws.
+ */
+export async function readFireOutcome(
+  row: T3CommandAdmissionRow,
+  reads: FireOutcomeReads
+): Promise<FireOutcome | null> {
+  let record = await readCascadeRecord(row.cascade_id ?? row.request_id, reads.cascadeRecordDir);
+  for (let hops = 0; record?.status === 'frontier-approved'; hops += 1) {
+    const next = record.frontierApproval?.resumeCascadeId;
+    if (!next || hops >= MAX_APPROVAL_HOPS) return null;
+    record = await readCascadeRecord(next, reads.cascadeRecordDir);
+  }
+  if (!record || !ENDED_CASCADE_STATUSES.has(record.status)) return null;
+  const last = record.attempts.length > 0 ? record.attempts[record.attempts.length - 1] : null;
+  const runId = last?.runId ?? null;
+  return {
+    cascadeId: record.cascadeId,
+    cascadeStatus: record.status,
+    winningTier: record.winningTier ?? null,
+    attempts: record.attempts.length,
+    runId,
+    runStatus: runId ? await reads.getRunStatus(runId) : null,
+    prUrl: runId ? await readRunPrUrl(runId, reads) : null,
+  };
+}
+
+/** The outcome row's body: exactly these fields, and NO `status` field. */
+function outcomeBody(row: T3CommandAdmissionRow, outcome: FireOutcome): string {
+  return JSON.stringify({
+    schema: REPLY_SCHEMA,
+    request_id: row.request_id,
+    verb: 'fire',
+    phase: 'outcome',
+    code: `cascade_${outcome.cascadeStatus.replace(/-/g, '_')}`,
+    task_outcome: outcome.cascadeStatus,
+    cascade_id: outcome.cascadeId,
+    cascade_status: outcome.cascadeStatus,
+    winning_tier: outcome.winningTier,
+    attempts: outcome.attempts,
+    run_id: outcome.runId,
+    run_status: outcome.runStatus,
+    pr_url: outcome.prUrl,
+    wo_id: row.wo_id,
+    thread_id: row.thread_id,
+  });
+}
+
+/**
+ * Send each admitted fire whose cascade has ended ONE outcome row, then record
+ * it. Identity is the dispatch row for idempotency key `outcome:<request_id>`
+ * and this sender: a failure between the send and the record is retried on the
+ * next tick and returns the same row. No order against the decision reply is
+ * guaranteed. A failure on one row is logged and the pass goes on.
+ */
+export async function sendFireOutcomes(deps: CauldronFireConsumerDeps): Promise<void> {
+  const rows = await admissions.listFiresAwaitingOutcome(deps.db);
+  for (const row of rows) {
+    let outcome: FireOutcome | null;
+    try {
+      outcome = await deps.getFireOutcome(row);
+    } catch (error) {
+      log.warn(
+        { requestId: row.request_id, cause: (error as Error).message?.slice(0, 200) },
+        'cauldron_fire_outcome_record_unreadable'
+      );
+      continue;
+    }
+    if (!outcome) continue;
+    try {
+      const mailbox = deps.resolveActorMailbox(row.actor_principal_id);
+      if (!mailbox) {
+        log.warn({ requestId: row.request_id }, 'cauldron_fire_outcome_mailbox_unresolved');
+        continue;
+      }
+      const message = await deps.sendReply({
+        recipient: mailbox,
+        correlationId: row.request_id,
+        idempotencyKey: `outcome:${row.request_id}`,
+        body: outcomeBody(row, outcome),
+      });
+      if (!message?.id) throw new Error('cauldron_fire_outcome_send_returned_no_row');
+      await admissions.recordOutcome(row.request_id, message.id, deps.now().toISOString(), deps.db);
+    } catch (error) {
+      log.warn(
+        { requestId: row.request_id, cause: (error as Error).message?.slice(0, 200) },
+        'cauldron_fire_outcome_row_failed'
+      );
+    }
+  }
+}
+
 export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): Promise<void> {
   if (tickInFlight) return;
   tickInFlight = true;
@@ -1431,6 +1603,13 @@ export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): 
       log.warn(
         { cause: (error as Error).message?.slice(0, 200) },
         'cauldron_fire_claim_reconcile_failed'
+      );
+    });
+    // WO-HARNESS-T3-FIRE-RUN-OUTCOME-REPLY-01: one outcome row per ended fire.
+    await sendFireOutcomes(deps).catch((error: unknown) => {
+      log.warn(
+        { cause: (error as Error).message?.slice(0, 200) },
+        'cauldron_fire_outcome_pass_failed'
       );
     });
     const commands = await deps.listCommands(CAULDRON_FIRE_RECIPIENT, COMMAND_LIST_LIMIT);
@@ -1945,5 +2124,11 @@ export function createRealCauldronFireConsumerDeps(
       if (!response.ok) throw new Error(`cauldron_fire_github_${response.status}`);
       return mapPullRequest((await response.json()) as Parameters<typeof mapPullRequest>[0]);
     },
+    getFireOutcome: (row): Promise<FireOutcome | null> =>
+      readFireOutcome(row, {
+        getRunStatus: async (runId): Promise<string | null> =>
+          (await workflowsDb.getWorkflowRun(runId))?.status ?? null,
+        listRunEvents: runId => workflowEventsDb.listWorkflowEvents(runId),
+      }),
   };
 }
