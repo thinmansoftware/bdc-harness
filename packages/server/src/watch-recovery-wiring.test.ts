@@ -25,21 +25,18 @@ import {
 } from '@archon/core/db/m31-target-v2';
 import { getRecoveryExecutionClaim } from '@archon/core/db/execution-claims';
 import { OpenAPIHono } from '@hono/zod-openapi';
-import type { WebAdapter } from '../../../server/src/adapters/web';
-import { registerApiRoutes } from '../../../server/src/routes/api';
+import type { WebAdapter } from './adapters/web';
+import { registerApiRoutes } from './routes/api';
 import { ConversationLockManager, loadConfig } from '@archon/core';
 import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { hashWorkflowDefinition } from '@archon/workflows/reliability/runtime-revisions';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
-import { composeOverseerRecovery } from '../../../server/src/overseer-runtime';
-import type {
-  OverseerRecoveryTransport,
-  RecoveryGitHubReads,
-} from '../../../server/src/overseer-recovery';
-import { dispatchGuardedWoRun } from '../../../server/src/routes/wo-fire-guard';
-import { handleRecord } from '../service';
-import { watchOnce } from '../watch';
-import type { PullRequestEvidence } from '../types';
+import { composeOverseerRecovery } from './overseer-runtime';
+import type { OverseerRecoveryTransport, RecoveryGitHubReads } from './overseer-recovery';
+import { dispatchGuardedWoRun } from './routes/wo-fire-guard';
+import { handleRecord } from '@archon/overseer/service';
+import { watchOnce } from '@archon/overseer/watch';
+import type { PullRequestEvidence } from '@archon/overseer';
 
 const REPO = 'thinmansoftware/bdc-harness';
 const REMOTE = `https://github.com/${REPO}.git`;
@@ -532,6 +529,28 @@ test('WATCH_RECOVERY_02 released stall resumes and final handback stays closed t
   const returned = await stored('returned');
   expect(returned.recovery?.blocker).toBe('returned_to_author');
   expect(returned.proposal).toBeNull();
+});
+
+test('held repair branch in a node_failed error refuses refire with no open PR', async () => {
+  const id = 'held-branch';
+  await seed(id, 'failed', false);
+  await event(
+    id,
+    'node_failed',
+    '2020-01-01T00:02:00.000Z',
+    { error: 'repair_target_branch_held: feat/recovery-fixture is checked out' },
+    'checkout-repair-target'
+  );
+
+  await tick();
+  await tick();
+
+  const blocked = await stored(id);
+  expect(blocked.recovery?.action).toBeNull();
+  expect(blocked.proposal).toBeNull();
+  expect(blocked.stages.recovery_handoff).toBeDefined();
+  expect(fireCalls).toBe(0);
+  expect(resumeCalls).toBe(0);
 });
 
 test('WATCH_RECOVERY_03 healthy waits and fresh progress stay out of recovery', async () => {

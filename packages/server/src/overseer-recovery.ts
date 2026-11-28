@@ -197,7 +197,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return (await exec('git', args, { cwd, timeout: 15_000, windowsHide: true })).stdout.trim();
 }
 
-function returnedToAuthor(
+function findReturnEvent(
   events: OverseerWorkflowEvent[],
   runId: string
 ): OverseerWorkflowEvent | undefined {
@@ -239,7 +239,7 @@ async function selectEvent(
   record: OverseerRunRecord,
   events: OverseerWorkflowEvent[]
 ): Promise<OverseerWorkflowEvent | undefined> {
-  const returned = returnedToAuthor(events, record.id);
+  const returned = findReturnEvent(events, record.id);
   if (returned) return returned;
   const failure = events.find(event =>
     ['node_failed', 'workflow_failed', 'workflow_stalled'].includes(event.event_type)
@@ -289,10 +289,17 @@ async function selectEvent(
 
 function hasHardStop(events: OverseerWorkflowEvent[]): boolean {
   return events.some(event =>
-    [event.data.output, event.data.node_output, event.data.reason].some(
+    [
+      event.data.error,
+      event.data.message,
+      event.data.stderr,
+      event.data.node_output,
+      event.data.output,
+      event.data.reason,
+    ].some(
       value =>
         typeof value === 'string' &&
-        /(?:CLOSED_LIST=(?:production settings|secrets|another product contract)|repair_target_(?:held|unreclaimable)|teardown_unconfirmed)/i.test(
+        /(?:CLOSED_LIST=(?:production settings|secrets|another product contract)|repair_target_(?:branch_)?(?:held|unreclaimable)|teardown_unconfirmed)/i.test(
           value
         )
     )
@@ -345,7 +352,7 @@ async function readCandidate(record: WatchedRunRecord, eventId: string): Promise
     !/^(archon\/|run\/|wip\/|repair\/|feat\/)/.test(authority.headBranch) ||
     matches.length !== 1 ||
     matches[0]?.id !== run.id ||
-    returnedToAuthor(events, run.id) ||
+    findReturnEvent(events, run.id) ||
     hasHardStop(events) ||
     !events.some(event => event.id === eventId) ||
     record.prEvidence.exists ||
@@ -1280,7 +1287,7 @@ export function createOverseerWatchRecovery(
       }
       const source = existing ? (JSON.parse(existing) as RecoveryCase).event : record.recoveryEvent;
       const events = await listRunEventsForOverseer(record.runId);
-      const event = returnedToAuthor(events, record.runId) ?? source;
+      const event = findReturnEvent(events, record.runId) ?? source;
       if (!event?.id) return true;
       const returned = event.event_type === 'run_outcome';
       const active = record.status === 'running' || record.status === 'interrupted';
