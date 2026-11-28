@@ -51,13 +51,13 @@ interface CodebaseRow {
   default_cwd: string;
 }
 
-interface ActiveRun {
-  id: string;
+interface WorkRun {
   codebase_id: string | null;
   canonical_remote: string | null;
   head_branch: string | null;
   wo_id: string | null;
   user_message: string;
+  is_active: boolean | 0 | 1;
 }
 
 type Query = IDatabase['query'];
@@ -172,7 +172,7 @@ async function activeWork(
   }>(
     "SELECT wo_id, project, target_repo, target_branch FROM cascade_wo_claims WHERE state = 'active'"
   );
-  const occupied = new Set<string>();
+  const claimedWork = new Set<string>();
   for (const claim of claims.rows) {
     const registered = matchProjectCodebase(codebases, claim.project);
     if (
@@ -185,18 +185,24 @@ async function activeWork(
     ) {
       if (branch && claim.target_branch === branch)
         throw new FireAdmissionDeferred('target_branch_held', { repo, branch });
-      occupied.add(`wo:${claim.wo_id}`);
+      claimedWork.add(`wo:${claim.wo_id}`);
     }
   }
-  const runs = await query<ActiveRun>(
-    `SELECT r.id, r.codebase_id, r.user_message, a.canonical_remote, a.head_branch, a.wo_id
-     FROM remote_agent_workflow_runs r LEFT JOIN remote_agent_run_authorities a ON a.run_id = r.id
-     WHERE r.status IN ('pending', 'running', 'waiting_provider', 'interrupted', 'orphaned', 'paused')
-       AND (a.wo_id IS NOT NULL OR r.user_message LIKE '%WO_ID=%')`
+  const runs = await query<WorkRun>(
+    `WITH wo_runs AS (
+       SELECT r.codebase_id, r.user_message, a.canonical_remote, a.head_branch, a.wo_id,
+         r.status IN ('pending', 'running', 'waiting_provider', 'interrupted', 'orphaned', 'paused')
+           AS is_active
+       FROM remote_agent_workflow_runs r LEFT JOIN remote_agent_run_authorities a ON a.run_id = r.id
+       WHERE a.wo_id IS NOT NULL OR r.user_message LIKE '%WO_ID=%'
+     )
+     SELECT * FROM wo_runs
+     WHERE is_active OR wo_id IN (SELECT wo_id FROM cascade_wo_claims WHERE state = 'active')`
   );
   const activePrBranches = new Set(
     pulls.filter(pull => !pull.draft && pull.headRepo === repo).map(pull => pull.branch)
   );
+  const occupied = new Set(claimedWork);
   const coveredWork = new Set<string>();
   for (const run of runs.rows) {
     const registered = codebases.find(row => row.id === run.codebase_id);
@@ -207,12 +213,14 @@ async function activeWork(
         : codebaseRepo(registered) !== repo && normalizeRepoSlug(registered?.name) !== repo
     )
       continue;
-    if (branch && run.head_branch === branch)
+    if (run.is_active && branch && run.head_branch === branch)
       throw new FireAdmissionDeferred('target_branch_held', { repo, branch });
     const woId = run.wo_id ?? /(?:^|\s)WO_ID=(WO-[A-Z0-9-]+)(?=\s|$)/.exec(run.user_message)?.[1];
     if (!woId) continue;
     const key = `wo:${woId}`;
-    occupied.add(key);
+    // A terminal run can cover a PR for a claim retained in this repository.
+    if (run.is_active) occupied.add(key);
+    else if (!claimedWork.has(key)) continue;
     if (run.head_branch && !coveredWork.has(key) && activePrBranches.delete(run.head_branch))
       coveredWork.add(key);
   }

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IDatabase } from '@archon/core';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
-import { acquireWoClaim, releaseWoClaim } from '@archon/core/db/cascade-wo-claims';
+import { acquireWoClaim, releaseWoClaim, retainWoClaim } from '@archon/core/db/cascade-wo-claims';
 import { resolveAgent, loadAgentRegistry } from '@archon/workflows/agents/registry';
 import { acquireAdmittedWoClaim, resolveRepoWipCap } from './fire-admission';
 
@@ -47,12 +47,12 @@ function seedClaim(woId = 'WO-OLD-01', project = PROJECT) {
   return acquireWoClaim({ woId, project, cascadeId: 'cascade-old', holder: 't3', now: NOW }, db);
 }
 
-async function seedRun(id: string, woId: string, branch: string) {
+async function seedRun(id: string, woId: string, branch: string, status = 'running') {
   await db.query(
     `INSERT INTO remote_agent_workflow_runs
       (id, workflow_name, conversation_id, codebase_id, status, user_message)
-     VALUES ($1, 'fixture', 'conversation', 'codebase', 'running', $2)`,
-    [id, `WO_ID=${woId}`]
+     VALUES ($1, 'fixture', 'conversation', 'codebase', $2, $3)`,
+    [id, status, `WO_ID=${woId}`]
   );
   await db.query(
     `INSERT INTO remote_agent_run_authorities (run_id, dispatch_id, wo_id, spec_source, spec_revision,
@@ -134,6 +134,39 @@ describe('Cauldron fire admission', () => {
     await seedClaim();
     await seedRun('run-1', 'WO-OLD-01', 'feature/1');
     expect((await admit({ readGitHub: evidence([pull(1)]) })).acquired).toBe(true);
+  });
+
+  test.each(['completed', 'failed'])(
+    'counts a retained claim and the ready PR from its %s run as one slot',
+    async status => {
+      await seedClaim();
+      await seedRun('run-1', 'WO-OLD-01', 'feature/1', status);
+      expect(
+        await retainWoClaim(
+          {
+            woId: 'WO-OLD-01',
+            cascadeId: 'cascade-old',
+            reason: 'awaiting approval',
+            runIds: ['run-1'],
+          },
+          db
+        )
+      ).toBe(true);
+
+      const readGitHub = evidence([pull(1)]);
+      expect(await admit({ readGitHub })).toMatchObject({
+        acquired: true,
+        claim: { wo_id: 'WO-NEW-01' },
+      });
+      await expect(
+        admit({ readGitHub, woId: 'WO-NEW-02', cascadeId: 'cascade-other' })
+      ).rejects.toMatchObject({ reason: 'repo_wip_cap', details: { active: 2, cap: 2 } });
+    }
+  );
+
+  test.each(['completed', 'failed'])('ignores an unclaimed %s run', async status => {
+    await seedRun('run-1', 'WO-OLD-01', 'feature/1', status);
+    expect((await admit({ env: { CAULDRON_FIRE_REPO_WIP_CAP: '1' } })).acquired).toBe(true);
   });
 
   test('counts an active run with only a draft; a fork branch cannot cover it', async () => {
