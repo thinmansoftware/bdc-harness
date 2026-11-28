@@ -25,6 +25,7 @@ import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import * as admissions from '@archon/core/db/t3-command-admissions';
 import * as claims from '@archon/core/db/cascade-wo-claims';
+import { FireAdmissionDeferred } from '../cascade/fire-admission';
 import {
   type CauldronFireConsumerDeps,
   type PullRequestIdentity,
@@ -360,6 +361,52 @@ describe('Test 1: fire admitted once and replied', () => {
 });
 
 describe('Test 2: double fire returns the first run id', () => {
+  test('replays a WIP refusal without firing again or retaining the WO reservation', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    const fire = world.deps.fireCascade;
+    world.deps.fireCascade = async input => {
+      world.calls.fire++;
+      if (input.dispatchId === 'Q-WIP')
+        throw new FireAdmissionDeferred('repo_wip_cap', { active: 2, cap: 2 });
+      world.calls.fire--;
+      return fire(input);
+    };
+    const message = makeMessage({
+      idempotencyKey: 'Q-WIP',
+      body: cmdBody({
+        request_id: 'Q-WIP',
+        verb: 'fire',
+        wo_id: 'WO-A-01',
+        project: 'bdc-harness',
+      }),
+    });
+    await processCommand(world.deps, message);
+    await processCommand(world.deps, message);
+    expect(world.calls.fire).toBe(1);
+    expect((await admissions.getByRequestId('Q-WIP', db))?.state).toBe('refused');
+    expect(parseReply(world.replies[0])).toMatchObject({
+      status: 409,
+      code: 'fire_deferred:repo_wip_cap',
+    });
+    world.fireResults.set('WO-A-01', { cascadeId: 'C1', status: 'running', runId: 'R1' });
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-retry',
+        idempotencyKey: 'Q-AFTER',
+        body: cmdBody({
+          request_id: 'Q-AFTER',
+          verb: 'fire',
+          wo_id: 'WO-A-01',
+          project: 'bdc-harness',
+        }),
+      })
+    );
+    expect(world.calls.fire).toBe(2);
+    expect((await admissions.getByRequestId('Q-AFTER', db))?.state).toBe('admitted');
+  });
+
   test('re-processing the same row never fires twice and replays R1', async () => {
     const world = makeWorld({ ...BASE_ENV });
     world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');

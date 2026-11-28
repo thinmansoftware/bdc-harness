@@ -9,6 +9,7 @@ import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { rootLogger } from '@archon/paths';
 import * as githubMetering from '@archon/core/github/metering';
+import { FireAdmissionDeferred } from '../cascade/fire-admission';
 import {
   setSeatUsageReaderForTests,
   unknownSeatReading,
@@ -341,7 +342,7 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     transitionPendingFireAction: async (
       id: string,
       expectedJson: string,
-      outcome: 'pending' | 'sent' | 'expired',
+      outcome: 'pending' | 'sent' | 'expired' | 'deferred',
       proposalJson: string
     ) => {
       const row = world.journal.find(row => row.id === id);
@@ -2069,6 +2070,41 @@ describe('pending fire custody', () => {
       }
     }
   );
+
+  test('repo WIP deferral returns the daily slot and retries after capacity opens', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      readFireCascadeEvidence: async () => ({
+        earliestRunId: 'wip-retry-run',
+        completedRunId: null,
+        status: 'running',
+        prOpened: false,
+      }),
+    });
+    const admitted = fixture.deps.runCascade!;
+    fixture.deps.runCascade = async () => {
+      throw new FireAdmissionDeferred('repo_wip_cap', {
+        repo: 'thinmansoftware/bdc-harness',
+        active: 2,
+        cap: 2,
+      });
+    };
+    const state = createTaskmasterState(60_000);
+    expect(await tick(state, fixture.deps)).toMatchObject({ effects: 0, deferred: 1 });
+    const action = world.journal.find(row => row.action_type === 'fire_cauldron')!;
+    expect(action.outcome).toBe('deferred');
+    expect(JSON.parse(action.proposal_json)).toMatchObject({
+      reason: 'repo_wip_cap',
+      wip: { cap: 2, active: 2 },
+    });
+    expect(fixture.fires()).toBe(0);
+    fixture.deps.runCascade = admitted;
+    world.nowMs += 60_000;
+    await tick(state, fixture.deps);
+    expect(fixture.fires()).toBe(1);
+    expect(world.journal.find(row => row.id === action.id)?.outcome).toBe('sent');
+  });
 
   test('admission without a proven workflow stays pending across later ticks and buckets', async () => {
     const world = makeWorld();
