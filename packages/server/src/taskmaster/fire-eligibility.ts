@@ -6,6 +6,7 @@ import {
 } from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { isSpecOnlyFileList } from '@archon/smart-cauldron/spec-only-pr';
+import { parseRepairTarget } from '@archon/workflows/reliability/run-branch-identity';
 import {
   freezeWorkOrderSource,
   type ExpectedSpecIdentity,
@@ -14,6 +15,7 @@ import {
 export interface FireEligibilityEvidence {
   woId: string;
   targetRepo: string;
+  targetBranch?: string;
   project: string;
   specVerifiedAt: string;
   noOpenOrMergedPr: true;
@@ -306,6 +308,7 @@ ${pr.body ?? ''}`) &&
     evidence: {
       woId,
       targetRepo,
+      targetBranch: parseRepairTarget(body)?.branch,
       project,
       specVerifiedAt: (deps.now ?? ((): Date => new Date()))().toISOString(),
       noOpenOrMergedPr: true,

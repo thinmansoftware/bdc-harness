@@ -94,6 +94,7 @@ import {
 import { pageOnce } from '../dispatch/worker-heartbeat-alarm';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
 import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
+import { FireAdmissionDeferred } from '../cascade/fire-admission';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -3183,7 +3184,18 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             // Amendment 5 A5.0 (WO-HARNESS-T3-COMMAND-CONSUMER-01): the shared
             // database WO claim, so a Taskmaster cascade and a T3 consumer
             // cascade can never run the same WO at once.
-            deps: { seatUsage: conductorSeatUsage, ...cascadeWoClaimDeps('taskmaster') },
+            deps: {
+              seatUsage: conductorSeatUsage,
+              ...cascadeWoClaimDeps('taskmaster', undefined, {
+                fireAdmission: {
+                  target: {
+                    repo: proposal.fireEvidence.targetRepo,
+                    branch: proposal.fireEvidence.targetBranch,
+                  },
+                  env: process.env,
+                },
+              }),
+            },
             beforeAdmission: async () => {
               guardAttempted = true;
               const decision = await fireBudget.authorizeAutomaticFire({
@@ -3202,8 +3214,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
                 ? laneDecision.lane
                 : undefined,
           });
-          void cascadePromise.catch(() => {
-            log.warn({ journalId: journalRow.id }, 'taskmaster.fire_cascade_failed');
+          void cascadePromise.catch((error: unknown) => {
+            if (!(error instanceof FireAdmissionDeferred))
+              log.warn({ journalId: journalRow.id }, 'taskmaster.fire_cascade_failed');
           });
           const admitted = await Promise.race([admission, cascadePromise]);
           // A direct, identity-bound refusal is positive no-fire evidence. A
@@ -3260,7 +3273,36 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           journalRow = settledJournal;
           if (!(await reconcilePendingFire(journalRow, dal, readFireEvidence))) continue;
           unconfirmedFireReservations -= 1;
-        } catch {
+        } catch (error) {
+          let releasedDeferral = false;
+          if (!guardAttempted && error instanceof FireAdmissionDeferred) {
+            try {
+              releasedDeferral = await fireBudget.releaseAutomaticFire(reservation);
+            } catch {
+              log.warn({ journalId: journalRow.id }, 'taskmaster.fire_release_unknown');
+            }
+          }
+          if (releasedDeferral && error instanceof FireAdmissionDeferred) {
+            const deferred = JSON.stringify({
+              ...proposal,
+              reason: error.reason,
+              wip: error.details,
+            });
+            if (
+              await dal.transitionPendingFireAction?.(
+                journalRow.id,
+                journalRow.proposal_json,
+                'deferred',
+                deferred
+              )
+            ) {
+              journalRow.outcome = 'deferred';
+              journalRow.proposal_json = deferred;
+              result.deferred += 1;
+            }
+            unconfirmedFireReservations -= 1;
+            continue;
+          }
           // Release only owned capacity without committed permission. A lost
           // authorization result remains charged and pending.
           try {

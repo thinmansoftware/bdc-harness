@@ -744,6 +744,15 @@ export class SqliteAdapter implements IDatabase {
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
+    const claimColumns = this.pragmaAll("PRAGMA table_info('cascade_wo_claims')") as {
+      name: string;
+    }[];
+    if (!claimColumns.some(column => column.name === 'target_repo')) {
+      this.db.run('ALTER TABLE cascade_wo_claims ADD COLUMN target_repo TEXT');
+    }
+    if (!claimColumns.some(column => column.name === 'target_branch')) {
+      this.db.run('ALTER TABLE cascade_wo_claims ADD COLUMN target_branch TEXT');
+    }
     // WO-GRIMOIRE-PROJECT-RECORD-01 (migration 068): additive and idempotent.
     const codebaseColumns = this.pragmaAll("PRAGMA table_info('remote_agent_codebases')") as {
       name: string;
@@ -2832,6 +2841,8 @@ export class SqliteAdapter implements IDatabase {
       CREATE TABLE IF NOT EXISTS cascade_wo_claims (
         wo_id TEXT NOT NULL,
         project TEXT NOT NULL,
+        target_repo TEXT,
+        target_branch TEXT,
         cascade_id TEXT NOT NULL,
         holder TEXT NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('active', 'released')),

@@ -18,7 +18,7 @@
  * operator release, or (c) reconcileRetainedWoClaims finding every run under the
  * claim terminal. No time-based expiry.
  */
-import type { IDatabase } from '@archon/core';
+import { getDatabase, type IDatabase } from '@archon/core';
 import {
   acquireWoClaim,
   findActiveWoClaim,
@@ -33,6 +33,7 @@ import { approvalHandOffBoundS, isApprovalHandOff } from './approval-handoff';
 import { readCascadeRecord } from '@archon/smart-cauldron/cascade';
 import type { CascadeDeps } from '@archon/smart-cauldron/cascade';
 import type { AcquireWoLockResult } from '@archon/smart-cauldron/wo-lock';
+import { acquireAdmittedWoClaim, type FireAdmissionTarget } from './fire-admission';
 
 /** Cascade record statuses that may still resume or are still executing. */
 const HOLDING_CASCADE_STATUSES = new Set([
@@ -89,6 +90,7 @@ async function everyRunTerminal(runIds: string[], readRun: ClaimRunReader): Prom
 export interface ClaimDepsOptions {
   readRun?: ClaimRunReader;
   readRecord?: typeof readCascadeRecord;
+  fireAdmission?: { target: FireAdmissionTarget; env: Record<string, string | undefined> };
 }
 
 export function cascadeWoClaimDeps(
@@ -101,9 +103,16 @@ export function cascadeWoClaimDeps(
   return {
     acquireWoLock: async (woId, project, cascadeId, outDir): Promise<AcquireWoLockResult> => {
       const now = new Date().toISOString();
-      let result = await acquireWoClaim({ woId, project, cascadeId, holder, now }, db);
+      const claimInput = { woId, project, cascadeId, holder, now };
+      let result = options.fireAdmission
+        ? await acquireAdmittedWoClaim({
+            ...claimInput,
+            ...options.fireAdmission,
+            db: db ?? getDatabase(),
+          })
+        : await acquireWoClaim(claimInput, db);
       // A frontier-approved pause hands its retained claim to the resumed cascade.
-      if (!result.acquired && result.claim?.retained_reason) {
+      if (!options.fireAdmission && !result.acquired && result.claim?.retained_reason) {
         const held = await readRecord(result.claim.cascade_id, outDir).catch(() => null);
         if (
           held?.status === 'frontier-approved' &&
